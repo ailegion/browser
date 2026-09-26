@@ -11,12 +11,14 @@ use selectors::context::{
     SelectorCaches,
 };
 use selectors::matching::matches_selector;
+use selectors::parser::{Combinator, Component};
 use slotmap::SecondaryMap;
 
 use crate::computed::{ComputedStyle, DeclaredValues, Viewport, compute};
 use crate::custom::{expand_pending, resolve_customs};
 use crate::properties::{CustomValue, Declaration, DeclaredValue};
-use crate::selector_impl::ElementRef;
+use crate::selector_impl::{BrowserSelectors, ElementRef, PseudoClass};
+use crate::state::{ElementStates, InteractionDeps, NO_STATES, Reach};
 use crate::stylesheet::{Origin, Rule, StyleRule, Stylesheet, parse_declaration_block};
 
 /// Computed style per element. Text nodes have no entry; use the parent's.
@@ -148,60 +150,164 @@ fn level(origin: Origin, important: bool) -> u8 {
     }
 }
 
-/// Compute styles for every element in `doc`.
+/// Compute styles for every element in `doc`, with no element hovered,
+/// active or focused.
 pub fn compute_styles(doc: &Document, stylist: &Stylist, viewport: &Viewport) -> StyleMap {
-    let index = RuleIndex::build(stylist.active_rules(viewport));
-    let rules = &index.rules;
-    let mut candidates: Vec<(u32, u32)> = Vec::new();
-    let mut styles: StyleMap = SecondaryMap::new();
-    let mut caches = SelectorCaches::default();
-    let quirks = match doc.quirks_mode {
-        browser_dom::QuirksMode::Quirks => QuirksMode::Quirks,
-        browser_dom::QuirksMode::LimitedQuirks => QuirksMode::LimitedQuirks,
-        browser_dom::QuirksMode::NoQuirks => QuirksMode::NoQuirks,
-    };
-    let initial = Arc::new(ComputedStyle::initial());
-    let mut root_font_size: Option<f32> = None;
+    compute_styles_with(doc, stylist, viewport, &NO_STATES)
+}
 
+/// Compute styles for every element in `doc` under the given interaction
+/// state.
+pub fn compute_styles_with(
+    doc: &Document,
+    stylist: &Stylist,
+    viewport: &Viewport,
+    states: &ElementStates,
+) -> StyleMap {
+    let mut styles: StyleMap = SecondaryMap::new();
     let Some(root) = doc.document_element() else {
         return styles;
     };
+    let mut restyler = Restyler::new(doc, stylist, viewport, states);
+    restyler.restyle_subtree(root, &mut styles, true);
+    styles
+}
 
-    // Pre-order traversal so parents are computed before children.
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        let Some(element) = doc.element(id) else { continue };
+/// Recompute the styles of `roots`, and of their descendants when
+/// `descendants`, in place after a change in interaction state. Parents
+/// keep their current styles. Returns whether any computed style changed,
+/// which is when layout has to run again.
+pub fn restyle(
+    doc: &Document,
+    stylist: &Stylist,
+    viewport: &Viewport,
+    states: &ElementStates,
+    styles: &mut StyleMap,
+    roots: &[NodeId],
+    descendants: bool,
+) -> bool {
+    let mut restyler = Restyler::new(doc, stylist, viewport, states);
+    let mut changed = false;
+    for &root in roots {
+        // A root inside another root's subtree is covered by it.
+        if descendants && roots.iter().any(|&other| other != root && is_inside(doc, root, other)) {
+            continue;
+        }
+        changed |= restyler.restyle_subtree(root, styles, descendants);
+    }
+    changed
+}
 
-        let parent_style = doc
-            .parent(id)
-            .and_then(|p| styles.get(p))
-            .cloned()
-            .unwrap_or_else(|| initial.clone());
+fn is_inside(doc: &Document, node: NodeId, ancestor: NodeId) -> bool {
+    let mut cur = doc.parent(node);
+    while let Some(n) = cur {
+        if n == ancestor {
+            return true;
+        }
+        cur = doc.parent(n);
+    }
+    false
+}
 
-        // `display: none` subtrees still get styles (cheap, and needed if a
-        // later change shows them), but their descendants are skipped from
-        // matching cost by not pushing them. Keep it simple: compute all.
+/// Computes elements' styles one at a time over a prepared rule index.
+struct Restyler<'a> {
+    doc: &'a Document,
+    index: RuleIndex<'a>,
+    caches: SelectorCaches,
+    candidates: Vec<(u32, u32)>,
+    quirks: QuirksMode,
+    viewport: &'a Viewport,
+    states: &'a ElementStates,
+    initial: Arc<ComputedStyle>,
+}
 
+impl<'a> Restyler<'a> {
+    fn new(doc: &'a Document, stylist: &'a Stylist, viewport: &'a Viewport, states: &'a ElementStates) -> Self {
+        Self {
+            doc,
+            index: RuleIndex::build(stylist.active_rules(viewport)),
+            caches: SelectorCaches::default(),
+            candidates: Vec::new(),
+            quirks: match doc.quirks_mode {
+                browser_dom::QuirksMode::Quirks => QuirksMode::Quirks,
+                browser_dom::QuirksMode::LimitedQuirks => QuirksMode::LimitedQuirks,
+                browser_dom::QuirksMode::NoQuirks => QuirksMode::NoQuirks,
+            },
+            viewport,
+            states,
+            initial: Arc::new(ComputedStyle::initial()),
+        }
+    }
+
+    /// Style `root` and, when `descendants`, everything below it, in
+    /// pre-order so parents are computed before children. Returns whether
+    /// any style in `styles` changed.
+    fn restyle_subtree(&mut self, root: NodeId, styles: &mut StyleMap, descendants: bool) -> bool {
+        let doc = self.doc;
+        let doc_root = doc.document_element();
+        let mut changed = false;
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let Some(element) = doc.element(id) else { continue };
+            let is_root = Some(id) == doc_root;
+            let parent_style = doc
+                .parent(id)
+                .and_then(|p| styles.get(p))
+                .cloned()
+                .unwrap_or_else(|| self.initial.clone());
+            let root_font_size = if is_root {
+                None
+            } else {
+                doc_root.and_then(|r| styles.get(r)).map(|s| s.font_size)
+            };
+            let computed = self.style_element(id, element, &parent_style, root_font_size, is_root);
+            if styles.get(id).is_none_or(|old| **old != computed) {
+                styles.insert(id, Arc::new(computed));
+                changed = true;
+            }
+            if descendants {
+                // `display: none` subtrees still get styles (cheap, and
+                // needed if a later change shows them).
+                let kids: Vec<NodeId> = doc.children(id).filter(|&c| doc.get(c).is_element()).collect();
+                for c in kids.into_iter().rev() {
+                    stack.push(c);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Match, cascade and compute one element.
+    fn style_element(
+        &mut self,
+        id: NodeId,
+        element: &browser_dom::Element,
+        parent_style: &ComputedStyle,
+        root_font_size: Option<f32>,
+        is_root: bool,
+    ) -> ComputedStyle {
+        let doc = self.doc;
+        let viewport = self.viewport;
         // (level, specificity, order) sort key, then the declaration.
         let mut matched: Vec<(u8, u32, u32, &Declaration)> = Vec::new();
-        let el = ElementRef::new(doc, id);
+        let el = ElementRef::with_states(doc, id, self.states);
         {
             let mut ctx = MatchingContext::new(
                 MatchingMode::Normal,
                 None,
-                &mut caches,
-                quirks,
+                &mut self.caches,
+                self.quirks,
                 NeedsSelectorFlags::No,
                 MatchingForInvalidation::No,
             );
-            index.candidates(element, &mut candidates);
-            for &(ri, si) in &candidates {
-                let (origin, rule) = &rules[ri as usize];
+            self.index.candidates(element, &mut self.candidates);
+            for &(ri, si) in &self.candidates {
+                let (origin, rule) = self.index.rules[ri as usize];
                 let selector = &rule.selectors.slice()[si as usize];
                 if matches_selector(selector, 0, None, &el, &mut ctx) {
                     let specificity = selector.specificity();
                     for d in &rule.declarations {
-                        matched.push((level(*origin, d.important), specificity, ri + 1, d));
+                        matched.push((level(origin, d.important), specificity, ri + 1, d));
                     }
                 }
             }
@@ -214,7 +320,7 @@ pub fn compute_styles(doc: &Document, stylist: &Stylist, viewport: &Viewport) ->
             .unwrap_or_default();
         // Presentational hints from HTML attributes (width/height/align/bgcolor).
         let hints = presentational_hints(element);
-        let inline_order = rules.len() as u32 + 1;
+        let inline_order = self.index.rules.len() as u32 + 1;
         for d in &hints {
             matched.push((level(Origin::Author, false), 0, 0, d));
         }
@@ -265,25 +371,75 @@ pub fn compute_styles(doc: &Document, stylist: &Stylist, viewport: &Viewport) ->
             }
         }
 
-        let is_root = id == root;
-        let computed = compute(&decls, &parent_style, root_font_size, viewport, is_root);
-        if is_root {
-            root_font_size = Some(computed.font_size);
-        }
-        let computed = Arc::new(computed);
-        styles.insert(id, computed);
+        compute(&decls, parent_style, root_font_size, viewport, is_root)
+    }
+}
 
-        // Push children in reverse so they pop in document order.
-        let kids: Vec<NodeId> = doc
-            .children(id)
-            .filter(|&c| doc.get(c).is_element())
-            .collect();
-        for c in kids.into_iter().rev() {
-            stack.push(c);
+impl Stylist {
+    /// How far each interaction state reaches through the selectors of all
+    /// sheets, media queries included (being wrong about an inactive query
+    /// only costs a wider restyle).
+    pub fn interaction_deps(&self) -> InteractionDeps {
+        fn walk(rules: &[Rule], deps: &mut InteractionDeps) {
+            for r in rules {
+                match r {
+                    Rule::Style(s) => {
+                        for selector in s.selectors.slice() {
+                            scan_selector(selector.iter_raw_match_order(), Reach::Element, deps);
+                        }
+                    }
+                    Rule::Media(_, inner) => walk(inner, deps),
+                }
+            }
+        }
+        let mut deps = InteractionDeps::default();
+        for sheet in &self.sheets {
+            walk(&sheet.rules, &mut deps);
+        }
+        deps
+    }
+}
+
+/// Scan a selector's components in match order (right to left). `reach` is
+/// what a pseudo-class in the rightmost compound would need; each
+/// combinator crossed widens it for the compounds to its left.
+fn scan_selector<'a>(
+    components: impl Iterator<Item = &'a Component<BrowserSelectors>>,
+    mut reach: Reach,
+    deps: &mut InteractionDeps,
+) {
+    for c in components {
+        match c {
+            Component::Combinator(comb) => {
+                reach = reach.max(match comb {
+                    Combinator::Child | Combinator::Descendant => Reach::Subtree,
+                    Combinator::NextSibling | Combinator::LaterSibling => Reach::Parent,
+                    _ => reach,
+                });
+            }
+            Component::NonTSPseudoClass(pc) => match pc {
+                PseudoClass::Hover => deps.hover = deps.hover.max(reach),
+                PseudoClass::Active => deps.active = deps.active.max(reach),
+                PseudoClass::Focus | PseudoClass::FocusVisible | PseudoClass::FocusWithin => {
+                    deps.focus = deps.focus.max(reach)
+                }
+                _ => {}
+            },
+            Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
+                for s in list.slice() {
+                    scan_selector(s.iter_raw_match_order(), reach, deps);
+                }
+            }
+            // `:has()` looks down and sideways, so a state change there
+            // affects the subject above it.
+            Component::Has(list) => {
+                for rs in list.iter() {
+                    scan_selector(rs.selector.iter_raw_match_order(), Reach::Document, deps);
+                }
+            }
+            _ => {}
         }
     }
-
-    styles
 }
 
 /// HTML attributes that map to CSS (a subset of the rendering section of
@@ -483,6 +639,61 @@ mod tests {
         assert_eq!(styles[p].color.to_rgba8(), [0, 0, 255, 255]);
         let span = find(&doc, "span");
         assert_eq!(styles[span].color.to_rgba8(), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn hover_states_apply_and_incremental_restyle_matches_full() {
+        let doc = parse_html(b"<div><p><a href=x>l</a> <span>s</span></p><p>other</p></div>");
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            "a:hover { background-color: red } p:hover span { color: blue } a:focus { font-weight: bold } div:active { --x: 1 }",
+            Origin::Author,
+        )));
+        let vp = Viewport::default();
+        let (a, span) = (find(&doc, "a"), find(&doc, "span"));
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        assert_eq!(styles[a].background_color.to_rgba8(), [0, 0, 0, 0]);
+
+        let mut states = ElementStates::default();
+        let mut changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
+        changed.extend(states.set_single(Some(a), ElementStates::FOCUS));
+        let full = compute_styles_with(&doc, &stylist, &vp, &states);
+        assert_eq!(full[a].background_color.to_rgba8(), [255, 0, 0, 255]);
+        assert_eq!(full[a].font_weight, 700);
+        assert_eq!(full[span].color.to_rgba8(), [0, 0, 255, 255]);
+
+        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, &changed, true));
+        for (id, s) in full.iter() {
+            assert_eq!(**s, *styles[id]);
+        }
+        assert!(!restyle(&doc, &stylist, &vp, &states, &mut styles, &changed, true), "nothing left to change");
+
+        // Leaving: the same roots, back to the plain styles.
+        let changed = states.set_chain(&doc, None, ElementStates::HOVER);
+        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, &changed, true));
+        assert_eq!(styles[a].background_color.to_rgba8(), [0, 0, 0, 0]);
+        assert_eq!(styles[a].font_weight, 700, "focus is separate from hover");
+        assert_eq!(styles[span].color.to_rgba8(), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn interaction_deps_reach() {
+        let deps = |css: &str| {
+            let mut st = Stylist::new();
+            st.add_sheet(Arc::new(Stylesheet::parse(css, Origin::Author)));
+            st.interaction_deps()
+        };
+        assert_eq!(deps("p { color: red }").hover, Reach::None);
+        assert_eq!(deps("a:hover { color: red }").hover, Reach::Element);
+        let d = deps("li:hover > ul, a:active { color: red }");
+        assert_eq!((d.hover, d.active), (Reach::Subtree, Reach::Element));
+        assert_eq!(deps("a:hover + .tip { }").hover, Reach::Parent);
+        assert_eq!(deps("nav:hover li ~ li { }").hover, Reach::Parent);
+        assert_eq!(deps("div:has(a:hover) { }").hover, Reach::Document);
+        assert_eq!(deps(":is(a:focus, .x) span { }").focus, Reach::Subtree);
+        assert_eq!(deps("@media (min-width: 1px) { .x:not(:focus-within) { } }").focus, Reach::Element);
+        assert_eq!(ua_stylesheet().origin, Origin::UserAgent);
     }
 
     #[test]

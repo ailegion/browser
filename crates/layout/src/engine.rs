@@ -903,66 +903,102 @@ fn emit_text_fragments(
     oy: f32,
     out: &mut Vec<Fragment>,
 ) {
+    let styles = layout.styles();
     for line in layout.lines() {
         let metrics = line.metrics();
         let line_top = metrics.block_min_coord;
         let line_height = metrics.block_max_coord - metrics.block_min_coord;
+        // A run is one font over any number of DOM spans and parley styles;
+        // parley yields one GlyphRun per style range, and identical styles
+        // merge across spans. Each run is walked once, cluster by cluster,
+        // cutting a fragment wherever the span or style changes so that a
+        // fragment maps to exactly one text node for hit testing.
+        let mut last_run: Option<std::ops::Range<usize>> = None;
         for item in line.items() {
             match item {
                 PositionedLayoutItem::GlyphRun(run) => {
-                    let style = run.style();
-                    let color = style.brush.0;
                     let r = run.run();
+                    if last_run.as_ref() == Some(&r.text_range()) {
+                        continue;
+                    }
+                    last_run = Some(r.text_range());
                     let rm = r.metrics();
                     let synthesis = r.synthesis();
-                    let x0 = run.offset();
                     let baseline = run.baseline();
-                    let glyphs: Vec<PositionedGlyph> = run
-                        .positioned_glyphs()
-                        .map(|g| PositionedGlyph {
-                            id: g.id,
-                            x: g.x - x0,
-                            y: g.y - line_top,
-                        })
-                        .collect();
-                    let deco = |d: &Option<parley::layout::Decoration<Brush>>, default_offset: f32, default_size: f32| {
-                        d.as_ref().map(|d| Decoration {
-                            y: baseline - line_top - d.offset.unwrap_or(default_offset),
-                            thickness: d.size.unwrap_or(default_size),
-                        })
+
+                    let make = |x0: f32, x1: f32, glyphs: Vec<PositionedGlyph>, span: Option<usize>, style_idx: usize| {
+                        let style = &styles[style_idx];
+                        let color = style.brush.0;
+                        let deco = |d: &Option<parley::layout::Decoration<Brush>>, default_offset: f32, default_size: f32| {
+                            d.as_ref().map(|d| Decoration {
+                                y: baseline - line_top - d.offset.unwrap_or(default_offset),
+                                thickness: d.size.unwrap_or(default_size),
+                            })
+                        };
+                        let text = TextFragment {
+                            font: r.font().clone(),
+                            font_size: r.font_size(),
+                            coords: r.normalized_coords().to_vec(),
+                            glyphs,
+                            color: browser_style::Rgba {
+                                r: color[0] as f32 / 255.0,
+                                g: color[1] as f32 / 255.0,
+                                b: color[2] as f32 / 255.0,
+                                a: color[3] as f32 / 255.0,
+                            },
+                            embolden: synthesis.embolden(),
+                            skew: synthesis.skew(),
+                            underline: deco(&style.underline, rm.underline_offset, rm.underline_size),
+                            strikethrough: deco(&style.strikethrough, rm.strikethrough_offset, rm.strikethrough_size),
+                            baseline: baseline - line_top,
+                        };
+                        let (style, node) = span
+                            .and_then(|i| content.spans.get(i))
+                            .map(|s| (s.style.clone(), s.node))
+                            .unwrap_or((content.container.clone(), None));
+                        Fragment {
+                            rect: Rect::new(ox + x0, oy + line_top, x1 - x0, line_height),
+                            node,
+                            style,
+                            content: FragmentContent::Text(text),
+                            children: Vec::new(),
+                        }
                     };
-                    let text = TextFragment {
-                        font: r.font().clone(),
-                        font_size: r.font_size(),
-                        coords: r.normalized_coords().to_vec(),
-                        glyphs,
-                        color: browser_style::Rgba {
-                            r: color[0] as f32 / 255.0,
-                            g: color[1] as f32 / 255.0,
-                            b: color[2] as f32 / 255.0,
-                            a: color[3] as f32 / 255.0,
-                        },
-                        embolden: synthesis.embolden(),
-                        skew: synthesis.skew(),
-                        underline: deco(&style.underline, rm.underline_offset, rm.underline_size),
-                        strikethrough: deco(&style.strikethrough, rm.strikethrough_offset, rm.strikethrough_size),
-                        baseline: baseline - line_top,
-                    };
-                    // Style of the fragment: the first span covering the run,
-                    // for anything paint needs beyond color.
-                    let span_style = content
-                        .spans
-                        .iter()
-                        .find(|s| s.start <= r.text_range().start && r.text_range().start < s.end)
-                        .map(|s| (s.style.clone(), s.node))
-                        .unwrap_or((content.container.clone(), None));
-                    out.push(Fragment {
-                        rect: Rect::new(ox + x0, oy + line_top, run.advance(), line_height),
-                        node: span_style.1,
-                        style: span_style.0,
-                        content: FragmentContent::Text(text),
-                        children: Vec::new(),
-                    });
+
+                    let mut x = run.offset();
+                    let mut frag_x0 = x;
+                    let mut glyphs: Vec<PositionedGlyph> = Vec::new();
+                    let mut current: Option<(Option<usize>, usize)> = None;
+                    for cluster in r.visual_clusters() {
+                        let start = cluster.text_range().start;
+                        let span = content.spans.iter().position(|s| s.start <= start && start < s.end);
+                        let style_idx = cluster
+                            .glyphs()
+                            .next()
+                            .map(|g| g.style_index())
+                            .or(current.map(|c| c.1))
+                            .unwrap_or(0);
+                        let key = (span, style_idx);
+                        if current.is_some_and(|c| c != key) && !glyphs.is_empty() {
+                            let (prev_span, prev_style) = current.unwrap_or(key);
+                            out.push(make(frag_x0, x, std::mem::take(&mut glyphs), prev_span, prev_style));
+                            frag_x0 = x;
+                        }
+                        current = Some(key);
+                        for g in cluster.glyphs() {
+                            glyphs.push(PositionedGlyph {
+                                id: g.id,
+                                x: x + g.x - frag_x0,
+                                y: g.y + baseline - line_top,
+                            });
+                            x += g.advance;
+                        }
+                    }
+                    if !glyphs.is_empty()
+                        && let Some((span, style_idx)) = current
+                    {
+                        out.push(make(frag_x0, x, glyphs, span, style_idx));
+                    }
                 }
                 PositionedLayoutItem::InlineBox(b) => {
                     if let Some(atomic) = content.atomics.get(b.id as usize)

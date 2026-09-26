@@ -4,14 +4,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use browser_dom::{Document, HtmlParser};
-use browser_ipc_types::{NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
+use browser_dom::{Document, HtmlParser, NodeId};
+use browser_ipc_types::{Cursor, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
 use browser_layout::{LayoutEngine, LayoutTree};
 use browser_net::{FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
-use browser_style::{Origin, Rule, StyleMap, Stylesheet, Stylist, compute_styles};
+use browser_style::{
+    ElementStates, InteractionDeps, Origin, Reach, Rule, StyleMap, Stylesheet, Stylist, compute_styles_with, restyle,
+};
 use html5ever::{local_name, ns};
 use url::Url;
 use vello::Scene;
@@ -71,9 +73,22 @@ pub(crate) struct TabState {
     layout: Option<LayoutTree>,
     scene: Scene,
 
+    /// Interaction state behind `:hover`, `:active` and `:focus`, and how
+    /// far a change in it reaches under the current sheets.
+    states: ElementStates,
+    deps: InteractionDeps,
+    hover: Option<NodeId>,
+    focus: Option<NodeId>,
+    /// Last pointer position in viewport coordinates while over the page.
+    mouse: Option<(f32, f32)>,
+    cursor: Cursor,
+
     history: Vec<Url>,
     history_index: usize,
 
+    /// Styles must be recomputed from scratch (new document, sheet, or
+    /// viewport); implies layout.
+    needs_style: bool,
     needs_layout: bool,
     needs_paint: bool,
     state_dirty: bool,
@@ -102,8 +117,15 @@ impl TabState {
             styles: StyleMap::new(),
             layout: None,
             scene: Scene::new(),
+            states: ElementStates::default(),
+            deps: InteractionDeps::default(),
+            hover: None,
+            focus: None,
+            mouse: None,
+            cursor: Cursor::Default,
             history: Vec::new(),
             history_index: 0,
+            needs_style: false,
             needs_layout: false,
             needs_paint: false,
             state_dirty: false,
@@ -170,7 +192,8 @@ impl TabState {
             ShellToTab::Resize(vp) => {
                 if vp != self.viewport {
                     self.viewport = vp;
-                    self.needs_layout = true;
+                    // Media queries may change with the viewport.
+                    self.needs_style = true;
                 }
             }
             ShellToTab::Scroll { dx, dy } => {
@@ -178,8 +201,167 @@ impl TabState {
                 self.scroll_y += dy;
                 self.clamp_scroll();
                 self.needs_paint = true;
+                self.update_hover();
+            }
+            ShellToTab::MouseMove { x, y } => {
+                self.mouse = Some((x, y));
+                self.update_hover();
+            }
+            ShellToTab::MouseLeave => {
+                self.mouse = None;
+                self.update_hover();
+            }
+            ShellToTab::MouseDown { x, y, button } => {
+                self.mouse = Some((x, y));
+                self.update_hover();
+                if button == MouseButton::Left {
+                    let hit = self.hover;
+                    self.set_active(hit);
+                    let focus = hit.and_then(|h| self.focusable_ancestor(h));
+                    self.set_focus(focus);
+                }
+            }
+            ShellToTab::MouseUp { x, y, button } => {
+                self.mouse = Some((x, y));
+                if button == MouseButton::Left {
+                    self.set_active(None);
+                }
+                self.update_hover();
             }
             ShellToTab::Close => {}
+        }
+    }
+
+    // ----- interaction state -----
+
+    /// The innermost node under a viewport point, text nodes included.
+    fn hit_node(&self, x: f32, y: f32) -> Option<NodeId> {
+        self.layout
+            .as_ref()?
+            .hit_test(x + self.scroll_x, y + self.scroll_y)
+    }
+
+    fn element_of(&self, node: NodeId) -> Option<NodeId> {
+        let doc = self.doc.as_ref()?;
+        if doc.get(node).is_element() {
+            Some(node)
+        } else {
+            doc.parent(node).filter(|&p| doc.get(p).is_element())
+        }
+    }
+
+    fn ancestor_or_self(&self, id: NodeId, pred: impl Fn(&browser_dom::Element) -> bool) -> Option<NodeId> {
+        let doc = self.doc.as_ref()?;
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            if let Some(e) = doc.element(n)
+                && pred(e)
+            {
+                return Some(n);
+            }
+            cur = doc.parent(n);
+        }
+        None
+    }
+
+    fn focusable_ancestor(&self, id: NodeId) -> Option<NodeId> {
+        self.ancestor_or_self(id, |e| {
+            e.name.ns == ns!(html)
+                && (is_link(e)
+                    || (matches!(
+                        e.name.local,
+                        local_name!("input") | local_name!("button") | local_name!("select") | local_name!("textarea")
+                    ) && e.attr("disabled").is_none())
+                    || e.attr("tabindex").is_some())
+        })
+    }
+
+    /// Re-evaluate what is under the pointer; restyle if it changed.
+    fn update_hover(&mut self) {
+        let raw = self.mouse.and_then(|(x, y)| self.hit_node(x, y));
+        let hit = raw.and_then(|n| self.element_of(n));
+        if hit == self.hover {
+            return;
+        }
+        self.hover = hit;
+
+        let over_link = hit.and_then(|h| self.ancestor_or_self(h, is_link)).is_some();
+        let over_text = raw.is_some_and(|n| self.doc.as_ref().is_some_and(|d| !d.get(n).is_element()));
+        let cursor = if over_link {
+            Cursor::Pointer
+        } else if over_text {
+            Cursor::Text
+        } else {
+            Cursor::Default
+        };
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            self.send(TabToShell::Cursor(cursor));
+        }
+
+        let Some(doc) = &self.doc else { return };
+        let changed = self.states.set_chain(doc, hit, ElementStates::HOVER);
+        let reach = self.deps.hover;
+        self.restyle_for(changed, reach);
+    }
+
+    fn set_active(&mut self, target: Option<NodeId>) {
+        let Some(doc) = &self.doc else { return };
+        let changed = self.states.set_chain(doc, target, ElementStates::ACTIVE);
+        let reach = self.deps.active;
+        self.restyle_for(changed, reach);
+    }
+
+    fn set_focus(&mut self, target: Option<NodeId>) {
+        if target == self.focus {
+            return;
+        }
+        self.focus = target;
+        let Some(doc) = &self.doc else { return };
+        let mut changed = self.states.set_single(target, ElementStates::FOCUS);
+        changed.extend(self.states.set_chain(doc, target, ElementStates::FOCUS_WITHIN));
+        changed.sort();
+        changed.dedup();
+        let reach = self.deps.focus;
+        self.restyle_for(changed, reach);
+    }
+
+    /// Restyle what a state change on `changed` can affect, per `reach`,
+    /// and schedule layout if any computed style moved.
+    fn restyle_for(&mut self, changed: Vec<NodeId>, reach: Reach) {
+        if changed.is_empty() || reach == Reach::None {
+            return;
+        }
+        let Some(doc) = &self.doc else { return };
+        let (roots, descendants) = match reach {
+            Reach::None => return,
+            Reach::Element => (changed, false),
+            Reach::Subtree => (changed, true),
+            Reach::Parent => {
+                let mut parents: Vec<NodeId> = changed
+                    .iter()
+                    .map(|&n| doc.parent(n).filter(|&p| doc.get(p).is_element()).unwrap_or(n))
+                    .collect();
+                parents.sort();
+                parents.dedup();
+                (parents, true)
+            }
+            Reach::Document => (doc.document_element().into_iter().collect(), true),
+        };
+        let started = std::time::Instant::now();
+        let stylist = self.stylist();
+        let vp = self.style_viewport();
+        let moved = restyle(doc, &stylist, &vp, &self.states, &mut self.styles, &roots, descendants);
+        tracing::debug!(
+            tab = self.id.0,
+            roots = roots.len(),
+            ?reach,
+            moved,
+            ms = started.elapsed().as_millis(),
+            "restyle for interaction"
+        );
+        if moved {
+            self.needs_layout = true;
         }
     }
 
@@ -346,7 +528,7 @@ impl TabState {
                     if let Some(s) = self.sheets.get_mut(slot) {
                         s.sheet = Some(Arc::new(sheet));
                     }
-                    self.needs_layout = true;
+                    self.needs_style = true;
                 }
             }
             PendingKind::Image { url } => {
@@ -377,9 +559,14 @@ impl TabState {
     fn set_document(&mut self, doc: Document) {
         self.sheets.clear();
         self.doc = Some(doc);
+        // Node ids of the old document mean nothing now. The pointer
+        // position is kept: hover is re-evaluated after the first layout.
+        self.states = ElementStates::default();
+        self.hover = None;
+        self.focus = None;
         self.collect_stylesheets();
         self.collect_images();
-        self.needs_layout = true;
+        self.needs_style = true;
         self.state_dirty = true;
     }
 
@@ -556,10 +743,27 @@ impl TabState {
 
     /// Called after each batch of events: do the work that is due.
     pub fn flush(&mut self) {
-        if self.needs_layout && self.doc.is_some() {
-            self.relayout();
-            self.needs_layout = false;
-            self.needs_paint = true;
+        // Style, then layout, then paint. A new layout can put a different
+        // element under the pointer, whose hover styles need one more
+        // round; two rounds always settle it.
+        for _ in 0..3 {
+            if self.doc.is_none() {
+                break;
+            }
+            if self.needs_style {
+                self.restyle_all();
+                self.needs_style = false;
+                self.needs_layout = true;
+            }
+            if self.needs_layout {
+                self.relayout();
+                self.needs_layout = false;
+                self.needs_paint = true;
+                self.update_hover();
+            }
+            if !self.needs_style && !self.needs_layout {
+                break;
+            }
         }
         if self.needs_paint && self.layout.is_some() {
             self.repaint();
@@ -570,34 +774,48 @@ impl TabState {
         }
     }
 
-    fn relayout(&mut self) {
-        let Some(doc) = &self.doc else { return };
-        let started = std::time::Instant::now();
-        let stylist = self.stylist();
-        let vp = browser_style::Viewport {
+    fn style_viewport(&self) -> browser_style::Viewport {
+        browser_style::Viewport {
             width: self.viewport.width,
             height: self.viewport.height,
             scale_factor: self.viewport.scale_factor,
             prefers_dark: false,
-        };
-        self.styles = compute_styles(doc, &stylist, &vp);
-        let styled = started.elapsed();
+        }
+    }
+
+    fn restyle_all(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let started = std::time::Instant::now();
+        let stylist = self.stylist();
+        let vp = self.style_viewport();
+        self.styles = compute_styles_with(doc, &stylist, &vp, &self.states);
+        self.deps = stylist.interaction_deps();
+        tracing::debug!(
+            tab = self.id.0,
+            nodes = doc.node_count(),
+            style_ms = started.elapsed().as_millis(),
+            deps = ?self.deps,
+            "restyle"
+        );
+        // Background images only become known after the cascade; fetching
+        // them re-triggers layout when they arrive.
+        self.fetch_background_images();
+    }
+
+    fn relayout(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let started = std::time::Instant::now();
         let tree = self
             .engine
             .layout(doc, &self.styles, self.viewport.width, self.viewport.height, &self.images);
         tracing::debug!(
             tab = self.id.0,
-            nodes = doc.node_count(),
-            style_ms = styled.as_millis(),
-            layout_ms = (started.elapsed() - styled).as_millis(),
+            layout_ms = started.elapsed().as_millis(),
             content_height = tree.content_height,
             "relayout"
         );
         self.layout = Some(tree);
         self.clamp_scroll();
-        // Background images only become known after the cascade; fetching
-        // them re-triggers layout when they arrive.
-        self.fetch_background_images();
     }
 
     fn repaint(&mut self) {
@@ -619,6 +837,183 @@ fn parse_media_attr(attr: Option<&str>) -> MediaQueryList {
     match attr {
         Some(s) => MediaQueryList::parse_str(s),
         None => MediaQueryList::all(),
+    }
+}
+
+fn is_link(e: &browser_dom::Element) -> bool {
+    e.name.ns == ns!(html)
+        && matches!(e.name.local, local_name!("a") | local_name!("area"))
+        && e.attr("href").is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, channel};
+
+    use browser_layout::Rect;
+
+    /// A tab with a document loaded from a `data:` URL, which the net
+    /// service answers synchronously, so no network and no threads.
+    struct Harness {
+        state: TabState,
+        net_events: Receiver<NetToTab>,
+        messages: Arc<Mutex<Vec<TabToShell>>>,
+    }
+
+    impl Harness {
+        fn load(html: &str) -> Self {
+            let net = Arc::new(NetService::new().expect("net service"));
+            let (tx, net_events) = channel();
+            let net_sink: Sink = Arc::new(move |ev| {
+                let _ = tx.send(ev);
+            });
+            let messages = Arc::new(Mutex::new(Vec::new()));
+            let sink_messages = messages.clone();
+            let output: Arc<OutputSink> = Arc::new(Box::new(move |_, out| {
+                if let TabOutput::Message(m) = out {
+                    sink_messages.lock().expect("lock").push(m);
+                }
+            }));
+            let viewport = Viewport {
+                width: 800.0,
+                height: 600.0,
+                scale_factor: 1.0,
+            };
+            let state = TabState::new(TabId(1), net, net_sink, viewport, output);
+            let mut h = Self {
+                state,
+                net_events,
+                messages,
+            };
+            let encoded: String = html
+                .bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect();
+            let url = Url::parse(&format!("data:text/html,{encoded}")).expect("data url");
+            h.send(ShellToTab::Navigate { url });
+            h
+        }
+
+        fn send(&mut self, msg: ShellToTab) {
+            self.state.handle_shell(msg);
+            while let Ok(ev) = self.net_events.try_recv() {
+                self.state.handle_net(ev);
+            }
+            self.state.flush();
+        }
+
+        fn find(&self, tag: &str) -> NodeId {
+            let doc = self.state.doc.as_ref().expect("document");
+            doc.descendants(doc.root())
+                .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == tag))
+                .expect("element")
+        }
+
+        /// The first fragment of the element, or of one of its text nodes:
+        /// inline elements have no box of their own, only their text does.
+        fn rect_of(&self, id: NodeId) -> Rect {
+            let doc = self.state.doc.as_ref().expect("document");
+            let mut found = None;
+            self.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+                let mine = f.node == Some(id) || f.node.is_some_and(|n| doc.parent(n) == Some(id));
+                if mine && found.is_none() {
+                    found = Some(f.rect);
+                }
+            });
+            found.expect("fragment")
+        }
+
+        fn center(&self, tag: &str) -> (f32, f32) {
+            let r = self.rect_of(self.find(tag));
+            (r.x + r.width / 2.0, r.y + r.height / 2.0)
+        }
+
+        fn style(&self, tag: &str) -> Arc<browser_style::ComputedStyle> {
+            self.state.styles[self.find(tag)].clone()
+        }
+
+        fn cursors(&self) -> Vec<Cursor> {
+            self.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|m| match m {
+                    TabToShell::Cursor(c) => Some(*c),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    const PAGE: &str = "<!doctype html><style>body { margin: 0; color: black } \
+        a { background-color: white } a:hover { background-color: red } \
+        p:hover span { color: blue } a:active { color: green } a:focus { font-weight: bold } \
+        div { height: 700px }</style>\
+        <div></div><p><a href='x'>link</a> <span>text</span></p><p>second paragraph</p>";
+
+    #[test]
+    fn hover_restyles_element_and_subtree_and_sets_cursor() {
+        let mut h = Harness::load(PAGE);
+        assert_eq!(h.style("a").background_color.to_rgba8(), [255, 255, 255, 255]);
+        assert_eq!(h.state.deps.hover, Reach::Subtree);
+
+        let (x, y) = h.center("a");
+        h.send(ShellToTab::MouseMove { x, y });
+        assert_eq!(h.style("a").background_color.to_rgba8(), [255, 0, 0, 255]);
+        assert_eq!(h.style("span").color.to_rgba8(), [0, 0, 255, 255], "p:hover reaches the span");
+        assert_eq!(h.cursors(), vec![Cursor::Pointer]);
+
+        // Over the empty div: nothing hovered but the div chain.
+        h.send(ShellToTab::MouseMove { x: 10.0, y: 10.0 });
+        assert_eq!(h.style("a").background_color.to_rgba8(), [255, 255, 255, 255]);
+        assert_eq!(h.style("span").color.to_rgba8(), [0, 0, 0, 255]);
+        assert_eq!(h.cursors(), vec![Cursor::Pointer, Cursor::Default]);
+
+        // Over plain text: text cursor. Leaving the window: default.
+        let (x2, y2) = h.center("span");
+        h.send(ShellToTab::MouseMove { x: x2, y: y2 });
+        assert_eq!(h.cursors().last(), Some(&Cursor::Text));
+        h.send(ShellToTab::MouseLeave);
+        assert_eq!(h.cursors().last(), Some(&Cursor::Default));
+        assert!(h.state.states.is_empty());
+    }
+
+    #[test]
+    fn click_sets_active_then_focus_stays() {
+        let mut h = Harness::load(PAGE);
+        let (x, y) = h.center("a");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        assert_eq!(h.style("a").color.to_rgba8(), [0, 128, 0, 255], "active");
+        assert_eq!(h.style("a").font_weight, 700, "focused");
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_ne!(h.style("a").color.to_rgba8(), [0, 128, 0, 255], "no longer active");
+        assert_eq!(h.style("a").font_weight, 700, "still focused");
+
+        // Clicking something unfocusable clears focus.
+        let (px, py) = h.center("span");
+        h.send(ShellToTab::MouseDown { x: px, y: py, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x: px, y: py, button: MouseButton::Left });
+        assert_eq!(h.style("a").font_weight, 400);
+        assert_eq!(h.state.focus, None);
+    }
+
+    #[test]
+    fn scrolling_moves_what_is_under_the_pointer() {
+        let mut h = Harness::load(PAGE);
+        let (x, y) = h.center("a");
+        // Point at where the link will be after scrolling down by 50px.
+        h.send(ShellToTab::MouseMove { x, y: y - 50.0 });
+        assert_eq!(h.style("a").background_color.to_rgba8(), [255, 255, 255, 255]);
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 50.0 });
+        assert_eq!(h.style("a").background_color.to_rgba8(), [255, 0, 0, 255]);
     }
 }
 

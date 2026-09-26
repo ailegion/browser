@@ -28,7 +28,25 @@ pub struct Viewport {
     pub scale_factor: f32,
 }
 
-/// Shell to tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    Other,
+}
+
+/// The cursor the shell should show over the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Cursor {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+}
+
+/// Shell to tab. Mouse positions are logical pixels within the page's
+/// viewport (the tab adds its own scroll offset).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ShellToTab {
     Navigate { url: Url },
@@ -38,6 +56,11 @@ pub enum ShellToTab {
     GoForward,
     Resize(Viewport),
     Scroll { dx: f32, dy: f32 },
+    MouseMove { x: f32, y: f32 },
+    MouseDown { x: f32, y: f32, button: MouseButton },
+    MouseUp { x: f32, y: f32, button: MouseButton },
+    /// The pointer left the page area.
+    MouseLeave,
     Close,
 }
 
@@ -52,6 +75,8 @@ pub enum TabToShell {
         can_go_back: bool,
         can_go_forward: bool,
     },
+    /// What the pointer is over calls for a different cursor.
+    Cursor(Cursor),
     /// The tab thread panicked and was unwound; the shell shows a crashed page.
     Crashed { message: String },
     Closed,

@@ -20,6 +20,8 @@ use selectors::parser::{
 use selectors::{OpaqueElement, SelectorImpl, SelectorList};
 use slotmap::Key as _;
 
+use crate::state::{ElementStates, NO_STATES};
+
 /// Attribute value as written.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AttrValue(pub String);
@@ -300,6 +302,8 @@ pub type Selectors = SelectorList<BrowserSelectors>;
 pub struct ElementRef<'a> {
     pub doc: &'a Document,
     pub id: NodeId,
+    /// Interaction state for `:hover` and friends.
+    pub states: &'a ElementStates,
 }
 
 impl fmt::Debug for ElementRef<'_> {
@@ -312,8 +316,17 @@ impl fmt::Debug for ElementRef<'_> {
 }
 
 impl<'a> ElementRef<'a> {
+    /// An element with no interaction state.
     pub fn new(doc: &'a Document, id: NodeId) -> Self {
-        Self { doc, id }
+        Self::with_states(doc, id, &NO_STATES)
+    }
+
+    pub fn with_states(doc: &'a Document, id: NodeId, states: &'a ElementStates) -> Self {
+        Self { doc, id, states }
+    }
+
+    fn same(&self, id: NodeId) -> Self {
+        Self::with_states(self.doc, id, self.states)
     }
 
     fn element(&self) -> &'a browser_dom::Element {
@@ -326,7 +339,7 @@ impl<'a> ElementRef<'a> {
         let mut cur = next(self.id);
         while let Some(c) = cur {
             if self.doc.get(c).is_element() {
-                return Some(Self::new(self.doc, c));
+                return Some(self.same(c));
             }
             cur = next(c);
         }
@@ -348,7 +361,7 @@ impl selectors::Element for ElementRef<'_> {
 
     fn parent_element(&self) -> Option<Self> {
         let p = self.doc.parent(self.id)?;
-        self.doc.get(p).is_element().then(|| Self::new(self.doc, p))
+        self.doc.get(p).is_element().then(|| self.same(p))
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
@@ -375,7 +388,7 @@ impl selectors::Element for ElementRef<'_> {
         self.doc
             .children(self.id)
             .find(|&c| self.doc.get(c).is_element())
-            .map(|c| Self::new(self.doc, c))
+            .map(|c| self.same(c))
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
@@ -421,14 +434,13 @@ impl selectors::Element for ElementRef<'_> {
     ) -> bool {
         let e = self.element();
         match pc {
-            // Interaction states arrive in Phase 2.
-            PseudoClass::Hover
-            | PseudoClass::Active
-            | PseudoClass::Focus
-            | PseudoClass::FocusVisible
-            | PseudoClass::FocusWithin
-            | PseudoClass::Visited
-            | PseudoClass::Target => false,
+            PseudoClass::Hover => self.states.has(self.id, ElementStates::HOVER),
+            PseudoClass::Active => self.states.has(self.id, ElementStates::ACTIVE),
+            PseudoClass::Focus | PseudoClass::FocusVisible => self.states.has(self.id, ElementStates::FOCUS),
+            PseudoClass::FocusWithin => self.states.has(self.id, ElementStates::FOCUS_WITHIN),
+            // Visited needs history (Phase 4); target needs fragment
+            // navigation (item 2).
+            PseudoClass::Visited | PseudoClass::Target => false,
             PseudoClass::Link | PseudoClass::AnyLink => self.is_link(),
             PseudoClass::Checked => {
                 e.attr("checked").is_some() || e.attr("selected").is_some()
@@ -577,6 +589,27 @@ mod tests {
         assert!(matches(&doc, a, "a:link"));
         assert!(matches(&doc, a, ":any-link"));
         assert!(!matches(&doc, a, "a:hover"));
+        {
+            let mut states = ElementStates::default();
+            states.set_chain(&doc, Some(a), ElementStates::HOVER);
+            states.set_single(Some(a), ElementStates::FOCUS);
+            let mut input = ParserInput::new("div:hover > p + a:hover:focus, div:focus-within");
+            let mut parser = cssparser::Parser::new(&mut input);
+            let list = parse_selectors(&mut parser).expect("valid selector");
+            let mut caches = SelectorCaches::default();
+            let mut ctx = MatchingContext::new(
+                MatchingMode::Normal,
+                None,
+                &mut caches,
+                QuirksMode::NoQuirks,
+                NeedsSelectorFlags::No,
+                MatchingForInvalidation::No,
+            );
+            assert!(matches_selector_list(&list, &ElementRef::with_states(&doc, a, &states), &mut ctx));
+            assert!(!matches_selector_list(&list, &ElementRef::with_states(&doc, div, &states), &mut ctx));
+            states.set_chain(&doc, Some(div), ElementStates::FOCUS_WITHIN);
+            assert!(matches_selector_list(&list, &ElementRef::with_states(&doc, div, &states), &mut ctx));
+        }
         assert!(matches(&doc, p1, ":is(p, div).x"));
         assert!(matches(&doc, p1, "*"));
         assert!(matches(&doc, doc.document_element().unwrap(), ":root"));

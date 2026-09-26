@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use browser_ipc_types::{ShellToTab, TabId, TabToShell, Viewport};
+use browser_ipc_types::{Cursor as PageCursor, MouseButton as PageButton, ShellToTab, TabId, TabToShell, Viewport};
 use browser_net::NetService;
 use browser_tab::{TabHandle, TabOutput, spawn_tab};
 use url::Url;
@@ -26,10 +26,10 @@ use vello::wgpu;
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 /// Window background while there is no page yet.
 const CLEAR: Color = Color::from_rgb8(0x1e, 0x1e, 0x2e);
@@ -113,6 +113,8 @@ struct App {
     page_loading: bool,
     page_title: Option<String>,
     screenshot_deadline: Option<Instant>,
+    /// Pointer position in logical pixels while it is over the window.
+    cursor_pos: Option<(f32, f32)>,
     /// Set when startup fails so the process can exit non-zero from `main`.
     failure: Option<anyhow::Error>,
 }
@@ -130,8 +132,13 @@ impl App {
             page_loading: false,
             page_title: None,
             screenshot_deadline: None,
+            cursor_pos: None,
             failure: None,
         }
+    }
+
+    fn scale(&self) -> f32 {
+        self.active.as_ref().map(|a| a.window.scale_factor()).unwrap_or(1.0) as f32
     }
 
     fn viewport(&self) -> Option<Viewport> {
@@ -414,6 +421,15 @@ impl ApplicationHandler<UserEvent> for App {
                     self.screenshot_deadline = Some(Instant::now() + Duration::from_millis(500));
                 }
             }
+            TabOutput::Message(TabToShell::Cursor(cursor)) => {
+                if let Some(active) = &self.active {
+                    active.window.set_cursor(match cursor {
+                        PageCursor::Default => CursorIcon::Default,
+                        PageCursor::Pointer => CursorIcon::Pointer,
+                        PageCursor::Text => CursorIcon::Text,
+                    });
+                }
+            }
             TabOutput::Message(TabToShell::Crashed { message }) => {
                 tracing::error!("tab crashed: {message}");
                 self.page_title = Some(format!("Tab crashed: {message}"));
@@ -458,11 +474,39 @@ impl ApplicationHandler<UserEvent> for App {
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (-x * LINE_SCROLL_PX, -y * LINE_SCROLL_PX),
                     MouseScrollDelta::PixelDelta(p) => {
-                        let scale = self.active.as_ref().map(|a| a.window.scale_factor()).unwrap_or(1.0) as f32;
+                        let scale = self.scale();
                         (-(p.x as f32) / scale, -(p.y as f32) / scale)
                     }
                 };
                 self.scroll(dx, dy);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.scale();
+                let (x, y) = (position.x as f32 / scale, position.y as f32 / scale);
+                self.cursor_pos = Some((x, y));
+                if let Some(tab) = &self.tab {
+                    tab.send(ShellToTab::MouseMove { x, y });
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_pos = None;
+                if let Some(tab) = &self.tab {
+                    tab.send(ShellToTab::MouseLeave);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let (Some(tab), Some((x, y))) = (&self.tab, self.cursor_pos) {
+                    let button = match button {
+                        MouseButton::Left => PageButton::Left,
+                        MouseButton::Right => PageButton::Right,
+                        MouseButton::Middle => PageButton::Middle,
+                        _ => PageButton::Other,
+                    };
+                    tab.send(match state {
+                        ElementState::Pressed => ShellToTab::MouseDown { x, y, button },
+                        ElementState::Released => ShellToTab::MouseUp { x, y, button },
+                    });
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let vp_h = self.viewport().map(|v| v.height).unwrap_or(600.0);

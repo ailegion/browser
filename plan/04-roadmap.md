@@ -140,7 +140,21 @@ Work:
    restart the parse), and CSS does not fall back to the document's
    encoding. **Item 0 complete.**
 1. Hit testing over layout fragments. `:hover`, `:active`, `:focus` through
-   the style engine with per-subtree dirty bits.
+   the style engine with per-subtree dirty bits. **Done 2026-09-26.** The
+   shell forwards pointer moves, buttons and leave (`ShellToTab::Mouse*`);
+   the tab hit-tests the fragment tree (text fragments now map to exactly
+   one text node: runs are split at DOM span boundaries), keeps hover,
+   active and focus-within chains and the focused element in
+   `browser_style::ElementStates`, and restyles only the changed roots
+   with `browser_style::restyle`. How far a restyle must go comes from
+   `Stylist::interaction_deps`, which scans the sheets once per full
+   restyle: element only, its subtree, its parent's subtree (sibling
+   combinators), or the whole document (`:has()`). Layout runs again only
+   when a computed style actually changed. Focus follows clicks on links,
+   form controls and `tabindex` elements; keyboard focus and tab order are
+   item 7. The tab reports the cursor to show (`TabToShell::Cursor`).
+   Tests: three tab-level tests drive a `data:` document through mouse
+   events (see O15 for what is not yet measured).
 2. Link navigation, redirects, `<meta http-equiv=refresh>`, fragment scroll.
 3. Navigation state machine and history per tab: back, forward, reload,
    stop. History entry commits on first response bytes.

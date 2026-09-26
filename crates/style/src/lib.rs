@@ -15,11 +15,13 @@ pub mod custom;
 pub mod media;
 pub mod properties;
 pub mod selector_impl;
+pub mod state;
 pub mod stylesheet;
 pub mod ua;
 pub mod values;
 
-pub use cascade::{StyleMap, Stylist, compute_styles};
+pub use cascade::{StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
+pub use state::{ElementStates, InteractionDeps, Reach};
 pub use computed::{ComputedStyle, LineHeight, Viewport};
 pub use properties::*;
 pub use media::MediaQueryList;
