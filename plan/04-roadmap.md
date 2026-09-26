@@ -154,7 +154,11 @@ Work:
 7. Text selection and copy on pages. Find in page. Keyboard focus and tab
    order. Form controls rendered (no submission yet).
 8. Media queries and custom properties in `style`.
-9. CI matrix: Windows, Linux, macOS builds.
+9. CI matrix: Windows, Linux, macOS builds. Note: on 2026-09-26 the owner
+   turned automatic CI runs off (`.github/workflows/ci.yml` is
+   `workflow_dispatch` only) to stop paying for runs during development.
+   Do not restore `push`/`pull_request` triggers until the owner says so;
+   run the workflow by hand when a check is wanted.
 
 Exit criteria:
 
