@@ -23,6 +23,8 @@ impl ElementStates {
     pub const ACTIVE: u8 = 2;
     pub const FOCUS: u8 = 4;
     pub const FOCUS_WITHIN: u8 = 8;
+    /// The element the URL fragment names (`:target`).
+    pub const TARGET: u8 = 16;
 
     pub fn has(&self, id: NodeId, flag: u8) -> bool {
         self.flags.get(id).is_some_and(|f| f & flag != 0)
@@ -105,6 +107,7 @@ pub struct InteractionDeps {
     pub hover: Reach,
     pub active: Reach,
     pub focus: Reach,
+    pub target: Reach,
 }
 
 #[cfg(test)]

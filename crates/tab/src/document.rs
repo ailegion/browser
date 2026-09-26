@@ -79,12 +79,21 @@ pub(crate) struct TabState {
     deps: InteractionDeps,
     hover: Option<NodeId>,
     focus: Option<NodeId>,
+    /// The link the primary button went down on; released on the same
+    /// link, it is followed.
+    press: Option<NodeId>,
     /// Last pointer position in viewport coordinates while over the page.
     mouse: Option<(f32, f32)>,
     cursor: Cursor,
 
     history: Vec<Url>,
     history_index: usize,
+    /// The URL's fragment must be scrolled to after the next layout.
+    pending_fragment: bool,
+    /// A `<meta http-equiv=refresh>` or `Refresh` header due at the instant.
+    refresh: Option<(std::time::Instant, Url)>,
+    /// `Refresh` header of the main response, applied when the document lands.
+    refresh_header: Option<String>,
 
     /// Styles must be recomputed from scratch (new document, sheet, or
     /// viewport); implies layout.
@@ -121,10 +130,14 @@ impl TabState {
             deps: InteractionDeps::default(),
             hover: None,
             focus: None,
+            press: None,
             mouse: None,
             cursor: Cursor::Default,
             history: Vec::new(),
             history_index: 0,
+            pending_fragment: false,
+            refresh: None,
+            refresh_header: None,
             needs_style: false,
             needs_layout: false,
             needs_paint: false,
@@ -160,10 +173,7 @@ impl TabState {
 
     pub fn handle_shell(&mut self, msg: ShellToTab) {
         match msg {
-            ShellToTab::Navigate { url } => {
-                self.push_history(url.clone());
-                self.navigate(url);
-            }
+            ShellToTab::Navigate { url } => self.go(url, true),
             ShellToTab::Reload => {
                 if let Some(url) = self.url.clone() {
                     self.navigate(url);
@@ -179,14 +189,14 @@ impl TabState {
                 if self.history_index > 0 {
                     self.history_index -= 1;
                     let url = self.history[self.history_index].clone();
-                    self.navigate(url);
+                    self.go(url, false);
                 }
             }
             ShellToTab::GoForward => {
                 if self.history_index + 1 < self.history.len() {
                     self.history_index += 1;
                     let url = self.history[self.history_index].clone();
-                    self.navigate(url);
+                    self.go(url, false);
                 }
             }
             ShellToTab::Resize(vp) => {
@@ -219,17 +229,153 @@ impl TabState {
                     self.set_active(hit);
                     let focus = hit.and_then(|h| self.focusable_ancestor(h));
                     self.set_focus(focus);
+                    self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link));
                 }
             }
             ShellToTab::MouseUp { x, y, button } => {
                 self.mouse = Some((x, y));
+                self.update_hover();
                 if button == MouseButton::Left {
                     self.set_active(None);
+                    let released_on = self.hover.and_then(|h| self.ancestor_or_self(h, is_link));
+                    if let (Some(pressed), Some(released)) = (self.press.take(), released_on)
+                        && pressed == released
+                    {
+                        self.follow_link(pressed);
+                    }
                 }
-                self.update_hover();
             }
             ShellToTab::Close => {}
         }
+    }
+
+    // ----- navigation -----
+
+    /// Follow a link the user clicked.
+    fn follow_link(&mut self, link: NodeId) {
+        let Some(doc) = &self.doc else { return };
+        let Some(href) = doc.element(link).and_then(|e| e.attr("href")) else { return };
+        let Some(url) = doc.resolve_url(href) else {
+            tracing::debug!(tab = self.id.0, "unresolvable href {href:?}");
+            return;
+        };
+        if !matches!(url.scheme(), "http" | "https" | "data") {
+            // javascript:, mailto: and the rest are not ours to open.
+            tracing::debug!(tab = self.id.0, "ignoring link to {url}");
+            return;
+        }
+        self.go(url, true);
+    }
+
+    /// Go to `url`, recording it in history when `push`. A change of
+    /// fragment within the current document scrolls instead of loading.
+    fn go(&mut self, url: Url, push: bool) {
+        if push {
+            self.push_history(url.clone());
+        }
+        if self.is_same_document(&url) {
+            tracing::info!(tab = self.id.0, "fragment navigation {url}");
+            self.url = Some(url);
+            self.pending_fragment = true;
+            self.state_dirty = true;
+        } else {
+            self.navigate(url);
+        }
+    }
+
+    /// Whether `url` names the loaded document, fragment aside.
+    fn is_same_document(&self, url: &Url) -> bool {
+        use url::Position;
+        self.doc.is_some()
+            && self.main_request.is_none()
+            && self
+                .url
+                .as_ref()
+                .is_some_and(|cur| cur[..Position::AfterQuery] == url[..Position::AfterQuery])
+    }
+
+    /// Scroll to the element the URL's fragment names and make it `:target`.
+    fn scroll_to_fragment(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let fragment = self.url.as_ref().and_then(|u| u.fragment()).map(percent_decode);
+        // No fragment (back to the plain URL), an empty one, or "top" all
+        // mean the top of the document.
+        let target = match fragment.as_deref() {
+            None | Some("") | Some("top") => None,
+            Some(name) => doc.descendants(doc.root()).find(|&n| {
+                doc.element(n).is_some_and(|e| {
+                    e.id() == Some(name)
+                        || (e.name.ns == ns!(html)
+                            && e.name.local == local_name!("a")
+                            && e.attr("name") == Some(name))
+                })
+            }),
+        };
+        if fragment.as_deref().is_some_and(|f| !f.is_empty() && f != "top") && target.is_none() {
+            tracing::debug!(tab = self.id.0, "no element for fragment {fragment:?}");
+            return;
+        }
+        let rect = target.and_then(|t| {
+            self.layout
+                .as_ref()?
+                .first_rect(|n| n == t || doc.parent(n) == Some(t))
+        });
+        self.scroll_y = rect.map_or(0.0, |r| r.y);
+        self.clamp_scroll();
+        self.needs_paint = true;
+
+        let changed = self.states.set_single(target, ElementStates::TARGET);
+        let reach = self.deps.target;
+        self.restyle_for(changed, reach);
+    }
+
+    /// The tab wants to be woken at this instant even if no event arrives.
+    pub fn next_wake(&self) -> Option<std::time::Instant> {
+        self.refresh.as_ref().map(|(at, _)| *at)
+    }
+
+    /// Run whatever timer is due.
+    pub fn tick(&mut self) {
+        if let Some((at, url)) = &self.refresh
+            && std::time::Instant::now() >= *at
+        {
+            let url = url.clone();
+            self.refresh = None;
+            tracing::info!(tab = self.id.0, "refresh to {url}");
+            // Refreshing to the same URL replaces the entry; to another
+            // adds one, as browsers do.
+            let same = self.url.as_ref() == Some(&url);
+            self.go(url, !same);
+        }
+    }
+
+    /// Arm the declarative refresh of the document, if it has one.
+    fn schedule_refresh(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let mut spec = self.refresh_header.take();
+        if spec.is_none() {
+            spec = doc.descendants(doc.root()).find_map(|n| {
+                let e = doc.element(n)?;
+                (e.name.ns == ns!(html)
+                    && e.name.local == local_name!("meta")
+                    && e.attr("http-equiv").is_some_and(|v| v.trim().eq_ignore_ascii_case("refresh")))
+                .then(|| e.attr("content").unwrap_or("").to_owned())
+            });
+        }
+        let Some(spec) = spec else { return };
+        let Some((seconds, target)) = parse_refresh(&spec) else { return };
+        let url = match target {
+            Some(t) => match doc.resolve_url(&t) {
+                Some(u) if matches!(u.scheme(), "http" | "https" | "data") => u,
+                _ => return,
+            },
+            None => match &self.url {
+                Some(u) => u.clone(),
+                None => return,
+            },
+        };
+        let at = std::time::Instant::now() + std::time::Duration::from_secs_f32(seconds.min(1.0e6));
+        self.refresh = Some((at, url));
     }
 
     // ----- interaction state -----
@@ -377,6 +523,9 @@ impl TabState {
         tracing::info!(tab = self.id.0, "navigate {url}");
         self.pending.clear();
         self.parser = None;
+        self.refresh = None;
+        self.refresh_header = None;
+        self.press = None;
         self.sheets.clear();
         self.fetched_urls.clear();
         self.images = ImageStore::new();
@@ -418,6 +567,11 @@ impl TabState {
                 p.status = status;
                 p.headers = headers;
                 if matches!(p.kind, PendingKind::Main) {
+                    self.refresh_header = p
+                        .headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("refresh"))
+                        .map(|(_, v)| v.clone());
                     self.url = Some(final_url.clone());
                     if let Some(i) = self.history.get_mut(self.history_index) {
                         *i = final_url.clone();
@@ -564,8 +718,11 @@ impl TabState {
         self.states = ElementStates::default();
         self.hover = None;
         self.focus = None;
+        self.press = None;
         self.collect_stylesheets();
         self.collect_images();
+        self.pending_fragment = self.url.as_ref().is_some_and(|u| u.fragment().is_some());
+        self.schedule_refresh();
         self.needs_style = true;
         self.state_dirty = true;
     }
@@ -761,6 +918,10 @@ impl TabState {
                 self.needs_paint = true;
                 self.update_hover();
             }
+            if self.pending_fragment && self.layout.is_some() {
+                self.pending_fragment = false;
+                self.scroll_to_fragment();
+            }
             if !self.needs_style && !self.needs_layout {
                 break;
             }
@@ -846,6 +1007,68 @@ fn is_link(e: &browser_dom::Element) -> bool {
         && e.attr("href").is_some()
 }
 
+/// Parse a `Refresh` value (`5`, `5; url=/next`, `0;URL='x'`) into the
+/// delay in seconds and the target, per the HTML standard's shared
+/// declarative refresh steps. `None` when the value is not a refresh.
+fn parse_refresh(spec: &str) -> Option<(f32, Option<String>)> {
+    let s = spec.trim_start();
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let rest = &s[digits.len()..];
+    let seconds: f32 = if digits.is_empty() {
+        // "; url=..." with no time counts as zero only if a separator follows.
+        if !rest.trim_start().starts_with([';', ',']) {
+            return None;
+        }
+        0.0
+    } else {
+        digits.parse().unwrap_or(0.0)
+    };
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix([';', ',']).unwrap_or(rest).trim_start();
+    if rest.is_empty() {
+        return Some((seconds, None));
+    }
+    let rest = match rest.get(..3) {
+        Some(p) if p.eq_ignore_ascii_case("url") => {
+            let after = rest[3..].trim_start();
+            match after.strip_prefix('=') {
+                Some(a) => a.trim_start(),
+                // "url" without "=" is itself the URL, per the standard.
+                None => rest,
+            }
+        }
+        _ => rest,
+    };
+    let url = match rest.chars().next() {
+        Some(q @ ('"' | '\'')) => {
+            let inner = &rest[1..];
+            inner.split(q).next().unwrap_or(inner)
+        }
+        _ => rest.trim_end(),
+    };
+    Some((seconds, Some(url.to_owned())))
+}
+
+fn percent_decode(s: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,8 +1085,27 @@ mod tests {
         messages: Arc<Mutex<Vec<TabToShell>>>,
     }
 
+    fn data_url(html: &str, fragment: Option<&str>) -> Url {
+        let encoded: String = html
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        let frag = fragment.map(|f| format!("#{f}")).unwrap_or_default();
+        Url::parse(&format!("data:text/html,{encoded}{frag}")).expect("data url")
+    }
+
     impl Harness {
         fn load(html: &str) -> Self {
+            Self::load_url(data_url(html, None))
+        }
+
+        fn load_url(url: Url) -> Self {
             let net = Arc::new(NetService::new().expect("net service"));
             let (tx, net_events) = channel();
             let net_sink: Sink = Arc::new(move |ev| {
@@ -887,27 +1129,42 @@ mod tests {
                 net_events,
                 messages,
             };
-            let encoded: String = html
-                .bytes()
-                .map(|b| {
-                    if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
-                        (b as char).to_string()
-                    } else {
-                        format!("%{b:02X}")
-                    }
-                })
-                .collect();
-            let url = Url::parse(&format!("data:text/html,{encoded}")).expect("data url");
             h.send(ShellToTab::Navigate { url });
             h
         }
 
         fn send(&mut self, msg: ShellToTab) {
             self.state.handle_shell(msg);
-            while let Ok(ev) = self.net_events.try_recv() {
-                self.state.handle_net(ev);
+            self.pump();
+        }
+
+        /// Deliver what the net answered and do the work due, as the tab
+        /// loop does after each batch.
+        fn pump(&mut self) {
+            // A navigation started by a timer or a click queues more net
+            // events; keep going until a round delivers none.
+            loop {
+                let mut delivered = false;
+                while let Ok(ev) = self.net_events.try_recv() {
+                    delivered = true;
+                    self.state.handle_net(ev);
+                }
+                self.state.tick();
+                self.state.flush();
+                if !delivered {
+                    break;
+                }
             }
-            self.state.flush();
+        }
+
+        fn click(&mut self, tag: &str) {
+            let (x, y) = self.center(tag);
+            self.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+            self.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        }
+
+        fn title(&self) -> Option<String> {
+            self.state.doc.as_ref().and_then(|d| d.title())
         }
 
         fn find(&self, tag: &str) -> NodeId {
@@ -1003,6 +1260,107 @@ mod tests {
         h.send(ShellToTab::MouseUp { x: px, y: py, button: MouseButton::Left });
         assert_eq!(h.style("a").font_weight, 400);
         assert_eq!(h.state.focus, None);
+    }
+
+    /// A second page a link or refresh can lead to.
+    fn second_page_href() -> String {
+        data_url("<title>Second</title><p>second page</p>", None).to_string()
+    }
+
+    #[test]
+    fn clicking_a_link_loads_it_and_records_history() {
+        let mut h = Harness::load(&format!("<title>First</title><p><a href='{}'>go</a></p>", second_page_href()));
+        assert_eq!(h.title().as_deref(), Some("First"));
+        h.click("a");
+        assert_eq!(h.title().as_deref(), Some("Second"));
+        assert_eq!(h.state.history.len(), 2);
+        assert_eq!(h.state.history_index, 1);
+
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.title().as_deref(), Some("First"));
+        assert_eq!(h.state.history_index, 0);
+
+        // A press and release on different links is not a click.
+        let (x, y) = h.center("a");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x: 5.0, y: 5.0, button: MouseButton::Left });
+        assert_eq!(h.title().as_deref(), Some("First"));
+        assert_eq!(h.state.history.len(), 2);
+    }
+
+    #[test]
+    fn unsupported_link_schemes_are_ignored() {
+        let mut h = Harness::load("<title>First</title><p><a href='javascript:alert(1)'>js</a> <a href='mailto:x@y'>m</a></p>");
+        h.click("a");
+        assert_eq!(h.title().as_deref(), Some("First"));
+        assert_eq!(h.state.history.len(), 1);
+    }
+
+    const TALL: &str = "<title>Tall</title><style>body { margin: 0 } div { height: 1500px } h2:target { color: red }</style>\
+        <p><a href='#end'>down</a> <a href='#top'>top</a></p><div></div><h2 id=end>The end</h2>";
+
+    #[test]
+    fn fragment_links_scroll_without_reloading_and_set_target() {
+        let mut h = Harness::load(TALL);
+        let nodes_before = h.state.doc.as_ref().map(|d| d.node_count());
+        h.click("a");
+        // The heading sits past 1500px; the scroll is clamped to the
+        // content height minus the 600px viewport.
+        assert!(h.state.scroll_y > 900.0, "scrolled to the heading, got {}", h.state.scroll_y);
+        assert_eq!(h.state.url.as_ref().and_then(|u| u.fragment()), Some("end"));
+        assert_eq!(h.state.history.len(), 2);
+        assert_eq!(h.state.doc.as_ref().map(|d| d.node_count()), nodes_before, "same document");
+        assert_eq!(h.style("h2").color.to_rgba8(), [255, 0, 0, 255], ":target applies");
+
+        // Back returns to the top of the same document; the target is gone.
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.state.scroll_y, 0.0);
+        assert_eq!(h.style("h2").color.to_rgba8(), [0, 0, 0, 255]);
+        assert_eq!(h.state.doc.as_ref().map(|d| d.node_count()), nodes_before);
+    }
+
+    #[test]
+    fn url_fragment_is_scrolled_to_after_load() {
+        let h = Harness::load_url(data_url(TALL, Some("end")));
+        assert!(h.state.scroll_y > 900.0, "got {}", h.state.scroll_y);
+        assert_eq!(h.style("h2").color.to_rgba8(), [255, 0, 0, 255]);
+        let h = Harness::load_url(data_url(TALL, Some("nowhere")));
+        assert_eq!(h.state.scroll_y, 0.0);
+    }
+
+    #[test]
+    fn meta_refresh_navigates_when_due() {
+        let h = Harness::load(&format!(
+            "<title>First</title><meta http-equiv=Refresh content=\"0; URL='{}'\"><p>x</p>",
+            second_page_href()
+        ));
+        // `load` already pumped once, right after the document landed; the
+        // refresh was due immediately, so it has already happened.
+        assert_eq!(h.title().as_deref(), Some("Second"));
+        assert_eq!(h.state.history.len(), 2);
+        assert!(h.state.next_wake().is_none());
+
+        // A refresh with a delay waits for it.
+        let mut h = Harness::load("<title>Wait</title><meta http-equiv=refresh content='30'>");
+        assert!(h.state.next_wake().is_some_and(|t| t > std::time::Instant::now()));
+        h.pump();
+        assert_eq!(h.title().as_deref(), Some("Wait"));
+        h.send(ShellToTab::Navigate { url: data_url("<title>Away</title>", None) });
+        assert!(h.state.next_wake().is_none(), "navigating away cancels the refresh");
+    }
+
+    #[test]
+    fn refresh_values_parse() {
+        assert_eq!(parse_refresh("5"), Some((5.0, None)));
+        assert_eq!(parse_refresh(" 5 ; url=/next "), Some((5.0, Some("/next".into()))));
+        assert_eq!(parse_refresh("0;URL='a b'"), Some((0.0, Some("a b".into()))));
+        assert_eq!(parse_refresh("2,url=\"x\"y"), Some((2.0, Some("x".into()))));
+        assert_eq!(parse_refresh("3; https://e.com/"), Some((3.0, Some("https://e.com/".into()))));
+        assert_eq!(parse_refresh("1.5;url"), Some((1.5, Some("url".into()))));
+        assert_eq!(parse_refresh("; url=x"), Some((0.0, Some("x".into()))));
+        assert_eq!(parse_refresh("nonsense"), None);
+        assert_eq!(parse_refresh(""), None);
+        assert_eq!(percent_decode("a%20b%zz%"), "a b%zz%");
     }
 
     #[test]

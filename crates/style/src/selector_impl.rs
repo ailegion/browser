@@ -438,9 +438,9 @@ impl selectors::Element for ElementRef<'_> {
             PseudoClass::Active => self.states.has(self.id, ElementStates::ACTIVE),
             PseudoClass::Focus | PseudoClass::FocusVisible => self.states.has(self.id, ElementStates::FOCUS),
             PseudoClass::FocusWithin => self.states.has(self.id, ElementStates::FOCUS_WITHIN),
-            // Visited needs history (Phase 4); target needs fragment
-            // navigation (item 2).
-            PseudoClass::Visited | PseudoClass::Target => false,
+            PseudoClass::Target => self.states.has(self.id, ElementStates::TARGET),
+            // Visited needs history (Phase 4).
+            PseudoClass::Visited => false,
             PseudoClass::Link | PseudoClass::AnyLink => self.is_link(),
             PseudoClass::Checked => {
                 e.attr("checked").is_some() || e.attr("selected").is_some()

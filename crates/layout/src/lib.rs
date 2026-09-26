@@ -146,6 +146,19 @@ pub struct LayoutTree {
 }
 
 impl LayoutTree {
+    /// The rectangle of the first fragment (in tree order) whose node
+    /// satisfies `matches`. Inline elements have no box of their own, so
+    /// callers accept their text nodes too.
+    pub fn first_rect(&self, matches: impl Fn(NodeId) -> bool) -> Option<Rect> {
+        let mut found = None;
+        self.root.walk(&mut |f| {
+            if found.is_none() && f.node.is_some_and(&matches) {
+                found = Some(f.rect);
+            }
+        });
+        found
+    }
+
     /// The innermost fragment with a node at the point, if any.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         fn visit(f: &Fragment, x: f32, y: f32, best: &mut Option<NodeId>) {

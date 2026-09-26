@@ -156,6 +156,19 @@ Work:
    Tests: three tab-level tests drive a `data:` document through mouse
    events (see O15 for what is not yet measured).
 2. Link navigation, redirects, `<meta http-equiv=refresh>`, fragment scroll.
+   **Done 2026-09-26.** A primary-button press and release on the same
+   link follows it (`http`, `https`, `data` only; `javascript:` and
+   `mailto:` are ignored). Redirects were already followed in `net`; the
+   tab adopts the final URL into the history entry. A link or address to
+   the current document with a different fragment scrolls instead of
+   loading, sets `:target`, and gets a history entry; back and forward
+   take the same shortcut. A URL fragment is scrolled to after the first
+   layout. `<meta http-equiv=refresh>` and the `Refresh` header are parsed
+   per the standard's declarative refresh steps and armed as a timer the
+   tab loop waits on (`TabState::next_wake`/`tick`); navigating away
+   cancels it. Six new tab tests. Not done: middle-click or `target=_blank`
+   into a new tab (item 5), `rel=noopener` and friends, and a fragment
+   whose element arrives only after later layout passes.
 3. Navigation state machine and history per tab: back, forward, reload,
    stop. History entry commits on first response bytes.
 4. Per-origin cookie jar and in-memory HTTP cache in `net`.

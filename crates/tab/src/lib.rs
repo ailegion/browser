@@ -122,10 +122,25 @@ fn run(
     let mut state = TabState::new(id, net, net_sink, viewport, output);
 
     loop {
-        // Block for the first event, then drain everything queued so that a
-        // burst of network chunks produces one render, not many.
-        let Ok(first) = inbox.recv() else { break };
-        let mut events = vec![first];
+        // Block for the first event (or the tab's next timer), then drain
+        // everything queued so that a burst of network chunks produces one
+        // render, not many.
+        let mut events = Vec::new();
+        let first = match state.next_wake() {
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(std::time::Instant::now());
+                match inbox.recv_timeout(wait) {
+                    Ok(ev) => Some(ev),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match inbox.recv() {
+                Ok(ev) => Some(ev),
+                Err(_) => break,
+            },
+        };
+        events.extend(first);
         while let Ok(more) = inbox.try_recv() {
             events.push(more);
             if events.len() > 256 {
@@ -146,6 +161,7 @@ fn run(
         if closing {
             break;
         }
+        state.tick();
         state.flush();
     }
     state.send(TabToShell::Closed);

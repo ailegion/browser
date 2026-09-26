@@ -423,6 +423,7 @@ fn scan_selector<'a>(
                 PseudoClass::Focus | PseudoClass::FocusVisible | PseudoClass::FocusWithin => {
                     deps.focus = deps.focus.max(reach)
                 }
+                PseudoClass::Target => deps.target = deps.target.max(reach),
                 _ => {}
             },
             Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
@@ -693,6 +694,7 @@ mod tests {
         assert_eq!(deps("div:has(a:hover) { }").hover, Reach::Document);
         assert_eq!(deps(":is(a:focus, .x) span { }").focus, Reach::Subtree);
         assert_eq!(deps("@media (min-width: 1px) { .x:not(:focus-within) { } }").focus, Reach::Element);
+        assert_eq!(deps("h2:target { color: red }").target, Reach::Element);
         assert_eq!(ua_stylesheet().origin, Origin::UserAgent);
     }
 
