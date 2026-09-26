@@ -80,6 +80,7 @@ bytes = "1"
 flate2 = "1"
 brotli = "9"
 cookie = "0.18"
+httpdate = "1"
 
 # store (RustCrypto group)
 argon2 = "0.6"

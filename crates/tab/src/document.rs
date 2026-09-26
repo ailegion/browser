@@ -7,7 +7,7 @@ use std::sync::Arc;
 use browser_dom::{Document, HtmlParser, NodeId};
 use browser_ipc_types::{Cursor, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
 use browser_layout::{LayoutEngine, LayoutTree};
-use browser_net::{FetchRequest, NetService, Sink};
+use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
@@ -94,6 +94,9 @@ pub(crate) struct TabState {
     sheets: Vec<SheetSlot>,
     fetched_urls: std::collections::HashSet<Url>,
     images: ImageStore,
+    /// How the current document's sub-resources use the HTTP cache: a
+    /// reloaded document revalidates them, as browsers do.
+    doc_cache: CacheMode,
 
     engine: LayoutEngine,
     styles: StyleMap,
@@ -150,6 +153,7 @@ impl TabState {
             sheets: Vec::new(),
             fetched_urls: Default::default(),
             images: ImageStore::new(),
+            doc_cache: CacheMode::Default,
             engine: LayoutEngine::new(),
             styles: StyleMap::new(),
             layout: None,
@@ -385,6 +389,11 @@ impl TabState {
         let kind = nav.kind;
         tracing::info!(tab = self.id.0, "committed {final_url}");
         self.apply_history(final_url.clone(), kind);
+        self.doc_cache = if kind == NavKind::Reload {
+            CacheMode::NoCache
+        } else {
+            CacheMode::Default
+        };
         // The old document's own fetches are moot now.
         self.pending.retain(|k, _| *k == id);
         self.scroll_x = 0.0;
@@ -617,7 +626,11 @@ impl TabState {
         self.refresh = None;
         self.refresh_header = None;
         self.press = None;
-        let id = self.fetch(FetchRequest::get(url.clone()), PendingKind::Main);
+        let mut request = FetchRequest::get(url.clone());
+        if kind == NavKind::Reload {
+            request.cache = CacheMode::NoCache;
+        }
+        let id = self.fetch(request, PendingKind::Main);
         self.nav = Some(PendingNav {
             url,
             request: id,
@@ -641,6 +654,13 @@ impl TabState {
         );
         self.net.fetch(id, request, self.net_sink.clone());
         id
+    }
+
+    /// A `GET` for a sub-resource of the current document.
+    fn subresource(&self, url: Url) -> FetchRequest {
+        let mut request = FetchRequest::get(url);
+        request.cache = self.doc_cache;
+        request
     }
 
     // ----- network messages -----
@@ -866,7 +886,8 @@ impl TabState {
                         media,
                         sheet: None,
                     });
-                    self.fetch(FetchRequest::get(url), PendingKind::Stylesheet { slot, depth: 0 });
+                    let request = self.subresource(url);
+                    self.fetch(request, PendingKind::Stylesheet { slot, depth: 0 });
                 }
                 _ => {}
             }
@@ -902,8 +923,9 @@ impl TabState {
                     *s += 1;
                 }
             }
+            let request = self.subresource(url);
             self.fetch(
-                FetchRequest::get(url),
+                request,
                 PendingKind::Stylesheet {
                     slot: insert_at,
                     depth: depth + 1,
@@ -940,7 +962,8 @@ impl TabState {
             return;
         }
         self.fetched_urls.insert(url.clone());
-        self.fetch(FetchRequest::get(url.clone()), PendingKind::Image { url });
+        let request = self.subresource(url.clone());
+        self.fetch(request, PendingKind::Image { url });
     }
 
     /// Background images only become known after the cascade.

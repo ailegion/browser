@@ -182,7 +182,32 @@ Work:
    commit shows what has arrived. A newer navigation abandons an older
    one, whose late responses are ignored. Same-document fragment changes
    commit at once. Four new tab tests.
-4. Per-origin cookie jar and in-memory HTTP cache in `net`.
+4. Per-origin cookie jar and in-memory HTTP cache in `net`. **Done
+   2026-09-27.** Both live in `NetService`, so one browser has one jar and
+   one cache shared by every tab (O16). Cookies
+   (`crates/net/src/cookies.rs`): the `cookie` crate parses `Set-Cookie`;
+   the storage model is ours per RFC 6265bis: `Domain` (host-only when
+   absent, a dotless domain is refused as a public suffix stand-in),
+   `Path` with the default-path rule, `Secure` both ways plus "leave
+   secure cookies alone", `HttpOnly` and `SameSite` stored, `Max-Age`
+   over `Expires`, the `__Secure-` and `__Host-` prefixes, per-domain
+   and total limits with least-recently-used eviction. Cookies are
+   stored from and sent on every hop of a redirect chain. Cache
+   (`crates/net/src/cache.rs`): RFC 9111 for `GET`, in RAM only (D02,
+   64 MiB total, 8 MiB per entry, LRU). Freshness from `max-age`,
+   `Expires` against `Date`, or the `Last-Modified` heuristic; age from
+   `Age` and `Date`; `no-store`, `no-cache`, `Vary` (by remembered
+   request headers, `*` refused); stale entries with a validator are
+   revalidated with `If-None-Match` / `If-Modified-Since` and refreshed
+   on `304`; bodies are stored decoded and served with an `Age` header.
+   `FetchRequest` carries a `CacheMode`: the tab sends `NoCache` for a
+   reload and for the sub-resources of a reloaded document. Tests:
+   twenty-one unit tests on the jar and cache, six through the real
+   client against a loopback HTTP server (cookies across requests and
+   redirect hops, cache hit, `304` revalidation, reload, `no-store`).
+   Not done: SameSite enforcement (needs the initiating site on
+   requests), the public suffix list, caching of redirect responses,
+   `document.cookie` (Phase 3), persistence on tab close (Phase 4).
 5. Multiple tabs: one thread each, `catch_unwind` at the boundary, crashed
    tab page, thread and memory released on close (leak test).
 6. `chrome`: widgets (button, text input with cursor/selection/clipboard/IME,

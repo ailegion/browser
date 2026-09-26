@@ -67,7 +67,8 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `flate2` | 1.1.10 | gzip, deflate | Backend `miniz_oxide` 0.9.1; never enable `zlib` features |
 | `brotli` | 9.0.0 | br | |
 | `ruzstd` | not added | zstd if ever needed | Never the `zstd` crate |
-| `cookie` | 0.18.2 | Cookie parsing | Jar and policy are ours |
+| `cookie` | 0.18.2 | Cookie parsing | Jar and policy are ours (`crates/net/src/cookies.rs`) |
+| `httpdate` | 1.0.3 | HTTP date parsing for the cache (`Date`, `Expires`, `Last-Modified`) | Added 2026-09-27 (D14). No dependencies, pure Rust |
 | `http`, `http-body-util`, `bytes` | 1.x, 0.1, 1.x | HTTP types | |
 | `adblock` | not added | Filter engine | Phase 4 |
 

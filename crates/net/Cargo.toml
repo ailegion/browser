@@ -25,6 +25,7 @@ bytes.workspace = true
 flate2.workspace = true
 brotli.workspace = true
 cookie.workspace = true
+httpdate.workspace = true
 url.workspace = true
 mime.workspace = true
 data-url.workspace = true
