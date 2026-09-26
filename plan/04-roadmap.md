@@ -67,7 +67,8 @@ Caveats carried forward (all logged in `05-risks-and-open-items.md`):
 - Snapshot PNGs depend on installed fonts, so they are only comparable on
   the machine that produced them (O11).
 - Legacy encodings: bytes are decoded as UTF-8 with replacement. Charset
-  detection through `encoding_rs` is still to do.
+  detection through `encoding_rs` is still to do. Done 2026-09-26 in
+  Phase 2 item 0.
 - The cascade on the Wikipedia article (19k elements, 230 KB of CSS) takes
   213 ms in a release build and about 2 s in a debug build after rule
   bucketing (O13). Selector-based invalidation stays a Phase 2 item.
@@ -128,7 +129,16 @@ Work:
    element with fallbacks, chains, cycles and the `unset` rule for invalid
    references; seven new tests; verified on docs.rs). Known gap: `url()`
    inside a custom property value is not resolved against the sheet's
-   URL. Charset detection: next.
+   URL. Charset detection: done 2026-09-26 (`crates/dom/src/encoding.rs`;
+   HTML per the standard's "determining the character encoding": byte
+   order mark, Content-Type charset, `<meta>` prescan of the first
+   kilobyte, then UTF-8 or windows-1252 by whether the prefix is valid
+   UTF-8; the parser holds bytes back until the answer is settled and
+   then decodes as a stream; stylesheets per CSS Syntax 3 with `@charset`;
+   five new tests, snapshot fixture `04-charset.html`). Known gap: a
+   `<meta charset>` after the first kilobyte is not acted on (browsers
+   restart the parse), and CSS does not fall back to the document's
+   encoding. **Item 0 complete.**
 1. Hit testing over layout fragments. `:hover`, `:active`, `:focus` through
    the style engine with per-subtree dirty bits.
 2. Link navigation, redirects, `<meta http-equiv=refresh>`, fragment scroll.

@@ -284,14 +284,14 @@ impl TabState {
 
     fn start_main_document(&mut self, id: RequestId, final_url: Url) {
         let Some(p) = self.pending.get(&id) else { return };
-        let (ct, _charset) = Self::content_type_of(&p.headers);
+        let (ct, charset) = Self::content_type_of(&p.headers);
         let html_like = ct.is_empty()
             || ct == "text/html"
             || ct == "application/xhtml+xml"
             || ct == "application/xml"
             || ct == "text/xml";
         if html_like {
-            self.parser = Some(HtmlParser::new(Some(final_url)));
+            self.parser = Some(HtmlParser::with_charset(Some(final_url), charset.as_deref()));
         }
         // Other types are wrapped when the body completes.
     }
@@ -331,7 +331,8 @@ impl TabState {
             }
             PendingKind::Stylesheet { slot, depth } => {
                 if p.status == 0 || (200..300).contains(&p.status) {
-                    let css = String::from_utf8_lossy(&p.body);
+                    let (_, charset) = Self::content_type_of(&p.headers);
+                    let css = browser_dom::encoding::decode_stylesheet(&p.body, charset.as_deref());
                     tracing::debug!(
                         tab = self.id.0,
                         bytes = css.len(),

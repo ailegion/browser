@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod encoding;
 mod sink;
 
 use std::fmt::Write as _;
@@ -580,6 +581,52 @@ mod tests {
         }
         let streamed = parser.finish();
         assert_eq!(whole.dump(), streamed.dump());
+    }
+
+    #[test]
+    fn legacy_encodings_are_decoded() {
+        // Declared in the document, arriving one byte at a time.
+        let html = b"<!doctype html><meta charset=windows-1252><p>caf\xe9</p>";
+        let mut parser = HtmlParser::new(None);
+        for b in html.iter() {
+            parser.feed(std::slice::from_ref(b));
+        }
+        let doc = parser.finish();
+        assert_eq!(parser_text(&doc), "caf\u{e9}");
+
+        // Declared by the transport, which beats the document.
+        let html = b"<meta charset=utf-8><p>na\xefve</p>";
+        let mut parser = HtmlParser::with_charset(None, Some("ISO-8859-1"));
+        parser.feed(html);
+        assert_eq!(parser.encoding().map(|e| e.name()), Some("windows-1252"));
+        let doc = parser.finish();
+        assert_eq!(parser_text(&doc), "na\u{ef}ve");
+
+        // A byte order mark beats both.
+        let mut html = b"\xff\xfe".to_vec();
+        for unit in "<p>\u{3042}</p>".encode_utf16() {
+            html.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut parser = HtmlParser::with_charset(None, Some("windows-1252"));
+        parser.feed(&html);
+        let doc = parser.finish();
+        assert_eq!(parser_text(&doc), "\u{3042}");
+
+        // Undeclared and not valid UTF-8: windows-1252. Undeclared and valid: UTF-8.
+        assert_eq!(parser_text(&parse_html(b"<p>\x93quoted\x94</p>")), "\u{201c}quoted\u{201d}");
+        assert_eq!(parser_text(&parse_html("<p>\u{201c}quoted\u{201d}</p>".as_bytes())), "\u{201c}quoted\u{201d}");
+        // A UTF-8 sequence split across chunks survives.
+        let html = "<p>\u{e9}\u{3042}</p>".as_bytes();
+        let mut parser = HtmlParser::new(None);
+        for b in html.iter() {
+            parser.feed(std::slice::from_ref(b));
+        }
+        assert_eq!(parser_text(&parser.finish()), "\u{e9}\u{3042}");
+    }
+
+    fn parser_text(doc: &Document) -> String {
+        let body = doc.body().expect("body");
+        doc.text_content(body)
     }
 
     #[test]

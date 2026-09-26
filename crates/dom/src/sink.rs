@@ -197,12 +197,18 @@ impl TreeSink for Sink {
 
 /// Streaming HTML parser. Feed bytes as they arrive, then `finish`.
 ///
-/// Bytes are decoded as UTF-8 with lossy replacement. Legacy encodings via
-/// `encoding_rs` are a later phase.
+/// The encoding is decided by `crate::encoding::sniff_html` once enough
+/// bytes are in: at once when the transport names a charset or a byte
+/// order mark is present, otherwise after the first kilobyte (or the end,
+/// for shorter documents). Bytes arriving before that are held back.
+/// Malformed sequences are replaced, never rejected.
 pub struct HtmlParser {
     inner: html5ever::driver::Parser<Sink>,
-    /// Bytes of an incomplete UTF-8 sequence at the end of the last chunk.
+    /// Charset parameter of the Content-Type header, if any.
+    transport: Option<String>,
+    /// Bytes held until the encoding is decided.
     buffer: Vec<u8>,
+    decoder: Option<encoding_rs::Decoder>,
 }
 
 impl std::fmt::Debug for HtmlParser {
@@ -213,43 +219,79 @@ impl std::fmt::Debug for HtmlParser {
 
 impl HtmlParser {
     pub fn new(base_url: Option<Url>) -> Self {
+        Self::with_charset(base_url, None)
+    }
+
+    /// `charset` is the transport layer's declaration (the Content-Type
+    /// header's parameter), which outranks anything in the document.
+    pub fn with_charset(base_url: Option<Url>, charset: Option<&str>) -> Self {
         let opts = ParseOpts::default();
         let inner = html5ever::parse_document(Sink::new(base_url), opts);
         Self {
             inner,
+            transport: charset.map(str::to_owned),
             buffer: Vec::new(),
+            decoder: None,
         }
     }
 
-    /// Feed a chunk of bytes. Invalid UTF-8 is replaced, never rejected.
+    /// The encoding in use, once decided.
+    pub fn encoding(&self) -> Option<&'static encoding_rs::Encoding> {
+        self.decoder.as_ref().map(|d| d.encoding())
+    }
+
+    /// Feed a chunk of bytes.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // Chunks can split a multi-byte sequence; html5ever's Utf8LossyDecoder
-        // handles that, but it consumes `self`, so decode here instead with a
-        // small carry-over buffer.
-        self.buffer.extend_from_slice(bytes);
-        let valid_up_to = match std::str::from_utf8(&self.buffer) {
-            Ok(_) => self.buffer.len(),
-            Err(e) => {
-                // Keep an incomplete trailing sequence for the next chunk;
-                // replace invalid bytes in the middle.
-                match e.error_len() {
-                    None => e.valid_up_to(),
-                    Some(_) => self.buffer.len(),
-                }
-            }
-        };
-        if valid_up_to == 0 {
+        if self.decoder.is_some() {
+            self.decode(bytes, false);
             return;
         }
-        let chunk: Vec<u8> = self.buffer.drain(..valid_up_to).collect();
-        let text = String::from_utf8_lossy(&chunk);
-        self.inner.process(StrTendril::from_slice(&text));
+        self.buffer.extend_from_slice(bytes);
+        // Decide as soon as nothing later could change the answer. Three
+        // bytes are enough to rule a byte order mark in or out.
+        let settled = self.buffer.len() >= crate::encoding::PRESCAN_BYTES
+            || (self.buffer.len() >= 3
+                && (self.transport.is_some() || encoding_rs::Encoding::for_bom(&self.buffer).is_some()));
+        if settled {
+            self.start_decoding(false);
+        }
+    }
+
+    /// Pick the encoding from what is buffered and decode the buffer.
+    fn start_decoding(&mut self, last: bool) {
+        let enc = crate::encoding::sniff_html(&self.buffer, self.transport.as_deref());
+        // `new_decoder` still honors a byte order mark over `enc`.
+        self.decoder = Some(enc.new_decoder());
+        let held = std::mem::take(&mut self.buffer);
+        self.decode(&held, last);
+    }
+
+    fn decode(&mut self, bytes: &[u8], last: bool) {
+        let Some(decoder) = &mut self.decoder else { return };
+        let mut text = String::new();
+        let mut read = 0;
+        loop {
+            let room = decoder
+                .max_utf8_buffer_length(bytes.len() - read)
+                .unwrap_or_else(|| (bytes.len() - read).saturating_mul(3))
+                .max(16);
+            text.reserve(room);
+            let (result, n, _) = decoder.decode_to_string(&bytes[read..], &mut text, last);
+            read += n;
+            if matches!(result, encoding_rs::CoderResult::InputEmpty) {
+                break;
+            }
+        }
+        if !text.is_empty() {
+            self.inner.process(StrTendril::from_slice(&text));
+        }
     }
 
     pub fn finish(mut self) -> Document {
-        if !self.buffer.is_empty() {
-            let text = String::from_utf8_lossy(&self.buffer).into_owned();
-            self.inner.process(StrTendril::from_slice(&text));
+        if self.decoder.is_none() {
+            self.start_decoding(true);
+        } else {
+            self.decode(&[], true);
         }
         self.inner.finish()
     }
