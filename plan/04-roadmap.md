@@ -45,6 +45,31 @@ Exit criteria:
 
 ## Phase 1: Static page renderer
 
+**Status: done 2026-09-26, with the caveats below.** `browser <url>` opens a
+window and renders the page; `--screenshot FILE` saves it. Verified on
+example.com, the Wikipedia article on Rust, and docs.rs (serde): all three
+render recognizably with correct fonts, images and list markers. 48 unit
+tests plus a snapshot suite and a malformed-input suite pass.
+
+Caveats carried forward (all logged in `05-risks-and-open-items.md`):
+
+- Floats are placed (taffy 0.14 has float support) but line boxes do not
+  shorten around them, so a floated Wikipedia infobox overlaps the text
+  beside it. This is the most visible defect and moves up to Phase 2 (O12).
+- CSS custom properties are not implemented, so sites that color through
+  `var()` (docs.rs's dark nav bar) fall back to transparent. Phase 2 as
+  planned.
+- Progressive rendering while the main document streams is not done; the
+  page appears when the HTML finishes. External stylesheets and images do
+  trigger re-renders as they arrive.
+- Snapshot PNGs depend on installed fonts, so they are only comparable on
+  the machine that produced them (O11).
+- Legacy encodings: bytes are decoded as UTF-8 with replacement. Charset
+  detection through `encoding_rs` is still to do.
+- The cascade on the Wikipedia article (19k elements, 230 KB of CSS) takes
+  213 ms in a release build and about 2 s in a debug build after rule
+  bucketing (O13). Selector-based invalidation stays a Phase 2 item.
+
 Goal: fetch a URL, paint it, scroll it. No script, no chrome, no clicking.
 
 Work:
@@ -91,6 +116,9 @@ Goal: usable as a browser for pages that do not need JavaScript.
 
 Work:
 
+0. Line boxes shortened around floats (O12), CSS custom properties, and
+   charset detection with `encoding_rs`: the three Phase 1 caveats that
+   affect the most pages.
 1. Hit testing over layout fragments. `:hover`, `:active`, `:focus` through
    the style engine with per-subtree dirty bits.
 2. Link navigation, redirects, `<meta http-equiv=refresh>`, fragment scroll.

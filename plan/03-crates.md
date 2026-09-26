@@ -30,6 +30,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `fontique` | 0.11.1 | System font enumeration and fallback | Direct dep only to set `fontconfig-dlopen`; see "OS bindings on Linux" |
 | `skrifa` | 0.44.0 | Font parsing, glyph outlines | via vello and parley |
 | `harfrust` | 0.12.0 | Shaping (pure-Rust HarfBuzz port) | via parley; parley 0.11 no longer uses `swash` |
+| `parlance` | 0.1.0 | Font family list parsing (`FontFamily::Source` takes the CSS list text) | via parley |
 
 ### Content
 
@@ -39,7 +40,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `xml5ever` | not added | XHTML, inline SVG | Phase 5; match html5ever's version |
 | `cssparser` | 0.37.0 | CSS tokens and parser framework | Pinned to `0.37` because `selectors` 0.40 requires it. 0.38 exists; bump both together |
 | `selectors` | 0.40.0 | Selector parsing, matching, specificity | |
-| `taffy` | 0.14.0 | Block, flex, grid layout | No tables or floats |
+| `taffy` | 0.14.0 | Block, flex, grid layout | Has `float`/`clear` support for block-level boxes; no tables. Line-box shortening around floats is ours to do (O12) |
 | `slotmap` | 1.1.1 | DOM node arena | |
 | `boa_engine` | 0.22.0 | JavaScript | Interpreter, no JIT; accepted |
 | `boa_gc` | 0.22.0 | GC traits for DOM wrappers | |

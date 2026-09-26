@@ -2,3 +2,5 @@
 **/*.rs.bk
 *.pdb
 /geiger-report.txt
+# Snapshot PNGs depend on the machine's fonts until a font is bundled (plan O11).
+/crates/paint/tests/snapshots/

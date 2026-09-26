@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<style>
+  body { margin: 0; font-family: serif; }
+  .rel { position: relative; height: 120px; background: #fafafa; border-bottom: 1px solid #ccc; }
+  .abs { position: absolute; top: 10px; right: 10px; width: 100px; height: 40px; background: #ffcc00; }
+  .clip { overflow: hidden; width: 150px; height: 40px; background: #cfc; }
+  .clip div { width: 400px; height: 400px; background: #6c6; }
+  .op { opacity: 0.5; background: #f00; width: 80px; height: 30px; }
+  .ib { display: inline-block; width: 50px; height: 20px; background: #99f; vertical-align: baseline; }
+</style>
+</head>
+<body>
+  <div class="rel">relative container<div class="abs"></div></div>
+  <div class="clip"><div></div></div>
+  <div class="op"></div>
+  <p>inline <span class="ib"></span> block <span class="ib"></span> boxes</p>
+  <p style="width: 200px; margin: 10px auto; background: #eee">auto margins center this paragraph</p>
+</body>
+</html>

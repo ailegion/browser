@@ -15,3 +15,6 @@ browser-style.workspace = true
 taffy.workspace = true
 parley.workspace = true
 fontique.workspace = true
+url.workspace = true
+html5ever.workspace = true
+tracing.workspace = true

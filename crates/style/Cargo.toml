@@ -13,4 +13,9 @@ workspace = true
 browser-dom.workspace = true
 cssparser.workspace = true
 selectors.workspace = true
+html5ever.workspace = true
+slotmap.workspace = true
 url.workspace = true
+# Trait that `selectors` requires on identifier types; html5ever's atoms
+# already implement it, the newtypes here delegate to them.
+precomputed-hash = "0.1"

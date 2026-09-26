@@ -591,8 +591,11 @@ dependencies = [
  "browser-dom",
  "browser-style",
  "fontique",
+ "html5ever",
  "parley",
  "taffy",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -625,10 +628,13 @@ dependencies = [
 name = "browser-paint"
 version = "0.0.1"
 dependencies = [
+ "browser-dom",
  "browser-layout",
  "browser-style",
  "image",
- "parley",
+ "pollster",
+ "tracing",
+ "url",
  "vello",
 ]
 
@@ -654,12 +660,16 @@ dependencies = [
  "arboard",
  "browser-chrome",
  "browser-ipc-types",
+ "browser-net",
+ "browser-paint",
  "browser-store",
  "browser-tab",
+ "image",
  "pollster",
  "rfd",
  "tracing",
  "tracing-subscriber",
+ "url",
  "vello",
  "wgpu",
  "winit",
@@ -683,7 +693,10 @@ version = "0.0.1"
 dependencies = [
  "browser-dom",
  "cssparser",
+ "html5ever",
+ "precomputed-hash",
  "selectors",
+ "slotmap",
  "url",
 ]
 
@@ -696,10 +709,10 @@ dependencies = [
  "browser-layout",
  "browser-net",
  "browser-paint",
- "browser-script",
  "browser-style",
- "tokio",
+ "html5ever",
  "tracing",
+ "url",
  "vello",
 ]
 

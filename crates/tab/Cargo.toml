@@ -15,8 +15,8 @@ browser-dom.workspace = true
 browser-style.workspace = true
 browser-layout.workspace = true
 browser-paint.workspace = true
-browser-script.workspace = true
 browser-net.workspace = true
-tokio = { workspace = true, features = ["sync"] }
 vello.workspace = true
+url.workspace = true
+html5ever.workspace = true
 tracing.workspace = true

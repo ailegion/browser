@@ -62,6 +62,13 @@ owner thread avoids all cross-thread DOM synchronization.
 
 ## Tab event loop
 
+Transport as built in Phase 1: the tab's inbox is a `std::sync::mpsc`
+channel that the tab thread blocks on (a dedicated thread is supposed to
+block); the shell and the network service both hold senders. Tab-to-shell
+messages and painted frames go through winit's `EventLoopProxy`, which wakes
+the shell's event loop without blocking it. D13's rule about `std::sync::mpsc`
+is about the shell never blocking on a receive, which this honors.
+
 ```
 loop {
     drain shell messages (input, navigate, resize, close)

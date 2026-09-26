@@ -17,14 +17,18 @@ workspace = true
 browser-ipc-types.workspace = true
 browser-chrome.workspace = true
 browser-tab.workspace = true
+browser-net.workspace = true
+browser-paint.workspace = true
 browser-store.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 vello.workspace = true
 pollster.workspace = true
+url.workspace = true
 # Default features are xdg-portal + wayland, which keeps Linux dialogs free of GTK (C).
 rfd.workspace = true
 arboard.workspace = true
+image = { workspace = true, features = ["png"] }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
