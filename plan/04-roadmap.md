@@ -10,9 +10,8 @@ build order.
 **Status: done 2026-09-26.** Workspace builds on Windows (x86_64-pc-windows-gnu),
 `cargo deny check bans` passes, `cargo test` passes, `browser --smoke` opens
 a window on Vulkan, renders a frame and exits 0. Unsafe baseline is in
-`06-unsafe-baseline.md`. Not done: `git init` (the session could not run
-git; do it first thing next session and commit everything including
-`Cargo.lock`).
+`06-unsafe-baseline.md`. Git is handled by the owner, never by the
+assistant.
 
 Goal: a workspace where the pure-Rust and no-unsafe rules are enforced by CI
 before any feature code exists.
@@ -56,6 +55,7 @@ Caveats carried forward (all logged in `05-risks-and-open-items.md`):
 - Floats are placed (taffy 0.14 has float support) but line boxes do not
   shorten around them, so a floated Wikipedia infobox overlaps the text
   beside it. This is the most visible defect and moves up to Phase 2 (O12).
+  Fixed 2026-09-26 in Phase 2 item 0.
 - CSS custom properties are not implemented, so sites that color through
   `var()` (docs.rs's dark nav bar) fall back to transparent. Phase 2 as
   planned.
@@ -118,7 +118,9 @@ Work:
 
 0. Line boxes shortened around floats (O12), CSS custom properties, and
    charset detection with `encoding_rs`: the three Phase 1 caveats that
-   affect the most pages.
+   affect the most pages. Floats: done 2026-09-26 (`crates/layout`, five
+   new unit tests, snapshot fixture `03-floats.html`, verified on the
+   Wikipedia Rust article). Custom properties and charset: next.
 1. Hit testing over layout fragments. `:hover`, `:active`, `:focus` through
    the style engine with per-subtree dirty bits.
 2. Link navigation, redirects, `<meta http-equiv=refresh>`, fragment scroll.

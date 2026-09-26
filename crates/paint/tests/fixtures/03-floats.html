@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+<style>
+  body { margin: 0; font-family: serif; font-size: 16px; }
+  .left { float: left; width: 160px; height: 90px; margin: 0 12px 8px 0; background: #fc9; }
+  .right { float: right; width: 120px; height: 140px; margin: 0 0 8px 12px; background: #9cf; }
+  p { margin: 0 0 8px; }
+  .box { overflow: hidden; background: #efe; padding: 4px; }
+</style>
+</head>
+<body>
+  <div class="left"></div>
+  <div class="right"></div>
+  <p>Lines beside the two floats are shortened on both sides, and lines below
+  the left float widen to the left edge while the right float still stands.
+  Once both floats end, the text takes the full width of the page again as it
+  did before, one two three four five six seven eight nine ten.</p>
+  <p>A second paragraph keeps avoiding the right float until it ends, then
+  spans the whole line like any ordinary block of running text would do.</p>
+  <div class="box">A box that establishes its own formatting context sits
+  beside the floats, narrowed by taffy, and its lines are not shortened again.</div>
+</body>
+</html>

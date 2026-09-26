@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use browser_dom::{Document, NodeId, NodeKind};
-use browser_style::{ComputedStyle, Display, ListStyleType, StyleMap, TextTransform, WhiteSpace};
+use browser_style::{ComputedStyle, Display, Float, ListStyleType, StyleMap, TextTransform, WhiteSpace};
 use html5ever::{local_name, ns};
 use url::Url;
 
@@ -79,6 +79,22 @@ pub(crate) struct AtomicResult {
 pub(crate) struct InlineLayout {
     pub max_width: Option<f32>,
     pub layout: parley::Layout<crate::Brush>,
+    /// Height of the laid-out lines, including gaps left when a line was
+    /// pushed below a float. Equals `layout.height()` when there are none.
+    pub height: f32,
+}
+
+/// The vertical band a float occupies next to an inline root, in the root's
+/// own coordinates (origin at the root's top-left). Lines that overlap the
+/// band vertically must keep clear of `edge` on the float's side.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FloatBand {
+    pub top: f32,
+    pub bottom: f32,
+    pub side: Float,
+    /// For a left float, the x of its right margin edge; for a right float,
+    /// the x of its left margin edge.
+    pub edge: f32,
 }
 
 pub(crate) struct InlineContent {
@@ -88,6 +104,9 @@ pub(crate) struct InlineContent {
     /// Style of the block container: alignment, white-space, defaults.
     pub container: Arc<ComputedStyle>,
     pub cache: Vec<InlineLayout>,
+    /// Floats this root's lines must avoid; filled by the engine after the
+    /// first layout pass, empty on float-free pages.
+    pub floats: Vec<FloatBand>,
 }
 
 impl InlineContent {
@@ -98,6 +117,7 @@ impl InlineContent {
             atomics: Vec::new(),
             container,
             cache: Vec::new(),
+            floats: Vec::new(),
         }
     }
 
