@@ -11,6 +11,7 @@
 
 pub mod cascade;
 pub mod computed;
+pub mod custom;
 pub mod media;
 pub mod properties;
 pub mod selector_impl;

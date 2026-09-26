@@ -5,8 +5,11 @@ use cssparser::{
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, match_ignore_ascii_case,
 };
 
+use std::sync::Arc;
+
+use crate::custom::contains_var;
 use crate::media::MediaQueryList;
-use crate::properties::{Declaration, parse_property};
+use crate::properties::{CustomValue, Declaration, DeclaredValue, longhands_of, parse_property};
 use crate::selector_impl::{Selectors, parse_selectors};
 
 /// Where a stylesheet comes from; decides cascade order.
@@ -70,7 +73,7 @@ impl Stylesheet {
     }
 
     fn resolve_urls(&mut self, base: &url::Url) {
-        use crate::properties::{DeclaredValue, PropertyDeclaration};
+        use crate::properties::PropertyDeclaration;
         fn walk(rules: &mut [Rule], base: &url::Url) {
             for r in rules {
                 match r {
@@ -275,10 +278,39 @@ impl<'i> DeclarationParser<'i> for Body {
         input: &mut Parser<'i, 't>,
         _declaration_start: &ParserState,
     ) -> Result<BodyItem, ParseError<'i, ()>> {
-        // Split off `!important` first.
-        let values = input.parse_until_before(cssparser::Delimiter::Bang, |i| {
-            parse_property(&name, i)
+        // The raw value text, up to any `!important`, for custom properties
+        // and for values that reference them; both are parsed later.
+        let start = input.state();
+        let raw = input.parse_until_before(cssparser::Delimiter::Bang, |i| {
+            let s = i.position();
+            while i.next().is_ok() {}
+            Ok::<_, ParseError<'i, ()>>(i.slice_from(s))
         })?;
+        let raw = raw.trim();
+
+        let values = if name.starts_with("--") {
+            let value = match_ignore_ascii_case! { raw,
+                "initial" => CustomValue::Initial,
+                "inherit" | "unset" | "revert" | "revert-layer" => CustomValue::Inherit,
+                _ => CustomValue::Raw(Arc::from(raw)),
+            };
+            vec![DeclaredValue::Custom {
+                name: Arc::from(&*name),
+                value,
+            }]
+        } else if contains_var(raw) {
+            if longhands_of(&name).is_none() {
+                return Err(input.new_custom_error(()));
+            }
+            vec![DeclaredValue::Pending {
+                name: Arc::from(&*name),
+                raw: Arc::from(raw),
+            }]
+        } else {
+            input.reset(&start);
+            input.parse_until_before(cssparser::Delimiter::Bang, |i| parse_property(&name, i))?
+        };
+
         let important = input
             .try_parse(|i| {
                 i.expect_delim('!')?;

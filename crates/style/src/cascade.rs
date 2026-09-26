@@ -14,7 +14,8 @@ use selectors::matching::matches_selector;
 use slotmap::SecondaryMap;
 
 use crate::computed::{ComputedStyle, DeclaredValues, Viewport, compute};
-use crate::properties::Declaration;
+use crate::custom::{expand_pending, resolve_customs};
+use crate::properties::{CustomValue, Declaration, DeclaredValue};
 use crate::selector_impl::ElementRef;
 use crate::stylesheet::{Origin, Rule, StyleRule, Stylesheet, parse_declaration_block};
 
@@ -223,9 +224,45 @@ pub fn compute_styles(doc: &Document, stylist: &Stylist, viewport: &Viewport) ->
 
         matched.sort_by_key(|(l, s, o, _)| (*l, *s, *o));
 
-        let mut decls = DeclaredValues::new();
+        // Custom properties first, since `var()` values depend on them;
+        // then declarations that reference them are substituted and parsed.
+        let mut custom_decls: Vec<(&Arc<str>, &CustomValue)> = Vec::new();
+        let mut has_pending = false;
         for (_, _, _, d) in &matched {
-            decls.set(&d.value);
+            match &d.value {
+                DeclaredValue::Custom { name, value } => custom_decls.push((name, value)),
+                DeclaredValue::Pending { .. } => has_pending = true,
+                _ => {}
+            }
+        }
+        let custom = resolve_customs(&parent_style.custom, &custom_decls);
+        let expanded: Vec<Vec<DeclaredValue>> = if has_pending {
+            matched
+                .iter()
+                .filter_map(|(_, _, _, d)| match &d.value {
+                    DeclaredValue::Pending { name, raw } => Some(expand_pending(name, raw, &custom)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut decls = DeclaredValues::new();
+        decls.custom = custom;
+        let mut expanded_iter = expanded.iter();
+        for (_, _, _, d) in &matched {
+            match &d.value {
+                DeclaredValue::Pending { .. } => {
+                    if let Some(values) = expanded_iter.next() {
+                        for v in values {
+                            decls.set(v);
+                        }
+                    }
+                }
+                DeclaredValue::Custom { .. } => {}
+                v => decls.set(v),
+            }
         }
 
         let is_root = id == root;
@@ -404,5 +441,58 @@ mod tests {
         let (doc, styles) = styles_for("<div hidden>x</div>", "");
         assert_eq!(styles[find(&doc, "div")].display, Display::None);
         assert_eq!(styles[find(&doc, "head")].display, Display::None);
+    }
+
+    #[test]
+    fn custom_properties_inherit_and_substitute() {
+        let (doc, styles) = styles_for(
+            "<div><p>t <em>e</em></p></div>",
+            ":root { --c: red; --m: 1px 2px } p { color: var(--c); margin: var(--m) } em { background-color: rgb(var(--r, 0), 128, 0) }",
+        );
+        let p = find(&doc, "p");
+        assert_eq!(styles[p].color.to_rgba8(), [255, 0, 0, 255]);
+        assert_eq!(styles[p].margin.top, crate::values::ComputedLpAuto::Px(1.0));
+        assert_eq!(styles[p].margin.right, crate::values::ComputedLpAuto::Px(2.0));
+        let em = find(&doc, "em");
+        // Fallback inside a function; the map itself is inherited.
+        assert_eq!(styles[em].background_color.to_rgba8(), [0, 128, 0, 255]);
+        assert_eq!(styles[em].custom.get("--c").map(|v| &**v), Some("red"));
+        assert!(Arc::ptr_eq(&styles[em].custom, &styles[p].custom), "unchanged maps are shared");
+    }
+
+    #[test]
+    fn missing_reference_is_unset_not_the_previous_value() {
+        // The later declaration wins the cascade, then fails at
+        // computed-value time, which means `unset`: inherited color.
+        let (doc, styles) = styles_for(
+            "<body><p>t</p></body>",
+            "body { color: blue } p { color: green; color: var(--nope) }",
+        );
+        let p = find(&doc, "p");
+        assert_eq!(styles[p].color.to_rgba8(), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn custom_chains_overrides_and_style_attribute() {
+        let (doc, styles) = styles_for(
+            "<div><p style='--w: var(--base); width: var(--w)'>t<span>s</span></p></div>",
+            ":root { --base: 20px; --c: red } div { --c: var(--other, blue) } p { color: var(--c) } span { color: var(--c) }",
+        );
+        let p = find(&doc, "p");
+        assert_eq!(styles[p].width, crate::values::ComputedSize::Px(20.0));
+        assert_eq!(styles[p].color.to_rgba8(), [0, 0, 255, 255]);
+        let span = find(&doc, "span");
+        assert_eq!(styles[span].color.to_rgba8(), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn cycle_falls_back_and_important_custom_wins() {
+        let (doc, styles) = styles_for(
+            "<p>t</p>",
+            ":root { --a: var(--b); --b: var(--a) } p { margin-top: var(--a, 5px); --x: 1px !important; --x: 9px; padding-top: var(--x) }",
+        );
+        let p = find(&doc, "p");
+        assert_eq!(styles[p].margin.top, crate::values::ComputedLpAuto::Px(5.0));
+        assert_eq!(styles[p].padding.top, crate::values::ComputedLp::Px(1.0));
     }
 }

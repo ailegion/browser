@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::custom::CustomMap;
 use crate::properties::*;
 use crate::values::*;
 
@@ -77,6 +78,9 @@ pub struct ComputedStyle {
     pub row_gap: ComputedLp,
     pub column_gap: ComputedLp,
     pub opacity: f32,
+    /// Custom properties in effect, inherited; shared with the parent when
+    /// this element declares none.
+    pub custom: Arc<CustomMap>,
 }
 
 /// Viewport information the cascade needs.
@@ -153,6 +157,7 @@ impl ComputedStyle {
             row_gap: ComputedLp::ZERO,
             column_gap: ComputedLp::ZERO,
             opacity: 1.0,
+            custom: Arc::new(CustomMap::new()),
         }
     }
 
@@ -176,6 +181,7 @@ impl ComputedStyle {
         self.text_transform = p.text_transform;
         self.white_space = p.white_space;
         self.list_style_type = p.list_style_type;
+        self.custom = p.custom.clone();
         // Not inherited by spec, but the decoration propagates to all
         // descendant text, which is what this achieves for now.
         self.text_decoration = p.text_decoration;
@@ -200,22 +206,28 @@ impl ComputedStyle {
     }
 }
 
-/// Declared values for one element, indexed by `PropertyId`.
+/// Declared values for one element, indexed by `PropertyId`, plus the
+/// element's resolved custom properties.
 #[derive(Debug)]
 pub struct DeclaredValues<'a> {
     slots: Vec<Option<&'a DeclaredValue>>,
+    pub custom: Arc<CustomMap>,
 }
 
 impl<'a> DeclaredValues<'a> {
     pub fn new() -> Self {
         Self {
             slots: vec![None; PropertyId::COUNT],
+            custom: Arc::new(CustomMap::new()),
         }
     }
 
-    /// Later calls override earlier ones; apply in cascade order.
+    /// Later calls override earlier ones; apply in cascade order. Custom
+    /// and pending values are ignored: the cascade resolves those first.
     pub fn set(&mut self, v: &'a DeclaredValue) {
-        self.slots[v.id().index()] = Some(v);
+        if let Some(id) = v.id() {
+            self.slots[id.index()] = Some(v);
+        }
     }
 
     pub fn get(&self, id: PropertyId) -> Option<&'a DeclaredValue> {
@@ -241,7 +253,8 @@ fn resolve<'a>(decls: &DeclaredValues<'a>, id: PropertyId) -> Resolved<'a> {
         Some(DeclaredValue::Value(v)) => Resolved::Specified(v),
         Some(DeclaredValue::Inherit(_)) => Resolved::Inherit,
         Some(DeclaredValue::Initial(_)) => Resolved::Initial,
-        Some(DeclaredValue::Unset(_)) | None => {
+        // Custom and pending never reach a slot (`set` skips them).
+        Some(DeclaredValue::Unset(_) | DeclaredValue::Custom { .. } | DeclaredValue::Pending { .. }) | None => {
             if id.is_inherited() {
                 Resolved::Inherit
             } else {
@@ -261,6 +274,7 @@ pub fn compute(
 ) -> ComputedStyle {
     let initial = ComputedStyle::initial();
     let mut out = ComputedStyle::initial();
+    out.custom = decls.custom.clone();
 
     // Font size first: em units on everything else depend on it.
     out.font_size = match resolve(decls, PropertyId::FontSize) {

@@ -405,6 +405,17 @@ longhands! {
     Opacity: "opacity" => f32, false;
 }
 
+/// The declared value of a custom property.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CustomValue {
+    /// Raw text, leading and trailing whitespace removed.
+    Raw(Arc<str>),
+    /// `initial`: the property has no value.
+    Initial,
+    /// `inherit` or `unset`: the parent's value (custom properties inherit).
+    Inherit,
+}
+
 /// A declared value: a real value or a CSS-wide keyword for a property.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeclaredValue {
@@ -412,15 +423,31 @@ pub enum DeclaredValue {
     Inherit(PropertyId),
     Initial(PropertyId),
     Unset(PropertyId),
+    /// `--name: value`, kept as text; see `crate::custom`.
+    Custom { name: Arc<str>, value: CustomValue },
+    /// A known property whose value contains `var()`; substituted and
+    /// parsed per element by `crate::custom::expand_pending`.
+    Pending { name: Arc<str>, raw: Arc<str> },
 }
 
 impl DeclaredValue {
-    pub fn id(&self) -> PropertyId {
+    /// The longhand this sets; `None` for custom and pending values, which
+    /// the cascade handles before the property table sees them.
+    pub fn id(&self) -> Option<PropertyId> {
         match self {
-            DeclaredValue::Value(v) => v.id(),
-            DeclaredValue::Inherit(id) | DeclaredValue::Initial(id) | DeclaredValue::Unset(id) => *id,
+            DeclaredValue::Value(v) => Some(v.id()),
+            DeclaredValue::Inherit(id) | DeclaredValue::Initial(id) | DeclaredValue::Unset(id) => Some(*id),
+            DeclaredValue::Custom { .. } | DeclaredValue::Pending { .. } => None,
         }
     }
+}
+
+/// The longhands a property name stands for: itself, or a shorthand's
+/// expansion. `None` for names we do not know.
+pub fn longhands_of(name: &str) -> Option<Vec<PropertyId>> {
+    shorthand_longhands(name)
+        .map(|s| s.to_vec())
+        .or_else(|| PropertyId::from_name(name).map(|id| vec![id]))
 }
 
 /// One declaration in a block, with its `!important` flag.
@@ -453,10 +480,7 @@ pub fn parse_property<'i>(
             _ => None,
         };
         if let Some(make) = make {
-            let ids = shorthand_longhands(name)
-                .map(|s| s.to_vec())
-                .or_else(|| PropertyId::from_name(name).map(|id| vec![id]))
-                .ok_or_else(|| input.new_custom_error(()))?;
+            let ids = longhands_of(name).ok_or_else(|| input.new_custom_error(()))?;
             return Ok(ids.into_iter().map(make).collect());
         }
         // Not a CSS-wide keyword: fall through and re-parse from the start.
