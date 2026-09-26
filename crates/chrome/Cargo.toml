@@ -1,0 +1,16 @@
+[package]
+name = "browser-chrome"
+description = "Browser UI widgets (tab strip, address bar, buttons, menus) drawn with vello, laid out with taffy, text via parley (plan D05)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-ipc-types.workspace = true
+vello.workspace = true
+parley.workspace = true
+taffy.workspace = true

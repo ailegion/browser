@@ -1,0 +1,16 @@
+[package]
+name = "browser-style"
+description = "Our CSS engine: parsing over cssparser, matching over selectors, and our own property table, cascade, inheritance, and computed values (plan D06)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-dom.workspace = true
+cssparser.workspace = true
+selectors.workspace = true
+url.workspace = true

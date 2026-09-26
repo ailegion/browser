@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  policy:
+    name: pure-rust policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - name: banned crates
+        run: cargo deny --all-features check bans
+      - name: no native build steps
+        # A second line of defense behind deny.toml: nothing may need cc,
+        # cmake, or pkg-config to build.
+        run: |
+          cargo tree -e build --all-features > build-deps.txt
+          if grep -Ei '^\s*[├└│ ]*(cc|cmake|pkg-config|vcpkg|bindgen) v' build-deps.txt; then
+            echo "native build dependency found"; exit 1
+          fi
+      - name: workspace crates forbid unsafe
+        run: |
+          fail=0
+          for f in crates/*/src/lib.rs crates/*/src/main.rs; do
+            [ -f "$f" ] || continue
+            case "$f" in crates/platform/*) continue;; esac
+            grep -q '#!\[forbid(unsafe_code)\]' "$f" || { echo "missing forbid(unsafe_code): $f"; fail=1; }
+          done
+          exit $fail
+
+  build:
+    name: build and test (${{ matrix.os }})
+    needs: policy
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux and macOS join the matrix in Phase 2 (plan D12).
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - name: smoke render
+        # Opens the window, renders one frame, exits. Needs a GPU-less
+        # fallback adapter; wgpu picks a software adapter on CI runners.
+        run: cargo run -p browser-shell --locked -- --smoke
+        continue-on-error: true
+
+  unsafe-audit:
+    name: unsafe baseline
+    needs: policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-geiger
+      - name: count unsafe in parser dependencies
+        run: |
+          # geiger needs a concrete package; the shell depends on every other crate.
+          # geiger also insists on an absolute manifest path.
+          cargo geiger --manifest-path "$(pwd)/crates/shell/Cargo.toml" --output-format Ascii > geiger-report.txt || true
+          cat geiger-report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geiger-report
+          path: geiger-report.txt

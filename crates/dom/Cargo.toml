@@ -1,0 +1,16 @@
+[package]
+name = "browser-dom"
+description = "DOM node arena fed by html5ever through TreeSink; the hub that style, layout, and script all reference by NodeId."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+html5ever.workspace = true
+slotmap.workspace = true
+url.workspace = true
+encoding_rs.workspace = true

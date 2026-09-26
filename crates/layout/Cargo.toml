@@ -1,0 +1,17 @@
+[package]
+name = "browser-layout"
+description = "Box tree, taffy for block/flex/grid, parley for inline text; produces positioned fragments for paint and hit testing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-dom.workspace = true
+browser-style.workspace = true
+taffy.workspace = true
+parley.workspace = true
+fontique.workspace = true

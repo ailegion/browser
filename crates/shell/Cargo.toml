@@ -1,0 +1,30 @@
+[package]
+name = "browser-shell"
+description = "The browser executable: winit window, wgpu device, vello renderer, compositor, chrome, downloads. The only code that writes user-visible files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "browser"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-ipc-types.workspace = true
+browser-chrome.workspace = true
+browser-tab.workspace = true
+browser-store.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+vello.workspace = true
+pollster.workspace = true
+# Default features are xdg-portal + wayland, which keeps Linux dialogs free of GTK (C).
+rfd.workspace = true
+arboard.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

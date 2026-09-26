@@ -1,0 +1,48 @@
+# Risks and Open Items
+
+## Open items
+
+These are implementation details, not direction. The implementer may resolve
+them within the crate rule and record the result here; only escalate to the
+owner if resolving one would contradict a decision in `01-decisions.md`.
+
+| # | Item | Resolve by |
+|---|------|-----------|
+| O1 | JPEG decoder. Baseline shows `png`, `gif`, `image-webp` are unsafe-free and `zune-jpeg` has about 1100 unsafe expressions (SIMD). Options: keep `zune-jpeg` for speed, or use an unsafe-free JPEG decoder at a speed cost. Decide when Phase 1 wires image decoding. | Phase 1 |
+| O2 | Whether `rustls-rustcrypto` supports every cipher suite and key exchange needed for common sites (TLS 1.3 with X25519 and P-256, TLS 1.2 ECDHE fallbacks). | Phase 1, first real fetches |
+| O3 | **Resolved 2026-09-26.** Linux OS bindings (`wayland-*`, `khronos-egl`, `x11-dl`, `yeslogic-fontconfig-sys`) compile no C with the features we resolve; they load system libraries at runtime. Recorded in `03-crates.md`, "OS bindings on Linux", and enforced through `wrappers` in `deny.toml`. | done |
+| O9 | Open-source license for the repository. Owner to pick (MIT, Apache-2.0, MPL-2.0, GPL family). Until chosen, `Cargo.toml` has no `license` field. | Owner picks before first public push |
+| O10 | The repository is not a git repository yet; the Phase 0 session could not run git. Initialize and commit everything, including `Cargo.lock`. | First thing next session |
+| O4 | Store file format: append-only log with compaction, or a single blob rewritten on change. Depends on how often localStorage writes happen. | Phase 4 |
+| O5 | Default ad-block lists to ship. Owner to choose from EasyList, EasyPrivacy, uBlock filters, and regional lists. | Phase 4, owner picks |
+| O6 | Default search engine, or none until the user sets one. | Phase 4, owner picks |
+| O7 | `vello` compute-shader requirement: which fallback renderer (`vello_cpu` or `vello_hybrid`) is mature enough by the time Phase 5 needs it. | Phase 5 |
+| O8 | Whether a Boa context per `iframe` or one per tab with realms. Depends on Boa's realm support at Phase 5. | Phase 5 |
+
+## Risks
+
+Ordered by likelihood of stalling the project.
+
+| # | Risk | Likelihood | Impact | Mitigation |
+|---|------|-----------|--------|------------|
+| R1 | Hand-written CSS engine grows without bound; every site needs one more property | Certain | Slow progress | Phase-gated property subsets; a UA sheet; ship Phase 2 as a usable no-script browser before chasing breadth |
+| R2 | Web API surface in Phase 3 is far larger than any list | High | Phase 3 never ends | Bindings ordered by what unlocks the most sites; the WPT subset defines done, not completeness |
+| R3 | Boa is an interpreter; script-heavy sites are slow | High | Product ceiling | Accepted. Nothing else is pure Rust. Track Boa's optimizer work; keep bindings cheap (no per-call allocation) |
+| R4 | Linebender crates (vello, parley, wgpu) change APIs each release | High | Churn | Pin as a group; bump only at phase boundaries; thin adapter layer in `paint` and `chrome` |
+| R5 | A parser dependency adds unsafe in a new release | Medium | Breaks D01 | `cargo geiger` gate in CI; baseline recorded in Phase 0 |
+| R6 | `rustls-rustcrypto` has a timing side channel or rejects a common site | Medium | Security or compatibility | Accepted per D09; open source means community review; report upstream |
+| R7 | Hand-drawn chrome takes longer than expected (text input with IME is the hard part) | Medium | Phase 2 slips | D05 records the fallback: Masonry or iced with CPU copy |
+| R8 | Tables and floats missing from taffy break common layouts | Certain | Some pages misrender | Phase 5 item; write on top of taffy's grid for tables |
+| R9 | Cross-platform surprises on Linux (fontconfig, portals) and macOS (Metal via wgpu) | Medium | Phase 2 CI matrix fails | Start the matrix in Phase 2, not later |
+| R10 | Scope creep toward video, WebGL, extensions | Medium | Dilution | Out of scope until Phase 5 lists them; video declared out |
+| R11 | Version drift between this plan and crates.io | Certain | Wasted effort | Re-resolve the set at each phase start; update `03-crates.md` |
+
+## Explicitly out of scope
+
+- Video decoding (no production pure-Rust decoder exists).
+- WebGL and WebGPU exposure to pages.
+- Browser extensions, unless a pure-Rust design that preserves D01 is found.
+- Sync, accounts, telemetry, crash reporting to a server, any network
+  request the user did not cause.
+- OS-level sandboxing as a requirement (optional extra only, D01).
+- AVIF images (decoder is C).

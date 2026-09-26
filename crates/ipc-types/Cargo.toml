@@ -1,0 +1,14 @@
+[package]
+name = "browser-ipc-types"
+description = "Message types exchanged between shell, tab, and network layers. Every cross-layer message is defined here and nowhere else."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+url = { workspace = true, features = ["serde"] }

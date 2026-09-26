@@ -1,0 +1,18 @@
+[package]
+name = "browser-paint"
+description = "Turns layout fragments into a vello::Scene; decodes images."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-layout.workspace = true
+browser-style.workspace = true
+vello.workspace = true
+parley.workspace = true
+# Decoder set is provisional until the Phase 0 unsafe audit (plan O1).
+image = { workspace = true, features = ["png", "jpeg", "gif", "webp"] }

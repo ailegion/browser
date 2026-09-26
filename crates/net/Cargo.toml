@@ -1,0 +1,32 @@
+[package]
+name = "browser-net"
+description = "HTTP client on hyper and rustls with the pure-Rust crypto provider; in-memory cache, cookie jar, and (Phase 4) ad-block filter. The only code that opens sockets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-ipc-types.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { workspace = true, features = ["http1", "http2", "tls12", "webpki-roots", "logging"] }
+rustls = { workspace = true, features = ["std", "tls12", "logging"] }
+rustls-rustcrypto.workspace = true
+webpki-roots.workspace = true
+hickory-resolver = { workspace = true, features = ["tokio"] }
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+brotli.workspace = true
+cookie.workspace = true
+url.workspace = true
+mime.workspace = true
+data-url.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

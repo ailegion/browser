@@ -1,0 +1,151 @@
+# cargo-deny configuration.
+# Enforces plan/03-crates.md: no C, C++, or assembly anywhere in the build,
+# no system WebView, no engine from another browser, no crates rejected in
+# plan/01-decisions.md.
+#
+# CI runs: cargo deny check bans
+
+[graph]
+all-features = false
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-pc-windows-gnu",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace members reference each other by path without a version.
+allow-wildcard-paths = true
+highlight = "all"
+
+deny = [
+    # TLS crypto with C or assembly (D09)
+    { crate = "ring", reason = "C and assembly; use rustls-rustcrypto" },
+    { crate = "aws-lc-rs", reason = "C and assembly; use rustls-rustcrypto" },
+    { crate = "aws-lc-sys", reason = "C and assembly; use rustls-rustcrypto" },
+    { crate = "openssl", reason = "C; use rustls" },
+    { crate = "openssl-sys", reason = "C; use rustls" },
+    { crate = "openssl-src", reason = "C; use rustls" },
+    { crate = "native-tls", reason = "OS TLS via C; use rustls" },
+    { crate = "security-framework", reason = "macOS TLS via OS; use rustls" },
+    { crate = "schannel", reason = "Windows TLS via OS; use rustls" },
+
+    # Compression with C
+    { crate = "zstd", reason = "C; use ruzstd" },
+    { crate = "zstd-sys", reason = "C; use ruzstd" },
+    { crate = "zstd-safe", reason = "C; use ruzstd" },
+    { crate = "libz-sys", reason = "C; flate2 default backend miniz_oxide" },
+    { crate = "libz-ng-sys", reason = "C; flate2 default backend miniz_oxide" },
+    { crate = "libz-rs-sys", reason = "keep flate2 on miniz_oxide" },
+    { crate = "cloudflare-zlib-sys", reason = "C" },
+    { crate = "bzip2-sys", reason = "C" },
+
+    # Image codecs with C
+    { crate = "dav1d", reason = "C; no AVIF" },
+    { crate = "dav1d-sys", reason = "C; no AVIF" },
+    { crate = "libwebp-sys", reason = "C; image crate has a pure-Rust WebP decoder" },
+    { crate = "mozjpeg-sys", reason = "C" },
+    { crate = "turbojpeg", reason = "C" },
+    { crate = "libjpeg-turbo-sys", reason = "C" },
+    { crate = "ravif", reason = "pulls C encoders" },
+
+    # Font stacks with C
+    { crate = "freetype-sys", reason = "C; use skrifa" },
+    { crate = "freetype-rs", reason = "C; use skrifa" },
+    { crate = "harfbuzz-sys", reason = "C; use swash via parley" },
+    { crate = "harfbuzz_rs", reason = "C; use swash via parley" },
+    { crate = "fontconfig-sys", reason = "C; fontique handles discovery" },
+    { crate = "servo-fontconfig-sys", reason = "C; fontique handles discovery" },
+    # `yeslogic-fontconfig-sys` is NOT banned: with fontique's
+    # `fontconfig-dlopen` feature it loads the Linux system fontconfig at
+    # runtime and compiles nothing. It is an OS binding, like `windows`.
+
+    # Renderers and engines from elsewhere
+    { crate = "skia-safe", reason = "C++; use vello" },
+    { crate = "skia-bindings", reason = "C++; use vello" },
+    { crate = "v8", reason = "C++; use boa_engine" },
+    { crate = "rusty_v8", reason = "C++; use boa_engine" },
+    { crate = "rquickjs", reason = "C; use boa_engine" },
+    { crate = "rquickjs-sys", reason = "C; use boa_engine" },
+    { crate = "mozjs", reason = "C++; use boa_engine" },
+    { crate = "mozjs_sys", reason = "C++; use boa_engine" },
+    { crate = "deno_core", reason = "C++ via V8; use boa_engine" },
+
+    # Not standalone or replaced by decision (D05, D06, D13)
+    { crate = "stylo", reason = "not standalone (D06); the style crate is ours" },
+    { crate = "stylo_traits", reason = "not standalone (D06)" },
+    { crate = "stylo_dom", reason = "not standalone (D06)" },
+    { crate = "stylo_atoms", reason = "not standalone (D06)" },
+    { crate = "iced", reason = "wgpu version conflict; chrome is hand-drawn (D05)" },
+    { crate = "iced_wgpu", reason = "wgpu version conflict; chrome is hand-drawn (D05)" },
+    { crate = "iced_core", reason = "chrome is hand-drawn (D05)" },
+    { crate = "vfs", reason = "an in-memory filesystem is not isolation (D13)" },
+
+    # System WebViews (D13)
+    { crate = "webview2", reason = "system WebView; never" },
+    { crate = "webview2-com", reason = "system WebView; never" },
+    { crate = "wry", reason = "system WebView; never" },
+    { crate = "tao", reason = "companion to wry; use winit" },
+
+    # GTK is C (rfd must use the xdg-portal feature on Linux)
+    { crate = "gtk", reason = "C; rfd uses xdg-portal" },
+    { crate = "gtk-sys", reason = "C; rfd uses xdg-portal" },
+    { crate = "gdk-sys", reason = "C; rfd uses xdg-portal" },
+    { crate = "glib-sys", reason = "C; rfd uses xdg-portal" },
+    { crate = "gobject-sys", reason = "C; rfd uses xdg-portal" },
+
+    # Build-time native toolchain signals. Any crate needing these is
+    # compiling C and must be replaced.
+    #
+    # `wrappers` lists the only crates allowed to declare the dependency.
+    # Each is a Linux OS binding whose build script skips the native step
+    # with the features we resolve (verified 2026-09-26, see
+    # plan/03-crates.md "OS bindings on Linux"):
+    #   wayland-backend: compiles a C shim only with its `log` feature, which
+    #                    nothing enables; runtime-loads libwayland (`dlopen`).
+    #   wayland-sys:     probes pkg-config only without `dlopen`; we have it.
+    #   khronos-egl:     probes pkg-config only with `static`; we use `dynamic`.
+    #   yeslogic-fontconfig-sys: probes pkg-config only without `dlopen`;
+    #                    fontique's `fontconfig-dlopen` feature sets it.
+    #   x11-dl:          asks pkg-config for X11 library directories and
+    #                    ignores failure; always runtime-loads libX11.
+    # If a new wrapper appears here, read its build.rs before adding it.
+    { crate = "cc", reason = "native code build; find a pure-Rust crate", wrappers = ["wayland-backend"] },
+    { crate = "cmake", reason = "native code build; find a pure-Rust crate" },
+    { crate = "pkg-config", reason = "native library lookup; find a pure-Rust crate", wrappers = ["wayland-sys", "khronos-egl", "yeslogic-fontconfig-sys", "x11-dl"] },
+    { crate = "vcpkg", reason = "native library lookup; find a pure-Rust crate" },
+    { crate = "bindgen", reason = "C header binding generation; find a pure-Rust crate" },
+]
+
+[licenses]
+# Not gated in CI yet; listed so `cargo deny check` as a whole can pass later.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OFL-1.1",
+    "BSL-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[advisories]
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

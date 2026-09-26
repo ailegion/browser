@@ -1,0 +1,113 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+repository = ""
+
+# Lint floor for every crate. `unsafe_code = "deny"` at this level; each crate
+# raises it to `#![forbid(unsafe_code)]` in its root except `crates/platform`,
+# which is the only crate allowed to call OS APIs directly (plan D01).
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+
+# Versions are pinned to what was resolved in Phase 0 (2026-09-26). Bump only
+# at phase boundaries, and bump each group in plan/03-crates.md together.
+[workspace.dependencies]
+# workspace members
+browser-ipc-types = { path = "crates/ipc-types" }
+browser-platform = { path = "crates/platform" }
+browser-net = { path = "crates/net" }
+browser-dom = { path = "crates/dom" }
+browser-style = { path = "crates/style" }
+browser-layout = { path = "crates/layout" }
+browser-paint = { path = "crates/paint" }
+browser-script = { path = "crates/script" }
+browser-tab = { path = "crates/tab" }
+browser-chrome = { path = "crates/chrome" }
+browser-store = { path = "crates/store" }
+
+# window and GPU (Linebender group)
+winit = "0.30"
+wgpu = "29"
+vello = "0.10.0"
+parley = "0.11.1"
+# Same version as parley's. `fontconfig-dlopen` makes the Linux fontconfig
+# binding load the system library at runtime instead of probing it with
+# pkg-config at build time (plan/03-crates.md, "OS bindings on Linux").
+fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
+pollster = "0.4"
+
+# content (Servo parsing group)
+html5ever = "0.40.1"
+cssparser = "0.37"
+selectors = "0.40.0"
+taffy = "0.14.0"
+slotmap = "1.1"
+url = "2"
+encoding_rs = "0.8"
+data-url = "0.3"
+mime = "0.3"
+image = { version = "0.25", default-features = false }
+
+# script (Boa group)
+boa_engine = "0.22.0"
+boa_gc = "0.22.0"
+boa_runtime = "0.22.0"
+
+# network
+tokio = { version = "1", default-features = false }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+hyper-rustls = { version = "0.27", default-features = false }
+rustls = { version = "0.23", default-features = false }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
+hickory-resolver = { version = "0.26", default-features = false }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+flate2 = "1"
+brotli = "9"
+cookie = "0.18"
+
+# store (RustCrypto group)
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+
+# shell
+# Defaults are xdg-portal + wayland (pure Rust). Never enable `gtk3`.
+rfd = "0.17"
+arboard = "3"
+
+# common
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.dev]
+panic = "unwind"
+# Dependencies at opt-level 2 keep debug builds of the renderer and parser usable.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+debug = 1

@@ -1,0 +1,22 @@
+[package]
+name = "browser-tab"
+description = "One tab: the event loop that ties parsing, style, layout, paint, and script together on a single thread, wrapped in catch_unwind."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-ipc-types.workspace = true
+browser-dom.workspace = true
+browser-style.workspace = true
+browser-layout.workspace = true
+browser-paint.workspace = true
+browser-script.workspace = true
+browser-net.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+vello.workspace = true
+tracing.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "browser-script"
+description = "Boa integration and Web API bindings. JavaScript sees only what this crate registers (plan D01)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browser-dom.workspace = true
+boa_engine.workspace = true
+boa_gc.workspace = true
+boa_runtime.workspace = true
