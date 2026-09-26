@@ -42,6 +42,29 @@ struct Pending {
     body: Vec<u8>,
 }
 
+/// What a navigation does to the history list when it commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavKind {
+    /// A new entry after the current one; later entries are dropped.
+    Push,
+    /// The current entry is loaded again and overwritten.
+    Reload,
+    /// Back or forward to the entry at the index.
+    Traverse(usize),
+}
+
+/// A navigation in flight. Until the first response bytes arrive nothing
+/// visible changes except the address the shell shows, so stopping or
+/// failing it leaves the current page, URL and history untouched. On
+/// commit the history is updated and the old document's fetches dropped;
+/// the old document stays on screen until the new one has parsed.
+struct PendingNav {
+    url: Url,
+    request: RequestId,
+    kind: NavKind,
+    committed: bool,
+}
+
 /// One author stylesheet in cascade order, possibly still loading.
 struct SheetSlot {
     url: Option<Url>,
@@ -58,10 +81,14 @@ pub(crate) struct TabState {
     scroll_x: f32,
     scroll_y: f32,
 
+    /// The committed URL: what history holds for the current entry.
     url: Option<Url>,
     doc: Option<Document>,
+    /// The URL `doc` was loaded from; differs from `url` while a later
+    /// navigation has committed but not yet finished parsing.
+    doc_url: Option<Url>,
     parser: Option<HtmlParser>,
-    main_request: Option<RequestId>,
+    nav: Option<PendingNav>,
     next_request: u64,
     pending: HashMap<RequestId, Pending>,
     sheets: Vec<SheetSlot>,
@@ -115,8 +142,9 @@ impl TabState {
             scroll_y: 0.0,
             url: None,
             doc: None,
+            doc_url: None,
             parser: None,
-            main_request: None,
+            nav: None,
             next_request: 1,
             pending: HashMap::new(),
             sheets: Vec::new(),
@@ -150,14 +178,18 @@ impl TabState {
     }
 
     fn is_loading(&self) -> bool {
-        self.main_request.is_some() || !self.pending.is_empty()
+        self.nav.is_some() || !self.pending.is_empty()
     }
 
     fn send_state(&mut self) {
         let title = self.doc.as_ref().and_then(|d| d.title());
+        // The address bar shows where we are going as soon as we start.
         let url = self
-            .url
-            .clone()
+            .nav
+            .as_ref()
+            .filter(|n| !n.committed)
+            .map(|n| n.url.clone())
+            .or_else(|| self.url.clone())
             .unwrap_or_else(|| Url::parse("about:blank").expect("static url"));
         self.send(TabToShell::StateChanged {
             url,
@@ -173,30 +205,25 @@ impl TabState {
 
     pub fn handle_shell(&mut self, msg: ShellToTab) {
         match msg {
-            ShellToTab::Navigate { url } => self.go(url, true),
+            ShellToTab::Navigate { url } => self.go(url, NavKind::Push),
             ShellToTab::Reload => {
-                if let Some(url) = self.url.clone() {
-                    self.navigate(url);
+                // Reloading while a navigation is pending restarts that one.
+                let url = self.nav.as_ref().map(|n| n.url.clone()).or_else(|| self.url.clone());
+                if let Some(url) = url {
+                    self.go(url, NavKind::Reload);
                 }
             }
-            ShellToTab::Stop => {
-                self.main_request = None;
-                self.pending.clear();
-                self.parser = None;
-                self.state_dirty = true;
-            }
+            ShellToTab::Stop => self.stop(),
             ShellToTab::GoBack => {
                 if self.history_index > 0 {
-                    self.history_index -= 1;
-                    let url = self.history[self.history_index].clone();
-                    self.go(url, false);
+                    let i = self.history_index - 1;
+                    self.go(self.history[i].clone(), NavKind::Traverse(i));
                 }
             }
             ShellToTab::GoForward => {
                 if self.history_index + 1 < self.history.len() {
-                    self.history_index += 1;
-                    let url = self.history[self.history_index].clone();
-                    self.go(url, false);
+                    let i = self.history_index + 1;
+                    self.go(self.history[i].clone(), NavKind::Traverse(i));
                 }
             }
             ShellToTab::Resize(vp) => {
@@ -264,34 +291,106 @@ impl TabState {
             tracing::debug!(tab = self.id.0, "ignoring link to {url}");
             return;
         }
-        self.go(url, true);
+        self.go(url, NavKind::Push);
     }
 
-    /// Go to `url`, recording it in history when `push`. A change of
-    /// fragment within the current document scrolls instead of loading.
-    fn go(&mut self, url: Url, push: bool) {
-        if push {
-            self.push_history(url.clone());
-        }
-        if self.is_same_document(&url) {
+    /// Go to `url`. A change of fragment within the displayed document
+    /// takes effect at once and only scrolls; anything else starts a load
+    /// that commits when its first bytes arrive.
+    fn go(&mut self, url: Url, kind: NavKind) {
+        self.cancel_pending_nav();
+        if kind != NavKind::Reload && self.is_same_document(&url) {
             tracing::info!(tab = self.id.0, "fragment navigation {url}");
-            self.url = Some(url);
+            self.apply_history(url, kind);
             self.pending_fragment = true;
             self.state_dirty = true;
         } else {
-            self.navigate(url);
+            self.navigate(url, kind);
         }
     }
 
-    /// Whether `url` names the loaded document, fragment aside.
+    /// Whether `url` names the displayed document, fragment aside.
     fn is_same_document(&self, url: &Url) -> bool {
         use url::Position;
         self.doc.is_some()
-            && self.main_request.is_none()
+            && self.nav.is_none()
             && self
-                .url
+                .doc_url
                 .as_ref()
                 .is_some_and(|cur| cur[..Position::AfterQuery] == url[..Position::AfterQuery])
+    }
+
+    /// Record a committed navigation in the history list and adopt its URL.
+    fn apply_history(&mut self, url: Url, kind: NavKind) {
+        match kind {
+            NavKind::Push => {
+                if !self.history.is_empty() {
+                    self.history.truncate(self.history_index + 1);
+                }
+                self.history.push(url.clone());
+                self.history_index = self.history.len() - 1;
+            }
+            NavKind::Reload => match self.history.get_mut(self.history_index) {
+                Some(entry) => *entry = url.clone(),
+                None => {
+                    self.history.push(url.clone());
+                    self.history_index = self.history.len() - 1;
+                }
+            },
+            NavKind::Traverse(i) => {
+                if let Some(entry) = self.history.get_mut(i) {
+                    // A redirect on the way back lands on the new URL.
+                    *entry = url.clone();
+                    self.history_index = i;
+                }
+            }
+        }
+        self.url = Some(url);
+    }
+
+    /// Drop a navigation in flight. Its late responses are ignored because
+    /// its request is no longer pending.
+    fn cancel_pending_nav(&mut self) {
+        if let Some(nav) = self.nav.take() {
+            tracing::debug!(tab = self.id.0, "navigation to {} abandoned", nav.url);
+            self.pending.remove(&nav.request);
+            if nav.committed {
+                self.parser = None;
+            }
+        }
+    }
+
+    /// Stop loading. Before commit the old page is untouched; after it,
+    /// what has arrived of the new one is shown.
+    fn stop(&mut self) {
+        let nav = self.nav.take();
+        self.pending.clear();
+        if let Some(nav) = nav
+            && nav.committed
+            && let Some(parser) = self.parser.take()
+        {
+            let doc = parser.finish();
+            self.set_document(doc);
+        }
+        self.state_dirty = true;
+    }
+
+    /// The first bytes of the main response: the navigation is now real.
+    fn commit(&mut self, id: RequestId, final_url: Url) {
+        let Some(nav) = self.nav.as_mut() else { return };
+        if nav.request != id {
+            return;
+        }
+        nav.committed = true;
+        let kind = nav.kind;
+        tracing::info!(tab = self.id.0, "committed {final_url}");
+        self.apply_history(final_url.clone(), kind);
+        // The old document's own fetches are moot now.
+        self.pending.retain(|k, _| *k == id);
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+        self.start_main_document(id, final_url);
+        self.state_dirty = true;
     }
 
     /// Scroll to the element the URL's fragment names and make it `:target`.
@@ -345,7 +444,7 @@ impl TabState {
             // Refreshing to the same URL replaces the entry; to another
             // adds one, as browsers do.
             let same = self.url.as_ref() == Some(&url);
-            self.go(url, !same);
+            self.go(url, if same { NavKind::Reload } else { NavKind::Push });
         }
     }
 
@@ -511,29 +610,20 @@ impl TabState {
         }
     }
 
-    fn push_history(&mut self, url: Url) {
-        if !self.history.is_empty() {
-            self.history.truncate(self.history_index + 1);
-        }
-        self.history.push(url);
-        self.history_index = self.history.len() - 1;
-    }
-
-    fn navigate(&mut self, url: Url) {
+    /// Start loading `url`. Nothing about the current page changes until
+    /// the response commits (`commit`).
+    fn navigate(&mut self, url: Url, kind: NavKind) {
         tracing::info!(tab = self.id.0, "navigate {url}");
-        self.pending.clear();
-        self.parser = None;
         self.refresh = None;
         self.refresh_header = None;
         self.press = None;
-        self.sheets.clear();
-        self.fetched_urls.clear();
-        self.images = ImageStore::new();
-        self.scroll_x = 0.0;
-        self.scroll_y = 0.0;
-        self.url = Some(url.clone());
-        let id = self.fetch(FetchRequest::get(url), PendingKind::Main);
-        self.main_request = Some(id);
+        let id = self.fetch(FetchRequest::get(url.clone()), PendingKind::Main);
+        self.nav = Some(PendingNav {
+            url,
+            request: id,
+            kind,
+            committed: false,
+        });
         self.state_dirty = true;
     }
 
@@ -572,21 +662,15 @@ impl TabState {
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("refresh"))
                         .map(|(_, v)| v.clone());
-                    self.url = Some(final_url.clone());
-                    if let Some(i) = self.history.get_mut(self.history_index) {
-                        *i = final_url.clone();
-                    }
-                    self.start_main_document(id, final_url);
+                    self.commit(id, final_url);
                 }
             }
             NetToTab::ResponseChunk { id, bytes } => {
                 let Some(p) = self.pending.get_mut(&id) else { return };
-                if matches!(p.kind, PendingKind::Main) {
-                    if let Some(parser) = &mut self.parser {
-                        parser.feed(&bytes);
-                    } else {
-                        p.body.extend_from_slice(&bytes);
-                    }
+                let is_current_main = matches!(p.kind, PendingKind::Main)
+                    && self.nav.as_ref().is_some_and(|n| n.request == id);
+                if is_current_main && let Some(parser) = &mut self.parser {
+                    parser.feed(&bytes);
                 } else {
                     p.body.extend_from_slice(&bytes);
                 }
@@ -598,10 +682,15 @@ impl TabState {
             NetToTab::Failed { id, error } => {
                 let Some(p) = self.pending.remove(&id) else { return };
                 tracing::warn!(tab = self.id.0, "request {} failed: {error}", id.0);
-                if matches!(p.kind, PendingKind::Main) {
-                    self.main_request = None;
-                    let url = self.url.clone().map(|u| u.to_string()).unwrap_or_default();
-                    self.show_error_page(&url, &error);
+                if matches!(p.kind, PendingKind::Main)
+                    && let Some(nav) = self.nav.take_if(|n| n.request == id)
+                {
+                    // The error page takes the entry the page would have.
+                    if !nav.committed {
+                        self.apply_history(nav.url.clone(), nav.kind);
+                        self.pending.clear();
+                    }
+                    self.show_error_page(nav.url.as_str(), &error);
                 }
                 self.state_dirty = true;
             }
@@ -632,10 +721,12 @@ impl TabState {
         // Other types are wrapped when the body completes.
     }
 
-    fn finish_response(&mut self, _id: RequestId, p: Pending) {
+    fn finish_response(&mut self, id: RequestId, p: Pending) {
         match p.kind {
             PendingKind::Main => {
-                self.main_request = None;
+                if self.nav.take_if(|n| n.request == id).is_none() {
+                    return;
+                }
                 let doc = if let Some(parser) = self.parser.take() {
                     parser.finish()
                 } else {
@@ -712,7 +803,10 @@ impl TabState {
     /// A finished document: collect its stylesheets and images, then render.
     fn set_document(&mut self, doc: Document) {
         self.sheets.clear();
+        self.fetched_urls.clear();
+        self.images = ImageStore::new();
         self.doc = Some(doc);
+        self.doc_url = self.url.clone();
         // Node ids of the old document mean nothing now. The pointer
         // position is kept: hover is re-evaluated after the first layout.
         self.states = ElementStates::default();
@@ -1167,6 +1261,25 @@ mod tests {
             self.state.doc.as_ref().and_then(|d| d.title())
         }
 
+        /// The last (url, loading, can_go_back, can_go_forward) reported.
+        fn last_state(&self) -> Option<(Url, bool, bool, bool)> {
+            self.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    TabToShell::StateChanged {
+                        url,
+                        loading,
+                        can_go_back,
+                        can_go_forward,
+                        ..
+                    } => Some((url.clone(), *loading, *can_go_back, *can_go_forward)),
+                    _ => None,
+                })
+        }
+
         fn find(&self, tag: &str) -> NodeId {
             let doc = self.state.doc.as_ref().expect("document");
             doc.descendants(doc.root())
@@ -1347,6 +1460,80 @@ mod tests {
         assert_eq!(h.title().as_deref(), Some("Wait"));
         h.send(ShellToTab::Navigate { url: data_url("<title>Away</title>", None) });
         assert!(h.state.next_wake().is_none(), "navigating away cancels the refresh");
+    }
+
+    fn page(title: &str) -> Url {
+        data_url(&format!("<title>{title}</title><p>{title}</p>"), None)
+    }
+
+    #[test]
+    fn history_back_forward_reload_and_truncation() {
+        let mut h = Harness::load_url(page("One"));
+        h.send(ShellToTab::Navigate { url: page("Two") });
+        h.send(ShellToTab::Navigate { url: page("Three") });
+        assert_eq!(h.title().as_deref(), Some("Three"));
+        assert_eq!((h.state.history.len(), h.state.history_index), (3, 2));
+        assert_eq!(h.last_state().map(|s| (s.2, s.3)), Some((true, false)));
+
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.title().as_deref(), Some("Two"));
+        assert_eq!(h.state.history_index, 1);
+        assert_eq!(h.last_state().map(|s| (s.2, s.3)), Some((true, true)));
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.title().as_deref(), Some("One"));
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.title().as_deref(), Some("One"), "nothing before the first entry");
+        h.send(ShellToTab::GoForward);
+        assert_eq!(h.title().as_deref(), Some("Two"));
+
+        // Navigating from the middle drops the entries after it.
+        h.send(ShellToTab::Navigate { url: page("Four") });
+        assert_eq!(h.title().as_deref(), Some("Four"));
+        assert_eq!((h.state.history.len(), h.state.history_index), (3, 2));
+        assert_eq!(h.state.history[1], page("Two"));
+
+        h.send(ShellToTab::Reload);
+        assert_eq!(h.title().as_deref(), Some("Four"));
+        assert_eq!((h.state.history.len(), h.state.history_index), (3, 2));
+        assert_eq!(h.last_state().map(|s| s.1), Some(false), "not loading");
+    }
+
+    #[test]
+    fn nothing_changes_until_the_response_commits() {
+        let mut h = Harness::load_url(page("One"));
+        // Start a load but withhold its response.
+        h.state.handle_shell(ShellToTab::Navigate { url: page("Two") });
+        h.state.flush();
+        assert_eq!(h.title().as_deref(), Some("One"));
+        assert_eq!(h.state.url, Some(page("One")));
+        assert_eq!(h.state.history.len(), 1);
+        assert_eq!(h.last_state().map(|s| (s.0, s.1)), Some((page("Two"), true)), "address shows the target");
+
+        // Stop before commit: as if nothing happened, and the withheld
+        // response is ignored when it does arrive.
+        h.send(ShellToTab::Stop);
+        assert_eq!(h.title().as_deref(), Some("One"));
+        assert_eq!(h.state.url, Some(page("One")));
+        assert_eq!(h.state.history.len(), 1);
+        assert_eq!(h.last_state().map(|s| (s.0, s.1)), Some((page("One"), false)));
+
+        // Superseded before commit: only the later one lands.
+        h.state.handle_shell(ShellToTab::Navigate { url: page("Two") });
+        h.send(ShellToTab::Navigate { url: page("Three") });
+        assert_eq!(h.title().as_deref(), Some("Three"));
+        assert_eq!(h.state.history.len(), 2);
+    }
+
+    #[test]
+    fn failed_load_shows_an_error_page_in_its_own_entry() {
+        let mut h = Harness::load_url(page("One"));
+        let bad = Url::parse("data:text/html;base64,@@@").expect("url");
+        h.send(ShellToTab::Navigate { url: bad.clone() });
+        assert_eq!(h.title().as_deref(), Some("Cannot load page"));
+        assert_eq!(h.state.url, Some(bad));
+        assert_eq!((h.state.history.len(), h.state.history_index), (2, 1));
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.title().as_deref(), Some("One"));
     }
 
     #[test]

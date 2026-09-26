@@ -170,7 +170,18 @@ Work:
    into a new tab (item 5), `rel=noopener` and friends, and a fragment
    whose element arrives only after later layout passes.
 3. Navigation state machine and history per tab: back, forward, reload,
-   stop. History entry commits on first response bytes.
+   stop. History entry commits on first response bytes. **Done
+   2026-09-26.** A navigation is a `PendingNav` (URL, request, kind: push,
+   reload, or traverse to an index). Until the first response bytes,
+   nothing changes but the address the shell shows; stop or failure then
+   leaves page, URL and history as they were (a failure shows the error
+   page in the entry the page would have taken). On commit the history is
+   applied (push truncates forward entries; traverse adopts a redirect's
+   URL into its entry), the old document's fetches are dropped, and the
+   old page stays on screen until the new one has parsed. Stop after
+   commit shows what has arrived. A newer navigation abandons an older
+   one, whose late responses are ignored. Same-document fragment changes
+   commit at once. Four new tab tests.
 4. Per-origin cookie jar and in-memory HTTP cache in `net`.
 5. Multiple tabs: one thread each, `catch_unwind` at the boundary, crashed
    tab page, thread and memory released on close (leak test).
