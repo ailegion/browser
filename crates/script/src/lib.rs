@@ -898,8 +898,8 @@ mod tests {
         assert!(why.contains("SyntaxError") && why.contains("broken.js"), "{why}");
         let err = h
             .parse_module("import {", &url("https://example.test/app/k.js"), false)
-            .err()
-            .expect("syntax error");
+            .map(|_| ())
+            .expect_err("syntax error");
         assert!(err.contains("SyntaxError"), "{err}");
 
         // A throw at the top level of a module is reported.

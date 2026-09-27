@@ -509,6 +509,53 @@ Work:
    `window`/`document` object (item 3).
 2. Script loading: inline, external, `async`, `defer`, `type=module` with a
    loader that fetches through `net`. Parser blocking for sync scripts.
+   **Done 2026-09-27.** `HtmlParser` (`crates/dom/src/sink.rs`) now
+   drives html5ever's tokenizer itself: when a `</script>` end tag is
+   seen the tree builder stops, `blocked_script` names the element, the
+   document under construction is readable through `document()`, and
+   `resume` parses on; bytes arriving meanwhile are decoded and held.
+   `end_input` marks the end of the response; `finish` on a blocked
+   parser skips the remaining scripts (the abort path). The tab
+   (`crates/tab/src/document.rs`) makes the document's `ScriptHost` at
+   commit and, per HTML "prepare the script element": an inline classic
+   script runs before the parser continues; an external classic script
+   is fetched (`Accept: */*`, the document's cache mode) and blocks the
+   parser, or with `defer` joins the list that runs in order after
+   parsing, or with `async` runs when it arrives; modules (inline or
+   `src`) are deferred unless `async`. Data blocks, unknown types,
+   `language` that is not JavaScript and `nomodule` classic scripts are
+   skipped; an empty or non-http(s)/data `src`, a non-2xx status, and a
+   module served with a non-JavaScript MIME type are reported on the
+   console. The document is finished when the response has ended and the
+   parser is not waiting; `Stop` finishes what has arrived and drops
+   waiting scripts, so a late response is ignored. Modules
+   (`crates/script`): the document has a module map (URL to Boa
+   `Module`, plus failures) that Boa's `ModuleLoader` hook answers from;
+   specifiers resolve as HTML does without import maps (absolute, or
+   `/`, `./`, `../` against the importing module's URL, which is stored
+   as the module's path; bare specifiers fail). Boa's hook is `async`,
+   but its future cannot outlive one job-queue run without unsafe code,
+   so a graph loads in rounds: `poll_module` asks Boa to load, the hook
+   returns the modules it has and records the missing URLs, the tab
+   fetches those (once each), and the next round goes one level deeper
+   until the load promise fulfills; then `run_module` links and
+   evaluates, reporting a rejected evaluation as uncaught. The job
+   executor now keeps running while an async job enqueued another,
+   which Boa's loading does per import level. Tests: one dom test
+   (blocking, resume, `finish` skipping), one script test (a three-level
+   graph in rounds, a dynamic `import()` from a classic script, bare
+   specifier, failed fetch, broken dependency, top-level throw), four
+   tab harness tests (blocking order with `data:` scripts and the skip
+   rules; `async`/`defer` order; modules with imports, syntax error,
+   MIME refusal, async module; a loopback server holding a
+   parser-blocking script back, then `Stop` while blocked). Not done:
+   a dynamic `import()` of a module not yet in the map rejects (the URL
+   is fetched so a retry works; item 3.5's fetch should make it wait),
+   `import.meta.url`, import maps, `integrity`/`crossorigin`/CORS (item
+   4), `charset` attribute on scripts, `document.write`, load/error
+   events on script elements and `DOMContentLoaded` (item 3.3), and
+   `<noscript>` is parsed as if scripting were off in the tree builder
+   (html5ever's default `scripting_enabled` is true, so it is fine).
 3. Bindings in this order, each unlocking more of the web:
    1. `window`, `document`, `console`, timers, `location`, `navigator`.
    2. `Node`, `Element`, `Text`, `Document`: traversal, mutation,
