@@ -12,7 +12,7 @@ use taffy::prelude::*;
 
 use crate::boxes::{Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, FloatBand, InlineContent, InlineLayout, TaffyId};
 use crate::convert::to_taffy;
-use crate::{Brush, Decoration, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
+use crate::{Brush, Cluster, Decoration, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
 
 /// Owns the font system and parley's scratch state. One per tab thread.
 pub struct LayoutEngine {
@@ -430,7 +430,8 @@ impl LayoutEngine {
             BoxKind::Inline(content) => {
                 let mut children = Vec::new();
                 if let Some(il) = content.cache.first() {
-                    emit_text_fragments(content, &il.layout, x, y, &mut children);
+                    let text: Arc<str> = Arc::from(content.text.as_str());
+                    emit_text_fragments(content, &text, &il.layout, x, y, &mut children);
                 }
                 Fragment {
                     rect,
@@ -898,6 +899,7 @@ fn push_style(
 /// (`ox`, `oy`), the inline root's top-left.
 fn emit_text_fragments(
     content: &InlineContent,
+    text: &Arc<str>,
     layout: &parley::Layout<Brush>,
     ox: f32,
     oy: f32,
@@ -925,8 +927,14 @@ fn emit_text_fragments(
                     let rm = r.metrics();
                     let synthesis = r.synthesis();
                     let baseline = run.baseline();
+                    let rtl = r.is_rtl();
 
-                    let make = |x0: f32, x1: f32, glyphs: Vec<PositionedGlyph>, span: Option<usize>, style_idx: usize| {
+                    let make = |x0: f32,
+                                x1: f32,
+                                glyphs: Vec<PositionedGlyph>,
+                                clusters: Vec<Cluster>,
+                                span: Option<usize>,
+                                style_idx: usize| {
                         let style = &styles[style_idx];
                         let color = style.brush.0;
                         let deco = |d: &Option<parley::layout::Decoration<Brush>>, default_offset: f32, default_size: f32| {
@@ -935,11 +943,16 @@ fn emit_text_fragments(
                                 thickness: d.size.unwrap_or(default_size),
                             })
                         };
+                        let range = clusters.iter().map(|c| c.start).min().unwrap_or(0)
+                            ..clusters.iter().map(|c| c.end).max().unwrap_or(0);
                         let text = TextFragment {
                             font: r.font().clone(),
                             font_size: r.font_size(),
                             coords: r.normalized_coords().to_vec(),
                             glyphs,
+                            text: text.clone(),
+                            range,
+                            clusters,
                             color: browser_style::Rgba {
                                 r: color[0] as f32 / 255.0,
                                 g: color[1] as f32 / 255.0,
@@ -968,9 +981,11 @@ fn emit_text_fragments(
                     let mut x = run.offset();
                     let mut frag_x0 = x;
                     let mut glyphs: Vec<PositionedGlyph> = Vec::new();
+                    let mut clusters: Vec<Cluster> = Vec::new();
                     let mut current: Option<(Option<usize>, usize)> = None;
                     for cluster in r.visual_clusters() {
-                        let start = cluster.text_range().start;
+                        let text_range = cluster.text_range();
+                        let start = text_range.start;
                         let span = content.spans.iter().position(|s| s.start <= start && start < s.end);
                         let style_idx = cluster
                             .glyphs()
@@ -981,10 +996,19 @@ fn emit_text_fragments(
                         let key = (span, style_idx);
                         if current.is_some_and(|c| c != key) && !glyphs.is_empty() {
                             let (prev_span, prev_style) = current.unwrap_or(key);
-                            out.push(make(frag_x0, x, std::mem::take(&mut glyphs), prev_span, prev_style));
+                            out.push(make(
+                                frag_x0,
+                                x,
+                                std::mem::take(&mut glyphs),
+                                std::mem::take(&mut clusters),
+                                prev_span,
+                                prev_style,
+                            ));
                             frag_x0 = x;
                         }
                         current = Some(key);
+                        let cluster_x = x - frag_x0;
+                        let mut advance = 0.0;
                         for g in cluster.glyphs() {
                             glyphs.push(PositionedGlyph {
                                 id: g.id,
@@ -992,12 +1016,20 @@ fn emit_text_fragments(
                                 y: g.y + baseline - line_top,
                             });
                             x += g.advance;
+                            advance += g.advance;
                         }
+                        clusters.push(Cluster {
+                            start: text_range.start,
+                            end: text_range.end,
+                            x: cluster_x,
+                            advance,
+                            rtl,
+                        });
                     }
                     if !glyphs.is_empty()
                         && let Some((span, style_idx)) = current
                     {
-                        out.push(make(frag_x0, x, glyphs, span, style_idx));
+                        out.push(make(frag_x0, x, glyphs, clusters, span, style_idx));
                     }
                 }
                 PositionedLayoutItem::InlineBox(b) => {

@@ -11,7 +11,8 @@ mod offscreen;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use browser_layout::{Fragment, FragmentContent, LayoutTree, Rect, TextFragment};
+use browser_dom::NodeId;
+use browser_layout::{Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment};
 use browser_style::{BorderStyle, ComputedStyle, Rgba, Visibility};
 use url::Url;
 use vello::kurbo::{Affine, Rect as KRect, RoundedRect, RoundedRectRadii, Shape as _};
@@ -114,6 +115,7 @@ pub fn render_html(html: &[u8], width: u32, height: u32, scale: f32) -> Option<V
             viewport_width: logical_w,
             viewport_height: logical_h,
             scale,
+            selection: SelectionRanges::default(),
         },
         &mut scene,
     );
@@ -121,7 +123,7 @@ pub fn render_html(html: &[u8], width: u32, height: u32, scale: f32) -> Option<V
 }
 
 /// What the painter needs besides the tree.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PaintOptions {
     /// Scroll offset in page pixels; content moves up by `scroll_y`.
     pub scroll_x: f32,
@@ -131,7 +133,12 @@ pub struct PaintOptions {
     pub viewport_height: f32,
     /// Device scale factor applied to the whole scene.
     pub scale: f32,
+    /// Text to highlight as selected.
+    pub selection: SelectionRanges,
 }
+
+/// Behind selected text.
+const SELECTION: Color = Color::from_rgb8(0xb4, 0xd5, 0xfe);
 
 /// Record the tree into `scene` (which is reset first).
 pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, scene: &mut Scene) {
@@ -183,6 +190,7 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         visible,
         transform,
         skip_background_of,
+        selection: &options.selection,
     };
     if let Some(html) = html {
         painter.fragment(html);
@@ -195,7 +203,8 @@ struct Painter<'a> {
     visible: Rect,
     transform: Affine,
     /// Elements whose background the canvas already painted.
-    skip_background_of: Vec<browser_dom::NodeId>,
+    skip_background_of: Vec<NodeId>,
+    selection: &'a SelectionRanges,
 }
 
 fn color(c: Rgba) -> Color {
@@ -242,7 +251,7 @@ impl Painter<'_> {
             FragmentContent::Anonymous | FragmentContent::Marker => {}
             FragmentContent::Text(t) => {
                 if !offscreen {
-                    self.text(&f.rect, t);
+                    self.text(&f.rect, t, f.node);
                 }
             }
             FragmentContent::Image(url) => {
@@ -357,7 +366,36 @@ impl Painter<'_> {
         }
     }
 
-    fn text(&mut self, rect: &Rect, t: &TextFragment) {
+    /// The highlight behind the selected clusters of a text fragment.
+    fn selection_highlight(&mut self, rect: &Rect, t: &TextFragment, node: Option<NodeId>) {
+        let Some((a, b)) = node.and_then(|n| self.selection.get(n)) else {
+            return;
+        };
+        // Merge runs of adjacent selected clusters into one rectangle each.
+        let mut runs: Vec<(f32, f32)> = Vec::new();
+        for c in &t.clusters {
+            if c.start >= b || c.end <= a {
+                continue;
+            }
+            let (x0, x1) = (c.x, c.x + c.advance);
+            match runs.last_mut() {
+                Some(last) if (last.1 - x0).abs() < 0.01 => last.1 = x1,
+                _ => runs.push((x0, x1)),
+            }
+        }
+        for (x0, x1) in runs {
+            let r = KRect::new(
+                (rect.x + x0) as f64,
+                rect.y as f64,
+                (rect.x + x1) as f64,
+                rect.bottom() as f64,
+            );
+            self.scene.fill(Fill::NonZero, self.transform, SELECTION, None, &r);
+        }
+    }
+
+    fn text(&mut self, rect: &Rect, t: &TextFragment, node: Option<NodeId>) {
+        self.selection_highlight(rect, t, node);
         let origin = self.transform * Affine::translate((rect.x as f64, rect.y as f64));
         let brush = color(t.color);
         let glyph_transform = t.skew.map(|deg| Affine::skew((-deg as f64).to_radians().tan(), 0.0));
@@ -440,6 +478,57 @@ fn content_box(rect: &Rect, style: &ComputedStyle) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render a page with everything selected; the highlight sits behind
+    /// the text and nowhere else.
+    #[test]
+    fn selection_is_highlighted_behind_the_text() {
+        let html = b"<body style='margin:0;font-size:20px;line-height:24px'><p style='margin:0'>Hello</p></body>";
+        let doc = browser_dom::parse_html(html);
+        let mut stylist = browser_style::Stylist::new();
+        stylist.add_sheet(browser_style::ua::ua_stylesheet());
+        let vp = browser_style::Viewport {
+            width: 200.0,
+            height: 100.0,
+            scale_factor: 1.0,
+            prefers_dark: false,
+        };
+        let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+        let mut engine = browser_layout::LayoutEngine::new();
+        let images = ImageStore::new();
+        let tree = engine.layout(&doc, &styles, 200.0, 100.0, &images);
+        let (a, b) = browser_layout::selection::text_extent(&tree).expect("text");
+        let mut options = PaintOptions {
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            viewport_width: 200.0,
+            viewport_height: 100.0,
+            scale: 1.0,
+            selection: browser_layout::selection::selection_ranges(&tree, a, b),
+        };
+        let mut scene = Scene::new();
+        paint(&tree, &images, &options, &mut scene);
+        let Some(pixels) = render_offscreen(&scene, 200, 100, Color::WHITE) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let px = |x: usize, y: usize| {
+            let i = (y * 200 + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        // Top-left corner of the line box, before the first glyph's ink.
+        assert_eq!(px(0, 1), [0xb4, 0xd5, 0xfe], "highlight at the line start");
+        // Well past the word, still on the line: the canvas.
+        assert_eq!(px(190, 12), [255, 255, 255]);
+        // Below the line: the canvas.
+        assert_eq!(px(2, 60), [255, 255, 255]);
+
+        // Without a selection the same pixel is the canvas.
+        options.selection = SelectionRanges::default();
+        paint(&tree, &images, &options, &mut scene);
+        let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
+        assert_eq!([pixels[800], pixels[801], pixels[802]], [255, 255, 255]);
+    }
 
     #[test]
     fn decodes_png_and_rejects_garbage() {

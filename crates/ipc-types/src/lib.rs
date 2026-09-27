@@ -61,6 +61,11 @@ pub enum ShellToTab {
     MouseUp { x: f32, y: f32, button: MouseButton },
     /// The pointer left the page area.
     MouseLeave,
+    /// Select all of the page's text.
+    SelectAll,
+    /// Put the selected text on the clipboard, if there is any
+    /// (answered with `TabToShell::CopyText`).
+    Copy,
     Close,
 }
 
@@ -79,6 +84,8 @@ pub enum TabToShell {
     Cursor(Cursor),
     /// The user asked for a link in a new tab (middle click).
     OpenInNewTab { url: Url },
+    /// Text the user copied; the shell owns the clipboard.
+    CopyText { text: String },
     /// The tab thread panicked and was unwound; the shell shows a crashed page.
     Crashed { message: String },
     Closed,

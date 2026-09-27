@@ -297,6 +297,34 @@ Work:
    to reorder.
 7. Text selection and copy on pages. Find in page. Keyboard focus and tab
    order. Form controls rendered (no submission yet).
+   **Block 1 done 2026-09-27: text selection and copy.** Layout text
+   fragments now carry the inline root's text (shared `Arc<str>`), the
+   byte range they show and per-cluster geometry
+   (`browser_layout::Cluster`). `crates/layout/src/selection.rs` maps a
+   page point to the nearest text position (in the fragment under it,
+   else the nearest fragment on that line, else the end of the text
+   above), orders positions by fragment tree order, and yields what to
+   highlight per text node (`SelectionRanges`) and the copied text (each
+   inline root contributes one slice, roots joined by newlines). A
+   position is a text node plus an offset into its root's text, so the
+   selection survives scrolling and relayout; a position no longer in
+   the layout selects nothing. Tab: a primary press clears the selection
+   and, unless on a link, anchors a drag; a double click selects the
+   word (letters and digits, or a run of spaces), a triple the inline
+   root; a drag held past the top or bottom edge scrolls a step every
+   50 ms toward the pointer (`TabState::next_wake`/`tick`, like the
+   refresh timer); `ShellToTab::SelectAll` and `ShellToTab::Copy`, the
+   latter answered with `TabToShell::CopyText`, which the shell puts on
+   the clipboard. Shell: Ctrl+A and Ctrl+C on the page, and a press on
+   the page keeps pointer moves going to the page while the button is
+   held so a drag can leave the page area. Paint draws the highlight
+   behind the selected clusters. Tests: three in the layout selection
+   module, one paint test that rasterizes a highlight and checks the
+   pixels, three tab harness tests (drag and copy, select all with
+   double and triple click and links, autoscroll while dragging). Not
+   done: Shift+click and keyboard extension of the selection, selection
+   in images or form controls, a context menu, right-to-left highlight
+   order is untested.
 8. Media queries and custom properties in `style`.
 9. CI matrix: Windows, Linux, macOS builds. Note: on 2026-09-26 the owner
    turned automatic CI runs off (`.github/workflows/ci.yml` is

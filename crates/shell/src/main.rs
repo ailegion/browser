@@ -142,6 +142,10 @@ struct App {
     pointer_on_page: bool,
     /// The last button press went to the chrome; its release goes there too.
     press_in_chrome: bool,
+    /// A primary button is held since a press on the page: pointer moves
+    /// keep going to the page even over the chrome, so a selection drag can
+    /// run past the top edge.
+    press_on_page: bool,
     modifiers: Modifiers,
     /// Set when startup fails so the process can exit non-zero from `main`.
     failure: Option<anyhow::Error>,
@@ -164,6 +168,7 @@ impl App {
             cursor_pos: None,
             pointer_on_page: false,
             press_in_chrome: false,
+            press_on_page: false,
             modifiers: Modifiers::default(),
             failure: None,
         }
@@ -718,6 +723,13 @@ impl ApplicationHandler<UserEvent> for App {
                     tracing::error!("open tab: {e}");
                 }
             }
+            TabOutput::Message(TabToShell::CopyText { text }) => {
+                if let Some(cb) = self.clipboard()
+                    && let Err(e) = cb.set_text(text)
+                {
+                    tracing::warn!("clipboard write: {e}");
+                }
+            }
             TabOutput::Message(TabToShell::Crashed { message }) => {
                 // The tab thread goes on and shows its crash page; nothing
                 // to do here but note it, and fail a screenshot run.
@@ -786,7 +798,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let (x, y) = (position.x as f32 / scale, position.y as f32 / scale);
                 self.cursor_pos = Some((x, y));
                 let page_top = self.page_top();
-                if self.chrome.contains(x, y) && !self.press_in_chrome && self.pointer_on_page {
+                if self.chrome.contains(x, y) && !self.press_in_chrome && !self.press_on_page && self.pointer_on_page {
                     // Crossing from the page into the chrome.
                     self.send_to_current(ShellToTab::MouseLeave);
                     self.pointer_on_page = false;
@@ -868,6 +880,9 @@ impl ApplicationHandler<UserEvent> for App {
                             MouseButton::Middle => PageButton::Middle,
                             _ => PageButton::Other,
                         };
+                        if button == PageButton::Left {
+                            self.press_on_page = state == ElementState::Pressed;
+                        }
                         let y = y - page_top;
                         self.send_to_current(match state {
                             ElementState::Pressed => ShellToTab::MouseDown { x, y, button },
@@ -888,6 +903,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(false) => {
                 // Losing the window drops any press in progress and any menu.
                 self.press_in_chrome = false;
+                self.press_on_page = false;
                 self.chrome.close_menu();
                 if self.chrome.take_dirty()
                     && let Some(active) = &self.active
@@ -935,6 +951,12 @@ impl ApplicationHandler<UserEvent> for App {
                     Key::Named(NamedKey::F6) => {
                         self.chrome.focus_address();
                         self.sync_ime();
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => {
+                        self.send_to_current(ShellToTab::Copy);
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => {
+                        self.send_to_current(ShellToTab::SelectAll);
                     }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => self.new_tab(),
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => {

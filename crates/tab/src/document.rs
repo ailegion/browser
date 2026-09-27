@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use browser_dom::{Document, HtmlParser, NodeId};
 use browser_ipc_types::{Cursor, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
-use browser_layout::{LayoutEngine, LayoutTree};
+use browser_layout::selection::{self, TextPos};
+use browser_layout::{LayoutEngine, LayoutTree, SelectionRanges};
 use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
@@ -124,6 +125,18 @@ pub(crate) struct TabState {
     scroll_drag: Option<f32>,
     cursor: Cursor,
 
+    /// The text selection as anchor (where the drag began) and focus (where
+    /// it is now), in either order.
+    selection: Option<(TextPos, TextPos)>,
+    /// A primary-button drag is extending the selection from this anchor.
+    select_anchor: Option<TextPos>,
+    /// The last primary press: when, where, and how many in a row, for
+    /// double and triple clicks.
+    last_click: Option<(std::time::Instant, f32, f32, u32)>,
+    /// While a selection drag holds the pointer outside the viewport, the
+    /// page scrolls a step at each of these instants.
+    autoscroll: Option<std::time::Instant>,
+
     history: Vec<Url>,
     history_index: usize,
     /// The URL's fragment must be scrolled to after the next layout.
@@ -175,6 +188,10 @@ impl TabState {
             hover_dirty: false,
             scroll_drag: None,
             cursor: Cursor::Default,
+            selection: None,
+            select_anchor: None,
+            last_click: None,
+            autoscroll: None,
             history: Vec::new(),
             history_index: 0,
             pending_fragment: false,
@@ -267,10 +284,22 @@ impl TabState {
                 } else {
                     self.hover_dirty = true;
                 }
+                if self.select_anchor.is_some() {
+                    self.extend_selection_to(x, y);
+                    // Outside the viewport the page scrolls toward the
+                    // pointer until it comes back.
+                    let outside = y < 0.0 || y > self.viewport.height;
+                    if outside && self.autoscroll.is_none() {
+                        self.autoscroll = Some(std::time::Instant::now());
+                    } else if !outside {
+                        self.autoscroll = None;
+                    }
+                }
             }
             ShellToTab::MouseLeave => {
                 self.mouse = None;
                 self.hover_dirty = true;
+                self.autoscroll = None;
             }
             ShellToTab::MouseDown { x, y, button } => {
                 self.mouse = Some((x, y));
@@ -298,9 +327,18 @@ impl TabState {
                 if matches!(button, MouseButton::Left | MouseButton::Middle) {
                     self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
                 }
+                if button == MouseButton::Left {
+                    let clicks = self.count_click(x, y);
+                    let on_link = self.press.is_some();
+                    self.begin_selection(x, y, clicks, on_link);
+                }
             }
             ShellToTab::MouseUp { x, y, button } => {
                 self.mouse = Some((x, y));
+                if button == MouseButton::Left {
+                    self.select_anchor = None;
+                    self.autoscroll = None;
+                }
                 if self.scroll_drag.take().is_some() {
                     self.needs_paint = true;
                     self.hover_dirty = true;
@@ -322,8 +360,121 @@ impl TabState {
                     }
                 }
             }
+            ShellToTab::SelectAll => {
+                let extent = self.layout.as_ref().and_then(selection::text_extent);
+                self.set_selection(extent);
+            }
+            ShellToTab::Copy => {
+                if let Some(text) = self.selected_text()
+                    && !text.is_empty()
+                {
+                    self.send(TabToShell::CopyText { text });
+                }
+            }
             ShellToTab::Close => {}
         }
+    }
+
+    // ----- text selection -----
+
+    /// How many primary presses in a row this one makes: a second within
+    /// half a second and a few pixels of the first is a double click, a
+    /// third a triple; after that it starts over.
+    fn count_click(&mut self, x: f32, y: f32) -> u32 {
+        let now = std::time::Instant::now();
+        let count = match self.last_click {
+            Some((at, lx, ly, n))
+                if now.duration_since(at) < std::time::Duration::from_millis(500)
+                    && (x - lx).abs() <= 4.0
+                    && (y - ly).abs() <= 4.0 =>
+            {
+                n % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, x, y, count));
+        count
+    }
+
+    fn text_position_at(&self, x: f32, y: f32) -> Option<TextPos> {
+        let tree = self.layout.as_ref()?;
+        selection::text_position_at(tree, x + self.scroll_x, y + self.scroll_y)
+    }
+
+    fn set_selection(&mut self, sel: Option<(TextPos, TextPos)>) {
+        let sel = sel.filter(|(a, b)| a != b);
+        if sel != self.selection {
+            self.selection = sel;
+            self.needs_paint = true;
+        }
+    }
+
+    /// A primary press: one click clears the selection and starts a drag
+    /// from the point, unless on a link (dragging a link is not selecting);
+    /// a double click selects the word and a triple the paragraph.
+    fn begin_selection(&mut self, x: f32, y: f32, clicks: u32, on_link: bool) {
+        self.select_anchor = None;
+        let pos = self.text_position_at(x, y);
+        let Some(tree) = self.layout.as_ref() else {
+            self.set_selection(None);
+            return;
+        };
+        let sel = match (clicks, pos) {
+            (2, Some(p)) => selection::word_at(tree, p),
+            (3, Some(p)) => selection::paragraph_at(tree, p),
+            (_, Some(p)) => {
+                if !on_link {
+                    self.select_anchor = Some(p);
+                }
+                None
+            }
+            _ => None,
+        };
+        self.set_selection(sel);
+    }
+
+    /// Move the selection's focus to the pointer during a drag.
+    fn extend_selection_to(&mut self, x: f32, y: f32) {
+        let Some(anchor) = self.select_anchor else { return };
+        if let Some(focus) = self.text_position_at(x, y) {
+            self.set_selection(Some((anchor, focus)));
+        }
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.selection?;
+        let tree = self.layout.as_ref()?;
+        Some(selection::selection_text(tree, a, b))
+    }
+
+    fn selection_ranges(&self) -> SelectionRanges {
+        match (self.selection, self.layout.as_ref()) {
+            (Some((a, b)), Some(tree)) => selection::selection_ranges(tree, a, b),
+            _ => SelectionRanges::default(),
+        }
+    }
+
+    /// One step of scrolling toward a pointer held outside the viewport
+    /// during a selection drag. Returns when the next step is due.
+    fn autoscroll_step(&mut self) -> Option<std::time::Instant> {
+        let (x, y) = self.mouse?;
+        self.select_anchor?;
+        let over = if y < 0.0 {
+            y
+        } else if y > self.viewport.height {
+            y - self.viewport.height
+        } else {
+            return None;
+        };
+        let before = self.scroll_y;
+        self.scroll_y += (over * 0.25).clamp(-60.0, 60.0);
+        self.clamp_scroll();
+        if self.scroll_y != before {
+            self.needs_paint = true;
+            self.hover_dirty = true;
+            self.extend_selection_to(x, y);
+        }
+        Some(std::time::Instant::now() + std::time::Duration::from_millis(50))
     }
 
     // ----- navigation -----
@@ -498,11 +649,19 @@ impl TabState {
 
     /// The tab wants to be woken at this instant even if no event arrives.
     pub fn next_wake(&self) -> Option<std::time::Instant> {
-        self.refresh.as_ref().map(|(at, _)| *at)
+        [self.refresh.as_ref().map(|(at, _)| *at), self.autoscroll]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Run whatever timer is due.
     pub fn tick(&mut self) {
+        if let Some(at) = self.autoscroll
+            && std::time::Instant::now() >= at
+        {
+            self.autoscroll = self.autoscroll_step();
+        }
         if let Some((at, url)) = &self.refresh
             && std::time::Instant::now() >= *at
         {
@@ -943,6 +1102,9 @@ impl TabState {
         self.hover = None;
         self.focus = None;
         self.press = None;
+        self.selection = None;
+        self.select_anchor = None;
+        self.autoscroll = None;
         self.collect_stylesheets();
         self.collect_images();
         self.pending_fragment = self.url.as_ref().is_some_and(|u| u.fragment().is_some());
@@ -1217,6 +1379,7 @@ impl TabState {
             viewport_width: self.viewport.width,
             viewport_height: self.viewport.height,
             scale: self.viewport.scale_factor,
+            selection: self.selection_ranges(),
         };
         paint(tree, &self.images, &options, &mut self.scene);
         if let Some(sb) = self.scrollbar() {
@@ -1791,6 +1954,120 @@ mod tests {
         assert_eq!(parse_refresh("nonsense"), None);
         assert_eq!(parse_refresh(""), None);
         assert_eq!(percent_decode("a%20b%zz%"), "a b%zz%");
+    }
+
+    const TEXT_PAGE: &str = "<!doctype html><style>body { margin: 0; font-size: 16px; line-height: 20px } p { margin: 0 }</style>\
+        <p>Hello <a href='#x'>link</a> world</p><p>Second paragraph</p>";
+
+    impl Harness {
+        fn copied(&self) -> Vec<String> {
+            self.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|m| match m {
+                    TabToShell::CopyText { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn selected(&self) -> Option<String> {
+            self.state.selected_text()
+        }
+    }
+
+    #[test]
+    fn dragging_selects_text_and_copy_sends_it_to_the_shell() {
+        let mut h = Harness::load(TEXT_PAGE);
+        // Nothing to copy yet.
+        h.send(ShellToTab::Copy);
+        assert!(h.copied().is_empty());
+
+        // Press left of the first line, drag to the end of the second.
+        h.send(ShellToTab::MouseDown { x: -5.0, y: 10.0, button: MouseButton::Left });
+        assert!(h.state.select_anchor.is_some());
+        assert_eq!(h.selected(), None, "a press alone selects nothing");
+        h.send(ShellToTab::MouseMove { x: 790.0, y: 30.0 });
+        assert_eq!(h.selected().as_deref(), Some("Hello link world\nSecond paragraph"));
+        h.send(ShellToTab::MouseUp { x: 790.0, y: 30.0, button: MouseButton::Left });
+        assert!(h.state.select_anchor.is_none());
+        assert_eq!(h.selected().as_deref(), Some("Hello link world\nSecond paragraph"), "the selection outlives the drag");
+        assert!(!h.state.selection_ranges().is_empty(), "the painter is told what to highlight");
+
+        h.send(ShellToTab::Copy);
+        assert_eq!(h.copied(), vec!["Hello link world\nSecond paragraph".to_owned()]);
+
+        // Scrolling keeps it; a click elsewhere clears it.
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 10.0 });
+        assert!(h.selected().is_some());
+        h.send(ShellToTab::MouseDown { x: 400.0, y: 400.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x: 400.0, y: 400.0, button: MouseButton::Left });
+        assert_eq!(h.selected(), None);
+        h.send(ShellToTab::Copy);
+        assert_eq!(h.copied().len(), 1, "nothing selected, nothing sent");
+    }
+
+    #[test]
+    fn select_all_and_multi_click() {
+        let mut h = Harness::load(TEXT_PAGE);
+        h.send(ShellToTab::SelectAll);
+        assert_eq!(h.selected().as_deref(), Some("Hello link world\nSecond paragraph"));
+
+        // Double click on "Second": the word. Triple: the paragraph.
+        let (x, y) = h.center("p");
+        let x = x.min(20.0);
+        let y = y + 20.0;
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(h.selected(), None, "one click clears the selection");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(h.selected().as_deref(), Some("Second"));
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(h.selected().as_deref(), Some("Second paragraph"));
+
+        // A press on a link does not start a drag selection.
+        let (lx, ly) = h.center("a");
+        h.send(ShellToTab::MouseDown { x: lx, y: ly, button: MouseButton::Left });
+        assert!(h.state.select_anchor.is_none());
+        assert_eq!(h.selected(), None);
+        h.send(ShellToTab::MouseMove { x: 790.0, y: 30.0 });
+        assert_eq!(h.selected(), None);
+        h.send(ShellToTab::MouseUp { x: 790.0, y: 30.0, button: MouseButton::Left });
+
+        // A new document drops the selection.
+        h.send(ShellToTab::SelectAll);
+        assert!(h.selected().is_some());
+        h.send(ShellToTab::Navigate { url: data_url("<p>other</p>", None) });
+        assert_eq!(h.selected(), None);
+    }
+
+    #[test]
+    fn dragging_past_the_bottom_scrolls_and_extends() {
+        let mut h = Harness::load(TALL);
+        h.send(ShellToTab::MouseDown { x: -5.0, y: 10.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseMove { x: 400.0, y: 650.0 });
+        assert!(h.state.autoscroll.is_some(), "the pointer is below the viewport");
+        assert!(h.state.next_wake().is_some());
+        // Fire the timer until the page can scroll no further.
+        let mut steps = 0;
+        loop {
+            let before = h.state.scroll_y;
+            h.state.autoscroll = Some(std::time::Instant::now());
+            h.pump();
+            steps += 1;
+            if h.state.scroll_y == before || steps > 500 {
+                break;
+            }
+        }
+        assert!(h.state.scroll_y > 900.0, "scrolled toward the pointer, got {}", h.state.scroll_y);
+        assert!(steps > 5, "one step at a time, not a jump: {steps}");
+        assert_eq!(h.selected().as_deref(), Some("down top\nThe end"), "the drag reached the heading below");
+        h.send(ShellToTab::MouseUp { x: 400.0, y: 650.0, button: MouseButton::Left });
+        assert!(h.state.autoscroll.is_none());
+        assert!(h.state.next_wake().is_none());
     }
 
     #[test]

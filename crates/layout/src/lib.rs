@@ -13,6 +13,7 @@
 mod boxes;
 mod convert;
 mod engine;
+pub mod selection;
 
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use url::Url;
 
 pub use engine::{LayoutEngine, layout_document};
 pub use parley::FontData;
+pub use selection::{SelectionRanges, TextPos};
 
 /// Axis-aligned rectangle in page pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -70,6 +72,18 @@ pub struct Decoration {
     pub thickness: f32,
 }
 
+/// One grapheme cluster of a text fragment: the bytes of the inline root's
+/// text it shows and where it sits, relative to the fragment's origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cluster {
+    pub start: usize,
+    pub end: usize,
+    pub x: f32,
+    pub advance: f32,
+    /// The cluster reads right to left: its visual left edge is `end`.
+    pub rtl: bool,
+}
+
 /// A run of glyphs sharing one font and style, positioned on one line.
 #[derive(Debug, Clone)]
 pub struct TextFragment {
@@ -78,6 +92,14 @@ pub struct TextFragment {
     /// Variable-font coordinates, if any.
     pub coords: Vec<i16>,
     pub glyphs: Vec<PositionedGlyph>,
+    /// The whole text of the inline root this fragment is part of, after
+    /// white-space processing. Shared by every fragment of the root, so
+    /// pointer equality tells whether two fragments belong together.
+    pub text: Arc<str>,
+    /// The bytes of `text` this fragment shows.
+    pub range: std::ops::Range<usize>,
+    /// Clusters in visual order, left to right.
+    pub clusters: Vec<Cluster>,
     pub color: Rgba,
     /// Synthetic bold requested because the font has no bold face.
     pub embolden: bool,
