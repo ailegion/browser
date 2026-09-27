@@ -647,6 +647,45 @@ mod tests {
     }
 
     #[test]
+    fn scripts_block_the_parser_until_resumed() {
+        // With the charset known, decoding (and so parsing) starts at once
+        // instead of waiting for the first kilobyte.
+        let html = b"<p>before</p><script>one</script><p>middle</p><script src=x></script><p>after</p>";
+        let mut parser = HtmlParser::with_charset(None, Some("utf-8"));
+        parser.feed(html);
+        // Stopped at the first script; nothing after it is in the tree yet.
+        let first = parser.blocked_script().expect("blocked on the first script");
+        {
+            let doc = parser.document();
+            let e = doc.element(first).expect("script element");
+            assert_eq!(&*e.name.local, "script");
+            assert_eq!(doc.text_content(first), "one");
+            assert_eq!(parser_text(&doc), "beforeone");
+        }
+        assert!(!parser.is_done());
+        parser.end_input();
+        assert!(parser.blocked_script().is_some(), "still blocked after the input ended");
+        parser.resume();
+        let second = parser.blocked_script().expect("blocked on the second script");
+        assert_ne!(first, second);
+        assert_eq!(parser.document().element(second).and_then(|e| e.attr("src")), Some("x"));
+        assert_eq!(parser_text(&parser.document()), "beforeonemiddle");
+        parser.resume();
+        assert!(parser.blocked_script().is_none());
+        assert!(parser.is_done());
+        let doc = parser.finish();
+        assert_eq!(parser_text(&doc), "beforeonemiddleafter");
+
+        // `finish` on a blocked parser skips the rest, as an abort does.
+        let mut parser = HtmlParser::with_charset(None, Some("utf-8"));
+        parser.feed(b"<script>a</script><p>x</p><script>b</script><p>y</p>");
+        assert!(parser.blocked_script().is_some());
+        let doc = parser.finish();
+        // The leading script lands in <head>, so read the whole document.
+        assert_eq!(doc.text_content(doc.root()), "axby");
+    }
+
+    #[test]
     fn remove_subtree_frees_nodes() {
         let mut doc = parse_html(b"<div><p>a<b>b</b></p><p>c</p></div>");
         let before = doc.node_count();

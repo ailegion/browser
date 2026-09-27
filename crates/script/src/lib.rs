@@ -1,6 +1,6 @@
 //! Script: the Boa `Context` a document runs in, and the job queue that
 //! ties it to the tab's event loop (plan/02-architecture.md, "Tab event
-//! loop"). Phase 3 item 1.
+//! loop"). Phase 3 items 1 and 2.
 //!
 //! JavaScript sees only what this crate registers (plan D01). So far that
 //! is the language itself, `console`, `queueMicrotask`, the timers and
@@ -18,21 +18,35 @@
 //!   paints; callbacks requested during a frame run in the next one.
 //! - An error thrown by a task is reported to the console and does not
 //!   stop the queue, as in a browser.
+//!
+//! Module scripts: the document has a module map (URL to module) that Boa
+//! consults for every `import`. The tab fetches; this crate never touches
+//! the network. A module graph is loaded in rounds (`poll_module`): each
+//! round asks Boa to load the graph, which resolves the imports already in
+//! the map and reports the ones that are not, the tab fetches those, and
+//! the next round goes deeper, until the graph is complete and the module
+//! can be linked and evaluated. Boa's loader hook is `async`, but its
+//! future cannot outlive one job-queue run without unsafe code, so the
+//! hook answers at once from the map and the waiting happens in the tab.
 
 #![forbid(unsafe_code)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use boa_engine::builtins::promise::PromiseState;
 use boa_engine::context::ContextBuilder;
 use boa_engine::job::{GenericJob, IntervalJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob};
+use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::builtins::JsFunction;
-use boa_engine::{Context, JsArgs, JsResult, JsValue, NativeFunction, Source, js_string};
+use boa_engine::{Context, JsArgs, JsError, JsNativeError, JsResult, JsValue, Module, NativeFunction, Source, js_string};
 use boa_gc::{Finalize, Trace};
 use boa_runtime::extensions::{ConsoleExtension, MicrotaskExtension, TimeoutExtension};
 use boa_runtime::{ConsoleState, Logger};
+use url::Url;
 
 /// What a console call was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +153,9 @@ impl WebExecutor {
     fn checkpoint(&self, context: &mut Context) {
         loop {
             let async_jobs = std::mem::take(&mut *self.async_jobs.borrow_mut());
+            // An async job may enqueue more (module graph loading does, one
+            // level of imports per job), so a round that ran any goes on.
+            let ran_async = !async_jobs.is_empty();
             for job in async_jobs {
                 if let Some(Err(err)) = poll_to_completion(job, context) {
                     self.report("(in async job) ", &err);
@@ -156,6 +173,9 @@ impl WebExecutor {
                 if let Err(err) = job.call(context) {
                     self.report("", &err);
                 }
+                continue;
+            }
+            if ran_async {
                 continue;
             }
             break;
@@ -295,12 +315,128 @@ fn cancel_animation_frame(_: &JsValue, args: &[JsValue], context: &mut Context) 
     Ok(JsValue::undefined())
 }
 
+/// The document's module map: every module script fetched for the
+/// document, by URL, and the ones that failed to fetch or parse. Boa asks
+/// it for imports; an import of a URL in neither map is recorded as
+/// missing and fails for now, and the tab fetches it (see
+/// `ScriptHost::poll_module`).
+#[derive(Default)]
+struct ModuleMap {
+    /// The document's URL: the base for imports from a classic script
+    /// that has no URL of its own.
+    base: Option<Url>,
+    modules: RefCell<HashMap<Url, Module>>,
+    failed: RefCell<HashMap<Url, String>>,
+    /// URLs asked for that are in neither map, since last taken.
+    missing: RefCell<Vec<Url>>,
+}
+
+impl std::fmt::Debug for ModuleMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleMap")
+            .field("modules", &self.modules.borrow().len())
+            .field("failed", &self.failed.borrow().len())
+            .finish()
+    }
+}
+
+impl ModuleLoader for ModuleMap {
+    fn load_imported_module(
+        self: Rc<Self>,
+        referrer: Referrer,
+        request: ModuleRequest,
+        _context: &RefCell<&mut Context>,
+    ) -> impl Future<Output = JsResult<Module>> {
+        let specifier = request.specifier().to_std_string_escaped();
+        // A module's path is its URL (see `ScriptHost::parse_module`).
+        let base = referrer
+            .path()
+            .and_then(|p| Url::parse(&p.to_string_lossy()).ok())
+            .or_else(|| self.base.clone());
+        let result = match resolve_module_specifier(&specifier, base.as_ref()) {
+            None => Err(JsNativeError::typ()
+                .with_message(format!(
+                    "Failed to resolve module specifier \"{specifier}\". Relative references must start with \"/\", \"./\", or \"../\"."
+                ))
+                .into()),
+            Some(url) => {
+                if let Some(module) = self.modules.borrow().get(&url) {
+                    Ok(module.clone())
+                } else if let Some(why) = self.failed.borrow().get(&url) {
+                    Err(JsNativeError::typ().with_message(why.clone()).into())
+                } else {
+                    self.missing.borrow_mut().push(url.clone());
+                    Err(JsNativeError::typ()
+                        .with_message(format!("module {url} is not loaded yet"))
+                        .into())
+                }
+            }
+        };
+        std::future::ready(result)
+    }
+}
+
+/// HTML's "resolve a module specifier" without import maps: an absolute
+/// URL, or a reference starting with `/`, `./` or `../` against the base.
+/// Bare specifiers do not resolve.
+fn resolve_module_specifier(specifier: &str, base: Option<&Url>) -> Option<Url> {
+    if let Ok(url) = Url::parse(specifier) {
+        return Some(url);
+    }
+    if specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../") {
+        return base?.join(specifier).ok();
+    }
+    None
+}
+
+/// A module script of the document: parsed, then loading its dependency
+/// graph through `ScriptHost::poll_module`, then ready to run.
+pub struct ModuleScript {
+    module: Module,
+    url: Url,
+    ready: bool,
+}
+
+impl std::fmt::Debug for ModuleScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleScript")
+            .field("url", &self.url.as_str())
+            .field("ready", &self.ready)
+            .finish()
+    }
+}
+
+impl ModuleScript {
+    /// The graph is loaded and the module can run.
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+}
+
+/// Where a module graph's loading stands after a `poll_module` round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleProgress {
+    /// Every module in the graph is in the map; the script can run.
+    Ready,
+    /// These modules are not in the map; fetch them and poll again once
+    /// they have been passed to `module_fetched`.
+    Fetch(Vec<Url>),
+    /// The graph cannot load: a specifier that does not resolve, a fetch
+    /// that failed, or a dependency that does not parse.
+    Failed(String),
+}
+
 /// A document's script context and its queues.
 pub struct ScriptHost {
     context: Context,
     executor: Rc<WebExecutor>,
     frames: SharedFrames,
     console: Rc<RefCell<Vec<ConsoleLine>>>,
+    modules: Rc<ModuleMap>,
 }
 
 impl std::fmt::Debug for ScriptHost {
@@ -308,16 +444,24 @@ impl std::fmt::Debug for ScriptHost {
         f.debug_struct("ScriptHost")
             .field("timers", &self.executor.timers.borrow().len())
             .field("frames", &self.frames.borrow().pending.len())
+            .field("modules", &self.modules)
             .finish()
     }
 }
 
 impl ScriptHost {
     /// A fresh context with the queue and the host functions registered.
-    pub fn new() -> Result<Self, String> {
+    /// `base` is the document's URL, against which module specifiers in
+    /// inline scripts resolve.
+    pub fn new(base: Option<Url>) -> Result<Self, String> {
         let executor = Rc::new(WebExecutor::default());
+        let modules = Rc::new(ModuleMap {
+            base,
+            ..ModuleMap::default()
+        });
         let mut context = ContextBuilder::new()
             .job_executor(executor.clone())
+            .module_loader(modules.clone())
             .build()
             .map_err(|e| e.to_string())?;
         let console = Rc::new(RefCell::new(Vec::new()));
@@ -351,17 +495,148 @@ impl ScriptHost {
             executor,
             frames,
             console,
+            modules,
         })
     }
 
     /// Run a classic script as a task: evaluate it, then a microtask
     /// checkpoint. An uncaught error goes to the console.
     pub fn run_script(&mut self, source: &str) {
-        let result = self.context.eval(Source::from_bytes(source.as_bytes()));
+        self.run_script_from(source, None);
+    }
+
+    /// `run_script` for an external script: its URL names it in errors
+    /// and is the base for dynamic imports from it.
+    pub fn run_script_from(&mut self, source: &str, url: Option<&Url>) {
+        let result = match url {
+            Some(url) => self
+                .context
+                .eval(Source::from_bytes(source.as_bytes()).with_path(Path::new(url.as_str()))),
+            None => self.context.eval(Source::from_bytes(source.as_bytes())),
+        };
         if let Err(err) = result {
             self.report_uncaught(&err);
         }
         self.microtask_checkpoint();
+    }
+
+    // ----- modules -----
+
+    /// Parse a module script. `url` is the module's own URL, which its
+    /// relative imports resolve against; an external module is
+    /// `register`ed in the map under it so other modules can import it,
+    /// an inline one (whose URL is the document's) is not. A syntax error
+    /// is returned as its message.
+    pub fn parse_module(&mut self, source: &str, url: &Url, register: bool) -> Result<ModuleScript, String> {
+        let src = Source::from_bytes(source.as_bytes()).with_path(Path::new(url.as_str()));
+        let module = Module::parse(src, None, &mut self.context).map_err(|e| e.to_string())?;
+        if register {
+            self.modules.modules.borrow_mut().insert(url.clone(), module.clone());
+        }
+        Ok(ModuleScript {
+            module,
+            url: url.clone(),
+            ready: false,
+        })
+    }
+
+    /// A module the tab fetched for the map (asked for by `poll_module`
+    /// or `take_module_requests`): its source text, or why it could not
+    /// be had. A URL already answered is left alone.
+    pub fn module_fetched(&mut self, url: Url, result: Result<String, String>) {
+        if self.modules.modules.borrow().contains_key(&url) || self.modules.failed.borrow().contains_key(&url) {
+            return;
+        }
+        match result {
+            Ok(text) => {
+                let src = Source::from_bytes(text.as_bytes()).with_path(Path::new(url.as_str()));
+                match Module::parse(src, None, &mut self.context) {
+                    Ok(module) => {
+                        self.modules.modules.borrow_mut().insert(url, module);
+                    }
+                    Err(e) => {
+                        let why = format!("{e} (in {url})");
+                        self.modules.failed.borrow_mut().insert(url, why);
+                    }
+                }
+            }
+            Err(why) => {
+                self.modules.failed.borrow_mut().insert(url, why);
+            }
+        }
+    }
+
+    /// Module URLs that imports asked for and the map does not have, since
+    /// the last call: the tab fetches them and answers with
+    /// `module_fetched`. `poll_module` takes its own; this catches the
+    /// rest, such as a dynamic `import()` from a running script.
+    pub fn take_module_requests(&mut self) -> Vec<Url> {
+        let mut seen = HashSet::new();
+        std::mem::take(&mut *self.modules.missing.borrow_mut())
+            .into_iter()
+            .filter(|u| seen.insert(u.clone()))
+            .collect()
+    }
+
+    /// One round of loading the module's graph. Ready when every import,
+    /// transitively, is in the map; otherwise the URLs to fetch before the
+    /// next round, or why it failed.
+    pub fn poll_module(&mut self, script: &mut ModuleScript) -> ModuleProgress {
+        if script.ready {
+            return ModuleProgress::Ready;
+        }
+        let promise = script.module.load(&mut self.context);
+        self.microtask_checkpoint();
+        match promise.state() {
+            PromiseState::Fulfilled(_) => {
+                script.ready = true;
+                ModuleProgress::Ready
+            }
+            PromiseState::Rejected(reason) => {
+                let missing = self.take_module_requests();
+                if missing.is_empty() {
+                    ModuleProgress::Failed(JsError::from_opaque(reason).to_string())
+                } else {
+                    ModuleProgress::Fetch(missing)
+                }
+            }
+            // The loader answers at once, so a load settles within the
+            // checkpoint.
+            PromiseState::Pending => ModuleProgress::Failed("module graph load did not settle".to_owned()),
+        }
+    }
+
+    /// Link and evaluate a ready module as a task. Errors, including a
+    /// rejected evaluation (a throw at the top level), go to the console.
+    pub fn run_module(&mut self, script: ModuleScript) {
+        if !script.ready {
+            self.report_error(format!("module {} ran before its graph loaded", script.url));
+            return;
+        }
+        if let Err(err) = script.module.link(&mut self.context) {
+            self.report_uncaught(&err);
+            self.microtask_checkpoint();
+            return;
+        }
+        match script.module.evaluate(&mut self.context) {
+            Err(err) => self.report_uncaught(&err),
+            Ok(promise) => {
+                self.microtask_checkpoint();
+                if let PromiseState::Rejected(reason) = promise.state() {
+                    self.report_uncaught(&JsError::from_opaque(reason));
+                }
+            }
+        }
+        self.microtask_checkpoint();
+    }
+
+    /// Put an error line on the console, for failures the tab sees (a
+    /// script that did not load, for instance).
+    pub fn report_error(&mut self, text: String) {
+        self.console.borrow_mut().push(ConsoleLine {
+            level: ConsoleLevel::Error,
+            text,
+        });
     }
 
     /// Evaluate an expression and render the result as a string, for
@@ -441,7 +716,11 @@ mod tests {
     use super::*;
 
     fn host() -> ScriptHost {
-        ScriptHost::new().expect("script host")
+        ScriptHost::new(Some(Url::parse("https://example.test/app/").expect("url"))).expect("script host")
+    }
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).expect("url")
     }
 
     fn lines(h: &mut ScriptHost) -> Vec<String> {
@@ -540,5 +819,97 @@ mod tests {
         h.run_script("cancelAnimationFrame(2000); frames = [];");
         assert!(h.run_animation_frames(50.0));
         assert_eq!(h.eval_to_string("frames.join(',')").as_deref(), Ok("\"50\""));
+    }
+
+    #[test]
+    fn module_graphs_load_in_rounds_through_the_map() {
+        let mut h = host();
+        let main = url("https://example.test/app/main.js");
+        let a = url("https://example.test/app/a.js");
+        let b = url("https://cdn.test/b.js");
+        let c = url("https://example.test/c.js");
+        let mut root = h
+            .parse_module(
+                "import { a } from './a.js'; import b from 'https://cdn.test/b.js'; console.log('root', a, b); export const done = true;",
+                &main,
+                true,
+            )
+            .expect("parses");
+        assert!(!root.is_ready());
+        // Round one: both direct imports are missing.
+        let ModuleProgress::Fetch(urls) = h.poll_module(&mut root) else {
+            panic!("expected a fetch round")
+        };
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert!(urls.contains(&a) && urls.contains(&b), "{urls:?}");
+        // Round two: `a` is in and wants `c`; `b` is still missing.
+        h.module_fetched(a.clone(), Ok("import { c } from '../c.js'; export const a = c + 1;".to_owned()));
+        let ModuleProgress::Fetch(urls) = h.poll_module(&mut root) else {
+            panic!("expected a second fetch round")
+        };
+        assert!(urls.contains(&c) && urls.contains(&b), "{urls:?}");
+        assert!(!urls.contains(&a), "{urls:?}");
+        h.module_fetched(b.clone(), Ok("export default 'B';".to_owned()));
+        h.module_fetched(c.clone(), Ok("export const c = 41;".to_owned()));
+        // A second answer for a URL is ignored.
+        h.module_fetched(c.clone(), Ok("export const c = 'wrong';".to_owned()));
+        assert_eq!(h.poll_module(&mut root), ModuleProgress::Ready);
+        assert!(root.is_ready());
+        h.run_module(root);
+        assert_eq!(lines(&mut h), vec!["root 42 B".to_owned()]);
+
+        // A classic script can import the registered module dynamically;
+        // its specifier resolves against the document URL.
+        h.run_script("import('./main.js').then(m => console.log('dyn', m.done), e => console.log('dyn failed', String(e)));");
+        assert_eq!(lines(&mut h), vec!["dyn true".to_owned()]);
+
+        // A bare specifier does not resolve.
+        let mut bare = h
+            .parse_module("import x from 'lodash';", &url("https://example.test/app/bare.js"), false)
+            .expect("parses");
+        let ModuleProgress::Failed(why) = h.poll_module(&mut bare) else {
+            panic!("bare specifier must fail")
+        };
+        assert!(why.contains("Failed to resolve module specifier \"lodash\""), "{why}");
+
+        // A fetch that failed fails the importer with the reason.
+        let gone = url("https://example.test/app/gone.js");
+        let mut importer = h
+            .parse_module("import './gone.js';", &url("https://example.test/app/i.js"), false)
+            .expect("parses");
+        assert_eq!(h.poll_module(&mut importer), ModuleProgress::Fetch(vec![gone.clone()]));
+        h.module_fetched(gone, Err("HTTP 404".to_owned()));
+        let ModuleProgress::Failed(why) = h.poll_module(&mut importer) else {
+            panic!("failed fetch must fail the graph")
+        };
+        assert!(why.contains("HTTP 404"), "{why}");
+
+        // A dependency that does not parse fails the graph with the
+        // syntax error; a root that does not parse fails at once.
+        let broken = url("https://example.test/app/broken.js");
+        let mut importer = h
+            .parse_module("import './broken.js';", &url("https://example.test/app/j.js"), false)
+            .expect("parses");
+        assert!(matches!(h.poll_module(&mut importer), ModuleProgress::Fetch(_)));
+        h.module_fetched(broken, Ok("export {".to_owned()));
+        let ModuleProgress::Failed(why) = h.poll_module(&mut importer) else {
+            panic!("broken dependency must fail the graph")
+        };
+        assert!(why.contains("SyntaxError") && why.contains("broken.js"), "{why}");
+        let err = h
+            .parse_module("import {", &url("https://example.test/app/k.js"), false)
+            .err()
+            .expect("syntax error");
+        assert!(err.contains("SyntaxError"), "{err}");
+
+        // A throw at the top level of a module is reported.
+        let mut thrower = h
+            .parse_module("throw new RangeError('boom')", &url("https://example.test/app/t.js"), false)
+            .expect("parses");
+        assert_eq!(h.poll_module(&mut thrower), ModuleProgress::Ready);
+        h.run_module(thrower);
+        let l = lines(&mut h);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].contains("RangeError: boom"), "{l:?}");
     }
 }

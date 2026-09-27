@@ -653,6 +653,7 @@ dependencies = [
  "boa_gc",
  "boa_runtime",
  "browser-dom",
+ "url",
 ]
 
 [[package]]

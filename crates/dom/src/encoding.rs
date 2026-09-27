@@ -29,6 +29,17 @@ pub fn sniff_html(head: &[u8], transport: Option<&str>) -> &'static Encoding {
     if looks_like_utf8(window) { UTF_8 } else { WINDOWS_1252 }
 }
 
+/// Decode an external script's bytes to text: byte order mark, then the
+/// transport charset, then UTF-8, per the HTML standard's "decode" for
+/// classic scripts (modules are always UTF-8, which the same steps yield
+/// when no charset is passed).
+pub fn decode_script(bytes: &[u8], transport: Option<&str>) -> String {
+    let enc = transport
+        .and_then(|l| Encoding::for_label(l.trim().as_bytes()))
+        .unwrap_or(UTF_8);
+    enc.decode(bytes).0.into_owned()
+}
+
 /// Decode a stylesheet's bytes to text.
 pub fn decode_stylesheet(bytes: &[u8], transport: Option<&str>) -> String {
     let enc = transport

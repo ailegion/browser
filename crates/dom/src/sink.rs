@@ -1,9 +1,9 @@
 //! html5ever `TreeSink` over the arena, plus a streaming parser wrapper.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 
-use html5ever::interface::{ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::interface::{ElemName, ElementFlags, NodeOrText, QuirksMode, TokenizerResult, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, LocalName, Namespace, ParseOpts, QualName};
 use url::Url;
@@ -38,6 +38,11 @@ impl Sink {
         Self {
             doc: RefCell::new(doc),
         }
+    }
+
+    /// The document as built so far.
+    fn document(&self) -> Ref<'_, Document> {
+        self.doc.borrow()
     }
 }
 
@@ -202,6 +207,13 @@ impl TreeSink for Sink {
 /// order mark is present, otherwise after the first kilobyte (or the end,
 /// for shorter documents). Bytes arriving before that are held back.
 /// Malformed sequences are replaced, never rejected.
+///
+/// Scripts block the parser, as in the HTML standard: when a `<script>`
+/// element's end tag has been seen, the tree builder stops and
+/// [`HtmlParser::blocked_script`] names the element. The owner runs (or
+/// skips) it, then calls [`HtmlParser::resume`]; input arriving in between
+/// is decoded and held. The document under construction is readable
+/// through [`HtmlParser::document`] the whole time.
 pub struct HtmlParser {
     inner: html5ever::driver::Parser<Sink>,
     /// Charset parameter of the Content-Type header, if any.
@@ -209,6 +221,10 @@ pub struct HtmlParser {
     /// Bytes held until the encoding is decided.
     buffer: Vec<u8>,
     decoder: Option<encoding_rs::Decoder>,
+    /// The script element the tree builder stopped at.
+    blocked: Option<NodeId>,
+    /// `end_input` was called: nothing more will be fed.
+    eof: bool,
 }
 
 impl std::fmt::Debug for HtmlParser {
@@ -232,12 +248,73 @@ impl HtmlParser {
             transport: charset.map(str::to_owned),
             buffer: Vec::new(),
             decoder: None,
+            blocked: None,
+            eof: false,
         }
     }
 
     /// The encoding in use, once decided.
     pub fn encoding(&self) -> Option<&'static encoding_rs::Encoding> {
         self.decoder.as_ref().map(|d| d.encoding())
+    }
+
+    /// The document as built so far. Read it while the parser is blocked
+    /// on a script; do not hold the borrow across `feed` or `resume`.
+    pub fn document(&self) -> Ref<'_, Document> {
+        self.inner.tokenizer.sink.sink.document()
+    }
+
+    /// The script element whose end tag stopped the parser, until
+    /// `resume` is called.
+    pub fn blocked_script(&self) -> Option<NodeId> {
+        self.blocked
+    }
+
+    /// The script has run (or was skipped): parse on. May block again.
+    pub fn resume(&mut self) {
+        self.blocked = None;
+        self.pump();
+    }
+
+    /// No more bytes will come. Decodes what was held back; the parser
+    /// runs on unless it is blocked.
+    pub fn end_input(&mut self) {
+        if self.eof {
+            return;
+        }
+        self.eof = true;
+        if self.decoder.is_none() {
+            self.start_decoding(true);
+        } else {
+            self.decode(&[], true);
+        }
+    }
+
+    /// All input has been fed, parsed and no script is pending: `finish`
+    /// will not run anything more.
+    pub fn is_done(&self) -> bool {
+        self.eof && self.blocked.is_none() && self.inner.input_buffer.is_empty()
+    }
+
+    /// Run the tree builder over the decoded input until it runs dry or
+    /// stops at a script.
+    fn pump(&mut self) {
+        if self.blocked.is_some() {
+            return;
+        }
+        loop {
+            match self.inner.tokenizer.feed(&self.inner.input_buffer) {
+                TokenizerResult::Done => break,
+                TokenizerResult::Script(node) => {
+                    self.blocked = Some(node);
+                    break;
+                }
+                // A `<meta charset>` past the prescan window. Browsers may
+                // restart the parse here; we keep the encoding already
+                // chosen (known gap from Phase 2 item 0) and parse on.
+                TokenizerResult::EncodingIndicator(_) => {}
+            }
+        }
     }
 
     /// Feed a chunk of bytes.
@@ -283,16 +360,18 @@ impl HtmlParser {
             }
         }
         if !text.is_empty() {
-            self.inner.process(StrTendril::from_slice(&text));
+            self.inner.input_buffer.push_back(StrTendril::from_slice(&text));
+            self.pump();
         }
     }
 
+    /// End the document. A script the parser is still blocked on, and any
+    /// it meets in the remaining input, is skipped: this is the path for
+    /// an aborted load, and scripts of an aborted document do not run.
     pub fn finish(mut self) -> Document {
-        if self.decoder.is_none() {
-            self.start_decoding(true);
-        } else {
-            self.decode(&[], true);
-        }
+        self.end_input();
+        // `Parser::finish` runs the tree builder to the end, ignoring
+        // script stops, then feeds the end of file.
         self.inner.finish()
     }
 }

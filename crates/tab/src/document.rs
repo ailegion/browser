@@ -1,7 +1,7 @@
 //! Per-tab state: the current document, its resources, and the render
 //! pipeline from DOM to scene.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use browser_dom::{Document, HtmlParser, NodeId};
@@ -11,7 +11,7 @@ use browser_layout::{LayoutEngine, LayoutTree, Rect, SelectionRanges};
 use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
-use browser_script::{ConsoleLevel, ConsoleLine, ScriptHost};
+use browser_script::{ConsoleLevel, ConsoleLine, ModuleProgress, ModuleScript, ScriptHost};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
@@ -37,6 +37,103 @@ enum PendingKind {
     Image {
         url: Url,
     },
+    /// An external script element's source; `id` is its `ScriptLoad`.
+    Script {
+        id: u64,
+    },
+    /// A module another module imports, for the document's module map.
+    ModuleSource {
+        url: Url,
+    },
+}
+
+/// Classic or module, per the `<script type>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptKind {
+    Classic,
+    Module,
+}
+
+/// Where a script element's source stands.
+enum LoadState {
+    /// On its way from the network.
+    Fetching,
+    /// A classic script ready to run.
+    Classic(String),
+    /// A module, loading its imports until `ModuleScript::is_ready`.
+    Module(ModuleScript),
+    /// Cannot run; the message goes to the console in its turn.
+    Failed(String),
+}
+
+/// A script element that is loading or waiting for its turn to run.
+struct ScriptLoad {
+    id: u64,
+    kind: ScriptKind,
+    /// The `src`, for external scripts.
+    url: Option<Url>,
+    state: LoadState,
+}
+
+impl ScriptLoad {
+    /// Nothing more to wait for: it runs (or reports) when its turn comes.
+    fn is_ready(&self) -> bool {
+        match &self.state {
+            LoadState::Fetching => false,
+            LoadState::Module(m) => m.is_ready(),
+            LoadState::Classic(_) | LoadState::Failed(_) => true,
+        }
+    }
+}
+
+/// The document's script loads, in the HTML standard's three groups.
+#[derive(Default)]
+struct Scripts {
+    next_id: u64,
+    /// The pending parsing-blocking script: the parser waits for it.
+    blocking: Option<ScriptLoad>,
+    /// Scripts that run once the document has finished parsing, in order
+    /// (`defer`, and modules without `async`).
+    deferred: VecDeque<ScriptLoad>,
+    /// `async` scripts: each runs as soon as it is ready.
+    asap: Vec<ScriptLoad>,
+    /// Module URLs fetched for the module map, so each is fetched once.
+    module_urls: HashSet<Url>,
+}
+
+impl Scripts {
+    fn next_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut ScriptLoad> {
+        self.blocking
+            .iter_mut()
+            .chain(self.deferred.iter_mut())
+            .chain(self.asap.iter_mut())
+    }
+
+    fn get_mut(&mut self, id: u64) -> Option<&mut ScriptLoad> {
+        self.iter_mut().find(|l| l.id == id)
+    }
+
+    /// Drop every waiting script (the load was stopped).
+    fn clear_loads(&mut self) {
+        self.blocking = None;
+        self.deferred.clear();
+        self.asap.clear();
+    }
+}
+
+/// What "prepare the script element" decided for a parser-inserted script.
+enum Prepared {
+    /// An inline classic script: run it now, then parse on.
+    Run(String),
+    /// An external script the parser must wait for.
+    Blocking,
+    /// Queued, skipped, or already handled: parse on.
+    Done,
 }
 
 struct Pending {
@@ -163,8 +260,14 @@ pub(crate) struct TabState {
     find: Option<Find>,
 
     /// The document's JavaScript context and queues; a new one per
-    /// document.
+    /// document, made when the document commits so scripts can run while
+    /// it parses.
     script: Option<ScriptHost>,
+    /// The document's script elements that are loading or waiting.
+    scripts: Scripts,
+    /// The main response has ended; the document is finished as soon as
+    /// the parser is no longer waiting for a script.
+    main_done: bool,
     /// When the next animation frame is due, while callbacks wait for one.
     frame_due: Option<std::time::Instant>,
     /// The document's time origin, for animation frame timestamps.
@@ -233,6 +336,8 @@ impl TabState {
             autoscroll: None,
             find: None,
             script: None,
+            scripts: Scripts::default(),
+            main_done: false,
             frame_due: None,
             doc_started: std::time::Instant::now(),
             console: Vec::new(),
@@ -1207,14 +1312,14 @@ impl TabState {
     }
 
     /// Stop loading. Before commit the old page is untouched; after it,
-    /// what has arrived of the new one is shown.
+    /// what has arrived of the new one is shown. Scripts still waiting
+    /// (for the network, or for parsing to end) are dropped.
     fn stop(&mut self) {
-        let nav = self.nav.take();
+        self.nav = None;
         self.pending.clear();
-        if let Some(nav) = nav
-            && nav.committed
-            && let Some(parser) = self.parser.take()
-        {
+        self.scripts.clear_loads();
+        // The parser exists only once a navigation has committed.
+        if let Some(parser) = self.parser.take() {
             let doc = parser.finish();
             self.set_document(doc);
         }
@@ -1236,10 +1341,16 @@ impl TabState {
         } else {
             CacheMode::Default
         };
-        // The old document's own fetches are moot now.
+        // The old document's own fetches are moot now, and so is a parse
+        // it may still have had going.
         self.pending.retain(|k, _| *k == id);
+        self.parser = None;
+        self.main_done = false;
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
+        // The new document's scripts run while it parses, so its context
+        // starts here; the old document's timers stop with its context.
+        self.new_script_host();
         self.start_main_document(id, final_url);
         self.state_dirty = true;
     }
@@ -1624,6 +1735,7 @@ impl TabState {
                     && self.nav.as_ref().is_some_and(|n| n.request == id);
                 if is_current_main && let Some(parser) = &mut self.parser {
                     parser.feed(&bytes);
+                    self.pump_scripts();
                 } else {
                     p.body.extend_from_slice(&bytes);
                 }
@@ -1680,9 +1792,16 @@ impl TabState {
                 if self.nav.take_if(|n| n.request == id).is_none() {
                     return;
                 }
-                let doc = if let Some(parser) = self.parser.take() {
-                    parser.finish()
-                } else {
+                if let Some(parser) = &mut self.parser {
+                    // The parser finishes once it is not waiting on a
+                    // script; `drive_parser` sets the document then.
+                    parser.end_input();
+                    self.main_done = true;
+                    self.pump_scripts();
+                    self.state_dirty = true;
+                    return;
+                }
+                let doc = {
                     let (ct, _) = Self::content_type_of(&p.headers);
                     let body = String::from_utf8_lossy(&p.body);
                     let html = if ct.starts_with("text/") || ct.ends_with("json") || ct.ends_with("javascript") {
@@ -1735,11 +1854,63 @@ impl TabState {
                     self.needs_layout = true;
                 }
             }
+            PendingKind::Script { id } => {
+                let ok = p.status == 0 || (200..300).contains(&p.status);
+                let (ct, charset) = Self::content_type_of(&p.headers);
+                if let Some(host) = &mut self.script
+                    && let Some(load) = self.scripts.get_mut(id)
+                {
+                    let url = load.url.clone().unwrap_or_else(|| Url::parse("about:blank").expect("static url"));
+                    load.state = if !ok {
+                        LoadState::Failed(format!("Failed to load script {url}: HTTP {}", p.status))
+                    } else {
+                        match load.kind {
+                            ScriptKind::Classic => {
+                                LoadState::Classic(browser_dom::encoding::decode_script(&p.body, charset.as_deref()))
+                            }
+                            ScriptKind::Module if !is_javascript_mime(&ct) => LoadState::Failed(format!(
+                                "Failed to load module script {url}: expected a JavaScript MIME type but the server responded with \"{ct}\""
+                            )),
+                            ScriptKind::Module => {
+                                // Modules are always UTF-8.
+                                let text = browser_dom::encoding::decode_script(&p.body, None);
+                                match host.parse_module(&text, &url, true) {
+                                    Ok(m) => LoadState::Module(m),
+                                    Err(e) => LoadState::Failed(format!("{e} (in {url})")),
+                                }
+                            }
+                        }
+                    };
+                }
+                self.run_ready_scripts();
+            }
+            PendingKind::ModuleSource { url } => {
+                let ok = p.status == 0 || (200..300).contains(&p.status);
+                let (ct, _) = Self::content_type_of(&p.headers);
+                let result = if !ok {
+                    Err(format!("Failed to load module script {url}: HTTP {}", p.status))
+                } else if !is_javascript_mime(&ct) {
+                    Err(format!(
+                        "Failed to load module script {url}: expected a JavaScript MIME type but the server responded with \"{ct}\""
+                    ))
+                } else {
+                    Ok(browser_dom::encoding::decode_script(&p.body, None))
+                };
+                if let Some(host) = &mut self.script {
+                    host.module_fetched(url, result);
+                }
+                self.run_ready_scripts();
+            }
         }
         self.state_dirty = true;
     }
 
     fn show_error_page(&mut self, url: &str, error: &str) {
+        // Whatever was being parsed or loaded for the failed document is
+        // over; the error page gets a context of its own.
+        self.parser = None;
+        self.main_done = false;
+        self.script = None;
         let html = format!(
             "<!doctype html><html><head><title>Cannot load page</title></head>\
              <body style='font-family:sans-serif;margin:40px'><h1>This page cannot be loaded</h1>\
@@ -1784,7 +1955,11 @@ impl TabState {
         self.collect_images();
         self.pending_fragment = self.url.as_ref().is_some_and(|u| u.fragment().is_some());
         self.schedule_refresh();
-        self.start_script();
+        // A parsed document already has its context (made at commit);
+        // documents made up here (error pages, wrapped non-HTML) get one.
+        if self.script.is_none() {
+            self.new_script_host();
+        }
         self.needs_style = true;
         self.state_dirty = true;
     }
@@ -1794,45 +1969,270 @@ impl TabState {
     /// Frame interval for animation frame callbacks.
     const FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
 
-    /// A new document gets a new context; the old one's timers and
-    /// frames die with it. Inline classic scripts run in document order
-    /// once the document has parsed (the full loader is item 2).
-    fn start_script(&mut self) {
+    /// A new document gets a new context; the old one's timers, frames
+    /// and waiting scripts die with it.
+    fn new_script_host(&mut self) {
         self.frame_due = None;
         self.doc_started = std::time::Instant::now();
-        self.script = match ScriptHost::new() {
+        self.scripts = Scripts::default();
+        self.script = match ScriptHost::new(self.url.clone()) {
             Ok(host) => Some(host),
             Err(e) => {
                 tracing::error!(tab = self.id.0, "script context: {e}");
                 None
             }
         };
-        let Some(doc) = &self.doc else { return };
-        let sources: Vec<String> = doc
-            .descendants(doc.root())
-            .filter_map(|n| {
-                let e = doc.element(n)?;
-                (e.name.ns == ns!(html)
-                    && e.name.local == local_name!("script")
-                    && e.attr("src").is_none()
-                    && is_classic_script_type(e.attr("type")))
-                .then(|| doc.text_content(n))
-            })
-            .collect();
-        if let Some(host) = &mut self.script {
-            for src in sources {
-                if !src.trim().is_empty() {
-                    host.run_script(&src);
+    }
+
+    /// Parse what has arrived, running the scripts the parser stops at,
+    /// finish the document once its response has ended, and run whatever
+    /// script is ready.
+    fn pump_scripts(&mut self) {
+        self.drive_parser();
+        self.run_ready_scripts();
+    }
+
+    /// Run the parser until it runs dry or waits on a script fetch. Every
+    /// `<script>` it stops at goes through `prepare_script`; an inline
+    /// classic script runs before the parser continues, as the HTML
+    /// standard requires, so a later part of the document is not yet in
+    /// the tree when it runs.
+    fn drive_parser(&mut self) {
+        loop {
+            let Some(parser) = &self.parser else { return };
+            let Some(node) = parser.blocked_script() else { break };
+            if self.scripts.blocking.is_some() {
+                // Waiting for the network; `run_ready_scripts` resumes.
+                return;
+            }
+            match self.prepare_script(node) {
+                Prepared::Run(source) => {
+                    if let Some(host) = &mut self.script {
+                        host.run_script(&source);
+                    }
+                    self.after_script();
                 }
+                Prepared::Blocking => return,
+                Prepared::Done => {}
+            }
+            if let Some(parser) = &mut self.parser {
+                parser.resume();
+            }
+        }
+        if self.main_done
+            && self.parser.as_ref().is_some_and(HtmlParser::is_done)
+            && let Some(parser) = self.parser.take()
+        {
+            let doc = parser.finish();
+            self.set_document(doc);
+        }
+    }
+
+    /// HTML "prepare the script element" for a script the parser stopped
+    /// at. Classic: inline runs now; external is fetched and blocks the
+    /// parser, unless `defer` (runs after parsing, in order) or `async`
+    /// (runs when it arrives). Module: inline or external, its graph
+    /// loads and it runs after parsing in order, or `async` when ready.
+    /// Data blocks, unknown types and `nomodule` classic scripts are
+    /// skipped.
+    fn prepare_script(&mut self, node: NodeId) -> Prepared {
+        let Some(parser) = &self.parser else { return Prepared::Done };
+        let (kind, src, is_async, defer, text, doc_url) = {
+            let doc = parser.document();
+            let Some(e) = doc.element(node) else { return Prepared::Done };
+            let Some(kind) = script_kind(e) else { return Prepared::Done };
+            let src = e.attr("src").map(|s| (s.to_owned(), doc.resolve_url(s)));
+            let text = if src.is_none() { doc.text_content(node) } else { String::new() };
+            (
+                kind,
+                src,
+                e.attr("async").is_some(),
+                e.attr("defer").is_some(),
+                text,
+                doc.base_url.clone(),
+            )
+        };
+        match src {
+            Some((raw, resolved)) => {
+                let url = match resolved {
+                    Some(u) if !raw.trim().is_empty() && matches!(u.scheme(), "http" | "https" | "data") => u,
+                    _ => {
+                        self.report_script_error(format!("Failed to load script: cannot use src \"{raw}\""));
+                        return Prepared::Done;
+                    }
+                };
+                let id = self.scripts.next_id();
+                let load = ScriptLoad {
+                    id,
+                    kind,
+                    url: Some(url.clone()),
+                    state: LoadState::Fetching,
+                };
+                let blocking = !is_async && !defer && kind == ScriptKind::Classic;
+                if is_async {
+                    self.scripts.asap.push(load);
+                } else if blocking {
+                    self.scripts.blocking = Some(load);
+                } else {
+                    self.scripts.deferred.push_back(load);
+                }
+                let mut request = self.subresource(url);
+                request.headers.push(("accept".to_owned(), "*/*".to_owned()));
+                self.fetch(request, PendingKind::Script { id });
+                if blocking { Prepared::Blocking } else { Prepared::Done }
+            }
+            None => match kind {
+                ScriptKind::Classic => {
+                    if text.trim().is_empty() {
+                        Prepared::Done
+                    } else {
+                        Prepared::Run(text)
+                    }
+                }
+                ScriptKind::Module => {
+                    let Some(host) = &mut self.script else { return Prepared::Done };
+                    let url = doc_url
+                        .or_else(|| self.url.clone())
+                        .unwrap_or_else(|| Url::parse("about:blank").expect("static url"));
+                    match host.parse_module(&text, &url, false) {
+                        Ok(m) => {
+                            let load = ScriptLoad {
+                                id: self.scripts.next_id(),
+                                kind,
+                                url: None,
+                                state: LoadState::Module(m),
+                            };
+                            if is_async {
+                                self.scripts.asap.push(load);
+                            } else {
+                                self.scripts.deferred.push_back(load);
+                            }
+                        }
+                        // A syntax error is reported where the parser is,
+                        // as browsers do.
+                        Err(e) => self.report_script_error(format!("Uncaught {e}")),
+                    }
+                    Prepared::Done
+                }
+            },
+        }
+    }
+
+    /// Run every script whose turn has come: the parser-blocking one (and
+    /// then parse on), `async` ones as they are ready, and once the
+    /// document has parsed the deferred ones in order. Module graphs are
+    /// polled first so a module whose last import just arrived counts as
+    /// ready.
+    fn run_ready_scripts(&mut self) {
+        loop {
+            let mut progressed = self.poll_modules();
+            if self.scripts.blocking.as_ref().is_some_and(ScriptLoad::is_ready)
+                && let Some(load) = self.scripts.blocking.take()
+            {
+                self.execute_script(load);
+                if let Some(parser) = &mut self.parser {
+                    parser.resume();
+                }
+                self.drive_parser();
+                progressed = true;
+            }
+            let mut i = 0;
+            while i < self.scripts.asap.len() {
+                if self.scripts.asap[i].is_ready() {
+                    let load = self.scripts.asap.remove(i);
+                    self.execute_script(load);
+                    progressed = true;
+                } else {
+                    i += 1;
+                }
+            }
+            // Deferred scripts wait for the end of parsing. Before a new
+            // navigation commits, the loads here are the shown document's.
+            let parsed = self.parser.is_none() && self.doc.is_some();
+            while parsed
+                && self.scripts.deferred.front().is_some_and(ScriptLoad::is_ready)
+                && let Some(load) = self.scripts.deferred.pop_front()
+            {
+                self.execute_script(load);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// One loading round for every module still loading its graph; fetch
+    /// what the rounds ask for. Returns whether any load settled here
+    /// without the network (so the caller polls again).
+    fn poll_modules(&mut self) -> bool {
+        let Some(host) = &mut self.script else { return false };
+        let mut to_fetch = Vec::new();
+        for load in self.scripts.iter_mut() {
+            let LoadState::Module(m) = &mut load.state else { continue };
+            if m.is_ready() {
+                continue;
+            }
+            match host.poll_module(m) {
+                ModuleProgress::Ready => {}
+                ModuleProgress::Fetch(urls) => to_fetch.extend(urls),
+                ModuleProgress::Failed(why) => load.state = LoadState::Failed(format!("Uncaught {why}")),
+            }
+        }
+        let mut settled = false;
+        for url in to_fetch {
+            settled |= self.fetch_module_source(url);
+        }
+        settled
+    }
+
+    /// Fetch a module for the module map, once per URL. Returns true when
+    /// the answer was given on the spot (an unsupported scheme).
+    fn fetch_module_source(&mut self, url: Url) -> bool {
+        if !self.scripts.module_urls.insert(url.clone()) {
+            return false;
+        }
+        if !matches!(url.scheme(), "http" | "https" | "data") {
+            if let Some(host) = &mut self.script {
+                host.module_fetched(
+                    url.clone(),
+                    Err(format!("Failed to load module script {url}: unsupported scheme")),
+                );
+            }
+            return true;
+        }
+        let mut request = self.subresource(url.clone());
+        request.headers.push(("accept".to_owned(), "*/*".to_owned()));
+        self.fetch(request, PendingKind::ModuleSource { url });
+        false
+    }
+
+    /// Run a ready script as a task, or report why it cannot run.
+    fn execute_script(&mut self, load: ScriptLoad) {
+        if let Some(host) = &mut self.script {
+            match load.state {
+                LoadState::Classic(source) => host.run_script_from(&source, load.url.as_ref()),
+                LoadState::Module(m) => host.run_module(m),
+                LoadState::Failed(why) => host.report_error(why),
+                LoadState::Fetching => {}
             }
         }
         self.after_script();
     }
 
-    /// After script ran: forward console output, and schedule a frame if
-    /// one was asked for.
+    fn report_script_error(&mut self, text: String) {
+        if let Some(host) = &mut self.script {
+            host.report_error(text);
+        }
+        self.after_script();
+    }
+
+    /// After script ran: forward console output, fetch the modules a
+    /// dynamic `import()` asked for, and schedule a frame if one was
+    /// asked for.
     fn after_script(&mut self) {
         let Some(host) = &mut self.script else { return };
+        let requests = host.take_module_requests();
         for line in host.take_console() {
             match line.level {
                 ConsoleLevel::Warn | ConsoleLevel::Error => {
@@ -1850,6 +2250,12 @@ impl TabState {
         }
         if host.has_frame_callbacks() && self.frame_due.is_none() {
             self.frame_due = Some(std::time::Instant::now() + Self::FRAME);
+        }
+        // A dynamic `import()` of a module not in the map rejects for now
+        // and is fetched here, so the map has it the next time (known
+        // limitation until fetch, Phase 3 item 3.5, makes imports wait).
+        for url in requests {
+            self.fetch_module_source(url);
         }
     }
 
@@ -2179,22 +2585,50 @@ fn tabindex(e: &browser_dom::Element) -> Option<i64> {
 /// Pixels one arrow key scrolls.
 const LINE_SCROLL: f32 = 40.0;
 
-/// Whether a `<script type>` names classic JavaScript (absent or empty
-/// counts). Modules and data blocks are not run here.
-fn is_classic_script_type(t: Option<&str>) -> bool {
-    let Some(t) = t else { return true };
-    let t = t.trim().to_ascii_lowercase();
-    t.is_empty()
-        || matches!(
-            t.as_str(),
-            "text/javascript"
-                | "application/javascript"
-                | "text/ecmascript"
-                | "application/ecmascript"
-                | "text/jscript"
-                | "text/x-javascript"
-                | "application/x-javascript"
-        )
+/// The HTML standard's JavaScript MIME type essences.
+fn is_javascript_mime(essence: &str) -> bool {
+    matches!(
+        essence.trim().to_ascii_lowercase().as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
+}
+
+/// What kind of script a `<script>` element is, per its `type` (and the
+/// legacy `language`): `None` for data blocks, unknown types and classic
+/// scripts marked `nomodule`.
+fn script_kind(e: &browser_dom::Element) -> Option<ScriptKind> {
+    let ty = e.attr("type").map(str::trim).unwrap_or("");
+    let kind = if ty.is_empty() {
+        match e.attr("language").map(str::trim).filter(|l| !l.is_empty()) {
+            Some(lang) if !is_javascript_mime(&format!("text/{lang}")) => return None,
+            _ => ScriptKind::Classic,
+        }
+    } else if is_javascript_mime(ty) {
+        ScriptKind::Classic
+    } else if ty.eq_ignore_ascii_case("module") {
+        ScriptKind::Module
+    } else {
+        return None;
+    };
+    if kind == ScriptKind::Classic && e.attr("nomodule").is_some() {
+        return None;
+    }
+    Some(kind)
 }
 
 /// An `<input>`'s type, lower-cased; `text` when absent. `None` for
@@ -2325,6 +2759,13 @@ mod tests {
         }
 
         fn load_url(url: Url) -> Self {
+            let mut h = Self::start(url);
+            h.pump();
+            h
+        }
+
+        /// Start a navigation without delivering any of its events yet.
+        fn start(url: Url) -> Self {
             let net = Arc::new(NetService::new().expect("net service"));
             let (tx, net_events) = channel();
             let net_sink: Sink = Arc::new(move |ev| {
@@ -2348,8 +2789,51 @@ mod tests {
                 net_events,
                 messages,
             };
-            h.send(ShellToTab::Navigate { url });
+            h.state.handle_shell(ShellToTab::Navigate { url });
             h
+        }
+
+        /// Deliver exactly `n` queued net events, then do the work due.
+        fn pump_n(&mut self, n: usize) {
+            for _ in 0..n {
+                let ev = self.net_events.try_recv().expect("a queued net event");
+                self.state.handle_net(ev);
+            }
+            self.state.tick();
+            self.state.flush();
+        }
+
+        /// Keep delivering net events, waiting for the network, until the
+        /// condition holds. Panics after ten seconds.
+        fn pump_until(&mut self, mut done: impl FnMut(&Self) -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                self.pump();
+                if done(self) {
+                    return;
+                }
+                let wait = deadline.saturating_duration_since(std::time::Instant::now());
+                match self.net_events.recv_timeout(wait) {
+                    Ok(ev) => self.state.handle_net(ev),
+                    Err(_) => panic!("timed out waiting for the tab"),
+                }
+            }
+        }
+
+        /// Deliver whatever the network sends for a while.
+        fn pump_for(&mut self, time: std::time::Duration) {
+            let deadline = std::time::Instant::now() + time;
+            loop {
+                self.pump();
+                let wait = deadline.saturating_duration_since(std::time::Instant::now());
+                if wait.is_zero() {
+                    return;
+                }
+                match self.net_events.recv_timeout(wait) {
+                    Ok(ev) => self.state.handle_net(ev),
+                    Err(_) => return,
+                }
+            }
         }
 
         fn send(&mut self, msg: ShellToTab) {
@@ -3201,6 +3685,9 @@ mod tests {
         let t = texts(&h);
         assert_eq!(&t[..3], ["hi", "second", "micro"], "{t:?}");
         assert!(t[3].starts_with("Uncaught SyntaxError"), "{t:?}");
+        // The inline module is deferred: it runs once the document has
+        // parsed, after every classic script.
+        assert_eq!(t[4], "no modules yet", "{t:?}");
         assert_eq!(h.state.console[1].level, ConsoleLevel::Warn);
         assert!(h.state.next_wake().is_some(), "the timeout is armed");
         assert!(h.state.frame_due.is_some(), "a frame is scheduled");
@@ -3218,6 +3705,204 @@ mod tests {
             url: data_url("<script>console.log(typeof marker)</script>", None),
         });
         assert_eq!(texts(&h).last().map(String::as_str), Some("undefined"));
+    }
+
+    /// Console text so far, in order.
+    fn console_texts(h: &Harness) -> Vec<String> {
+        h.state.console.iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn external_scripts_block_the_parser_and_run_in_document_order() {
+        let html = "<title>Order</title><script>console.log('a')</script>\
+                    <script src=\"data:text/javascript,console.log('b')\"></script>\
+                    <script>console.log('c')</script><p>x</p>\
+                    <script src=\"data:text/javascript,console.log('d')\" nomodule></script>\
+                    <script type=\"text/plain\">not script</script>\
+                    <script src=\"\"></script>\
+                    <script src=\"data:text/javascript,console.log('bad status')\" language=\"vbscript\"></script>";
+        let mut h = Harness::start(data_url(html, None));
+        // The main response is three events; handling its body stops the
+        // parser at the external script, whose fetch is answered after.
+        h.pump_n(3);
+        assert_eq!(console_texts(&h), ["a"], "only the script before the external one has run");
+        assert!(h.state.scripts.blocking.is_some(), "the parser waits for the fetch");
+        assert!(h.state.main_done, "the main response has ended");
+        assert!(h.state.doc.is_none(), "the document is not shown while parsing waits");
+        h.pump();
+        assert_eq!(console_texts(&h)[..3], ["a", "b", "c"]);
+        assert_eq!(h.title().as_deref(), Some("Order"));
+        // `nomodule`, a data block, a foreign `language` and an empty src
+        // do not run; the empty src is reported.
+        let t = console_texts(&h);
+        assert_eq!(t.len(), 4, "{t:?}");
+        assert!(t[3].starts_with("Failed to load script"), "{t:?}");
+        assert!(h.state.scripts.blocking.is_none() && h.state.scripts.deferred.is_empty());
+        assert!(!h.state.is_loading());
+    }
+
+    #[test]
+    fn async_and_defer_scripts_run_in_their_own_order() {
+        let html = "<title>Async</title>\
+                    <script defer src=\"data:text/javascript,console.log('defer1')\"></script>\
+                    <script async src=\"data:text/javascript,console.log('async')\"></script>\
+                    <script defer src=\"data:text/javascript,console.log('defer2')\"></script>\
+                    <script defer>console.log('inline defer runs inline')</script>\
+                    <script>console.log('inline')</script>";
+        let mut h = Harness::start(data_url(html, None));
+        h.pump_n(3);
+        // Nothing external blocked the parser: the document is complete
+        // and its deferred scripts wait for their bodies.
+        assert!(h.state.doc.is_some() && h.state.parser.is_none());
+        assert_eq!(console_texts(&h), ["inline defer runs inline", "inline"]);
+        assert_eq!(h.state.scripts.deferred.len(), 2);
+        assert_eq!(h.state.scripts.asap.len(), 1);
+        h.pump();
+        // Deferred scripts keep document order; the async one runs as
+        // soon as it arrives, here between them.
+        assert_eq!(
+            console_texts(&h),
+            ["inline defer runs inline", "inline", "defer1", "async", "defer2"]
+        );
+    }
+
+    #[test]
+    fn module_scripts_load_their_imports_and_run_after_parsing() {
+        let html = "<title>Mod</title>\
+                    <script type=module>import { x } from \"data:text/javascript,export const x = 40 %2B 2\"; console.log('module', x);</script>\
+                    <script>console.log('classic')</script>\
+                    <script type=module>import x from 'nowhere';</script>\
+                    <script type=module src=\"data:text/javascript,console.log('external module')\"></script>\
+                    <script type=module>export {</script>\
+                    <script type=module src=\"data:text/plain,console.log('wrong mime')\"></script>\
+                    <script type=module async>console.log('async module')</script>";
+        let h = Harness::load(html);
+        let t = console_texts(&h);
+        assert_eq!(t[0], "classic", "classic scripts run during parsing, modules after: {t:?}");
+        assert!(t[1].starts_with("Uncaught SyntaxError"), "a module syntax error is reported at once: {t:?}");
+        assert_eq!(t[2], "async module", "an async inline module runs as soon as it is ready: {t:?}");
+        assert_eq!(t[3], "module 42", "{t:?}");
+        assert!(t[4].contains("Failed to resolve module specifier \"nowhere\""), "{t:?}");
+        assert_eq!(t[5], "external module", "{t:?}");
+        assert!(t[6].contains("text/plain"), "a module served as text is refused: {t:?}");
+        assert_eq!(t.len(), 7, "{t:?}");
+        assert!(!h.state.is_loading());
+    }
+
+    /// A loopback HTTP/1.1 server answering canned responses by path, able
+    /// to hold a response back until told. Nothing leaves the machine.
+    struct Server {
+        base: Url,
+        held: Arc<(Mutex<std::collections::HashSet<String>>, std::sync::Condvar)>,
+    }
+
+    impl Server {
+        fn start(routes: &[(&str, &str, &str)], held: &[&str]) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let routes: Arc<HashMap<String, (String, String)>> = Arc::new(
+                routes
+                    .iter()
+                    .map(|(p, ct, body)| ((*p).to_owned(), ((*ct).to_owned(), (*body).to_owned())))
+                    .collect(),
+            );
+            let held = Arc::new((
+                Mutex::new(held.iter().map(|s| (*s).to_owned()).collect::<std::collections::HashSet<_>>()),
+                std::sync::Condvar::new(),
+            ));
+            let gate = held.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let routes = routes.clone();
+                    let gate = gate.clone();
+                    std::thread::spawn(move || {
+                        let mut head = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let Ok(n) = stream.read(&mut buf) else { return };
+                            if n == 0 {
+                                return;
+                            }
+                            head.extend_from_slice(&buf[..n]);
+                        }
+                        let head = String::from_utf8_lossy(&head).into_owned();
+                        let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                        {
+                            let (set, cv) = &*gate;
+                            let mut set = set.lock().expect("lock");
+                            while set.contains(&path) {
+                                set = cv.wait(set).expect("wait");
+                            }
+                        }
+                        let response = match routes.get(&path) {
+                            Some((ct, body)) => format!(
+                                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            ),
+                            None => "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    });
+                }
+            });
+            Self {
+                base: Url::parse(&format!("http://127.0.0.1:{port}/")).expect("url"),
+                held,
+            }
+        }
+
+        fn url(&self, path: &str) -> Url {
+            self.base.join(path).expect("url")
+        }
+
+        fn hold(&self, path: &str) {
+            self.held.0.lock().expect("lock").insert(path.to_owned());
+        }
+
+        fn release(&self, path: &str) {
+            self.held.0.lock().expect("lock").remove(path);
+            self.held.1.notify_all();
+        }
+    }
+
+    #[test]
+    fn a_parser_blocking_script_waits_for_the_network_and_stop_gives_up_on_it() {
+        let page = "<title>Net</title><script>console.log('a')</script>\
+                    <script src=\"/slow.js\"></script><script>console.log('c')</script><p>x</p>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/slow.js", "text/javascript", "console.log('b')"),
+            ],
+            &["/slow.js"],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.scripts.blocking.is_some());
+        assert!(h.state.doc.is_none(), "nothing is shown while the parser waits for the script");
+        assert_eq!(console_texts(&h), ["a"]);
+        assert!(h.state.is_loading());
+        server.release("/slow.js");
+        h.pump_until(|h| h.state.doc.is_some());
+        assert_eq!(console_texts(&h), ["a", "b", "c"]);
+        assert_eq!(h.title().as_deref(), Some("Net"));
+        h.pump_until(|h| !h.state.is_loading());
+
+        // Stop while the parser waits: what has arrived is shown and the
+        // script is dropped, even when its response comes in later.
+        server.hold("/slow.js");
+        h.state.handle_shell(ShellToTab::Reload);
+        h.pump_until(|h| h.state.scripts.blocking.is_some());
+        assert_eq!(console_texts(&h), ["a", "b", "c", "a"]);
+        h.send(ShellToTab::Stop);
+        assert!(h.state.parser.is_none() && h.state.doc.is_some());
+        assert_eq!(h.title().as_deref(), Some("Net"));
+        assert!(!h.state.is_loading());
+        server.release("/slow.js");
+        h.pump_for(std::time::Duration::from_millis(300));
+        assert_eq!(console_texts(&h), ["a", "b", "c", "a"], "the late script did not run");
     }
 
     #[test]

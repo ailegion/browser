@@ -14,3 +14,4 @@ browser-dom.workspace = true
 boa_engine.workspace = true
 boa_gc.workspace = true
 boa_runtime.workspace = true
+url.workspace = true
