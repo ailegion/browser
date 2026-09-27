@@ -99,28 +99,132 @@ pub enum Reach {
     Subtree,
     /// Their later siblings too (`a:hover + .tip`): restyle from the parent.
     Parent,
-    /// Ancestors too (`:has(:hover)`): restyle everything.
+    /// `Parent`, plus the ancestors of the changed elements and the earlier
+    /// siblings of those (`li:has(a:hover)`, `h2:has(+ p:hover)`): the
+    /// only places the subject of a `:has()` in the subject compound can
+    /// be.
+    Ancestors,
+    /// `Ancestors`, plus the subtrees of those ancestors and earlier
+    /// siblings that carry a `:has()` left of a combinator
+    /// (`.menu:has(:hover) .item`): the subject is somewhere below the
+    /// `:has()` element.
     Document,
 }
 
-/// The reach of each state under the current stylesheets, and which
-/// elements beyond the changed ones a state change can restyle.
+/// The interaction states a selector can depend on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateKind {
+    Hover,
+    Active,
+    Focus,
+    Target,
+}
+
+/// Where the elements a state change can affect are, relative to the
+/// element whose state changed (the one the rule's trigger matches).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// Descendants matching the key (`li:hover > ul`).
+    Subtree(SubjectKey),
+    /// Later siblings and their descendants matching the key
+    /// (`a:hover + .tip`, `a:hover ~ p b`): the parent's subtree.
+    Siblings(SubjectKey),
+    /// The element carrying `:has()` with the state inside, which is an
+    /// ancestor of the changed element or an earlier sibling of one
+    /// (`li:has(a:hover)`, `h2:has(+ p:hover)`).
+    Above(SubjectKey),
+    /// A `:has()` element as above, but left of a combinator
+    /// (`.menu:has(:hover) .item`): the subjects are in its subtree.
+    AboveSubtree { has: SubjectKey, subject: SubjectKey },
+}
+
+/// One way a state change can alter the style of an element other than
+/// the changed one: when `trigger` matches the changed element, the
+/// elements in `scope` may match the selector differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateRule {
+    pub state: StateKind,
+    /// Key of the compound that carries the state pseudo-class.
+    pub trigger: SubjectKey,
+    pub scope: Scope,
+}
+
+/// The reach of each state under the current stylesheets (a summary for
+/// logging and tests), and the rules that say exactly what a change can
+/// affect. A changed element is always recomputed itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InteractionDeps {
     pub hover: Reach,
     pub active: Reach,
     pub focus: Reach,
     pub target: Reach,
-    /// Subjects of the selectors that put an interaction pseudo-class to
-    /// the left of a combinator or inside `:has()`: the only elements,
-    /// other than the ones whose state changed, whose matching can change.
-    pub subjects: SubjectKeys,
+    pub rules: Vec<StateRule>,
 }
 
-/// Keys of selector subjects (the rightmost compound), one per selector:
-/// its id if it has one, else its first class, else its tag, else it is
-/// universal. An element matching a subject matches at least its key, so
-/// testing the key is a cheap superset test.
+impl InteractionDeps {
+    pub fn reach(&self, state: StateKind) -> Reach {
+        match state {
+            StateKind::Hover => self.hover,
+            StateKind::Active => self.active,
+            StateKind::Focus => self.focus,
+            StateKind::Target => self.target,
+        }
+    }
+
+    pub fn reach_mut(&mut self, state: StateKind) -> &mut Reach {
+        match state {
+            StateKind::Hover => &mut self.hover,
+            StateKind::Active => &mut self.active,
+            StateKind::Focus => &mut self.focus,
+            StateKind::Target => &mut self.target,
+        }
+    }
+
+    pub fn rules_for(&self, state: StateKind) -> impl Iterator<Item = &StateRule> {
+        self.rules.iter().filter(move |r| r.state == state)
+    }
+}
+
+/// The key of one compound selector: its id if it has one, else its
+/// first class, else its tag, else universal. An element matching the
+/// compound matches its key, so the key is a cheap superset test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectKey {
+    Id(String),
+    Class(String),
+    Tag(LocalName),
+    Universal,
+}
+
+impl SubjectKey {
+    pub fn matches(&self, element: &browser_dom::Element) -> bool {
+        match self {
+            SubjectKey::Id(id) => element.id() == Some(id.as_str()),
+            SubjectKey::Class(class) => element.classes().any(|c| c == class),
+            SubjectKey::Tag(tag) => element.name.local == *tag,
+            SubjectKey::Universal => true,
+        }
+    }
+}
+
+impl SubjectKeys {
+    pub fn insert(&mut self, key: SubjectKey) {
+        match key {
+            SubjectKey::Id(id) => {
+                self.ids.insert(id);
+            }
+            SubjectKey::Class(class) => {
+                self.classes.insert(class);
+            }
+            SubjectKey::Tag(tag) => {
+                self.tags.insert(tag);
+            }
+            SubjectKey::Universal => self.universal = true,
+        }
+    }
+}
+
+/// A set of subject keys: the elements to recompute in one subtree walk.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SubjectKeys {
     /// Some subject has no id, class or tag (`.menu:hover *`), so every

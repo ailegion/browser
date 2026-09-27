@@ -69,10 +69,28 @@ impl TabHandle {
 
     /// Ask the tab to exit and wait for its thread to finish. When this
     /// returns, the thread is gone and everything it owned is dropped.
-    pub fn close(mut self) {
+    /// Blocks for as long as the tab's current unit of work takes, so the
+    /// shell uses `close` instead; this is for tests and shutdown.
+    pub fn close_and_wait(mut self) {
         let _ = self.sender.send(TabEvent::Shell(ShellToTab::Close));
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+    }
+
+    /// Ask the tab to exit without waiting. The thread finishes its
+    /// current unit of work, then ends and releases what it owned; a
+    /// helper thread reaps it so the shell never blocks on a busy tab.
+    pub fn close(mut self) {
+        let _ = self.sender.send(TabEvent::Shell(ShellToTab::Close));
+        if let Some(t) = self.thread.take() {
+            let id = self.id;
+            let _ = std::thread::Builder::new()
+                .name(format!("tab-{}-reaper", id.0))
+                .spawn(move || {
+                    let _ = t.join();
+                    tracing::debug!(tab = id.0, "tab thread ended");
+                });
         }
     }
 }
@@ -317,8 +335,8 @@ mod tests {
         assert!(Arc::strong_count(&net) > 1, "the tab holds the net service");
 
         let Spawned { tab, messages, token } = s;
-        tab.close();
-        // `close` joined the thread: everything it owned is gone.
+        tab.close_and_wait();
+        // The thread was joined: everything it owned is gone.
         assert!(token.upgrade().is_none(), "the sink, and with it the tab state, was dropped");
         assert_eq!(Arc::strong_count(&net), 1, "the tab's reference to the net service was released");
         let last = std::iter::from_fn(|| messages.try_recv().ok()).last();
@@ -357,8 +375,8 @@ mod tests {
         });
         b.wait_for_title("B again");
 
-        a.tab.close();
-        b.tab.close();
+        a.tab.close_and_wait();
+        b.tab.close_and_wait();
         assert!(a.token.upgrade().is_none() && b.token.upgrade().is_none());
         assert_eq!(Arc::strong_count(&net), 1);
     }

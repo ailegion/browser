@@ -12,8 +12,8 @@ use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
-    ElementStates, InteractionDeps, Origin, Reach, Rule, StateChange, StyleMap, Stylesheet, Stylist, compute_styles_with,
-    restyle,
+    ElementStates, InteractionDeps, Origin, Reach, Rule, StateChange, StateKind, StyleMap, Stylesheet, Stylist,
+    compute_styles_with, restyle,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -461,8 +461,7 @@ impl TabState {
         self.needs_paint = true;
 
         let changed = self.states.set_single(target, ElementStates::TARGET);
-        let reach = self.deps.target;
-        self.restyle_for(changed, reach);
+        self.restyle_for(changed, StateKind::Target);
     }
 
     /// The tab wants to be woken at this instant even if no event arrives.
@@ -584,15 +583,13 @@ impl TabState {
 
         let Some(doc) = &self.doc else { return };
         let changed = self.states.set_chain(doc, hit, ElementStates::HOVER);
-        let reach = self.deps.hover;
-        self.restyle_for(changed, reach);
+        self.restyle_for(changed, StateKind::Hover);
     }
 
     fn set_active(&mut self, target: Option<NodeId>) {
         let Some(doc) = &self.doc else { return };
         let changed = self.states.set_chain(doc, target, ElementStates::ACTIVE);
-        let reach = self.deps.active;
-        self.restyle_for(changed, reach);
+        self.restyle_for(changed, StateKind::Active);
     }
 
     fn set_focus(&mut self, target: Option<NodeId>) {
@@ -605,13 +602,13 @@ impl TabState {
         changed.extend(self.states.set_chain(doc, target, ElementStates::FOCUS_WITHIN));
         changed.sort();
         changed.dedup();
-        let reach = self.deps.focus;
-        self.restyle_for(changed, reach);
+        self.restyle_for(changed, StateKind::Focus);
     }
 
     /// Restyle what a state change on `changed` can affect, per `reach`,
     /// and schedule layout if any computed style moved.
-    fn restyle_for(&mut self, changed: Vec<NodeId>, reach: Reach) {
+    fn restyle_for(&mut self, changed: Vec<NodeId>, state: StateKind) {
+        let reach = self.deps.reach(state);
         if changed.is_empty() || reach == Reach::None {
             return;
         }
@@ -627,8 +624,8 @@ impl TabState {
             &mut self.styles,
             StateChange {
                 changed: &changed,
-                reach,
-                subjects: &self.deps.subjects,
+                state,
+                deps: &self.deps,
             },
         );
         tracing::debug!(

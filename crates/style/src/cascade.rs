@@ -18,7 +18,7 @@ use crate::computed::{ComputedStyle, DeclaredValues, Viewport, compute};
 use crate::custom::{expand_pending, resolve_customs};
 use crate::properties::{CustomValue, Declaration, DeclaredValue};
 use crate::selector_impl::{BrowserSelectors, ElementRef, PseudoClass};
-use crate::state::{ElementStates, InteractionDeps, NO_STATES, Reach, SubjectKeys};
+use crate::state::{ElementStates, InteractionDeps, NO_STATES, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 use crate::stylesheet::{Origin, Rule, StyleRule, Stylesheet, parse_declaration_block};
 
 /// Computed style per element. Text nodes have no entry; use the parent's.
@@ -168,8 +168,8 @@ pub fn compute_styles_with(
     let Some(root) = doc.document_element() else {
         return styles;
     };
-    let mut restyler = Restyler::new(doc, stylist, viewport, states, &[], None);
-    restyler.restyle_subtree(root, &mut styles, true);
+    let mut restyler = Restyler::new(doc, stylist, viewport, states, &[]);
+    restyler.restyle_all(root, &mut styles);
     styles
 }
 
@@ -182,20 +182,19 @@ pub struct Restyled {
     pub styled: usize,
 }
 
-/// One interaction state changed on `changed`; `reach` is how far that
-/// state reaches under the sheets and `subjects` the subjects of the
-/// selectors that carry any state past a combinator.
+/// One interaction state changed on the `changed` elements, under `deps`.
 #[derive(Debug, Clone, Copy)]
 pub struct StateChange<'a> {
     pub changed: &'a [NodeId],
-    pub reach: Reach,
-    pub subjects: &'a SubjectKeys,
+    pub state: StateKind,
+    pub deps: &'a InteractionDeps,
 }
 
 /// Recompute, in place, the styles a state change can affect: the changed
-/// elements, the elements in reach whose key is in the subjects, and every
-/// descendant of an element whose computed style did change, since it may
-/// inherit from it. Everything else keeps its style.
+/// elements; for each rule of that state whose trigger matches a changed
+/// element, the elements its scope names; and every descendant of an
+/// element whose computed style did change, since it may inherit from
+/// it. Everything else keeps its style.
 pub fn restyle(
     doc: &Document,
     stylist: &Stylist,
@@ -204,40 +203,69 @@ pub fn restyle(
     styles: &mut StyleMap,
     change: StateChange<'_>,
 ) -> Restyled {
-    let StateChange {
-        changed,
-        reach,
-        subjects,
-    } = change;
-    if changed.is_empty() || reach == Reach::None {
+    let StateChange { changed, state, deps } = change;
+    if changed.is_empty() || deps.reach(state) == Reach::None {
         return Restyled::default();
     }
-    let (roots, descendants): (Vec<NodeId>, bool) = match reach {
-        Reach::None => return Restyled::default(),
-        Reach::Element => (changed.to_vec(), false),
-        Reach::Subtree => (changed.to_vec(), true),
-        Reach::Parent => {
-            let mut parents: Vec<NodeId> = changed
-                .iter()
-                .map(|&n| doc.parent(n).filter(|&p| doc.get(p).is_element()).unwrap_or(n))
-                .collect();
-            parents.sort();
-            parents.dedup();
-            (parents, true)
+
+    // Subtree walks, keyed by root, with the keys of the elements to
+    // recompute below it; and elements to recompute on their own.
+    let mut walks: HashMap<NodeId, SubjectKeys> = HashMap::new();
+    let mut singles: Vec<NodeId> = Vec::new();
+    let parent_of = |n: NodeId| doc.parent(n).filter(|&p| doc.get(p).is_element()).unwrap_or(n);
+    for &e in changed {
+        let Some(element) = doc.element(e) else { continue };
+        // Where the element of a `:has()` with `e` inside can be: an
+        // ancestor of `e`, or an earlier sibling of `e` or of an ancestor.
+        let mut above: Option<Vec<NodeId>> = None;
+        for rule in deps.rules_for(state) {
+            if !rule.trigger.matches(element) {
+                continue;
+            }
+            match &rule.scope {
+                Scope::Subtree(key) => walks.entry(e).or_default().insert(key.clone()),
+                Scope::Siblings(key) => walks.entry(parent_of(e)).or_default().insert(key.clone()),
+                Scope::Above(has) | Scope::AboveSubtree { has, .. } => {
+                    let candidates = above.get_or_insert_with(|| ancestors_and_earlier_siblings(doc, e));
+                    for &c in candidates.iter() {
+                        if !doc.element(c).is_some_and(|el| has.matches(el)) {
+                            continue;
+                        }
+                        match &rule.scope {
+                            Scope::Above(_) => singles.push(c),
+                            Scope::AboveSubtree { subject, .. } => {
+                                walks.entry(c).or_default().insert(subject.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
-        Reach::Document => (doc.document_element().into_iter().collect(), true),
-    };
+    }
+    // A changed element inside a walk is recomputed there (it is in
+    // `must`); the rest are recomputed on their own.
+    for &e in changed {
+        if !walks.keys().any(|&r| r == e || is_inside(doc, e, r)) {
+            singles.push(e);
+        }
+    }
+
+    // Parents before children, so inherited values are current when a
+    // child is recomputed.
+    let mut jobs: Vec<(NodeId, Option<SubjectKeys>)> = walks.into_iter().map(|(n, k)| (n, Some(k))).collect();
+    singles.sort();
+    singles.dedup();
+    jobs.extend(singles.into_iter().map(|n| (n, None)));
+    jobs.sort_by_key(|(n, _)| depth(doc, *n));
+
     let mut must = changed.to_vec();
     must.sort();
     must.dedup();
-    let mut restyler = Restyler::new(doc, stylist, viewport, states, &must, Some(subjects));
+    let mut restyler = Restyler::new(doc, stylist, viewport, states, &must);
     let mut result = Restyled::default();
-    for &root in &roots {
-        // A root inside another root's subtree is covered by it.
-        if descendants && roots.iter().any(|&other| other != root && is_inside(doc, root, other)) {
-            continue;
-        }
-        result.moved |= restyler.restyle_subtree(root, styles, descendants);
+    for (root, keys) in &jobs {
+        result.moved |= restyler.restyle_subtree(*root, styles, keys.as_ref());
     }
     result.styled = restyler.styled;
     result
@@ -254,6 +282,35 @@ fn is_inside(doc: &Document, node: NodeId, ancestor: NodeId) -> bool {
     false
 }
 
+fn depth(doc: &Document, mut n: NodeId) -> usize {
+    let mut d = 0;
+    while let Some(p) = doc.parent(n) {
+        d += 1;
+        n = p;
+    }
+    d
+}
+
+/// `e`, its ancestors, and the earlier siblings of each of those.
+fn ancestors_and_earlier_siblings(doc: &Document, e: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut cur = Some(e);
+    while let Some(a) = cur {
+        if doc.get(a).is_element() {
+            out.push(a);
+            let mut sib = doc.prev_sibling(a);
+            while let Some(s) = sib {
+                if doc.get(s).is_element() {
+                    out.push(s);
+                }
+                sib = doc.prev_sibling(s);
+            }
+        }
+        cur = doc.parent(a);
+    }
+    out
+}
+
 /// Computes elements' styles one at a time over a prepared rule index.
 struct Restyler<'a> {
     doc: &'a Document,
@@ -266,9 +323,6 @@ struct Restyler<'a> {
     initial: Arc<ComputedStyle>,
     /// Elements whose own state changed: always recomputed. Sorted.
     must: &'a [NodeId],
-    /// When set, other elements are recomputed only if their key is here
-    /// or their parent's style changed.
-    subjects: Option<&'a SubjectKeys>,
     styled: usize,
 }
 
@@ -279,7 +333,6 @@ impl<'a> Restyler<'a> {
         viewport: &'a Viewport,
         states: &'a ElementStates,
         must: &'a [NodeId],
-        subjects: Option<&'a SubjectKeys>,
     ) -> Self {
         Self {
             doc,
@@ -295,18 +348,37 @@ impl<'a> Restyler<'a> {
             states,
             initial: Arc::new(ComputedStyle::initial()),
             must,
-            subjects,
             styled: 0,
         }
     }
 
-    /// Style `root` and, when `descendants`, what is below it, in
-    /// pre-order so parents are computed before children. Below the root
-    /// an element is recomputed if its parent's style changed (it may
-    /// inherit from it), if its own state changed, or if it is a subject
-    /// candidate; with no subject filter, everything is. Returns whether
-    /// any style in `styles` changed.
-    fn restyle_subtree(&mut self, root: NodeId, styles: &mut StyleMap, descendants: bool) -> bool {
+    /// Style everything under `root`, in pre-order so parents are computed
+    /// before children.
+    fn restyle_all(&mut self, root: NodeId, styles: &mut StyleMap) -> bool {
+        self.walk(root, styles, true, None)
+    }
+
+    /// Style `root`; below it, recompute the elements whose key is in
+    /// `keys` (none if `keys` is `None`), the elements whose own state
+    /// changed, and every descendant of an element whose style changed
+    /// (it may inherit from it). Returns whether any style changed.
+    fn restyle_subtree(&mut self, root: NodeId, styles: &mut StyleMap, keys: Option<&SubjectKeys>) -> bool {
+        match keys {
+            Some(keys) => {
+                let keep = |e: &browser_dom::Element| keys.matches(e);
+                self.walk(root, styles, true, Some(&keep))
+            }
+            None => self.walk(root, styles, false, Some(&|_: &browser_dom::Element| false)),
+        }
+    }
+
+    fn walk(
+        &mut self,
+        root: NodeId,
+        styles: &mut StyleMap,
+        descendants: bool,
+        filter: Option<&dyn Fn(&browser_dom::Element) -> bool>,
+    ) -> bool {
         let doc = self.doc;
         let doc_root = doc.document_element();
         let mut changed = false;
@@ -316,7 +388,7 @@ impl<'a> Restyler<'a> {
             let Some(element) = doc.element(id) else { continue };
             let recompute = forced
                 || self.must.binary_search(&id).is_ok()
-                || self.subjects.is_none_or(|keys| keys.matches(element));
+                || filter.is_none_or(|keep| keep(element));
             let mut changed_here = false;
             if recompute {
                 let is_root = Some(id) == doc_root;
@@ -458,9 +530,15 @@ impl Stylist {
                 match r {
                     Rule::Style(s) => {
                         for selector in s.selectors.slice() {
-                            if scan_selector(selector.iter_raw_match_order(), Reach::Element, deps) {
-                                add_subject_key(selector, &mut deps.subjects);
-                            }
+                            let subject: Vec<&Component<BrowserSelectors>> = selector
+                                .iter_raw_match_order()
+                                .take_while(|c| !is_tree_combinator(c))
+                                .collect();
+                            let ctx = ScanCtx {
+                                subject: compound_key(&subject),
+                                has: None,
+                            };
+                            scan_selector(selector.iter_raw_match_order(), Reach::Element, deps, &ctx, None);
                         }
                     }
                     Rule::Media(_, inner) => walk(inner, deps),
@@ -475,69 +553,136 @@ impl Stylist {
     }
 }
 
+/// Whether a combinator separates two elements' compounds (pseudo-element
+/// and shadow combinators stay within one element's compound).
+fn is_tree_combinator(c: &Component<BrowserSelectors>) -> bool {
+    matches!(
+        c,
+        Component::Combinator(
+            Combinator::Child | Combinator::Descendant | Combinator::NextSibling | Combinator::LaterSibling
+        )
+    )
+}
+
+/// What a nested scan needs to know about the selector it is part of.
+struct ScanCtx {
+    /// Key of the whole selector's subject.
+    subject: SubjectKey,
+    /// Inside a `:has()`: the key of the element carrying it, and whether
+    /// that element is the subject (the `:has()` is in the subject
+    /// compound) rather than left of a combinator.
+    has: Option<(SubjectKey, bool)>,
+}
+
 /// Scan a selector's components in match order (right to left). `reach` is
 /// what a pseudo-class in the rightmost compound would need; each
-/// combinator crossed widens it for the compounds to its left. Returns
-/// whether a state pseudo-class was found beyond the subject, in which
-/// case a state change elsewhere can change what the subject matches.
+/// combinator crossed widens it for the compounds to its left. Records
+/// each state's reach and, for every state pseudo-class that can change
+/// another element's matching, a `StateRule`. `outer` is the key of the
+/// compound a nested selector list (`:is()`, `:not()`) sits in: an inner
+/// selector's own subject compound matches that same element.
 fn scan_selector<'a>(
     components: impl Iterator<Item = &'a Component<BrowserSelectors>>,
     mut reach: Reach,
     deps: &mut InteractionDeps,
-) -> bool {
-    let mut beyond_subject = false;
-    for c in components {
-        match c {
-            Component::Combinator(comb) => {
-                reach = reach.max(match comb {
-                    Combinator::Child | Combinator::Descendant => Reach::Subtree,
-                    Combinator::NextSibling | Combinator::LaterSibling => Reach::Parent,
-                    _ => reach,
-                });
-            }
-            Component::NonTSPseudoClass(pc) => {
-                let state = match pc {
-                    PseudoClass::Hover => Some(&mut deps.hover),
-                    PseudoClass::Active => Some(&mut deps.active),
-                    PseudoClass::Focus | PseudoClass::FocusVisible | PseudoClass::FocusWithin => Some(&mut deps.focus),
-                    PseudoClass::Target => Some(&mut deps.target),
-                    _ => None,
-                };
-                if let Some(state) = state {
-                    *state = (*state).max(reach);
-                    beyond_subject |= reach > Reach::Element;
+    ctx: &ScanCtx,
+    outer: Option<&SubjectKey>,
+) {
+    let components: Vec<&Component<BrowserSelectors>> = components.collect();
+    for (i, compound) in components.split_inclusive(|c| is_tree_combinator(c)).enumerate() {
+        let (compound, combinator) = match compound.split_last() {
+            Some((last, rest)) if is_tree_combinator(last) => (rest, Some(*last)),
+            _ => (compound, None),
+        };
+        let key = compound_key(compound);
+        // A keyless subject compound of a nested selector is the element
+        // of the compound around it.
+        let trigger = match (&key, outer) {
+            (SubjectKey::Universal, Some(o)) if i == 0 => o.clone(),
+            _ => key.clone(),
+        };
+        for c in compound {
+            match c {
+                Component::NonTSPseudoClass(pc) => {
+                    let state = match pc {
+                        PseudoClass::Hover => Some(StateKind::Hover),
+                        PseudoClass::Active => Some(StateKind::Active),
+                        PseudoClass::Focus | PseudoClass::FocusVisible | PseudoClass::FocusWithin => {
+                            Some(StateKind::Focus)
+                        }
+                        PseudoClass::Target => Some(StateKind::Target),
+                        _ => None,
+                    };
+                    let Some(state) = state else { continue };
+                    let r = deps.reach_mut(state);
+                    *r = (*r).max(reach);
+                    let scope = match (&ctx.has, reach) {
+                        (Some((has, true)), _) => Scope::Above(has.clone()),
+                        (Some((has, false)), _) => Scope::AboveSubtree {
+                            has: has.clone(),
+                            subject: ctx.subject.clone(),
+                        },
+                        (None, Reach::None | Reach::Element) => continue,
+                        (None, Reach::Subtree) => Scope::Subtree(ctx.subject.clone()),
+                        (None, Reach::Parent | Reach::Ancestors | Reach::Document) => {
+                            Scope::Siblings(ctx.subject.clone())
+                        }
+                    };
+                    deps.rules.push(StateRule {
+                        state,
+                        trigger: trigger.clone(),
+                        scope,
+                    });
                 }
-            }
-            Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
-                for s in list.slice() {
-                    beyond_subject |= scan_selector(s.iter_raw_match_order(), reach, deps);
+                Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
+                    for s in list.slice() {
+                        scan_selector(s.iter_raw_match_order(), reach, deps, ctx, Some(&trigger));
+                    }
                 }
-            }
-            // `:has()` looks down and sideways, so a state change there
-            // affects the subject above it.
-            Component::Has(list) => {
-                for rs in list.iter() {
-                    beyond_subject |= scan_selector(rs.selector.iter_raw_match_order(), Reach::Document, deps);
+                // `:has()` looks down and sideways from its element, so a
+                // state inside it is on an element below or after that
+                // one. The outermost `:has()` is the one whose element
+                // matters; nested ones keep its context.
+                Component::Has(list) => {
+                    let in_subject = reach <= Reach::Element;
+                    let inner_ctx = match &ctx.has {
+                        Some(_) => None,
+                        None => Some(ScanCtx {
+                            subject: ctx.subject.clone(),
+                            has: Some((trigger.clone(), in_subject)),
+                        }),
+                    };
+                    let inside = if in_subject { Reach::Ancestors } else { Reach::Document };
+                    for rs in list.iter() {
+                        scan_selector(
+                            rs.selector.iter_raw_match_order(),
+                            reach.max(inside),
+                            deps,
+                            inner_ctx.as_ref().unwrap_or(ctx),
+                            None,
+                        );
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+        if let Some(Component::Combinator(comb)) = combinator {
+            reach = reach.max(match comb {
+                Combinator::Child | Combinator::Descendant => Reach::Subtree,
+                Combinator::NextSibling | Combinator::LaterSibling => Reach::Parent,
+                _ => reach,
+            });
         }
     }
-    beyond_subject
 }
 
-/// Record the key of a selector's subject, its rightmost compound: id,
-/// else first class, else tag, else universal. A pseudo-element belongs
-/// to the element before it, so its compound does not end the subject.
-fn add_subject_key(selector: &selectors::parser::Selector<BrowserSelectors>, keys: &mut SubjectKeys) {
+/// The key of one compound: id, else first class, else tag, else universal.
+fn compound_key(compound: &[&Component<BrowserSelectors>]) -> SubjectKey {
     let mut id = None;
     let mut class = None;
     let mut tag = None;
-    for c in selector.iter_raw_match_order() {
+    for c in compound {
         match c {
-            Component::Combinator(
-                Combinator::Child | Combinator::Descendant | Combinator::NextSibling | Combinator::LaterSibling,
-            ) => break,
             Component::ID(i) => id = Some(i.0.to_string()),
             Component::Class(c) if class.is_none() => class = Some(c.0.to_string()),
             Component::LocalName(ln) => tag = Some(ln.lower_name.0.clone()),
@@ -545,15 +690,16 @@ fn add_subject_key(selector: &selectors::parser::Selector<BrowserSelectors>, key
         }
     }
     if let Some(id) = id {
-        keys.ids.insert(id);
+        SubjectKey::Id(id)
     } else if let Some(class) = class {
-        keys.classes.insert(class);
+        SubjectKey::Class(class)
     } else if let Some(tag) = tag {
-        keys.tags.insert(tag);
+        SubjectKey::Tag(tag)
     } else {
-        keys.universal = true;
+        SubjectKey::Universal
     }
 }
+
 
 /// HTML attributes that map to CSS (a subset of the rendering section of
 /// the HTML spec). These sit below author styles.
@@ -778,17 +924,17 @@ mod tests {
 
         let deps = stylist.interaction_deps();
         assert_eq!(deps.hover, Reach::Subtree);
-        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
         assert!(r.moved);
         for (id, s) in full.iter() {
             assert_eq!(**s, *styles[id]);
         }
-        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
         assert!(!r.moved, "nothing left to change");
 
         // Leaving: the same roots, back to the plain styles.
         let changed = states.set_chain(&doc, None, ElementStates::HOVER);
-        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects }).moved);
+        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps }).moved);
         assert_eq!(styles[a].background_color.to_rgba8(), [0, 0, 0, 0]);
         assert_eq!(styles[a].font_weight, 700, "focus is separate from hover");
         assert_eq!(styles[span].color.to_rgba8(), [0, 0, 0, 255]);
@@ -810,9 +956,17 @@ mod tests {
         )));
         let deps = stylist.interaction_deps();
         assert_eq!(deps.hover, Reach::Parent);
-        assert!(deps.subjects.classes.contains("x"));
-        assert!(deps.subjects.tags.contains(&LocalName::from("li")));
-        assert!(!deps.subjects.universal);
+        assert!(deps.rules.contains(&StateRule {
+            state: StateKind::Hover,
+            trigger: tag("div"),
+            scope: Scope::Subtree(SubjectKey::Class("x".into())),
+        }));
+        assert!(deps.rules.contains(&StateRule {
+            state: StateKind::Hover,
+            trigger: tag("li"),
+            scope: Scope::Siblings(tag("li")),
+        }));
+        assert_eq!(deps.rules.len(), 2, "{:?}", deps.rules);
 
         let vp = Viewport::default();
         let mut styles = compute_styles(&doc, &stylist, &vp);
@@ -820,16 +974,130 @@ mod tests {
         let mut states = ElementStates::default();
         let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
         let full = compute_styles_with(&doc, &stylist, &vp, &states);
-        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
         assert!(r.moved);
         for (id, s) in full.iter() {
             assert_eq!(**s, *styles[id]);
         }
         let span_in_a = doc.children(a).find(|&c| doc.get(c).is_element()).expect("span");
         assert_eq!(styles[span_in_a].color.to_rgba8(), [0, 0, 255, 255], "inherited from the hovered link");
-        // Reach is Parent, so the root is the chain's topmost parent, html:
-        // html, head, body, div, p.x, li, li, a, span = 9 at most.
-        assert!(r.styled <= 9, "recomputed {} elements", r.styled);
+        // The chain html, body, div, a; the div's rule walks its subtree
+        // for `.x`; a's change forces its span. The li rule is not
+        // triggered: no li changed.
+        assert_eq!(r.styled, 6, "recomputed {} elements", r.styled);
+    }
+
+    fn tag(t: &str) -> SubjectKey {
+        SubjectKey::Tag(LocalName::from(t))
+    }
+
+    #[test]
+    fn has_in_the_subject_restyles_ancestors_and_earlier_siblings_only() {
+        // Hovering `a` (inside the second li) can change: the li (ancestor,
+        // `li:has(a:hover)`), the h2 before the list (`h2:has(+ ul a:hover)`
+        // is an earlier sibling of an ancestor), and a's span (inherits).
+        // Not: the first li, the third li, or the p after the list.
+        let doc = parse_html(
+            b"<h2>t</h2><ul><li>one</li><li><a href=x><span>two</span></a></li><li>three</li></ul><p>after</p>",
+        );
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            "li:has(a:hover) { color: red } h2:has(+ ul a:hover) { color: blue } p { color: green }",
+            Origin::Author,
+        )));
+        let deps = stylist.interaction_deps();
+        assert_eq!(deps.hover, Reach::Ancestors);
+        assert!(deps.rules.contains(&StateRule {
+            state: StateKind::Hover,
+            trigger: tag("a"),
+            scope: Scope::Above(tag("li")),
+        }));
+        assert!(deps.rules.contains(&StateRule {
+            state: StateKind::Hover,
+            trigger: tag("a"),
+            scope: Scope::Above(tag("h2")),
+        }));
+
+        let vp = Viewport::default();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let a = find(&doc, "a");
+        let mut states = ElementStates::default();
+        let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
+        let full = compute_styles_with(&doc, &stylist, &vp, &states);
+        let r = restyle(
+            &doc,
+            &stylist,
+            &vp,
+            &states,
+            &mut styles,
+            StateChange { changed: &changed, state: StateKind::Hover, deps: &deps },
+        );
+        assert!(r.moved);
+        for (id, s) in full.iter() {
+            assert_eq!(**s, *styles[id]);
+        }
+        let h2 = find(&doc, "h2");
+        assert_eq!(styles[h2].color.to_rgba8(), [0, 0, 255, 255]);
+        let li = doc.parent(a).expect("li");
+        assert_eq!(styles[li].color.to_rgba8(), [255, 0, 0, 255]);
+        // Recomputed: the chain html, body, ul, li, a; the h2 candidate;
+        // and the li's change forces its subtree (a again, span).
+        assert!(r.styled <= 8, "recomputed {} elements", r.styled);
+    }
+
+    #[test]
+    fn has_left_of_a_combinator_restyles_the_scope_subtree_only() {
+        // Hovering the link: the first `.menu` is an earlier sibling of
+        // it, so its subtree is in scope (`:has(~ a:hover)`), and the
+        // `.item` there turns red. The second `.menu` after the link and
+        // the `.item` outside any menu are untouched.
+        let doc = parse_html(
+            b"<div class=menu><span class=item>a</span><b>x</b></div><a href=x>link</a>\
+              <div class=menu><span class=item>b</span></div><p class=item>c</p>",
+        );
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            ".menu:has(~ a:hover) .item { color: red }",
+            Origin::Author,
+        )));
+        let deps = stylist.interaction_deps();
+        assert_eq!(deps.hover, Reach::Document);
+        assert_eq!(
+            deps.rules,
+            vec![StateRule {
+                state: StateKind::Hover,
+                trigger: tag("a"),
+                scope: Scope::AboveSubtree {
+                    has: SubjectKey::Class("menu".into()),
+                    subject: SubjectKey::Class("item".into()),
+                },
+            }]
+        );
+        let vp = Viewport::default();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let a = find(&doc, "a");
+        let mut states = ElementStates::default();
+        let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
+        let full = compute_styles_with(&doc, &stylist, &vp, &states);
+        let r = restyle(
+            &doc,
+            &stylist,
+            &vp,
+            &states,
+            &mut styles,
+            StateChange { changed: &changed, state: StateKind::Hover, deps: &deps },
+        );
+        assert!(r.moved);
+        for (id, s) in full.iter() {
+            assert_eq!(**s, *styles[id]);
+        }
+        let first_item = find(&doc, "span");
+        assert_eq!(styles[first_item].color.to_rgba8(), [255, 0, 0, 255]);
+        // Chain html, body, a; the first menu's subtree: item only (b is
+        // no subject); the second menu and the p are never visited.
+        assert!(r.styled <= 6, "recomputed {} elements", r.styled);
     }
 
     #[test]
@@ -839,13 +1107,20 @@ mod tests {
         stylist.add_sheet(ua_stylesheet());
         stylist.add_sheet(Arc::new(Stylesheet::parse("div:hover * { color: red }", Origin::Author)));
         let deps = stylist.interaction_deps();
-        assert!(deps.subjects.universal);
+        assert_eq!(
+            deps.rules,
+            vec![StateRule {
+                state: StateKind::Hover,
+                trigger: tag("div"),
+                scope: Scope::Subtree(SubjectKey::Universal),
+            }]
+        );
         let vp = Viewport::default();
         let mut styles = compute_styles(&doc, &stylist, &vp);
         let div = find(&doc, "div");
         let mut states = ElementStates::default();
         let changed = states.set_chain(&doc, Some(div), ElementStates::HOVER);
-        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
         assert!(r.moved);
         for p in doc.children(div).filter(|&c| doc.get(c).is_element()) {
             assert_eq!(styles[p].color.to_rgba8(), [255, 0, 0, 255]);
@@ -860,13 +1135,13 @@ mod tests {
         stylist.add_sheet(Arc::new(Stylesheet::parse("a:hover { color: red }", Origin::Author)));
         let deps = stylist.interaction_deps();
         assert_eq!(deps.hover, Reach::Element);
-        assert!(deps.subjects.is_empty());
+        assert!(deps.rules.is_empty());
         let vp = Viewport::default();
         let mut styles = compute_styles(&doc, &stylist, &vp);
         let (a, span) = (find(&doc, "a"), find(&doc, "span"));
         let mut states = ElementStates::default();
         let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
-        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
         assert!(r.moved);
         assert_eq!(styles[span].color.to_rgba8(), [255, 0, 0, 255]);
     }
@@ -884,22 +1159,57 @@ mod tests {
         assert_eq!((d.hover, d.active), (Reach::Subtree, Reach::Element));
         assert_eq!(deps("a:hover + .tip { }").hover, Reach::Parent);
         assert_eq!(deps("nav:hover li ~ li { }").hover, Reach::Parent);
+        let class = |c: &str| SubjectKey::Class(c.into());
+        let rule = |state, trigger, scope| StateRule { state, trigger, scope };
         let d = deps("div:has(a:hover) { }");
+        assert_eq!(d.hover, Reach::Ancestors);
+        assert_eq!(d.rules, vec![rule(StateKind::Hover, tag("a"), Scope::Above(tag("div")))]);
+        let d = deps(".menu:has(:hover) .item { }");
         assert_eq!(d.hover, Reach::Document);
-        assert!(d.subjects.tags.contains(&LocalName::from("div")));
+        assert_eq!(
+            d.rules,
+            vec![rule(
+                StateKind::Hover,
+                SubjectKey::Universal,
+                Scope::AboveSubtree { has: class("menu"), subject: class("item") }
+            )]
+        );
+        let d = deps("#map:has(tr[data-x]:hover) svg .rir { }");
+        assert_eq!(
+            d.rules,
+            vec![rule(
+                StateKind::Hover,
+                tag("tr"),
+                Scope::AboveSubtree { has: SubjectKey::Id("map".into()), subject: class("rir") }
+            )]
+        );
+        assert!(deps(".a:has(.b) .c { }").rules.is_empty(), "no state inside");
         let d = deps(":is(a:focus, .x) span { }");
         assert_eq!(d.focus, Reach::Subtree);
-        assert!(d.subjects.tags.contains(&LocalName::from("span")));
+        assert_eq!(d.rules, vec![rule(StateKind::Focus, tag("a"), Scope::Subtree(tag("span")))]);
+        // A keyless nested subject is the element of the compound around it.
+        let d = deps(".k:not(:hover) > b { }");
+        assert_eq!(d.rules, vec![rule(StateKind::Hover, class("k"), Scope::Subtree(tag("b")))]);
         let d = deps("#m:hover .item, .n:hover > b.c { }");
-        assert!(d.subjects.classes.contains("item") && d.subjects.classes.contains("c"));
-        assert!(d.subjects.tags.is_empty() && !d.subjects.universal);
-        assert!(deps("a:hover, .x:focus { }").subjects.is_empty(), "no combinator, no subject key");
+        assert_eq!(
+            d.rules,
+            vec![
+                rule(StateKind::Hover, SubjectKey::Id("m".into()), Scope::Subtree(class("item"))),
+                rule(StateKind::Hover, class("n"), Scope::Subtree(class("c"))),
+            ]
+        );
+        assert!(deps("a:hover, .x:focus { }").rules.is_empty(), "no combinator, no rule");
         // A pseudo-element does not end the subject compound, and a
         // `:has()` without a state inside is not a state dependency.
         let d = deps(".m:hover > .n::after, .q:has(.r):active + .s::before { }");
-        assert!(d.subjects.classes.contains("n") && d.subjects.classes.contains("s"));
-        assert!(!d.subjects.universal);
-        assert!(deps("a:has(+ .x)::after { }").subjects.is_empty());
+        assert_eq!(
+            d.rules,
+            vec![
+                rule(StateKind::Hover, class("m"), Scope::Subtree(class("n"))),
+                rule(StateKind::Active, class("q"), Scope::Siblings(class("s"))),
+            ]
+        );
+        assert!(deps("a:has(+ .x)::after { }").rules.is_empty());
         assert_eq!(deps("a:has(+ .x)::after { }").hover, Reach::None);
         assert_eq!(deps("@media (min-width: 1px) { .x:not(:focus-within) { } }").focus, Reach::Element);
         assert_eq!(deps("h2:target { color: red }").target, Reach::Element);

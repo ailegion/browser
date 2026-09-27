@@ -21,7 +21,7 @@ pub mod ua;
 pub mod values;
 
 pub use cascade::{Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
-pub use state::{ElementStates, InteractionDeps, Reach, SubjectKeys};
+pub use state::{ElementStates, InteractionDeps, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 pub use computed::{ComputedStyle, LineHeight, Viewport};
 pub use properties::*;
 pub use media::MediaQueryList;

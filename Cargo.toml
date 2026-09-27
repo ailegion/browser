@@ -105,6 +105,13 @@ panic = "unwind"
 # Dependencies at opt-level 2 keep debug builds of the renderer and parser usable.
 [profile.dev.package."*"]
 opt-level = 2
+# With debug assertions on and no `log` backend, ICU4X prints "No
+# segmentation model for complex script" to stderr for every run of
+# Chinese, Japanese or Thai text it breaks lines in; thousands of console
+# writes per page. The condition is real (parley ships no dictionaries for
+# those scripts; see O17) but the print is noise.
+[profile.dev.package.icu_provider]
+debug-assertions = false
 
 [profile.release]
 panic = "unwind"

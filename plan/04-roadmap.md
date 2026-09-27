@@ -154,9 +154,10 @@ Work:
    form controls and `tabindex` elements; keyboard focus and tab order are
    item 7. The tab reports the cursor to show (`TabToShell::Cursor`).
    Tests: three tab-level tests drive a `data:` document through mouse
-   events. Restyle cost was measured and cut on 2026-09-27 (O15): the
-   restyle is filtered by selector subject keys, and pointer events are
-   coalesced per batch.
+   events. Restyle cost was measured and cut on 2026-09-27 (O15): each
+   state pseudo-class yields a rule (trigger key, scope, subject key)
+   and a change recomputes only what the matching rules name, and
+   pointer events are coalesced per batch.
 2. Link navigation, redirects, `<meta http-equiv=refresh>`, fragment scroll.
    **Done 2026-09-26.** A primary-button press and release on the same
    link follows it (`http`, `https`, `data` only; `javascript:` and
@@ -225,10 +226,12 @@ Work:
    a "Try again" link to the last URL the tab reported), so the tab can
    be navigated or closed like any other. `about:blank` is an empty
    document and `about:crash` panics the tab on purpose, so the exit
-   criterion can be exercised by hand. Close: `TabHandle::close` joins
-   the thread; the leak test holds a `Weak` to something the tab's sink
-   owns and the `Arc` count of the net service, and checks both are
-   released after close. Tests: two thread-level tests in
+   criterion can be exercised by hand. Close: `TabHandle::close` sends
+   the close and lets a reaper thread join, so a busy tab (a 373k-node
+   page mid-layout) never blocks the shell; `close_and_wait` joins in
+   place for tests and shutdown. The leak test holds a `Weak` to
+   something the tab's sink owns and the `Arc` count of the net service,
+   and checks both are released after `close_and_wait`. Tests: two thread-level tests in
    `crates/tab/src/lib.rs` (leak; two tabs, one crashes, both go on),
    three harness tests (middle click, `about:blank`, `about:crash`). Not
    done: the crash page does not keep the tab's history (the state that
