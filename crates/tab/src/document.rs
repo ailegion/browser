@@ -11,7 +11,7 @@ use browser_layout::{LayoutEngine, LayoutTree, Rect, SelectionRanges};
 use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
-use browser_script::{ConsoleLevel, ConsoleLine, ModuleProgress, ModuleScript, ScriptHost};
+use browser_script::{ConsoleLevel, ConsoleLine, HostRequest, ModuleProgress, ModuleScript, ScriptHost};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
@@ -99,6 +99,8 @@ struct Scripts {
     asap: Vec<ScriptLoad>,
     /// Module URLs fetched for the module map, so each is fetched once.
     module_urls: HashSet<Url>,
+    /// A deferred script is running: the document is still `interactive`.
+    running_deferred: bool,
 }
 
 impl Scripts {
@@ -1975,13 +1977,64 @@ impl TabState {
         self.frame_due = None;
         self.doc_started = std::time::Instant::now();
         self.scripts = Scripts::default();
-        self.script = match ScriptHost::new(self.url.clone()) {
+        self.script = match ScriptHost::new(self.url.clone(), browser_net::USER_AGENT) {
             Ok(host) => Some(host),
             Err(e) => {
                 tracing::error!(tab = self.id.0, "script context: {e}");
                 None
             }
         };
+    }
+
+    /// Tell the bindings where the document stands before a script runs:
+    /// its URL, its title so far, and its readiness (`loading` while it
+    /// parses, `interactive` while deferred scripts remain, `complete`).
+    fn sync_document_info(&mut self) {
+        let Some(host) = &mut self.script else { return };
+        let title = match (&self.parser, &self.doc) {
+            (Some(parser), _) => parser.document().title(),
+            (None, Some(doc)) => doc.title(),
+            (None, None) => None,
+        };
+        let ready = if self.parser.is_some() {
+            "loading"
+        } else if !self.scripts.deferred.is_empty() || self.scripts.running_deferred {
+            "interactive"
+        } else {
+            "complete"
+        };
+        host.set_document_info(self.url.clone(), title.unwrap_or_default(), ready);
+    }
+
+    /// Act on what a script asked of the document or the tab.
+    fn apply_host_requests(&mut self, requests: Vec<HostRequest>) {
+        for request in requests {
+            match request {
+                HostRequest::SetTitle(title) => {
+                    match (&mut self.parser, &mut self.doc) {
+                        (Some(parser), _) => parser.document_mut().set_title(&title),
+                        (None, Some(doc)) => doc.set_title(&title),
+                        (None, None) => {}
+                    }
+                    self.state_dirty = true;
+                }
+                // A replace overwrites the current history entry, which is
+                // what `NavKind::Reload` does (it also revalidates the
+                // cache, a small inaccuracy until history gets its own kind).
+                HostRequest::Navigate { url, replace } => {
+                    if !matches!(url.scheme(), "http" | "https" | "data" | "about") {
+                        continue;
+                    }
+                    self.go(url, if replace { NavKind::Reload } else { NavKind::Push });
+                    // Later requests belong to a document that is going away.
+                    break;
+                }
+                HostRequest::Reload => {
+                    self.handle_shell(ShellToTab::Reload);
+                    break;
+                }
+            }
+        }
     }
 
     /// Parse what has arrived, running the scripts the parser stops at,
@@ -2007,6 +2060,7 @@ impl TabState {
             }
             match self.prepare_script(node) {
                 Prepared::Run(source) => {
+                    self.sync_document_info();
                     if let Some(host) = &mut self.script {
                         host.run_script(&source);
                     }
@@ -2153,7 +2207,9 @@ impl TabState {
                 && self.scripts.deferred.front().is_some_and(ScriptLoad::is_ready)
                 && let Some(load) = self.scripts.deferred.pop_front()
             {
+                self.scripts.running_deferred = true;
                 self.execute_script(load);
+                self.scripts.running_deferred = false;
                 progressed = true;
             }
             if !progressed {
@@ -2209,6 +2265,7 @@ impl TabState {
 
     /// Run a ready script as a task, or report why it cannot run.
     fn execute_script(&mut self, load: ScriptLoad) {
+        self.sync_document_info();
         if let Some(host) = &mut self.script {
             match load.state {
                 LoadState::Classic(source) => host.run_script_from(&source, load.url.as_ref()),
@@ -2233,6 +2290,7 @@ impl TabState {
     fn after_script(&mut self) {
         let Some(host) = &mut self.script else { return };
         let requests = host.take_module_requests();
+        let host_requests = host.take_requests();
         for line in host.take_console() {
             match line.level {
                 ConsoleLevel::Warn | ConsoleLevel::Error => {
@@ -2257,6 +2315,7 @@ impl TabState {
         for url in requests {
             self.fetch_module_source(url);
         }
+        self.apply_host_requests(host_requests);
     }
 
     fn collect_stylesheets(&mut self) {
@@ -2845,15 +2904,16 @@ mod tests {
         /// loop does after each batch.
         fn pump(&mut self) {
             // A navigation started by a timer or a click queues more net
-            // events; keep going until a round delivers none.
+            // events; keep going until a round delivers none. Timers run
+            // first so what they start is delivered in the same call.
             loop {
+                self.state.tick();
+                self.state.flush();
                 let mut delivered = false;
                 while let Ok(ev) = self.net_events.try_recv() {
                     delivered = true;
                     self.state.handle_net(ev);
                 }
-                self.state.tick();
-                self.state.flush();
                 if !delivered {
                     break;
                 }
@@ -3705,6 +3765,27 @@ mod tests {
             url: data_url("<script>console.log(typeof marker)</script>", None),
         });
         assert_eq!(texts(&h).last().map(String::as_str), Some("undefined"));
+    }
+
+    #[test]
+    fn window_bindings_see_the_document_and_drive_it() {
+        let target = data_url("<title>Second</title><script>console.log(document.readyState, document.title)</script>", None);
+        let html = format!(
+            "<title>First</title>\
+             <script>console.log(document.readyState, document.title, location.protocol, typeof navigator.userAgent, window === self); document.title = 'Renamed';</script>\
+             <script defer src=\"data:text/javascript,console.log(document.readyState)\"></script>\
+             <script>setTimeout(() => location.assign('{target}'), 50)</script>"
+        );
+        let mut h = Harness::load(&html);
+        assert_eq!(h.title().as_deref(), Some("Renamed"), "the title set from script reaches the document");
+        let t = console_texts(&h);
+        assert_eq!(t[0], "loading First data: string true");
+        assert_eq!(t[1], "interactive", "a deferred script sees the document parsed but not complete");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        h.pump();
+        assert_eq!(h.title().as_deref(), Some("Second"), "location.assign navigated");
+        assert_eq!(console_texts(&h).last().map(String::as_str), Some("loading Second"));
+        assert_eq!(h.state.history.len(), 2, "assign pushed an entry");
     }
 
     /// Console text so far, in order.

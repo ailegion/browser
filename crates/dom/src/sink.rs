@@ -1,7 +1,7 @@
 //! html5ever `TreeSink` over the arena, plus a streaming parser wrapper.
 
 use std::borrow::Cow;
-use std::cell::{Ref, RefCell};
+use std::cell::{Ref, RefCell, RefMut};
 
 use html5ever::interface::{ElemName, ElementFlags, NodeOrText, QuirksMode, TokenizerResult, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
@@ -43,6 +43,10 @@ impl Sink {
     /// The document as built so far.
     fn document(&self) -> Ref<'_, Document> {
         self.doc.borrow()
+    }
+
+    fn document_mut(&self) -> RefMut<'_, Document> {
+        self.doc.borrow_mut()
     }
 }
 
@@ -262,6 +266,13 @@ impl HtmlParser {
     /// on a script; do not hold the borrow across `feed` or `resume`.
     pub fn document(&self) -> Ref<'_, Document> {
         self.inner.tokenizer.sink.sink.document()
+    }
+
+    /// Mutable access to the document under construction, for changes a
+    /// script makes while the parser is blocked on it. Nodes the tree
+    /// builder still holds open must not be removed.
+    pub fn document_mut(&self) -> RefMut<'_, Document> {
+        self.inner.tokenizer.sink.sink.document_mut()
     }
 
     /// The script element whose end tag stopped the parser, until

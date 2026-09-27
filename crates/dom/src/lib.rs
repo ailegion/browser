@@ -295,6 +295,21 @@ impl Document {
         out
     }
 
+    /// Set the `<title>` text, creating the element under `<head>` when
+    /// there is none. Does nothing without a `<head>`.
+    pub fn set_title(&mut self, text: &str) {
+        let Some(head) = self.head() else { return };
+        let title = match self.find_child_element(head, &local_name!("title")) {
+            Some(t) => t,
+            None => {
+                let t = self.create_element(QualName::new(None, ns!(html), local_name!("title")), Vec::new());
+                self.append_child(head, t);
+                t
+            }
+        };
+        self.set_text_content(title, text);
+    }
+
     /// The document `<title>` text, trimmed, if present.
     pub fn title(&self) -> Option<String> {
         let head = self.head()?;

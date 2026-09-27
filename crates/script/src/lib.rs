@@ -41,8 +41,12 @@ use boa_engine::builtins::promise::PromiseState;
 use boa_engine::context::ContextBuilder;
 use boa_engine::job::{GenericJob, IntervalJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob};
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
-use boa_engine::object::builtins::JsFunction;
-use boa_engine::{Context, JsArgs, JsError, JsNativeError, JsResult, JsValue, Module, NativeFunction, Source, js_string};
+use boa_engine::object::builtins::{JsArray, JsFunction};
+use boa_engine::object::{FunctionObjectBuilder, ObjectInitializer};
+use boa_engine::property::Attribute;
+use boa_engine::{
+    Context, JsArgs, JsError, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction, Source, js_string,
+};
 use boa_gc::{Finalize, Trace};
 use boa_runtime::extensions::{ConsoleExtension, MicrotaskExtension, TimeoutExtension};
 use boa_runtime::{ConsoleState, Logger};
@@ -430,6 +434,276 @@ pub enum ModuleProgress {
     Failed(String),
 }
 
+// ----- window, location, navigator, document (Phase 3 item 3.1) -----
+
+/// What the bindings tell scripts about the document. The tab keeps it
+/// current through `ScriptHost::set_document_info`.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentInfo {
+    pub url: Option<Url>,
+    pub title: String,
+    /// `loading`, `interactive` or `complete`.
+    pub ready_state: String,
+    pub user_agent: String,
+}
+
+/// Something a script asked of the document or the tab, collected for
+/// the tab to act on after the script ran (`ScriptHost::take_requests`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRequest {
+    /// `location.href = `, `location.assign` (`replace` false) or
+    /// `location.replace` (`replace` true).
+    Navigate { url: Url, replace: bool },
+    /// `location.reload()`.
+    Reload,
+    /// `document.title = `.
+    SetTitle(String),
+}
+
+#[derive(Default)]
+struct HostState {
+    info: DocumentInfo,
+    requests: Vec<HostRequest>,
+}
+
+type SharedHost = Rc<RefCell<HostState>>;
+
+fn host_state(context: &mut Context) -> JsResult<SharedHost> {
+    context
+        .get_data::<SharedHost>()
+        .cloned()
+        .ok_or_else(|| JsNativeError::error().with_message("no document").into())
+}
+
+fn current_url(info: &DocumentInfo) -> Url {
+    info.url
+        .clone()
+        .unwrap_or_else(|| Url::parse("about:blank").expect("static url"))
+}
+
+fn js_str(s: &str) -> JsValue {
+    JsString::from(s).into()
+}
+
+// Parts of `location`, by number so one getter serves them all.
+const LOC_HREF: u8 = 0;
+const LOC_PROTOCOL: u8 = 1;
+const LOC_HOST: u8 = 2;
+const LOC_HOSTNAME: u8 = 3;
+const LOC_PORT: u8 = 4;
+const LOC_PATHNAME: u8 = 5;
+const LOC_SEARCH: u8 = 6;
+const LOC_HASH: u8 = 7;
+const LOC_ORIGIN: u8 = 8;
+
+fn location_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) -> JsResult<JsValue> {
+    let host = host_state(context)?;
+    let url = current_url(&host.borrow().info);
+    let s = match *part {
+        LOC_HREF => url.as_str().to_owned(),
+        LOC_PROTOCOL => format!("{}:", url.scheme()),
+        LOC_HOST => match (url.host_str(), url.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_owned(),
+            _ => String::new(),
+        },
+        LOC_HOSTNAME => url.host_str().unwrap_or("").to_owned(),
+        LOC_PORT => url.port().map(|p| p.to_string()).unwrap_or_default(),
+        LOC_PATHNAME => url.path().to_owned(),
+        LOC_SEARCH => url.query().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default(),
+        LOC_HASH => url.fragment().filter(|f| !f.is_empty()).map(|f| format!("#{f}")).unwrap_or_default(),
+        _ => url.origin().ascii_serialization(),
+    };
+    Ok(js_str(&s))
+}
+
+// What a `location` setter or method does.
+const NAV_ASSIGN: u8 = 0;
+const NAV_REPLACE: u8 = 1;
+const NAV_HASH: u8 = 2;
+const NAV_RELOAD: u8 = 3;
+
+fn location_set(_: &JsValue, args: &[JsValue], what: &u8, context: &mut Context) -> JsResult<JsValue> {
+    let host = host_state(context)?;
+    if *what == NAV_RELOAD {
+        host.borrow_mut().requests.push(HostRequest::Reload);
+        return Ok(JsValue::undefined());
+    }
+    let target = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let mut state = host.borrow_mut();
+    let base = current_url(&state.info);
+    let url = if *what == NAV_HASH {
+        let mut url = base;
+        url.set_fragment(Some(target.trim_start_matches('#')));
+        url
+    } else {
+        base.join(&target).map_err(|_| {
+            JsNativeError::syntax().with_message(format!("Failed to navigate: \"{target}\" is not a valid URL"))
+        })?
+    };
+    state.requests.push(HostRequest::Navigate {
+        url,
+        replace: *what == NAV_REPLACE,
+    });
+    Ok(JsValue::undefined())
+}
+
+// Parts of `document`.
+const DOC_URL: u8 = 0;
+const DOC_READY_STATE: u8 = 1;
+const DOC_TITLE: u8 = 2;
+
+fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) -> JsResult<JsValue> {
+    let host = host_state(context)?;
+    let info = &host.borrow().info;
+    Ok(match *part {
+        DOC_URL => js_str(current_url(info).as_str()),
+        DOC_READY_STATE => js_str(&info.ready_state),
+        _ => js_str(&info.title),
+    })
+}
+
+fn document_set_title(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let title = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let host = host_state(context)?;
+    let mut state = host.borrow_mut();
+    state.info.title = title.clone();
+    state.requests.push(HostRequest::SetTitle(title));
+    Ok(JsValue::undefined())
+}
+
+fn getter(context: &mut Context, name: &str, f: NativeFunction) -> JsFunction {
+    FunctionObjectBuilder::new(context.realm(), f)
+        .name(JsString::from(format!("get {name}")))
+        .length(0)
+        .build()
+}
+
+fn setter(context: &mut Context, name: &str, f: NativeFunction) -> JsFunction {
+    FunctionObjectBuilder::new(context.realm(), f)
+        .name(JsString::from(format!("set {name}")))
+        .length(1)
+        .build()
+}
+
+/// Register `window` (the global object under its usual names),
+/// `location`, `navigator` and `document`.
+fn register_window(context: &mut Context) -> JsResult<()> {
+    let attr = Attribute::ENUMERABLE | Attribute::CONFIGURABLE;
+    let fixed = Attribute::ENUMERABLE;
+
+    // location
+    let mut init = ObjectInitializer::new(context);
+    for (name, part, settable) in [
+        ("href", LOC_HREF, Some(NAV_ASSIGN)),
+        ("protocol", LOC_PROTOCOL, None),
+        ("host", LOC_HOST, None),
+        ("hostname", LOC_HOSTNAME, None),
+        ("port", LOC_PORT, None),
+        ("pathname", LOC_PATHNAME, None),
+        ("search", LOC_SEARCH, None),
+        ("hash", LOC_HASH, Some(NAV_HASH)),
+        ("origin", LOC_ORIGIN, None),
+    ] {
+        let get = getter(
+            init.context(),
+            name,
+            NativeFunction::from_copy_closure_with_captures(location_get, part),
+        );
+        let set = settable.map(|what| {
+            setter(
+                init.context(),
+                name,
+                NativeFunction::from_copy_closure_with_captures(location_set, what),
+            )
+        });
+        init.accessor(JsString::from(name), Some(get), set, attr);
+    }
+    init.function(
+        NativeFunction::from_copy_closure_with_captures(location_set, NAV_ASSIGN),
+        js_string!("assign"),
+        1,
+    )
+    .function(
+        NativeFunction::from_copy_closure_with_captures(location_set, NAV_REPLACE),
+        js_string!("replace"),
+        1,
+    )
+    .function(
+        NativeFunction::from_copy_closure_with_captures(location_set, NAV_RELOAD),
+        js_string!("reload"),
+        0,
+    )
+    .function(
+        NativeFunction::from_copy_closure_with_captures(location_get, LOC_HREF),
+        js_string!("toString"),
+        0,
+    );
+    let location = init.build();
+
+    // navigator
+    let user_agent = host_state(context)?.borrow().info.user_agent.clone();
+    let platform = if cfg!(target_os = "windows") {
+        "Win32"
+    } else if cfg!(target_os = "macos") {
+        "MacIntel"
+    } else {
+        "Linux x86_64"
+    };
+    let languages = JsArray::from_iter([js_str("en-US"), js_str("en")], context);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let navigator = ObjectInitializer::new(context)
+        .property(js_string!("userAgent"), js_str(&user_agent), fixed)
+        .property(js_string!("appName"), js_str("Netscape"), fixed)
+        .property(js_string!("appVersion"), js_str(&user_agent), fixed)
+        .property(js_string!("appCodeName"), js_str("Mozilla"), fixed)
+        .property(js_string!("product"), js_str("Gecko"), fixed)
+        .property(js_string!("vendor"), js_str(""), fixed)
+        .property(js_string!("platform"), js_str(platform), fixed)
+        .property(js_string!("language"), js_str("en-US"), fixed)
+        .property(js_string!("languages"), languages, fixed)
+        .property(js_string!("onLine"), true, fixed)
+        .property(js_string!("cookieEnabled"), true, fixed)
+        .property(js_string!("webdriver"), false, fixed)
+        .property(js_string!("hardwareConcurrency"), threads as i32, fixed)
+        .build();
+
+    // document
+    let global = context.global_object();
+    let mut init = ObjectInitializer::new(context);
+    for (name, part) in [("URL", DOC_URL), ("documentURI", DOC_URL), ("readyState", DOC_READY_STATE)] {
+        let get = getter(
+            init.context(),
+            name,
+            NativeFunction::from_copy_closure_with_captures(document_get, part),
+        );
+        init.accessor(JsString::from(name), Some(get), None, attr);
+    }
+    let get_title = getter(
+        init.context(),
+        "title",
+        NativeFunction::from_copy_closure_with_captures(document_get, DOC_TITLE),
+    );
+    let set_title = setter(init.context(), "title", NativeFunction::from_fn_ptr(document_set_title));
+    init.accessor(js_string!("title"), Some(get_title), Some(set_title), attr)
+        .property(js_string!("location"), location.clone(), fixed)
+        .property(js_string!("defaultView"), global.clone(), fixed)
+        .property(js_string!("characterSet"), js_str("UTF-8"), fixed)
+        .property(js_string!("charset"), js_str("UTF-8"), fixed)
+        .property(js_string!("contentType"), js_str("text/html"), fixed)
+        .property(js_string!("compatMode"), js_str("CSS1Compat"), fixed);
+    let document = init.build();
+
+    // These are [Replaceable] in browsers: a page's `var frames` wins.
+    for name in ["window", "self", "frames", "parent", "top"] {
+        context.register_global_property(JsString::from(name), global.clone(), Attribute::all())?;
+    }
+    context.register_global_property(js_string!("location"), location, fixed)?;
+    context.register_global_property(js_string!("navigator"), navigator, fixed)?;
+    context.register_global_property(js_string!("document"), document, fixed)?;
+    Ok(())
+}
+
 /// A document's script context and its queues.
 pub struct ScriptHost {
     context: Context,
@@ -437,6 +711,7 @@ pub struct ScriptHost {
     frames: SharedFrames,
     console: Rc<RefCell<Vec<ConsoleLine>>>,
     modules: Rc<ModuleMap>,
+    host: SharedHost,
 }
 
 impl std::fmt::Debug for ScriptHost {
@@ -451,14 +726,24 @@ impl std::fmt::Debug for ScriptHost {
 
 impl ScriptHost {
     /// A fresh context with the queue and the host functions registered.
-    /// `base` is the document's URL, against which module specifiers in
-    /// inline scripts resolve.
-    pub fn new(base: Option<Url>) -> Result<Self, String> {
+    /// `base` is the document's URL: `location`, and what module
+    /// specifiers in inline scripts resolve against. `user_agent` is what
+    /// `navigator.userAgent` reports.
+    pub fn new(base: Option<Url>, user_agent: &str) -> Result<Self, String> {
         let executor = Rc::new(WebExecutor::default());
         let modules = Rc::new(ModuleMap {
-            base,
+            base: base.clone(),
             ..ModuleMap::default()
         });
+        let host: SharedHost = Rc::new(RefCell::new(HostState {
+            info: DocumentInfo {
+                url: base,
+                title: String::new(),
+                ready_state: "loading".to_owned(),
+                user_agent: user_agent.to_owned(),
+            },
+            requests: Vec::new(),
+        }));
         let mut context = ContextBuilder::new()
             .job_executor(executor.clone())
             .module_loader(modules.clone())
@@ -476,6 +761,8 @@ impl ScriptHost {
         .map_err(|e| e.to_string())?;
         let frames: SharedFrames = Rc::new(RefCell::new(Frames::default()));
         context.insert_data(frames.clone());
+        context.insert_data(host.clone());
+        register_window(&mut context).map_err(|e| e.to_string())?;
         context
             .register_global_builtin_callable(
                 js_string!("requestAnimationFrame"),
@@ -496,7 +783,21 @@ impl ScriptHost {
             frames,
             console,
             modules,
+            host,
         })
+    }
+
+    /// Keep what `location` and `document` report current.
+    pub fn set_document_info(&mut self, url: Option<Url>, title: String, ready_state: &str) {
+        let mut state = self.host.borrow_mut();
+        state.info.url = url;
+        state.info.title = title;
+        state.info.ready_state = ready_state.to_owned();
+    }
+
+    /// What scripts asked of the document or tab since the last call.
+    pub fn take_requests(&mut self) -> Vec<HostRequest> {
+        std::mem::take(&mut self.host.borrow_mut().requests)
     }
 
     /// Run a classic script as a task: evaluate it, then a microtask
@@ -716,7 +1017,48 @@ mod tests {
     use super::*;
 
     fn host() -> ScriptHost {
-        ScriptHost::new(Some(Url::parse("https://example.test/app/").expect("url"))).expect("script host")
+        ScriptHost::new(Some(Url::parse("https://example.test/app/").expect("url")), "browser/test").expect("script host")
+    }
+
+    #[test]
+    fn window_location_navigator_and_document_report_and_request() {
+        let mut h = host();
+        h.set_document_info(
+            Some(url("https://user@example.test:8443/a/b.html?q=1#frag")),
+            "Hello".to_owned(),
+            "interactive",
+        );
+        assert_eq!(h.eval_to_string("window === globalThis && self === window && top === window && frames === window && parent === window").as_deref(), Ok("true"));
+        assert_eq!(
+            h.eval_to_string("[location.href, location.protocol, location.host, location.hostname, location.port, location.pathname, location.search, location.hash, location.origin, String(location)].join('|')").as_deref(),
+            Ok("\"https://user@example.test:8443/a/b.html?q=1#frag|https:|example.test:8443|example.test|8443|/a/b.html|?q=1|#frag|https://example.test:8443|https://user@example.test:8443/a/b.html?q=1#frag\"")
+        );
+        assert_eq!(
+            h.eval_to_string("[document.URL === location.href, document.location === location, document.defaultView === window, document.readyState, document.title, document.characterSet, navigator.userAgent, navigator.language, navigator.languages.length, navigator.onLine, navigator.cookieEnabled, typeof navigator.platform].join('|')").as_deref(),
+            Ok("\"true|true|true|interactive|Hello|UTF-8|browser/test|en-US|2|true|true|string\"")
+        );
+        h.run_script(
+            "document.title = 'New'; console.log(document.title); \
+             location.assign('../c.html'); location.replace('https://other.test/'); location.hash = 'x'; location.href = '/root'; location.reload(); \
+             try { location.assign('http://[bad'); } catch (e) { console.log(e.name); }",
+        );
+        assert_eq!(lines(&mut h), vec!["New".to_owned(), "SyntaxError".to_owned()]);
+        let u = |s: &str| url(s);
+        assert_eq!(
+            h.take_requests(),
+            vec![
+                HostRequest::SetTitle("New".to_owned()),
+                HostRequest::Navigate { url: u("https://user@example.test:8443/c.html"), replace: false },
+                HostRequest::Navigate { url: u("https://other.test/"), replace: true },
+                HostRequest::Navigate { url: u("https://user@example.test:8443/a/b.html?q=1#x"), replace: false },
+                HostRequest::Navigate { url: u("https://user@example.test:8443/root"), replace: false },
+                HostRequest::Reload,
+            ]
+        );
+        assert!(h.take_requests().is_empty());
+        // Without a document URL, `location` is about:blank.
+        let mut blank = ScriptHost::new(None, "ua").expect("host");
+        assert_eq!(blank.eval_to_string("location.href + '|' + location.origin").as_deref(), Ok("\"about:blank|null\""));
     }
 
     fn url(s: &str) -> Url {

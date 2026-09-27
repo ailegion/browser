@@ -558,6 +558,35 @@ Work:
    (html5ever's default `scripting_enabled` is true, so it is fine).
 3. Bindings in this order, each unlocking more of the web:
    1. `window`, `document`, `console`, timers, `location`, `navigator`.
+      **Done 2026-09-27 (lean).** `console` and timers came with item 1.
+      `crates/script` registers the global object as `window`, `self`,
+      `frames`, `parent` and `top` (writable, as browsers' replaceable
+      attributes are); `location` with `href` (settable), `protocol`,
+      `host`, `hostname`, `port`, `pathname`, `search`, `hash`
+      (settable), `origin`, `assign`, `replace`, `reload` and
+      `toString`; `navigator` with `userAgent` (the net crate's string),
+      `appName`, `appVersion`, `appCodeName`, `product`, `vendor`,
+      `platform`, `language`, `languages`, `onLine`, `cookieEnabled`,
+      `webdriver`, `hardwareConcurrency`; and `document` with `URL`,
+      `documentURI`, `readyState`, `title` (settable), `location`,
+      `defaultView`, `characterSet`, `charset`, `contentType`,
+      `compatMode`. The bindings read a `DocumentInfo` the tab refreshes
+      before every script (URL, title, readiness: `loading` while
+      parsing, `interactive` while deferred scripts remain, then
+      `complete`) and queue `HostRequest`s the tab applies after the
+      script: a title set is written into the `<title>` element (made
+      under `<head>` if missing, also while the parser is blocked), a
+      navigation goes through the tab's `go` (a `replace` reuses the
+      reload kind, which also revalidates the cache: small inaccuracy),
+      a reload through the shell's path; a bad URL throws
+      `SyntaxError`. Tests: one script test over every property and
+      request, one tab harness test (readiness at each stage, title
+      from script, `location.assign` from a timer pushing history). Not
+      done: `history` (item 3.6), `window.open`, `alert`/`confirm`/
+      `prompt` (shell dialogs), `screen`, `devicePixelRatio`,
+      `innerWidth`/`innerHeight`/scroll positions (item 3.4),
+      `document.domain`/`referrer`/`cookie`, `location.ancestorOrigins`,
+      `navigator.sendBeacon`/`clipboard`, `import.meta`.
    2. `Node`, `Element`, `Text`, `Document`: traversal, mutation,
       `querySelector*`, attributes, `classList`, `innerHTML` (fragment
       parser), `textContent`, `dataset`.
