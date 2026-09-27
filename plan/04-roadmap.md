@@ -476,7 +476,37 @@ Work:
 
 1. Boa `Context` per document on the tab thread. `JobQueue` implementation
    integrated with the tab loop: macrotasks, microtask checkpoint after each,
-   timers, `requestAnimationFrame` before paint.
+   timers, `requestAnimationFrame` before paint. **Done 2026-09-27.**
+   `crates/script` (`ScriptHost`) owns a Boa 0.22 `Context` built with our
+   `JobExecutor`: promise and `queueMicrotask` jobs are microtasks run to
+   exhaustion after every task (a script, a timer callback, a frame
+   callback); `setTimeout`/`setInterval` (boa_runtime's, which enqueue
+   Boa `TimeoutJob`/`IntervalJob`s) are kept by due instant so the tab
+   can wake for the earliest; `requestAnimationFrame`/
+   `cancelAnimationFrame` are ours, callbacks queue for the next frame
+   and ones requested during a frame wait for the frame after; `console`
+   goes to a collector the tab drains into the log (and keeps for
+   tests). An error thrown by a task is reported as `Uncaught ...` on the
+   console and the queue goes on. The tab creates a host per document
+   (`TabState::start_script`) and, until item 2's loader, runs inline
+   classic scripts in document order once the document has parsed (a
+   `type` of module or a data block is skipped); `next_wake` includes the
+   next timer and the next frame (16.7 ms after a frame is requested),
+   `tick` runs due timers and the frame, and repaints after a frame. A
+   new document gets a fresh context; the old one's timers die with it.
+   Under `#![forbid(unsafe_code)]`: the console collector derives
+   `boa_gc::Trace` with an ignored field, which the lint allows in an
+   external macro's expansion. Tests: four in the script crate (task and
+   microtask order, error reporting without stopping the queue, timers
+   with intervals clearing themselves and a timer callback's own
+   microtasks, frames per frame with cancel), one tab harness test
+   (inline scripts, console levels, a timer waking the loop, a frame
+   firing and clearing, a fresh context per document). Not done:
+   unhandled promise rejections are not reported (needs Boa's host
+   rejection tracker), native async jobs are polled to completion on the
+   spot (nothing waits on anything yet; fetch in item 3.5 must revisit),
+   `performance.now`, script-driven DOM changes (item 3), any
+   `window`/`document` object (item 3).
 2. Script loading: inline, external, `async`, `defer`, `type=module` with a
    loader that fetches through `net`. Parser blocking for sync scripts.
 3. Bindings in this order, each unlocking more of the web:

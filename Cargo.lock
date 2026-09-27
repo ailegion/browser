@@ -713,6 +713,7 @@ dependencies = [
  "browser-layout",
  "browser-net",
  "browser-paint",
+ "browser-script",
  "browser-style",
  "html5ever",
  "tracing",

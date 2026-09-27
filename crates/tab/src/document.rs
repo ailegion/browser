@@ -11,6 +11,7 @@ use browser_layout::{LayoutEngine, LayoutTree, Rect, SelectionRanges};
 use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
+use browser_script::{ConsoleLevel, ConsoleLine, ScriptHost};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
@@ -161,6 +162,16 @@ pub(crate) struct TabState {
     /// Find in page, while the find bar is open with a query.
     find: Option<Find>,
 
+    /// The document's JavaScript context and queues; a new one per
+    /// document.
+    script: Option<ScriptHost>,
+    /// When the next animation frame is due, while callbacks wait for one.
+    frame_due: Option<std::time::Instant>,
+    /// The document's time origin, for animation frame timestamps.
+    doc_started: std::time::Instant,
+    /// Recent console output, for tests and tools; the log gets it too.
+    console: Vec<ConsoleLine>,
+
     history: Vec<Url>,
     history_index: usize,
     /// The URL's fragment must be scrolled to after the next layout.
@@ -221,6 +232,10 @@ impl TabState {
             last_click: None,
             autoscroll: None,
             find: None,
+            script: None,
+            frame_due: None,
+            doc_started: std::time::Instant::now(),
+            console: Vec::new(),
             history: Vec::new(),
             history_index: 0,
             pending_fragment: false,
@@ -1265,18 +1280,41 @@ impl TabState {
 
     /// The tab wants to be woken at this instant even if no event arrives.
     pub fn next_wake(&self) -> Option<std::time::Instant> {
-        [self.refresh.as_ref().map(|(at, _)| *at), self.autoscroll]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.refresh.as_ref().map(|(at, _)| *at),
+            self.autoscroll,
+            self.script.as_ref().and_then(ScriptHost::next_wake),
+            self.frame_due,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Run whatever timer is due.
     pub fn tick(&mut self) {
+        let now = std::time::Instant::now();
         if let Some(at) = self.autoscroll
-            && std::time::Instant::now() >= at
+            && now >= at
         {
             self.autoscroll = self.autoscroll_step();
+        }
+        // Script timers, then an animation frame if one is due: each
+        // callback is a task with its own microtask checkpoint.
+        if let Some(s) = &mut self.script
+            && s.next_wake().is_some_and(|w| now >= w)
+        {
+            s.run_timers(now);
+            self.after_script();
+        }
+        if self.frame_due.is_some_and(|due| now >= due) {
+            self.frame_due = None;
+            let time_ms = self.doc_started.elapsed().as_secs_f64() * 1000.0;
+            if let Some(s) = &mut self.script {
+                s.run_animation_frames(time_ms);
+            }
+            self.needs_paint = true;
+            self.after_script();
         }
         if let Some((at, url)) = &self.refresh
             && std::time::Instant::now() >= *at
@@ -1746,8 +1784,73 @@ impl TabState {
         self.collect_images();
         self.pending_fragment = self.url.as_ref().is_some_and(|u| u.fragment().is_some());
         self.schedule_refresh();
+        self.start_script();
         self.needs_style = true;
         self.state_dirty = true;
+    }
+
+    // ----- script -----
+
+    /// Frame interval for animation frame callbacks.
+    const FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
+
+    /// A new document gets a new context; the old one's timers and
+    /// frames die with it. Inline classic scripts run in document order
+    /// once the document has parsed (the full loader is item 2).
+    fn start_script(&mut self) {
+        self.frame_due = None;
+        self.doc_started = std::time::Instant::now();
+        self.script = match ScriptHost::new() {
+            Ok(host) => Some(host),
+            Err(e) => {
+                tracing::error!(tab = self.id.0, "script context: {e}");
+                None
+            }
+        };
+        let Some(doc) = &self.doc else { return };
+        let sources: Vec<String> = doc
+            .descendants(doc.root())
+            .filter_map(|n| {
+                let e = doc.element(n)?;
+                (e.name.ns == ns!(html)
+                    && e.name.local == local_name!("script")
+                    && e.attr("src").is_none()
+                    && is_classic_script_type(e.attr("type")))
+                .then(|| doc.text_content(n))
+            })
+            .collect();
+        if let Some(host) = &mut self.script {
+            for src in sources {
+                if !src.trim().is_empty() {
+                    host.run_script(&src);
+                }
+            }
+        }
+        self.after_script();
+    }
+
+    /// After script ran: forward console output, and schedule a frame if
+    /// one was asked for.
+    fn after_script(&mut self) {
+        let Some(host) = &mut self.script else { return };
+        for line in host.take_console() {
+            match line.level {
+                ConsoleLevel::Warn | ConsoleLevel::Error => {
+                    tracing::warn!(tab = self.id.0, "console: {}", line.text);
+                }
+                ConsoleLevel::Log | ConsoleLevel::Info => {
+                    tracing::info!(tab = self.id.0, "console: {}", line.text);
+                }
+            }
+            self.console.push(line);
+        }
+        if self.console.len() > 500 {
+            let excess = self.console.len() - 500;
+            self.console.drain(..excess);
+        }
+        if host.has_frame_callbacks() && self.frame_due.is_none() {
+            self.frame_due = Some(std::time::Instant::now() + Self::FRAME);
+        }
     }
 
     fn collect_stylesheets(&mut self) {
@@ -2075,6 +2178,24 @@ fn tabindex(e: &browser_dom::Element) -> Option<i64> {
 
 /// Pixels one arrow key scrolls.
 const LINE_SCROLL: f32 = 40.0;
+
+/// Whether a `<script type>` names classic JavaScript (absent or empty
+/// counts). Modules and data blocks are not run here.
+fn is_classic_script_type(t: Option<&str>) -> bool {
+    let Some(t) = t else { return true };
+    let t = t.trim().to_ascii_lowercase();
+    t.is_empty()
+        || matches!(
+            t.as_str(),
+            "text/javascript"
+                | "application/javascript"
+                | "text/ecmascript"
+                | "application/ecmascript"
+                | "text/jscript"
+                | "text/x-javascript"
+                | "application/x-javascript"
+        )
+}
 
 /// An `<input>`'s type, lower-cased; `text` when absent. `None` for
 /// anything that is not an input.
@@ -3064,6 +3185,39 @@ mod tests {
         h.key(Key::ArrowUp, false);
         assert_eq!(h.control_text("sel"), "Two");
         assert_eq!(h.state.scroll_y, 0.0, "arrows on a select do not scroll");
+    }
+
+    #[test]
+    fn inline_scripts_run_and_their_timers_and_frames_fire() {
+        let mut h = Harness::load(
+            "<title>JS</title><script>var marker = 1; console.log('hi'); \
+             setTimeout(() => console.log('later'), 1); \
+             requestAnimationFrame(t => console.log('frame ' + (t >= 0)));</script>\
+             <p>x</p><script type=module>console.log('no modules yet')</script>\
+             <script type='text/javascript'>console.warn('second'); Promise.resolve().then(() => console.log('micro'));</script>\
+             <script>oops(</script>",
+        );
+        let texts = |h: &Harness| h.state.console.iter().map(|l| l.text.clone()).collect::<Vec<String>>();
+        let t = texts(&h);
+        assert_eq!(&t[..3], ["hi", "second", "micro"], "{t:?}");
+        assert!(t[3].starts_with("Uncaught SyntaxError"), "{t:?}");
+        assert_eq!(h.state.console[1].level, ConsoleLevel::Warn);
+        assert!(h.state.next_wake().is_some(), "the timeout is armed");
+        assert!(h.state.frame_due.is_some(), "a frame is scheduled");
+
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        h.pump();
+        assert!(texts(&h).contains(&"later".to_owned()));
+        h.state.frame_due = Some(std::time::Instant::now());
+        h.pump();
+        assert_eq!(texts(&h).last().map(String::as_str), Some("frame true"));
+        assert!(h.state.frame_due.is_none(), "no more callbacks, no more frames");
+
+        // A new document gets a fresh context.
+        h.send(ShellToTab::Navigate {
+            url: data_url("<script>console.log(typeof marker)</script>", None),
+        });
+        assert_eq!(texts(&h).last().map(String::as_str), Some("undefined"));
     }
 
     #[test]
