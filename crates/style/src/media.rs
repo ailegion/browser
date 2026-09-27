@@ -1,6 +1,9 @@
 //! Media query parsing and evaluation. Enough of Media Queries Level 4 for
-//! responsive stylesheets: types, `not`, `and`, `or`, and the features that
-//! a desktop browser can answer.
+//! responsive stylesheets: types, `not`, `and`, `or`, both range syntaxes
+//! (`(min-width: 600px)`, `(600px <= width < 900px)`), and the features
+//! that a desktop browser can answer. Unknown features follow the level 4
+//! three-valued logic: they are neither true nor false, so `not (unknown)`
+//! does not match either.
 
 use cssparser::{Parser, Token, match_ignore_ascii_case};
 
@@ -38,16 +41,49 @@ enum Condition {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Feature {
-    /// `min-`/`max-` or exact: (name, comparison, value in px)
-    Width(Cmp, f32),
-    Height(Cmp, f32),
-    AspectRatioAny,
+    Width(Cmp, MqLength),
+    Height(Cmp, MqLength),
+    /// Width over height.
+    AspectRatio(Cmp, f32),
+    /// Device pixels per CSS pixel.
+    Resolution(Cmp, f32),
     Orientation(bool),
     PrefersColorScheme(bool),
     /// Boolean features that are true for us.
     True,
     /// Boolean features that are false for us.
     False,
+}
+
+/// A length in a media query: absolute, or a fraction of the viewport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MqLength {
+    Px(f32),
+    Vw(f32),
+    Vh(f32),
+}
+
+impl MqLength {
+    fn px(self, vp: &Viewport) -> f32 {
+        match self {
+            MqLength::Px(v) => v,
+            MqLength::Vw(v) => v / 100.0 * vp.width,
+            MqLength::Vh(v) => v / 100.0 * vp.height,
+        }
+    }
+}
+
+/// The value after a feature name, before it is known what the feature
+/// makes of it.
+#[derive(Debug, Clone, PartialEq)]
+enum MqValue {
+    Length(MqLength),
+    Number(f32),
+    /// `16/9`.
+    Ratio(f32),
+    /// `2dppx`, `192dpi`, in dppx.
+    Resolution(f32),
+    Ident(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,6 +93,20 @@ enum Cmp {
     Ge,
     Lt,
     Gt,
+}
+
+impl Cmp {
+    /// The comparison read from the other side: `600px < width` is
+    /// `width > 600px`.
+    fn flipped(self) -> Self {
+        match self {
+            Cmp::Eq => Cmp::Eq,
+            Cmp::Le => Cmp::Ge,
+            Cmp::Ge => Cmp::Le,
+            Cmp::Lt => Cmp::Gt,
+            Cmp::Gt => Cmp::Lt,
+        }
+    }
 }
 
 impl MediaQueryList {
@@ -111,8 +161,13 @@ impl MediaQueryList {
     pub fn evaluate(&self, vp: &Viewport) -> bool {
         self.queries.iter().any(|q| {
             let type_ok = matches!(q.media_type, MediaType::All | MediaType::Screen);
-            let cond_ok = q.condition.as_ref().is_none_or(|c| eval(c, vp));
-            (type_ok && cond_ok) != q.negated
+            let cond = q.condition.as_ref().map_or(Some(true), |c| eval(c, vp));
+            // An unknown result stays unknown through `not`, and an
+            // unknown query does not match.
+            match cond {
+                Some(c) => (type_ok && c) != q.negated,
+                None => false,
+            }
         })
     }
 }
@@ -249,152 +304,218 @@ fn parse_in_parens<'i>(input: &mut Parser<'i, '_>) -> Result<Condition, ParseErr
     }
 }
 
+/// The inside of a feature's parentheses, in any of the forms
+/// `(name)`, `(name: value)`, `(name op value)`, `(value op name)` and
+/// `(value op name op value)`. What cannot be made sense of is
+/// `Condition::Unknown`.
 fn parse_feature<'i>(input: &mut Parser<'i, '_>) -> Result<Condition, ParseErr<'i>> {
-    let name = input.expect_ident()?.to_ascii_lowercase();
-    let name = name
-        .strip_prefix("-webkit-")
-        .or_else(|| name.strip_prefix("-moz-"))
-        .map(str::to_owned)
-        .unwrap_or(name);
+    if let Ok(name) = input.try_parse(|i| i.expect_ident().map(|s| s.to_ascii_lowercase())) {
+        let name = strip_vendor(&name);
+        // Boolean form `(name)`.
+        if input.is_exhausted() {
+            return Ok(Condition::Feature(match name.as_str() {
+                "width" | "height" | "color" | "hover" | "pointer" | "any-hover" | "any-pointer" | "resolution"
+                | "aspect-ratio" | "orientation" | "grid" => Feature::True,
+                _ => Feature::False,
+            }));
+        }
+        let before = input.state();
+        let location = input.current_source_location();
+        let cmp = match input.next()?.clone() {
+            Token::Colon => None,
+            Token::Delim('<' | '>' | '=') => {
+                input.reset(&before);
+                Some(parse_cmp(input)?)
+            }
+            t => return Err(location.new_unexpected_token_error(t)),
+        };
+        let (base, cmp) = match cmp {
+            Some(c) => (name.as_str(), c),
+            None => {
+                if let Some(b) = name.strip_prefix("min-") {
+                    (b, Cmp::Ge)
+                } else if let Some(b) = name.strip_prefix("max-") {
+                    (b, Cmp::Le)
+                } else {
+                    (name.as_str(), Cmp::Eq)
+                }
+            }
+        };
+        let value = parse_value(input)?;
+        return Ok(feature_from(base, cmp, value).map_or(Condition::Unknown, Condition::Feature));
+    }
 
-    // Boolean form `(name)`.
+    // Value first: `(600px < width)`, `(400px <= width <= 800px)`.
+    let first = parse_value(input)?;
+    let op1 = parse_cmp(input)?;
+    let name = strip_vendor(&input.expect_ident()?.to_ascii_lowercase());
+    let lower = feature_from(&name, op1.flipped(), first);
     if input.is_exhausted() {
-        return Ok(Condition::Feature(match name.as_str() {
-            "width" | "height" | "color" | "hover" | "pointer" | "any-hover" | "any-pointer"
-            | "resolution" | "aspect-ratio" | "orientation" | "grid" => Feature::True,
-            "monochrome" | "prefers-reduced-motion" | "prefers-contrast" | "forced-colors" => {
-                Feature::False
-            }
-            _ => Feature::False,
-        }));
+        return Ok(lower.map_or(Condition::Unknown, Condition::Feature));
     }
+    let op2 = parse_cmp(input)?;
+    let second = parse_value(input)?;
+    let upper = feature_from(&name, op2, second);
+    Ok(match (lower, upper) {
+        (Some(a), Some(b)) => Condition::And(vec![Condition::Feature(a), Condition::Feature(b)]),
+        _ => Condition::Unknown,
+    })
+}
 
-    // Range syntax `(width >= 600px)` or `(width: 600px)`.
+fn strip_vendor(name: &str) -> String {
+    name.strip_prefix("-webkit-")
+        .or_else(|| name.strip_prefix("-moz-"))
+        .unwrap_or(name)
+        .to_owned()
+}
+
+/// `<`, `<=`, `>`, `>=` or `=`.
+fn parse_cmp<'i>(input: &mut Parser<'i, '_>) -> Result<Cmp, ParseErr<'i>> {
     let location = input.current_source_location();
-    let cmp = match input.next()?.clone() {
-        Token::Colon => None,
-        Token::Delim('<') => Some(if input.try_parse(|i| i.expect_delim('=')).is_ok() { Cmp::Le } else { Cmp::Lt }),
-        Token::Delim('>') => Some(if input.try_parse(|i| i.expect_delim('=')).is_ok() { Cmp::Ge } else { Cmp::Gt }),
-        Token::Delim('=') => Some(Cmp::Eq),
+    Ok(match input.next()?.clone() {
+        Token::Delim('<') => {
+            if input.try_parse(|i| i.expect_delim('=')).is_ok() {
+                Cmp::Le
+            } else {
+                Cmp::Lt
+            }
+        }
+        Token::Delim('>') => {
+            if input.try_parse(|i| i.expect_delim('=')).is_ok() {
+                Cmp::Ge
+            } else {
+                Cmp::Gt
+            }
+        }
+        Token::Delim('=') => Cmp::Eq,
         t => return Err(location.new_unexpected_token_error(t)),
-    };
-
-    let (base, cmp) = match cmp {
-        Some(c) => (name.as_str(), c),
-        None => {
-            if let Some(b) = name.strip_prefix("min-") {
-                (b, Cmp::Ge)
-            } else if let Some(b) = name.strip_prefix("max-") {
-                (b, Cmp::Le)
-            } else {
-                (name.as_str(), Cmp::Eq)
-            }
-        }
-    };
-
-    let feature = match base {
-        "width" | "device-width" => Feature::Width(cmp, parse_media_length(input)?),
-        "height" | "device-height" => Feature::Height(cmp, parse_media_length(input)?),
-        "orientation" => {
-            let v = input.expect_ident()?.to_ascii_lowercase();
-            Feature::Orientation(v == "landscape")
-        }
-        "prefers-color-scheme" => {
-            let v = input.expect_ident()?.to_ascii_lowercase();
-            Feature::PrefersColorScheme(v == "dark")
-        }
-        "prefers-reduced-motion" | "prefers-contrast" | "forced-colors" | "prefers-reduced-transparency" => {
-            let v = input.expect_ident()?.to_ascii_lowercase();
-            if matches!(v.as_str(), "no-preference" | "none") {
-                Feature::True
-            } else {
-                Feature::False
-            }
-        }
-        "hover" | "any-hover" => {
-            let v = input.expect_ident()?.to_ascii_lowercase();
-            if v == "hover" { Feature::True } else { Feature::False }
-        }
-        "pointer" | "any-pointer" => {
-            let v = input.expect_ident()?.to_ascii_lowercase();
-            if v == "fine" { Feature::True } else { Feature::False }
-        }
-        "display-mode" => {
-            let v = input.expect_ident()?.to_ascii_lowercase();
-            if v == "browser" { Feature::True } else { Feature::False }
-        }
-        "scripting" => {
-            let v = input.expect_ident()?.to_ascii_lowercase();
-            if v == "enabled" { Feature::True } else { Feature::False }
-        }
-        "resolution" | "-webkit-device-pixel-ratio" | "device-pixel-ratio" => {
-            // Evaluated at 1dppx.
-            let location = input.current_source_location();
-            let value = match input.next()?.clone() {
-                Token::Number { value, .. } => value,
-                Token::Dimension { value, unit, .. } => match_ignore_ascii_case! { &unit,
-                    "dppx" | "x" => value,
-                    "dpi" => value / 96.0,
-                    "dpcm" => value / 96.0 * 2.54,
-                    _ => return Err(location.new_unexpected_token_error(Token::Ident(unit))),
-                },
-                t => return Err(location.new_unexpected_token_error(t)),
-            };
-            let ok = match cmp {
-                Cmp::Eq => (value - 1.0).abs() < 0.01,
-                Cmp::Le | Cmp::Lt => 1.0 < value || (cmp == Cmp::Le && (value - 1.0).abs() < 0.01),
-                Cmp::Ge | Cmp::Gt => 1.0 > value || (cmp == Cmp::Ge && (value - 1.0).abs() < 0.01),
-            };
-            if ok { Feature::True } else { Feature::False }
-        }
-        "aspect-ratio" | "device-aspect-ratio" | "min-aspect-ratio" | "max-aspect-ratio" => {
-            while input.next().is_ok() {}
-            Feature::AspectRatioAny
-        }
-        "color" | "color-index" | "color-gamut" | "grid" | "monochrome" | "update"
-        | "overflow-block" | "overflow-inline" | "dynamic-range" | "video-dynamic-range" => {
-            while input.next().is_ok() {}
-            Feature::True
-        }
-        _ => {
-            while input.next().is_ok() {}
-            return Ok(Condition::Unknown);
-        }
-    };
-    Ok(Condition::Feature(feature))
+    })
 }
 
-/// Lengths in media queries: px, or em/rem at 16px (they never inherit).
-fn parse_media_length<'i>(input: &mut Parser<'i, '_>) -> Result<f32, ParseErr<'i>> {
+/// A feature value: a length (px, em and rem at 16px since they never
+/// inherit, pt, vw, vh), a number or ratio, a resolution, or a keyword.
+fn parse_value<'i>(input: &mut Parser<'i, '_>) -> Result<MqValue, ParseErr<'i>> {
     let location = input.current_source_location();
-    match input.next()?.clone() {
-        Token::Dimension { value, unit, .. } => Ok(match_ignore_ascii_case! { &unit,
-            "px" => value,
-            "em" | "rem" => value * 16.0,
-            "pt" => value * 96.0 / 72.0,
-            "vw" | "vh" => value,
+    Ok(match input.next()?.clone() {
+        Token::Dimension { value, unit, .. } => match_ignore_ascii_case! { &unit,
+            "px" => MqValue::Length(MqLength::Px(value)),
+            "em" | "rem" => MqValue::Length(MqLength::Px(value * 16.0)),
+            "pt" => MqValue::Length(MqLength::Px(value * 96.0 / 72.0)),
+            "vw" => MqValue::Length(MqLength::Vw(value)),
+            "vh" => MqValue::Length(MqLength::Vh(value)),
+            "dppx" | "x" => MqValue::Resolution(value),
+            "dpi" => MqValue::Resolution(value / 96.0),
+            "dpcm" => MqValue::Resolution(value / 96.0 * 2.54),
             _ => return Err(location.new_unexpected_token_error(Token::Ident(unit))),
-        }),
-        Token::Number { value: 0.0, .. } => Ok(0.0),
-        t => Err(location.new_unexpected_token_error(t)),
-    }
+        },
+        Token::Number { value, .. } => {
+            if input.try_parse(|i| i.expect_delim('/')).is_ok() {
+                let denominator = input.expect_number()?;
+                MqValue::Ratio(if denominator > 0.0 { value / denominator } else { f32::INFINITY })
+            } else {
+                MqValue::Number(value)
+            }
+        }
+        Token::Ident(s) => MqValue::Ident(s.to_ascii_lowercase()),
+        t => return Err(location.new_unexpected_token_error(t)),
+    })
 }
 
-fn eval(c: &Condition, vp: &Viewport) -> bool {
+/// What a feature makes of a comparison and a value; `None` when the
+/// feature is unknown or the value does not fit it.
+fn feature_from(name: &str, cmp: Cmp, value: MqValue) -> Option<Feature> {
+    let ident = |v: &MqValue| match v {
+        MqValue::Ident(s) => Some(s.clone()),
+        _ => None,
+    };
+    let yes_no = |cond: bool| if cond { Feature::True } else { Feature::False };
+    Some(match name {
+        "width" | "device-width" | "height" | "device-height" => {
+            let len = match value {
+                MqValue::Length(l) => l,
+                MqValue::Number(0.0) => MqLength::Px(0.0),
+                _ => return None,
+            };
+            if name.ends_with("width") {
+                Feature::Width(cmp, len)
+            } else {
+                Feature::Height(cmp, len)
+            }
+        }
+        "aspect-ratio" | "device-aspect-ratio" => match value {
+            MqValue::Ratio(r) | MqValue::Number(r) => Feature::AspectRatio(cmp, r),
+            _ => return None,
+        },
+        "resolution" | "device-pixel-ratio" => match value {
+            MqValue::Resolution(r) | MqValue::Number(r) => Feature::Resolution(cmp, r),
+            _ => return None,
+        },
+        "orientation" => Feature::Orientation(ident(&value)? == "landscape"),
+        "prefers-color-scheme" => Feature::PrefersColorScheme(ident(&value)? == "dark"),
+        "prefers-reduced-motion" | "prefers-contrast" | "forced-colors" | "prefers-reduced-transparency" => {
+            yes_no(matches!(ident(&value)?.as_str(), "no-preference" | "none"))
+        }
+        "hover" | "any-hover" => yes_no(ident(&value)? == "hover"),
+        "pointer" | "any-pointer" => yes_no(ident(&value)? == "fine"),
+        "display-mode" => yes_no(ident(&value)? == "browser"),
+        "scripting" => yes_no(ident(&value)? == "enabled"),
+        "color" | "color-index" | "color-gamut" | "grid" | "monochrome" | "update" | "overflow-block"
+        | "overflow-inline" | "dynamic-range" | "video-dynamic-range" => Feature::True,
+        _ => return None,
+    })
+}
+
+/// Three-valued: `None` is "unknown", which `not` keeps and which makes
+/// an `and` unknown unless another operand is false, and an `or` unknown
+/// unless another is true.
+fn eval(c: &Condition, vp: &Viewport) -> Option<bool> {
     match c {
-        Condition::Not(inner) => !eval(inner, vp),
-        Condition::And(items) => items.iter().all(|i| eval(i, vp)),
-        Condition::Or(items) => items.iter().any(|i| eval(i, vp)),
-        Condition::Unknown => false,
-        Condition::Feature(f) => match f {
-            Feature::Width(cmp, v) => compare(*cmp, vp.width, *v),
-            Feature::Height(cmp, v) => compare(*cmp, vp.height, *v),
-            Feature::AspectRatioAny => true,
+        Condition::Not(inner) => eval(inner, vp).map(|b| !b),
+        Condition::And(items) => {
+            let results: Vec<Option<bool>> = items.iter().map(|i| eval(i, vp)).collect();
+            if results.contains(&Some(false)) {
+                Some(false)
+            } else if results.contains(&None) {
+                None
+            } else {
+                Some(true)
+            }
+        }
+        Condition::Or(items) => {
+            let results: Vec<Option<bool>> = items.iter().map(|i| eval(i, vp)).collect();
+            if results.contains(&Some(true)) {
+                Some(true)
+            } else if results.contains(&None) {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Condition::Unknown => None,
+        Condition::Feature(f) => Some(match f {
+            Feature::Width(cmp, v) => compare(*cmp, vp.width, v.px(vp)),
+            Feature::Height(cmp, v) => compare(*cmp, vp.height, v.px(vp)),
+            Feature::AspectRatio(cmp, r) => {
+                let actual = if vp.height > 0.0 { vp.width / vp.height } else { f32::INFINITY };
+                compare_ratio(*cmp, actual, *r)
+            }
+            Feature::Resolution(cmp, r) => compare_ratio(*cmp, vp.scale_factor, *r),
             Feature::Orientation(landscape) => (vp.width >= vp.height) == *landscape,
             Feature::PrefersColorScheme(dark) => vp.prefers_dark == *dark,
             Feature::True => true,
             Feature::False => false,
-        },
+        }),
+    }
+}
+
+/// Like `compare`, with a tolerance fit for ratios.
+fn compare_ratio(cmp: Cmp, actual: f32, wanted: f32) -> bool {
+    match cmp {
+        Cmp::Eq => (actual - wanted).abs() < 0.001,
+        Cmp::Le => actual <= wanted + 0.001,
+        Cmp::Ge => actual >= wanted - 0.001,
+        Cmp::Lt => actual < wanted - 0.001,
+        Cmp::Gt => actual > wanted + 0.001,
     }
 }
 
@@ -413,16 +534,59 @@ mod tests {
     use super::*;
     use cssparser::ParserInput;
 
-    fn matches(q: &str, w: f32) -> bool {
+    fn matches_at(q: &str, w: f32, scale: f32) -> bool {
         let mut input = ParserInput::new(q);
         let mut parser = Parser::new(&mut input);
         let list = MediaQueryList::parse(&mut parser);
         list.evaluate(&Viewport {
             width: w,
             height: 600.0,
-            scale_factor: 1.0,
+            scale_factor: scale,
             prefers_dark: false,
         })
+    }
+
+    fn matches(q: &str, w: f32) -> bool {
+        matches_at(q, w, 1.0)
+    }
+
+    #[test]
+    fn ranges_ratios_resolutions_and_unknowns() {
+        // Value-first and double-ended ranges.
+        assert!(matches("(600px < width)", 800.0));
+        assert!(!matches("(900px < width)", 800.0));
+        assert!(matches("(400px <= width <= 800px)", 800.0));
+        assert!(!matches("(400px <= width < 800px)", 800.0));
+        assert!(matches("(1000px > width > 100px)", 800.0));
+        assert!(matches("(width = 800px)", 800.0));
+        assert!(matches("screen and (width >= 50em) and (height <= 40em)", 800.0));
+        // Viewport units are fractions of the viewport itself.
+        assert!(matches("(min-width: 100vw)", 800.0));
+        assert!(!matches("(max-width: 99vw)", 800.0));
+        assert!(matches("(max-height: 100vh)", 800.0));
+        // 800 by 600 is 4/3.
+        assert!(matches("(aspect-ratio: 4/3)", 800.0));
+        assert!(matches("(min-aspect-ratio: 1/1)", 800.0));
+        assert!(!matches("(min-aspect-ratio: 16/9)", 800.0));
+        assert!(matches("(aspect-ratio < 16/9)", 800.0));
+        assert!(matches("(orientation: portrait)", 500.0));
+        // Resolution follows the scale factor.
+        assert!(matches_at("(min-resolution: 2dppx)", 800.0, 2.0));
+        assert!(matches_at("(-webkit-min-device-pixel-ratio: 1.5)", 800.0, 2.0));
+        assert!(!matches_at("(min-resolution: 192dpi)", 800.0, 1.0));
+        assert!(matches_at("(resolution >= 2x)", 800.0, 2.0));
+        assert!(matches_at("(max-resolution: 1.9dppx)", 800.0, 1.0));
+        // Unknown is not false: it cannot be negated into true, an `or`
+        // with a true side still matches, an `and` with a false side
+        // still fails, and otherwise the query does not match.
+        assert!(!matches("not (unknown-feature: 3)", 800.0));
+        assert!(matches("(unknown-feature: 3) or (min-width: 1px)", 800.0));
+        assert!(!matches("(unknown-feature: 3) and (min-width: 9000px)", 800.0));
+        assert!(!matches("(unknown-feature: 3) and (min-width: 1px)", 800.0));
+        assert!(matches("not ((unknown-feature: 3) and (min-width: 9000px))", 800.0), "false under not");
+        assert!(!matches("(width: nonsense)", 800.0));
+        assert!(!matches("not (width: nonsense)", 800.0));
+        assert!(matches("(min-width: 1px), (unknown)", 800.0), "a list matches if any query does");
     }
 
     #[test]
@@ -442,7 +606,6 @@ mod tests {
         assert!(!matches("(prefers-color-scheme: dark)", 800.0));
         assert!(matches("(prefers-color-scheme: light)", 800.0));
         assert!(!matches("(unknown-feature: 3)", 800.0));
-        assert!(matches("not (unknown-feature: 3)", 800.0));
         assert!(matches("only screen and (max-width: 50em)", 700.0));
         assert!(matches("(hover: hover) and (pointer: fine)", 800.0));
         assert!(matches("(-webkit-min-device-pixel-ratio: 1)", 800.0));

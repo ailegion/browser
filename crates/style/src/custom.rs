@@ -30,6 +30,71 @@ pub fn contains_var(raw: &str) -> bool {
     raw.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"var("))
 }
 
+/// Make every `url()` in a raw value absolute against `base`, keeping the
+/// rest of the text as written. Used when a sheet is parsed, on custom
+/// property values and on `var()`-carrying declarations, so that a URL
+/// resolves against the sheet it was written in and not the one it is
+/// substituted into (CSS Values 4). `None` when there is nothing to do.
+pub fn resolve_urls(raw: &str, base: &url::Url) -> Option<String> {
+    if !raw.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"url(")) {
+        return None;
+    }
+    let mut input = ParserInput::new(raw);
+    let mut parser = Parser::new(&mut input);
+    let mut out = String::new();
+    let mut last = parser.position();
+    if resolve_urls_walk(&mut parser, base, &mut out, &mut last).is_err() {
+        return None;
+    }
+    out.push_str(parser.slice_from(last));
+    Some(out)
+}
+
+fn resolve_urls_walk<'i>(
+    input: &mut Parser<'i, '_>,
+    base: &url::Url,
+    out: &mut String,
+    last: &mut SourcePosition,
+) -> Result<(), ()> {
+    loop {
+        let start = input.position();
+        let token = match input.next_including_whitespace_and_comments() {
+            Ok(t) => t.clone(),
+            Err(_) => return Ok(()),
+        };
+        let emit = |out: &mut String, input: &Parser<'i, '_>, u: &str| {
+            out.push_str(input.slice(*last..start));
+            let abs = base.join(u).map(|a| a.to_string()).unwrap_or_else(|_| u.to_owned());
+            out.push_str("url(\"");
+            out.push_str(&abs.replace('\\', "\\\\").replace('"', "\\\""));
+            out.push_str("\")");
+        };
+        match token {
+            Token::UnquotedUrl(u) => {
+                emit(out, input, &u);
+                *last = input.position();
+            }
+            Token::Function(name) if name.eq_ignore_ascii_case("url") => {
+                let u = input
+                    .parse_nested_block(|i| {
+                        let s = i.expect_string()?.to_string();
+                        while i.next().is_ok() {}
+                        Ok::<_, ParseError<'i, ()>>(s)
+                    })
+                    .map_err(|_| ())?;
+                emit(out, input, &u);
+                *last = input.position();
+            }
+            Token::Function(_) | Token::ParenthesisBlock | Token::SquareBracketBlock | Token::CurlyBracketBlock => {
+                input
+                    .parse_nested_block(|i| resolve_urls_walk(i, base, out, last).map_err(|()| i.new_custom_error(())))
+                    .map_err(|_: ParseError<'i, ()>| ())?;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Replace every `var()` in `raw` with the value `lookup` gives for its
 /// name, or its fallback. `None` when a reference has neither, or a limit
 /// is exceeded. Text between references is copied verbatim.
@@ -243,6 +308,21 @@ mod tests {
         assert_eq!(subst("var(--x)", &m), None);
         assert_eq!(subst("var(a)", &m), None);
         assert_eq!(subst("var(--x, var(--y))", &m), None);
+    }
+
+    #[test]
+    fn urls_in_raw_values_become_absolute() {
+        let base = url::Url::parse("https://a.example/css/site.css").expect("url");
+        assert_eq!(
+            resolve_urls("url(img/x.png) no-repeat", &base).as_deref(),
+            Some("url(\"https://a.example/css/img/x.png\") no-repeat")
+        );
+        assert_eq!(
+            resolve_urls("var(--a, url('../y.png')), url( \"/z.png\" )", &base).as_deref(),
+            Some("var(--a, url(\"https://a.example/y.png\")), url(\"https://a.example/z.png\")")
+        );
+        assert_eq!(resolve_urls("red", &base), None, "nothing to resolve");
+        assert_eq!(resolve_urls("url(\"https://b.example/q.png\")", &base).as_deref(), Some("url(\"https://b.example/q.png\")"));
     }
 
     #[test]

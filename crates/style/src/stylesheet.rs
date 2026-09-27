@@ -79,10 +79,24 @@ impl Stylesheet {
                 match r {
                     Rule::Style(s) => {
                         for d in &mut s.declarations {
-                            if let DeclaredValue::Value(PropertyDeclaration::BackgroundImage(Some(u))) = &mut d.value
-                                && let Ok(abs) = base.join(u)
-                            {
-                                *u = std::sync::Arc::from(abs.as_str());
+                            match &mut d.value {
+                                DeclaredValue::Value(PropertyDeclaration::BackgroundImage(Some(u))) => {
+                                    if let Ok(abs) = base.join(u) {
+                                        *u = Arc::from(abs.as_str());
+                                    }
+                                }
+                                // Text that is parsed later, per element: make
+                                // its URLs absolute now, while the sheet is known.
+                                DeclaredValue::Custom {
+                                    value: CustomValue::Raw(raw),
+                                    ..
+                                }
+                                | DeclaredValue::Pending { raw, .. } => {
+                                    if let Some(resolved) = crate::custom::resolve_urls(raw, base) {
+                                        *raw = Arc::from(resolved);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }

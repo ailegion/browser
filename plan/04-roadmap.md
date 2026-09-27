@@ -421,7 +421,26 @@ Work:
    `[value]` selectors reacting to edits (only layout runs), caret
    blink.
    **Item 7 complete.**
-8. Media queries and custom properties in `style`.
+8. Media queries and custom properties in `style`. **Done 2026-09-27.**
+   Both arrived earlier (custom properties in item 0, media queries with
+   the Phase 1 sheets) and this item closed the gaps. Media queries
+   (`crates/style/src/media.rs`): the value-first range syntax
+   (`(600px < width)`, `(400px <= width <= 800px)`), viewport units as
+   fractions of the viewport, `aspect-ratio` and `resolution` evaluated
+   for real (resolution against the window's scale factor) instead of
+   assumed, and Media Queries 4 three-valued logic, so an unknown
+   feature is neither true nor false: `not (unknown)` does not match, an
+   `or` with a true side still does, an `and` with a false side still
+   fails. Custom properties (`crates/style/src/custom.rs`): a `url()`
+   inside a custom property value or a `var()`-carrying declaration is
+   made absolute against the sheet it was written in when that sheet is
+   parsed, so it no longer depends on where it is substituted (the gap
+   recorded under item 0). Tests: one media query test over the new
+   forms, one custom property test over URL rewriting; the existing
+   `not (unknown)` expectation flipped to the level 4 answer. Not done:
+   `prefers-color-scheme` is always light until settings exist (Phase
+   4), `@supports`, `@container`, `env()`, `@property`, and media
+   queries in `@import` beyond the list already parsed.
 9. CI matrix: Windows, Linux, macOS builds. Note: on 2026-09-26 the owner
    turned automatic CI runs off (`.github/workflows/ci.yml` is
    `workflow_dispatch` only) to stop paying for runs during development.
