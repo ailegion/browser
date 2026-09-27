@@ -563,6 +563,8 @@ dependencies = [
  "browser-ipc-types",
  "parley",
  "taffy",
+ "tracing",
+ "url",
  "vello",
 ]
 

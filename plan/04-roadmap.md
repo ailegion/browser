@@ -241,6 +241,26 @@ Work:
    tab strip, menu, tooltip, scrollbar, progress), laid out with taffy,
    drawn with vello. Address bar, back, forward, reload, new tab, close tab,
    loading indicator, HTTPS indicator, settings menu.
+   **Block 1 done 2026-09-27: frame and address bar.** `crates/chrome`
+   draws a 44px toolbar over the page; the shell gives the page the
+   window below it, offsets pointer events, and routes keys to the
+   address bar while it has focus. The text input is parley's
+   `PlainEditor` (cursor, selection, word moves, IME preedit), wrapped in
+   `crates/chrome/src/input.rs` with focus, a box, horizontal scroll to
+   keep the caret in view, placeholder, selection and caret drawing.
+   Keys: typing, Backspace/Delete (Ctrl: word), arrows (Shift: select,
+   Ctrl: word), Home/End, Ctrl+A/C/X/V (clipboard through the shell and
+   `arboard`), Enter, Escape (restores the tab's URL), Tab. Mouse: a
+   click into the unfocused bar selects all, then clicks place the caret,
+   drag selects, double click selects a word, Shift+click extends. Ctrl+L
+   and F6 focus the bar; a click on the page or Enter gives focus back
+   to the page. Enter takes a full URL, or `https://` plus a bare host,
+   IP or `localhost`; anything else does nothing since there is no
+   search engine (O6). The IME candidate window is positioned at the
+   caret (`set_ime_cursor_area`). A thin accent line under the box shows
+   loading. Eight unit tests in the chrome crate. Not yet: buttons, tab
+   strip, menus, tooltip, scrollbar, HTTPS indicator (later blocks);
+   caret blink; a `drop`-style URL suggestion list.
 7. Text selection and copy on pages. Find in page. Keyboard focus and tab
    order. Form controls rendered (no submission yet).
 8. Media queries and custom properties in `style`.

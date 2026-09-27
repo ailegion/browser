@@ -14,3 +14,5 @@ browser-ipc-types.workspace = true
 vello.workspace = true
 parley.workspace = true
 taffy.workspace = true
+url.workspace = true
+tracing.workspace = true

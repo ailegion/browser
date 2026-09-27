@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use browser_chrome::{Chrome, ChromeAction, Key as ChromeKey, KeyInput};
 use browser_ipc_types::{Cursor as PageCursor, MouseButton as PageButton, ShellToTab, TabId, TabToShell, Viewport};
 use browser_net::NetService;
 use browser_tab::{TabHandle, TabOutput, spawn_tab};
@@ -31,8 +32,8 @@ use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::event::{ElementState, Ime, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
@@ -50,6 +51,8 @@ struct Options {
     smoke: bool,
     /// Save the loaded page to this PNG and exit.
     screenshot: Option<PathBuf>,
+    /// The screenshot is the whole window, toolbar included.
+    with_chrome: bool,
     width: f64,
     height: f64,
     url: Option<Url>,
@@ -59,6 +62,7 @@ fn parse_args() -> Result<Options> {
     let mut opts = Options {
         smoke: false,
         screenshot: None,
+        with_chrome: false,
         width: 1024.0,
         height: 768.0,
         url: None,
@@ -71,6 +75,7 @@ fn parse_args() -> Result<Options> {
                 let path = args.next().context("--screenshot needs a file path")?;
                 opts.screenshot = Some(PathBuf::from(path));
             }
+            "--with-chrome" => opts.with_chrome = true,
             "--width" => {
                 opts.width = args.next().context("--width needs a number")?.parse()?;
             }
@@ -79,12 +84,8 @@ fn parse_args() -> Result<Options> {
             }
             other if other.starts_with("--") => anyhow::bail!("unknown argument: {other}"),
             other => {
-                let url = if other.contains("://") {
-                    Url::parse(other)
-                } else {
-                    Url::parse(&format!("https://{other}"))
-                }
-                .with_context(|| format!("invalid url: {other}"))?;
+                // The same rules as the address bar.
+                let url = browser_chrome::url_from_input(other).with_context(|| format!("invalid url: {other}"))?;
                 opts.url = Some(url);
             }
         }
@@ -114,6 +115,7 @@ struct Tab {
     page: Option<Scene>,
     loading: bool,
     title: Option<String>,
+    url: Option<Url>,
     cursor: CursorIcon,
 }
 
@@ -123,6 +125,9 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     net: Option<Arc<NetService>>,
     active: Option<Active>,
+    /// The toolbar above the page.
+    chrome: Chrome,
+    clipboard: Option<arboard::Clipboard>,
     tabs: Vec<Tab>,
     /// Index into `tabs` of the one shown.
     current: usize,
@@ -130,6 +135,11 @@ struct App {
     screenshot_deadline: Option<Instant>,
     /// Pointer position in logical pixels while it is over the window.
     cursor_pos: Option<(f32, f32)>,
+    /// The pointer was last over the page (else the chrome), so the page
+    /// gets a leave when it crosses into the chrome.
+    pointer_on_page: bool,
+    /// The last button press went to the chrome; its release goes there too.
+    press_in_chrome: bool,
     modifiers: Modifiers,
     /// Set when startup fails so the process can exit non-zero from `main`.
     failure: Option<anyhow::Error>,
@@ -143,14 +153,69 @@ impl App {
             proxy,
             net: None,
             active: None,
+            chrome: Chrome::new(),
+            clipboard: None,
             tabs: Vec::new(),
             current: 0,
             next_tab_id: 1,
             screenshot_deadline: None,
             cursor_pos: None,
+            pointer_on_page: false,
+            press_in_chrome: false,
             modifiers: Modifiers::default(),
             failure: None,
         }
+    }
+
+    /// Where the page starts below the toolbar, in logical pixels.
+    fn page_top(&self) -> f32 {
+        self.chrome.height()
+    }
+
+    /// Keep the window's IME state in step with the address bar.
+    fn sync_ime(&mut self) {
+        let Some(active) = &self.active else { return };
+        let focused = self.chrome.has_focus();
+        active.window.set_ime_allowed(focused);
+        if focused && let Some((x, y, w, h)) = self.chrome.ime_cursor_area() {
+            active
+                .window
+                .set_ime_cursor_area(LogicalPosition::new(x, y), LogicalSize::new(w.max(1.0), h.max(1.0)));
+        }
+        active.window.request_redraw();
+    }
+
+    /// Do what the chrome asked for after an interaction.
+    fn handle_chrome_actions(&mut self, actions: Vec<ChromeAction>) {
+        for action in actions {
+            match action {
+                ChromeAction::Navigate(url) => self.send_to_current(ShellToTab::Navigate { url }),
+                ChromeAction::CopyText(text) => {
+                    if let Some(cb) = self.clipboard()
+                        && let Err(e) = cb.set_text(text)
+                    {
+                        tracing::warn!("clipboard write: {e}");
+                    }
+                }
+                ChromeAction::RequestPaste => {
+                    let text = self.clipboard().and_then(|cb| cb.get_text().ok());
+                    if let Some(text) = text {
+                        self.chrome.paste(&text);
+                    }
+                }
+            }
+        }
+        self.sync_ime();
+    }
+
+    fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(cb) => self.clipboard = Some(cb),
+                Err(e) => tracing::warn!("clipboard unavailable: {e}"),
+            }
+        }
+        self.clipboard.as_mut()
     }
 
     fn current_tab(&self) -> Option<&Tab> {
@@ -172,13 +237,14 @@ impl App {
         self.active.as_ref().map(|a| a.window.scale_factor()).unwrap_or(1.0) as f32
     }
 
+    /// The page's viewport: the window below the toolbar.
     fn viewport(&self) -> Option<Viewport> {
         let active = self.active.as_ref()?;
         let size = active.window.inner_size();
         let scale = active.window.scale_factor() as f32;
         Some(Viewport {
             width: size.width as f32 / scale,
-            height: size.height as f32 / scale,
+            height: (size.height as f32 / scale - self.page_top()).max(1.0),
             scale_factor: scale,
         })
     }
@@ -221,6 +287,9 @@ impl App {
             "window ready"
         );
 
+        let scale = window.scale_factor() as f32;
+        self.chrome.resize(size.width as f32 / scale, scale);
+        window.set_ime_allowed(false);
         self.active = Some(Active {
             window,
             surface,
@@ -263,6 +332,7 @@ impl App {
             page: None,
             loading: true,
             title: None,
+            url: None,
             cursor: CursorIcon::Default,
         });
         tracing::info!(tab = id.0, tabs = self.tabs.len(), "tab opened");
@@ -311,15 +381,27 @@ impl App {
         // Background tabs are not told about resizes; the one coming to
         // the front lays out for the current window if it has to.
         self.send_viewport();
+        let page_top = self.page_top();
         if let Some((x, y)) = self.cursor_pos
+            && y >= page_top
             && let Some(tab) = self.current_handle()
         {
-            tab.send(ShellToTab::MouseMove { x, y });
+            tab.send(ShellToTab::MouseMove { x, y: y - page_top });
+        }
+        // The address bar shows the new tab; an edit in progress is dropped.
+        self.chrome.blur();
+        if let Some(tab) = self.current_tab() {
+            let (url, loading) = (tab.url.clone(), tab.loading);
+            if let Some(url) = url {
+                self.chrome.set_url(&url);
+            }
+            self.chrome.set_loading(loading);
         }
         if let Some(active) = &self.active {
             active.window.set_cursor(self.current_tab().map(|t| t.cursor).unwrap_or_default());
             active.window.request_redraw();
         }
+        self.sync_ime();
         self.update_title();
     }
 
@@ -345,6 +427,8 @@ impl App {
         self.context
             .resize_surface(&mut active.surface, width, height);
         active.window.request_redraw();
+        let scale = active.window.scale_factor() as f32;
+        self.chrome.resize(width as f32 / scale, scale);
         self.send_viewport();
     }
 
@@ -359,14 +443,15 @@ impl App {
         }
         let scale = active.window.scale_factor();
 
+        // The page below the toolbar, then the toolbar over it.
+        let page_top = (f64::from(self.chrome.height()) * scale).round();
         let page = self.tabs.get(self.current).and_then(|t| t.page.as_ref());
+        active.scene.reset();
         match page {
-            Some(page) => {
-                active.scene.reset();
-                active.scene.append(page, None);
-            }
-            None => build_placeholder_scene(&mut active.scene, width, height, scale),
+            Some(page) => active.scene.append(page, Some(Affine::translate((0.0, page_top)))),
+            None => build_placeholder_scene(&mut active.scene, width, height, page_top, scale),
         }
+        self.chrome.draw(&mut active.scene);
         let has_page = page.is_some();
 
         let handle = &self.context.devices[active.surface.dev_id];
@@ -444,14 +529,24 @@ impl App {
         // delivers a few more events before it actually exits.
         let Some(path) = self.options.screenshot.take() else { return };
         self.screenshot_deadline = None;
-        let Some(page) = self.current_tab().and_then(|t| t.page.as_ref()) else {
+        let Some(page) = self.tabs.get(self.current).and_then(|t| t.page.as_ref()) else {
             tracing::warn!("no frame to screenshot");
             return;
         };
         let Some(active) = &self.active else { return };
         let width = active.surface.config.width;
-        let height = active.surface.config.height;
-        match browser_paint::render_offscreen(page, width, height, Color::WHITE) {
+        let page_top = (f64::from(self.chrome.height()) * active.window.scale_factor()).round() as u32;
+        let (scene, height) = if self.options.with_chrome {
+            // The window as composed: the page below the toolbar.
+            let mut scene = Scene::new();
+            scene.append(page, Some(Affine::translate((0.0, f64::from(page_top)))));
+            self.chrome.draw(&mut scene);
+            (scene, active.surface.config.height)
+        } else {
+            // The page only, at the size the tab laid it out for.
+            (page.clone(), active.surface.config.height.saturating_sub(page_top).max(1))
+        };
+        match browser_paint::render_offscreen(&scene, width, height, Color::WHITE) {
             Some(pixels) => match image::RgbaImage::from_raw(width, height, pixels) {
                 Some(img) => match img.save(&path) {
                     Ok(()) => tracing::info!("screenshot written to {}", path.display()),
@@ -465,13 +560,12 @@ impl App {
     }
 }
 
-/// Drawn until the first page frame arrives.
-fn build_placeholder_scene(scene: &mut Scene, width: u32, height: u32, scale: f64) {
-    scene.reset();
+/// Drawn in the page area until the first page frame arrives.
+fn build_placeholder_scene(scene: &mut Scene, width: u32, height: u32, top: f64, scale: f64) {
     let w = f64::from(width);
     let h = f64::from(height);
     let inset = 24.0 * scale;
-    let panel = RoundedRect::new(inset, inset, w - inset, h - inset, 12.0 * scale);
+    let panel = RoundedRect::new(inset, top + inset, w - inset, h - inset, 12.0 * scale);
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
@@ -480,7 +574,7 @@ fn build_placeholder_scene(scene: &mut Scene, width: u32, height: u32, scale: f6
         &panel,
     );
     let bar_h = 40.0 * scale;
-    let bar = Rect::new(inset, inset, w - inset, inset + bar_h);
+    let bar = Rect::new(inset, top + inset, w - inset, top + inset + bar_h);
     scene.fill(Fill::NonZero, Affine::IDENTITY, ACCENT, None, &bar);
 }
 
@@ -524,11 +618,17 @@ impl ApplicationHandler<UserEvent> for App {
                 let (was_loading, has_page) = {
                     let tab = &mut self.tabs[index];
                     tab.title = title.or_else(|| Some(url.to_string()));
+                    tab.url = Some(url.clone());
                     let was = tab.loading;
                     tab.loading = loading;
                     (was, tab.page.is_some())
                 };
                 if is_current {
+                    self.chrome.set_url(&url);
+                    self.chrome.set_loading(loading);
+                    if let Some(active) = &self.active {
+                        active.window.request_redraw();
+                    }
                     self.update_title();
                     if was_loading && !loading && self.options.screenshot.is_some() && has_page {
                         // The last frame painted may predate the final resource;
@@ -607,32 +707,136 @@ impl ApplicationHandler<UserEvent> for App {
                 let scale = self.scale();
                 let (x, y) = (position.x as f32 / scale, position.y as f32 / scale);
                 self.cursor_pos = Some((x, y));
-                self.send_to_current(ShellToTab::MouseMove { x, y });
+                let page_top = self.page_top();
+                if self.chrome.contains(x, y) && !self.press_in_chrome && self.pointer_on_page {
+                    // Crossing from the page into the chrome.
+                    self.send_to_current(ShellToTab::MouseLeave);
+                    self.pointer_on_page = false;
+                }
+                if (self.chrome.contains(x, y) && !self.pointer_on_page) || self.press_in_chrome {
+                    let cursor = self.chrome.mouse_move(x, y);
+                    if let Some(active) = &self.active {
+                        active.window.set_cursor(match cursor {
+                            PageCursor::Text => CursorIcon::Text,
+                            PageCursor::Pointer => CursorIcon::Pointer,
+                            PageCursor::Default => CursorIcon::Default,
+                        });
+                        if self.press_in_chrome {
+                            active.window.request_redraw();
+                        }
+                    }
+                } else {
+                    if !self.pointer_on_page {
+                        self.chrome.mouse_leave();
+                        if let Some(active) = &self.active {
+                            active.window.set_cursor(self.current_tab().map(|t| t.cursor).unwrap_or_default());
+                        }
+                    }
+                    self.pointer_on_page = true;
+                    self.send_to_current(ShellToTab::MouseMove { x, y: y - page_top });
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_pos = None;
-                self.send_to_current(ShellToTab::MouseLeave);
+                self.chrome.mouse_leave();
+                if self.pointer_on_page {
+                    self.send_to_current(ShellToTab::MouseLeave);
+                    self.pointer_on_page = false;
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some((x, y)) = self.cursor_pos {
-                    let button = match button {
-                        MouseButton::Left => PageButton::Left,
-                        MouseButton::Right => PageButton::Right,
-                        MouseButton::Middle => PageButton::Middle,
-                        _ => PageButton::Other,
+                    let page_top = self.page_top();
+                    let in_chrome = match state {
+                        ElementState::Pressed => {
+                            self.press_in_chrome = self.chrome.contains(x, y);
+                            self.press_in_chrome
+                        }
+                        ElementState::Released => self.press_in_chrome,
                     };
-                    self.send_to_current(match state {
-                        ElementState::Pressed => ShellToTab::MouseDown { x, y, button },
-                        ElementState::Released => ShellToTab::MouseUp { x, y, button },
-                    });
+                    if in_chrome {
+                        if button == MouseButton::Left {
+                            match state {
+                                ElementState::Pressed => {
+                                    let shift = self.modifiers.state().shift_key();
+                                    let actions = self.chrome.mouse_down(x, y, shift);
+                                    self.handle_chrome_actions(actions);
+                                }
+                                ElementState::Released => {
+                                    self.chrome.mouse_up(x, y);
+                                    self.press_in_chrome = false;
+                                    self.sync_ime();
+                                }
+                            }
+                        }
+                    } else {
+                        if state == ElementState::Pressed && self.chrome.has_focus() {
+                            // A click on the page takes focus from the address bar.
+                            self.chrome.blur();
+                            self.sync_ime();
+                        }
+                        let button = match button {
+                            MouseButton::Left => PageButton::Left,
+                            MouseButton::Right => PageButton::Right,
+                            MouseButton::Middle => PageButton::Middle,
+                            _ => PageButton::Other,
+                        };
+                        let y = y - page_top;
+                        self.send_to_current(match state {
+                            ElementState::Pressed => ShellToTab::MouseDown { x, y, button },
+                            ElementState::Released => ShellToTab::MouseUp { x, y, button },
+                        });
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m,
+            WindowEvent::Ime(ime) => {
+                match ime {
+                    Ime::Preedit(text, cursor) => self.chrome.ime_preedit(&text, cursor),
+                    Ime::Commit(text) => self.chrome.ime_commit(&text),
+                    Ime::Enabled | Ime::Disabled => {}
+                }
+                self.sync_ime();
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let vp_h = self.viewport().map(|v| v.height).unwrap_or(600.0);
                 let ctrl = self.modifiers.state().control_key();
                 let shift = self.modifiers.state().shift_key();
+                let alt = self.modifiers.state().alt_key();
+                // The address bar takes the keyboard while it has focus.
+                if self.chrome.has_focus() {
+                    let key = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => Some(ChromeKey::Backspace),
+                        Key::Named(NamedKey::Delete) => Some(ChromeKey::Delete),
+                        Key::Named(NamedKey::ArrowLeft) => Some(ChromeKey::ArrowLeft),
+                        Key::Named(NamedKey::ArrowRight) => Some(ChromeKey::ArrowRight),
+                        Key::Named(NamedKey::Home) => Some(ChromeKey::Home),
+                        Key::Named(NamedKey::End) => Some(ChromeKey::End),
+                        Key::Named(NamedKey::Enter) => Some(ChromeKey::Enter),
+                        Key::Named(NamedKey::Escape) => Some(ChromeKey::Escape),
+                        Key::Named(NamedKey::Tab) => Some(ChromeKey::Tab),
+                        Key::Character(c) if ctrl => Some(ChromeKey::Character(c.to_string())),
+                        _ => event
+                            .text
+                            .as_ref()
+                            .filter(|t| !ctrl && !alt && !t.chars().all(char::is_control))
+                            .map(|t| ChromeKey::Character(t.to_string())),
+                    };
+                    if let Some(key) = key {
+                        let actions = self.chrome.key(KeyInput { key, ctrl, shift, alt });
+                        self.handle_chrome_actions(actions);
+                    }
+                    return;
+                }
                 match &event.logical_key {
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("l") => {
+                        self.chrome.focus_address();
+                        self.sync_ime();
+                    }
+                    Key::Named(NamedKey::F6) => {
+                        self.chrome.focus_address();
+                        self.sync_ime();
+                    }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => {
                         let url = self.start_url();
                         if let Err(e) = self.open_tab(url, true) {
