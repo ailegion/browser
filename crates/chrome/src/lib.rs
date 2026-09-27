@@ -148,6 +148,9 @@ pub enum ChromeAction {
     FindNext { forward: bool },
     /// The find bar closed.
     FindClose,
+    /// Tab (or Shift+Tab) left a chrome text box: the page should focus
+    /// its first (or last) focusable element.
+    FocusPage { forward: bool },
 }
 
 /// What the tab strip shows for one tab.
@@ -538,7 +541,7 @@ impl Chrome {
             Key::Escape => return self.close_find(),
             Key::Tab => {
                 self.blur();
-                return Vec::new();
+                return vec![ChromeAction::FocusPage { forward: !input.shift }];
             }
             _ => {}
         }
@@ -1036,7 +1039,10 @@ impl Chrome {
                 }
                 self.blur();
             }
-            Some(InputEvent::Blur) => self.blur(),
+            Some(InputEvent::Blur) => {
+                self.blur();
+                actions.push(ChromeAction::FocusPage { forward: !input.shift });
+            }
             Some(InputEvent::Copy(text)) => actions.push(ChromeAction::CopyText(text)),
             Some(InputEvent::RequestPaste) => actions.push(ChromeAction::RequestPaste),
             None => {}
@@ -1566,7 +1572,10 @@ mod tests {
         assert_eq!(c.address_text(), "q");
         c.key(KeyInput::shift(Key::Home));
         assert_eq!(c.key(KeyInput::ctrl(Key::Character("c".into()))), vec![ChromeAction::CopyText("q".into())]);
-        c.key(KeyInput::plain(Key::Tab));
+        assert_eq!(c.key(KeyInput::plain(Key::Tab)), vec![ChromeAction::FocusPage { forward: true }]);
+        assert!(!c.has_focus());
+        c.focus_address();
+        assert_eq!(c.key(KeyInput::shift(Key::Tab)), vec![ChromeAction::FocusPage { forward: false }]);
         assert!(!c.has_focus());
     }
 

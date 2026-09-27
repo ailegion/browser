@@ -354,6 +354,34 @@ Work:
    match-case options, matching across block boundaries, a find bar
    per tab (it closes on tab switch), scrolling horizontally to a match
    inside an `overflow: hidden` box.
+   **Block 3 done 2026-09-27: keyboard focus and tab order.** The shell
+   sends Tab, Shift+Tab and Enter to the page as `ShellToTab::Key`
+   (a small `Key` enum in `ipc-types`, for form controls to grow into).
+   The tab computes the sequential focus order per HTML: positive
+   `tabindex` first ascending, then links, enabled controls (not hidden
+   inputs) and `tabindex=0` elements in tree order; negative `tabindex`
+   is click-focusable only; elements with nothing laid out (`display:
+   none`) are skipped. Tab from nothing starts at the first, Shift+Tab
+   at the last; from an element outside the order it continues from
+   that element's place in the tree; past either end the tab reports
+   `TabToShell::FocusOut` and the shell focuses the address bar, and
+   Tab or Shift+Tab out of the address bar or the find box
+   (`ChromeAction::FocusPage`) comes back to the page's first or last
+   element. Keyboard focus gets a new `FOCUS_VISIBLE` state bit so
+   `:focus-visible` matches only then (a click focuses without it), and
+   a focus ring: the tab keeps the focused element's boxes (text
+   fragments of one line joined) and paint draws a 2px blue rounded
+   outline just outside them, over the page; the focused element is
+   scrolled into view with a margin. Enter follows a focused link.
+   Tests: the paint pixel test checks the ring, one chrome test checks
+   the hand-off actions, one tab harness test walks the whole order
+   both ways, checks `:focus-visible` and the ring for keyboard focus
+   only, a click on a negative-tabindex element, Enter, and focus
+   leaving the page at both ends and on a page with nothing focusable.
+   Not done: `outline` properties (a page cannot restyle or suppress
+   the ring), Space or Enter on buttons and other controls (block 4),
+   focus following the fragment target, `autofocus`, `accesskey`,
+   arrow keys and Escape reaching the page.
 8. Media queries and custom properties in `style`.
 9. CI matrix: Windows, Linux, macOS builds. Note: on 2026-09-26 the owner
    turned automatic CI runs off (`.github/workflows/ci.yml` is

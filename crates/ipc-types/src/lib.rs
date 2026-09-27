@@ -45,6 +45,27 @@ pub enum Cursor {
     Text,
 }
 
+/// A key the page may act on. Text keys come as `Character` with what
+/// the key produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Key {
+    Character(String),
+    Tab,
+    Enter,
+    Escape,
+    Space,
+    Backspace,
+    Delete,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
 /// Shell to tab. Mouse positions are logical pixels within the page's
 /// viewport (the tab adds its own scroll offset).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +95,16 @@ pub enum ShellToTab {
     FindNext { forward: bool },
     /// The find bar closed: drop the matches and their highlights.
     FindClose,
+    /// A key went down while the page has the keyboard. Tab and
+    /// Shift+Tab move focus through the page's tab order; Enter activates
+    /// the focused element. With nothing focused, Tab starts from the
+    /// first focusable element and Shift+Tab from the last.
+    Key {
+        key: Key,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    },
     Close,
 }
 
@@ -96,6 +127,9 @@ pub enum TabToShell {
     CopyText { text: String },
     /// How many find matches there are and which is current (1-based).
     FindResult { current: Option<usize>, total: usize },
+    /// Tab moved past the page's last focusable element (or Shift+Tab
+    /// before its first): focus goes to the chrome.
+    FocusOut { forward: bool },
     /// The tab thread panicked and was unwound; the shell shows a crashed page.
     Crashed { message: String },
     Closed,

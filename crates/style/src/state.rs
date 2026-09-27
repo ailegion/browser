@@ -27,6 +27,9 @@ impl ElementStates {
     pub const FOCUS_WITHIN: u8 = 8;
     /// The element the URL fragment names (`:target`).
     pub const TARGET: u8 = 16;
+    /// The focused element when focus came from the keyboard
+    /// (`:focus-visible`); a mouse click focuses without it.
+    pub const FOCUS_VISIBLE: u8 = 32;
 
     pub fn has(&self, id: NodeId, flag: u8) -> bool {
         self.flags.get(id).is_some_and(|f| f & flag != 0)
@@ -83,6 +86,11 @@ impl ElementStates {
 
     pub fn is_empty(&self) -> bool {
         self.flags.is_empty()
+    }
+
+    /// Whether any element has `flag`.
+    pub fn has_any(&self, flag: u8) -> bool {
+        self.flags.values().any(|f| f & flag != 0)
     }
 }
 

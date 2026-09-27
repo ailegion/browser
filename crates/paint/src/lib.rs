@@ -138,7 +138,15 @@ pub struct PaintOptions {
     /// Find-in-page matches, and the current one, drawn over the selection.
     pub matches: SelectionRanges,
     pub current_match: SelectionRanges,
+    /// Page rectangles to draw the keyboard focus ring around, over
+    /// everything else.
+    pub focus_ring: Vec<Rect>,
 }
+
+/// The keyboard focus ring.
+const FOCUS_RING: Color = Color::from_rgb8(0x1a, 0x5f, 0xd6);
+const FOCUS_RING_WIDTH: f64 = 2.0;
+const FOCUS_RING_OFFSET: f64 = 1.0;
 
 /// Behind selected text.
 const SELECTION: Color = Color::from_rgb8(0xb4, 0xd5, 0xfe);
@@ -204,6 +212,9 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
     };
     if let Some(html) = html {
         painter.fragment(html);
+    }
+    for r in &options.focus_ring {
+        painter.focus_ring(r);
     }
 }
 
@@ -408,6 +419,18 @@ impl Painter<'_> {
         }
     }
 
+    /// A rounded outline just outside `rect`.
+    fn focus_ring(&mut self, rect: &Rect) {
+        if !intersects(rect, &self.visible) {
+            return;
+        }
+        let outer = krect(rect).inflate(FOCUS_RING_OFFSET + FOCUS_RING_WIDTH, FOCUS_RING_OFFSET + FOCUS_RING_WIDTH);
+        let inner = krect(rect).inflate(FOCUS_RING_OFFSET, FOCUS_RING_OFFSET);
+        let mut path = RoundedRect::from_rect(outer, 4.0).to_path(0.1);
+        path.extend(RoundedRect::from_rect(inner, 2.0).to_path(0.1));
+        self.scene.fill(Fill::EvenOdd, self.transform, FOCUS_RING, None, &path);
+    }
+
     fn text(&mut self, rect: &Rect, t: &TextFragment, node: Option<NodeId>) {
         self.selection_highlight(rect, t, node);
         let origin = self.transform * Affine::translate((rect.x as f64, rect.y as f64));
@@ -555,6 +578,25 @@ mod tests {
         paint(&tree, &images, &options, &mut scene);
         let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
         assert_eq!([pixels[800], pixels[801], pixels[802]], [0xff, 0x96, 0x32]);
+
+        // A focus ring around a rectangle: blue just outside it, canvas
+        // further out and inside.
+        options = PaintOptions {
+            focus_ring: vec![browser_layout::Rect::new(50.0, 50.0, 40.0, 20.0)],
+            ..PaintOptions::default()
+        };
+        options.viewport_width = 200.0;
+        options.viewport_height = 100.0;
+        options.scale = 1.0;
+        paint(&tree, &images, &options, &mut scene);
+        let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
+        let px = |x: usize, y: usize| {
+            let i = (y * 200 + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        assert_eq!(px(70, 48), [0x1a, 0x5f, 0xd6], "ring above the box");
+        assert_eq!(px(70, 60), [255, 255, 255], "inside is untouched");
+        assert_eq!(px(70, 44), [255, 255, 255], "outside the ring");
     }
 
     #[test]

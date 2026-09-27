@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use browser_dom::{Document, HtmlParser, NodeId};
-use browser_ipc_types::{Cursor, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
+use browser_ipc_types::{Cursor, Key, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
 use browser_layout::selection::{self, TextPos};
-use browser_layout::{LayoutEngine, LayoutTree, SelectionRanges};
+use browser_layout::{LayoutEngine, LayoutTree, Rect, SelectionRanges};
 use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
@@ -123,6 +123,10 @@ pub(crate) struct TabState {
     deps: InteractionDeps,
     hover: Option<NodeId>,
     focus: Option<NodeId>,
+    /// Where the focus ring is drawn: the focused element's boxes, when
+    /// focus came from the keyboard. Kept up to date with focus and layout
+    /// so a repaint does not walk the tree.
+    focus_ring: Vec<Rect>,
     /// The link a button went down on; released on the same link, the
     /// primary button follows it and the middle button opens it in a new
     /// tab.
@@ -196,6 +200,7 @@ impl TabState {
             deps: InteractionDeps::default(),
             hover: None,
             focus: None,
+            focus_ring: Vec::new(),
             press: None,
             mouse: None,
             hover_dirty: false,
@@ -336,7 +341,7 @@ impl TabState {
                 if button == MouseButton::Left {
                     self.set_active(hit);
                     let focus = hit.and_then(|h| self.focusable_ancestor(h));
-                    self.set_focus(focus);
+                    self.set_focus(focus, false);
                 }
                 if matches!(button, MouseButton::Left | MouseButton::Middle) {
                     self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
@@ -392,8 +397,187 @@ impl TabState {
                     self.needs_paint = true;
                 }
             }
+            ShellToTab::Key { key, shift, ctrl, alt } => match key {
+                Key::Tab if !ctrl && !alt => self.focus_step(!shift),
+                Key::Enter if !ctrl && !alt => {
+                    if let Some(f) = self.focus
+                        && self.doc.as_ref().and_then(|d| d.element(f)).is_some_and(is_link)
+                    {
+                        self.follow_link(f);
+                    }
+                }
+                _ => {}
+            },
             ShellToTab::Close => {}
         }
+    }
+
+    // ----- keyboard focus -----
+
+    /// Elements that have something laid out, with their ancestors: an
+    /// element with no box of its own (a link) is rendered if any of its
+    /// content is.
+    fn rendered_elements(&self) -> std::collections::HashSet<NodeId> {
+        let mut out = std::collections::HashSet::new();
+        let (Some(doc), Some(tree)) = (&self.doc, &self.layout) else {
+            return out;
+        };
+        tree.root.walk(&mut |f| {
+            let mut cur = f.node;
+            while let Some(n) = cur {
+                if !out.insert(n) {
+                    break;
+                }
+                cur = doc.parent(n);
+            }
+        });
+        out
+    }
+
+    /// The page's sequential focus navigation order (HTML "tabindex"):
+    /// positive `tabindex` values first, ascending, then everything
+    /// focusable with `tabindex` 0 or none, in tree order. Elements with a
+    /// negative `tabindex` are click-focusable only. Each entry carries the
+    /// element's tree position.
+    fn focus_order(&self) -> Vec<(usize, NodeId)> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let rendered = self.rendered_elements();
+        let mut positive: Vec<(i64, usize, NodeId)> = Vec::new();
+        let mut normal: Vec<(usize, NodeId)> = Vec::new();
+        for (i, n) in doc.descendants(doc.root()).enumerate() {
+            let Some(e) = doc.element(n) else { continue };
+            if !is_focusable(e) || !rendered.contains(&n) {
+                continue;
+            }
+            match tabindex(e) {
+                Some(t) if t < 0 => {}
+                Some(t) if t > 0 => positive.push((t, i, n)),
+                _ => normal.push((i, n)),
+            }
+        }
+        positive.sort();
+        positive.into_iter().map(|(_, i, n)| (i, n)).chain(normal).collect()
+    }
+
+    /// Tab or Shift+Tab: focus the next or previous element in the tab
+    /// order. Past either end, focus leaves the page for the chrome.
+    fn focus_step(&mut self, forward: bool) {
+        let order = self.focus_order();
+        let current = self.focus.and_then(|f| order.iter().position(|&(_, n)| n == f));
+        let next = match (current, self.focus) {
+            (Some(i), _) => {
+                if forward {
+                    order.get(i + 1)
+                } else {
+                    i.checked_sub(1).and_then(|j| order.get(j))
+                }
+            }
+            // Focused by a click on something outside the order (a
+            // negative tabindex): continue from its place in the tree.
+            (None, Some(f)) => {
+                let pos = self
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d.descendants(d.root()).position(|n| n == f))
+                    .unwrap_or(0);
+                if forward {
+                    order.iter().find(|&&(i, _)| i > pos)
+                } else {
+                    order.iter().rev().find(|&&(i, _)| i < pos)
+                }
+            }
+            (None, None) => {
+                if forward {
+                    order.first()
+                } else {
+                    order.last()
+                }
+            }
+        }
+        .map(|&(_, n)| n);
+        self.set_focus(next, true);
+        if next.is_some() {
+            self.scroll_focus_into_view();
+        } else {
+            self.send(TabToShell::FocusOut { forward });
+        }
+    }
+
+    /// The boxes of the focused element, one per line for inline content,
+    /// or nothing when focus did not come from the keyboard.
+    fn compute_focus_ring(&self) -> Vec<Rect> {
+        let (Some(doc), Some(tree), Some(focus)) = (&self.doc, &self.layout, self.focus) else {
+            return Vec::new();
+        };
+        if !self.states.has(focus, ElementStates::FOCUS_VISIBLE) {
+            return Vec::new();
+        }
+        let mut rects: Vec<Rect> = Vec::new();
+        tree.root.walk(&mut |f| {
+            let Some(n) = f.node else { return };
+            let mut cur = Some(n);
+            let inside = loop {
+                match cur {
+                    Some(c) if c == focus => break true,
+                    Some(c) => cur = doc.parent(c),
+                    None => break false,
+                }
+            };
+            if inside && f.rect.width > 0.0 && f.rect.height > 0.0 {
+                // A box fragment covers its own children; keep the outer one.
+                if let Some(last) = rects.last()
+                    && last.x <= f.rect.x
+                    && last.y <= f.rect.y
+                    && last.right() >= f.rect.right()
+                    && last.bottom() >= f.rect.bottom()
+                {
+                    return;
+                }
+                rects.push(f.rect);
+            }
+        });
+        // Join text fragments that sit side by side on one line.
+        rects.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+        let mut merged: Vec<Rect> = Vec::new();
+        for r in rects {
+            match merged.last_mut() {
+                Some(m)
+                    if (m.y - r.y).abs() < 0.5 && (m.height - r.height).abs() < 0.5 && r.x <= m.right() + 0.5 =>
+                {
+                    let right = m.right().max(r.right());
+                    m.width = right - m.x;
+                }
+                _ => merged.push(r),
+            }
+        }
+        merged
+    }
+
+    /// Scroll so the focus ring is inside the viewport, with a margin.
+    fn scroll_focus_into_view(&mut self) {
+        let Some(first) = self.focus_ring.first().copied() else { return };
+        let union = self.focus_ring.iter().fold(first, |u, r| {
+            let x = u.x.min(r.x);
+            let y = u.y.min(r.y);
+            Rect::new(x, y, u.right().max(r.right()) - x, u.bottom().max(r.bottom()) - y)
+        });
+        let margin = 24.0;
+        let (w, h) = (self.viewport.width, self.viewport.height);
+        if union.bottom() + margin > self.scroll_y + h {
+            self.scroll_y = union.bottom() + margin - h;
+        }
+        if union.y - margin < self.scroll_y {
+            self.scroll_y = union.y - margin;
+        }
+        if union.right() + margin > self.scroll_x + w {
+            self.scroll_x = union.right() + margin - w;
+        }
+        if union.x - margin < self.scroll_x {
+            self.scroll_x = union.x - margin;
+        }
+        self.clamp_scroll();
+        self.needs_paint = true;
+        self.hover_dirty = true;
     }
 
     // ----- find in page -----
@@ -863,15 +1047,7 @@ impl TabState {
     }
 
     fn focusable_ancestor(&self, id: NodeId) -> Option<NodeId> {
-        self.ancestor_or_self(id, |e| {
-            e.name.ns == ns!(html)
-                && (is_link(e)
-                    || (matches!(
-                        e.name.local,
-                        local_name!("input") | local_name!("button") | local_name!("select") | local_name!("textarea")
-                    ) && e.attr("disabled").is_none())
-                    || e.attr("tabindex").is_some())
-        })
+        self.ancestor_or_self(id, is_focusable)
     }
 
     /// Re-evaluate what is under the pointer; restyle if it changed.
@@ -925,17 +1101,26 @@ impl TabState {
         self.restyle_for(changed, StateKind::Active);
     }
 
-    fn set_focus(&mut self, target: Option<NodeId>) {
-        if target == self.focus {
-            return;
-        }
+    /// Focus `target`. Focus from the keyboard also gets `:focus-visible`
+    /// and the focus ring; a click gets neither.
+    fn set_focus(&mut self, target: Option<NodeId>, keyboard: bool) {
+        let visible = if keyboard { target } else { None };
+        let same = target == self.focus && visible.is_some() == self.states.has_any(ElementStates::FOCUS_VISIBLE);
         self.focus = target;
         let Some(doc) = &self.doc else { return };
         let mut changed = self.states.set_single(target, ElementStates::FOCUS);
         changed.extend(self.states.set_chain(doc, target, ElementStates::FOCUS_WITHIN));
+        changed.extend(self.states.set_single(visible, ElementStates::FOCUS_VISIBLE));
         changed.sort();
         changed.dedup();
-        self.restyle_for(changed, StateKind::Focus);
+        if !same {
+            self.restyle_for(changed, StateKind::Focus);
+        }
+        let ring = self.compute_focus_ring();
+        if ring != self.focus_ring {
+            self.focus_ring = ring;
+            self.needs_paint = true;
+        }
     }
 
     /// Restyle what a state change on `changed` can affect, per `reach`,
@@ -1227,6 +1412,7 @@ impl TabState {
         self.states = ElementStates::default();
         self.hover = None;
         self.focus = None;
+        self.focus_ring.clear();
         self.press = None;
         self.selection = None;
         self.select_anchor = None;
@@ -1507,6 +1693,9 @@ impl TabState {
             let prefer = self.current_match_start();
             self.refresh_find(prefer, false);
         }
+        if self.focus.is_some() {
+            self.focus_ring = self.compute_focus_ring();
+        }
     }
 
     fn repaint(&mut self) {
@@ -1520,6 +1709,7 @@ impl TabState {
             selection: self.selection_ranges(),
             matches: self.find.as_ref().map(|f| f.ranges.clone()).unwrap_or_default(),
             current_match: self.find.as_ref().map(|f| f.current_ranges.clone()).unwrap_or_default(),
+            focus_ring: self.focus_ring.clone(),
         };
         paint(tree, &self.images, &options, &mut self.scene);
         if let Some(sb) = self.scrollbar() {
@@ -1542,6 +1732,26 @@ fn is_link(e: &browser_dom::Element) -> bool {
     e.name.ns == ns!(html)
         && matches!(e.name.local, local_name!("a") | local_name!("area"))
         && e.attr("href").is_some()
+}
+
+/// Whether an element can take focus at all: links, enabled form
+/// controls (not hidden inputs), and anything with a `tabindex`.
+fn is_focusable(e: &browser_dom::Element) -> bool {
+    if e.name.ns != ns!(html) {
+        return false;
+    }
+    let control = matches!(
+        e.name.local,
+        local_name!("input") | local_name!("button") | local_name!("select") | local_name!("textarea")
+    ) && e.attr("disabled").is_none()
+        && !(e.name.local == local_name!("input")
+            && e.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")));
+    is_link(e) || control || e.attr("tabindex").is_some()
+}
+
+/// The element's `tabindex`, if it has a valid one.
+fn tabindex(e: &browser_dom::Element) -> Option<i64> {
+    e.attr("tabindex")?.trim().parse().ok()
 }
 
 /// Parse a `Refresh` value (`5`, `5; url=/next`, `0;URL='x'`) into the
@@ -1611,8 +1821,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::mpsc::{Receiver, channel};
-
-    use browser_layout::Rect;
 
     /// A tab with a document loaded from a `data:` URL, which the net
     /// service answers synchronously, so no network and no threads.
@@ -2261,6 +2469,122 @@ mod tests {
         assert_eq!(h.find_result(), Some((Some(1), 2)), "found again on the new page");
         h.send(ShellToTab::Navigate { url: data_url("<p>nothing here</p>", None) });
         assert_eq!(h.find_result(), Some((None, 0)));
+    }
+
+    impl Harness {
+        fn by_id(&self, id: &str) -> NodeId {
+            let doc = self.state.doc.as_ref().expect("document");
+            doc.descendants(doc.root())
+                .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+                .expect("element with id")
+        }
+
+        fn key(&mut self, key: Key, shift: bool) {
+            self.send(ShellToTab::Key {
+                key,
+                shift,
+                ctrl: false,
+                alt: false,
+            });
+        }
+
+        fn focus_id(&self) -> Option<String> {
+            let doc = self.state.doc.as_ref()?;
+            doc.element(self.state.focus?)?.id().map(str::to_owned)
+        }
+
+        fn focus_outs(&self) -> Vec<bool> {
+            self.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|m| match m {
+                    TabToShell::FocusOut { forward } => Some(*forward),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn color_of(&self, id: &str) -> [u8; 4] {
+            self.state.styles[self.by_id(id)].color.to_rgba8()
+        }
+    }
+
+    const FOCUS_PAGE: &str = "<!doctype html><style>body { margin: 0; line-height: 20px; color: black } \
+        :focus-visible { color: red } div { height: 1500px }</style>\
+        <p><a id=a1 href='#x'>one</a> <a id=a2 href='#y' tabindex='-1'>two</a> \
+        <span id=s tabindex='0'>three</span> <a id=a3 href='#z' tabindex='2'>four</a> \
+        <b id=b tabindex='1'>five</b> <a id=hidden href='#h' style='display:none'>hidden</a> \
+        <input id=hid type=hidden> <input id=dis disabled></p>\
+        <div></div><p><a id=last href='#last'>last</a></p>";
+
+    #[test]
+    fn tab_walks_the_focus_order_shows_a_ring_and_leaves_the_page_at_the_ends() {
+        let mut h = Harness::load(FOCUS_PAGE);
+        // Positive tabindex first, ascending, then tree order; hidden,
+        // disabled and negative-tabindex elements are skipped.
+        let expected = ["b", "a3", "a1", "s", "last"];
+        for id in expected {
+            h.key(Key::Tab, false);
+            assert_eq!(h.focus_id().as_deref(), Some(id));
+            assert_eq!(h.color_of(id), [255, 0, 0, 255], ":focus-visible on {id}");
+            assert!(!h.state.focus_ring.is_empty(), "a ring on {id}");
+        }
+        assert!(h.state.scroll_y > 900.0, "the last link was scrolled into view");
+        assert!(h.focus_outs().is_empty());
+        h.key(Key::Tab, false);
+        assert_eq!(h.focus_id(), None);
+        assert_eq!(h.focus_outs(), vec![true], "past the end, focus leaves the page");
+        assert!(h.state.focus_ring.is_empty());
+
+        // Shift+Tab from nothing starts at the last; keeps going back.
+        h.key(Key::Tab, true);
+        assert_eq!(h.focus_id().as_deref(), Some("last"));
+        h.key(Key::Tab, true);
+        assert_eq!(h.focus_id().as_deref(), Some("s"));
+        assert!(h.state.scroll_y < 100.0, "scrolled back up to it");
+        for _ in 0..3 {
+            h.key(Key::Tab, true);
+        }
+        assert_eq!(h.focus_id().as_deref(), Some("b"));
+        h.key(Key::Tab, true);
+        assert_eq!(h.focus_outs(), vec![true, false]);
+
+        // A click focuses without the ring or :focus-visible; Tab goes
+        // on from there. A negative tabindex is click-focusable and Tab
+        // continues from its place in the tree.
+        h.click("a");
+        assert_eq!(h.focus_id().as_deref(), Some("a1"));
+        assert_ne!(h.color_of("a1"), [255, 0, 0, 255], "no :focus-visible from a click");
+        assert!(h.state.focus_ring.is_empty());
+        h.key(Key::Tab, false);
+        assert_eq!(h.focus_id().as_deref(), Some("s"));
+        let a2 = h.by_id("a2");
+        let r = h.rect_of(a2);
+        let (x, y) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(h.focus_id().as_deref(), Some("a2"));
+        h.key(Key::Tab, true);
+        assert_eq!(h.focus_id().as_deref(), Some("a1"), "the element before a2 in the order");
+        h.key(Key::Tab, true);
+        assert_eq!(h.focus_id().as_deref(), Some("a3"));
+
+        // Enter follows a focused link; on a plain tabindex element it
+        // does nothing.
+        h.key(Key::Enter, false);
+        assert_eq!(h.state.url.as_ref().and_then(|u| u.fragment()), Some("z"));
+        h.key(Key::Tab, false);
+        h.key(Key::Tab, false);
+        assert_eq!(h.focus_id().as_deref(), Some("s"));
+        h.key(Key::Enter, false);
+        assert_eq!(h.state.url.as_ref().and_then(|u| u.fragment()), Some("z"));
+
+        // A new document has no focus.
+        h.send(ShellToTab::Navigate { url: data_url("<p>plain</p>", None) });
+        assert_eq!(h.state.focus, None);
+        h.key(Key::Tab, false);
+        assert_eq!(h.focus_outs(), vec![true, false, true], "nothing focusable: straight out");
     }
 
     #[test]

@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use browser_chrome::{Chrome, ChromeAction, Key as ChromeKey, KeyInput, TabInfo};
-use browser_ipc_types::{Cursor as PageCursor, MouseButton as PageButton, ShellToTab, TabId, TabToShell, Viewport};
+use browser_ipc_types::{
+    Cursor as PageCursor, Key as PageKey, MouseButton as PageButton, ShellToTab, TabId, TabToShell, Viewport,
+};
 use browser_net::NetService;
 use browser_tab::{TabHandle, TabOutput, spawn_tab};
 use url::Url;
@@ -229,6 +231,12 @@ impl App {
                 ChromeAction::Find(query) => self.send_to_current(ShellToTab::Find { query }),
                 ChromeAction::FindNext { forward } => self.send_to_current(ShellToTab::FindNext { forward }),
                 ChromeAction::FindClose => self.send_to_current(ShellToTab::FindClose),
+                ChromeAction::FocusPage { forward } => self.send_to_current(ShellToTab::Key {
+                    key: PageKey::Tab,
+                    shift: !forward,
+                    ctrl: false,
+                    alt: false,
+                }),
             }
         }
         self.sync_ime();
@@ -746,6 +754,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            TabOutput::Message(TabToShell::FocusOut { .. }) => {
+                // Past either end of the page's tab order: the address bar
+                // is the chrome's one stop, in both directions.
+                if is_current {
+                    self.chrome.focus_address();
+                    self.sync_ime();
+                }
+            }
             TabOutput::Message(TabToShell::Crashed { message }) => {
                 // The tab thread goes on and shows its crash page; nothing
                 // to do here but note it, and fail a screenshot run.
@@ -1008,6 +1024,18 @@ impl ApplicationHandler<UserEvent> for App {
                         let next = if shift { (self.current + count - 1) % count } else { (self.current + 1) % count };
                         self.activate(next);
                     }
+                    Key::Named(NamedKey::Tab) => self.send_to_current(ShellToTab::Key {
+                        key: PageKey::Tab,
+                        shift,
+                        ctrl,
+                        alt,
+                    }),
+                    Key::Named(NamedKey::Enter) => self.send_to_current(ShellToTab::Key {
+                        key: PageKey::Enter,
+                        shift,
+                        ctrl,
+                        alt,
+                    }),
                     Key::Named(NamedKey::ArrowDown) => self.scroll(0.0, LINE_SCROLL_PX),
                     Key::Named(NamedKey::ArrowUp) => self.scroll(0.0, -LINE_SCROLL_PX),
                     Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll(0.0, vp_h * 0.9),

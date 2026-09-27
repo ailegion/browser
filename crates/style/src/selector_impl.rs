@@ -436,7 +436,8 @@ impl selectors::Element for ElementRef<'_> {
         match pc {
             PseudoClass::Hover => self.states.has(self.id, ElementStates::HOVER),
             PseudoClass::Active => self.states.has(self.id, ElementStates::ACTIVE),
-            PseudoClass::Focus | PseudoClass::FocusVisible => self.states.has(self.id, ElementStates::FOCUS),
+            PseudoClass::Focus => self.states.has(self.id, ElementStates::FOCUS),
+            PseudoClass::FocusVisible => self.states.has(self.id, ElementStates::FOCUS_VISIBLE),
             PseudoClass::FocusWithin => self.states.has(self.id, ElementStates::FOCUS_WITHIN),
             PseudoClass::Target => self.states.has(self.id, ElementStates::TARGET),
             // Visited needs history (Phase 4).
