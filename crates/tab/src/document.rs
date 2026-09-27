@@ -127,6 +127,13 @@ pub(crate) struct TabState {
     /// focus came from the keyboard. Kept up to date with focus and layout
     /// so a repaint does not walk the tree.
     focus_ring: Vec<Rect>,
+    /// Byte offset of the caret in the focused text control's value.
+    caret: usize,
+    /// Where the caret is drawn, kept up to date like `focus_ring`.
+    caret_rect: Option<Rect>,
+    /// The checkbox or radio a primary button went down on; released on
+    /// the same one, it toggles.
+    press_control: Option<NodeId>,
     /// The link a button went down on; released on the same link, the
     /// primary button follows it and the middle button opens it in a new
     /// tab.
@@ -201,6 +208,9 @@ impl TabState {
             hover: None,
             focus: None,
             focus_ring: Vec::new(),
+            caret: 0,
+            caret_rect: None,
+            press_control: None,
             press: None,
             mouse: None,
             hover_dirty: false,
@@ -342,6 +352,8 @@ impl TabState {
                     self.set_active(hit);
                     let focus = hit.and_then(|h| self.focusable_ancestor(h));
                     self.set_focus(focus, false);
+                    self.press_control = hit.and_then(|h| self.ancestor_or_self(h, is_toggle));
+                    self.place_caret_at(x, y);
                 }
                 if matches!(button, MouseButton::Left | MouseButton::Middle) {
                     self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
@@ -366,6 +378,12 @@ impl TabState {
                 self.update_hover();
                 if button == MouseButton::Left {
                     self.set_active(None);
+                    let released_control = self.hover.and_then(|h| self.ancestor_or_self(h, is_toggle));
+                    if let Some(c) = self.press_control.take()
+                        && released_control == Some(c)
+                    {
+                        self.toggle_control(c);
+                    }
                 }
                 let released_on = self.hover.and_then(|h| self.ancestor_or_self(h, is_link));
                 if let (Some((pressed, pressed_button)), Some(released)) = (self.press.take(), released_on)
@@ -397,19 +415,307 @@ impl TabState {
                     self.needs_paint = true;
                 }
             }
-            ShellToTab::Key { key, shift, ctrl, alt } => match key {
-                Key::Tab if !ctrl && !alt => self.focus_step(!shift),
-                Key::Enter if !ctrl && !alt => {
-                    if let Some(f) = self.focus
-                        && self.doc.as_ref().and_then(|d| d.element(f)).is_some_and(is_link)
-                    {
-                        self.follow_link(f);
-                    }
-                }
-                _ => {}
-            },
+            ShellToTab::Key { key, shift, ctrl, alt } => self.key(key, shift, ctrl, alt),
             ShellToTab::Close => {}
         }
+    }
+
+    // ----- keys and form controls -----
+
+    /// A key for the page: Tab moves focus; a focused text control takes
+    /// the rest as editing; otherwise Enter follows a link, Space toggles
+    /// a checkbox or radio, arrows step a select, and the remaining keys
+    /// scroll.
+    fn key(&mut self, key: Key, shift: bool, ctrl: bool, alt: bool) {
+        if key == Key::Tab && !ctrl && !alt {
+            self.focus_step(!shift);
+            return;
+        }
+        let focus = self.focus;
+        let focused_is = |pred: fn(&browser_dom::Element) -> bool| {
+            focus
+                .and_then(|f| self.doc.as_ref()?.element(f))
+                .is_some_and(pred)
+        };
+        let (text, link, toggle, select) = (
+            focused_is(is_text_control),
+            focused_is(is_link),
+            focused_is(is_toggle),
+            focused_is(is_select),
+        );
+        // Only read where one of the flags above is set, so a missing
+        // focus never reaches a control.
+        let f = focus.unwrap_or_default();
+        if text {
+            self.edit_key(f, key, ctrl, alt);
+            return;
+        }
+        let h = self.viewport.height;
+        match key {
+            Key::Enter if link && !ctrl && !alt => self.follow_link(f),
+            Key::Space if toggle => self.toggle_control(f),
+            Key::ArrowUp | Key::ArrowDown if select => self.step_select(f, key == Key::ArrowDown),
+            Key::ArrowDown => self.scroll_by(0.0, LINE_SCROLL),
+            Key::ArrowUp => self.scroll_by(0.0, -LINE_SCROLL),
+            Key::ArrowRight => self.scroll_by(LINE_SCROLL, 0.0),
+            Key::ArrowLeft => self.scroll_by(-LINE_SCROLL, 0.0),
+            Key::PageDown => self.scroll_by(0.0, h * 0.9),
+            Key::PageUp => self.scroll_by(0.0, -h * 0.9),
+            Key::Space => self.scroll_by(0.0, if shift { -h * 0.9 } else { h * 0.9 }),
+            Key::Home => self.scroll_by(0.0, -1.0e9),
+            Key::End => self.scroll_by(0.0, 1.0e9),
+            _ => {}
+        }
+    }
+
+    fn scroll_by(&mut self, dx: f32, dy: f32) {
+        self.scroll_x += dx;
+        self.scroll_y += dy;
+        self.clamp_scroll();
+        self.needs_paint = true;
+        self.hover_dirty = true;
+    }
+
+    /// The live value of a text control: a textarea's text, an input's
+    /// `value` attribute (which editing updates, there being no script to
+    /// tell the difference yet).
+    fn control_value(&self, id: NodeId) -> String {
+        let Some(doc) = &self.doc else { return String::new() };
+        if doc.element(id).is_some_and(is_textarea) {
+            doc.text_content(id)
+        } else {
+            doc.element(id).and_then(|e| e.attr("value")).unwrap_or("").to_owned()
+        }
+    }
+
+    fn set_control_value(&mut self, id: NodeId, value: &str) {
+        let Some(doc) = &mut self.doc else { return };
+        if doc.element(id).is_some_and(is_textarea) {
+            doc.set_text_content(id, value);
+        } else if let Some(e) = doc.get_mut(id).as_element_mut() {
+            e.set_attr("value", value);
+        }
+        // The value is not a selector subject yet; layout is enough.
+        self.needs_layout = true;
+    }
+
+    /// Editing keys in a focused text control.
+    fn edit_key(&mut self, f: NodeId, key: Key, ctrl: bool, alt: bool) {
+        let textarea = self.doc.as_ref().and_then(|d| d.element(f)).is_some_and(is_textarea);
+        let mut value = self.control_value(f);
+        let mut caret = self.caret.min(value.len());
+        while !value.is_char_boundary(caret) {
+            caret -= 1;
+        }
+        let prev_len = |v: &str, c: usize| v[..c].chars().next_back().map_or(0, char::len_utf8);
+        let next_len = |v: &str, c: usize| v[c..].chars().next().map_or(0, char::len_utf8);
+        let mut changed = false;
+        match key {
+            Key::Character(s) if !ctrl && !alt => {
+                let s: String = s.chars().filter(|c| !c.is_control()).collect();
+                if !s.is_empty() {
+                    value.insert_str(caret, &s);
+                    caret += s.len();
+                    changed = true;
+                }
+            }
+            Key::Space if !ctrl && !alt => {
+                value.insert(caret, ' ');
+                caret += 1;
+                changed = true;
+            }
+            Key::Enter if textarea && !ctrl && !alt => {
+                value.insert(caret, '\n');
+                caret += 1;
+                changed = true;
+            }
+            Key::Backspace => {
+                let n = prev_len(&value, caret);
+                if n > 0 {
+                    value.replace_range(caret - n..caret, "");
+                    caret -= n;
+                    changed = true;
+                }
+            }
+            Key::Delete => {
+                let n = next_len(&value, caret);
+                if n > 0 {
+                    value.replace_range(caret..caret + n, "");
+                    changed = true;
+                }
+            }
+            Key::ArrowLeft => caret -= prev_len(&value, caret),
+            Key::ArrowRight => caret += next_len(&value, caret),
+            Key::Home => caret = value[..caret].rfind('\n').map_or(0, |i| i + 1),
+            Key::End => caret += value[caret..].find('\n').unwrap_or(value.len() - caret),
+            _ => {}
+        }
+        if changed {
+            self.set_control_value(f, &value);
+        }
+        self.caret = caret;
+        // With a layout pending the caret is placed after it.
+        if !changed {
+            self.update_caret();
+        }
+    }
+
+    /// A click in a text control puts the caret where it landed.
+    fn place_caret_at(&mut self, x: f32, y: f32) {
+        let Some(f) = self.focus else { return };
+        let Some(doc) = &self.doc else { return };
+        let Some(e) = doc.element(f) else { return };
+        if !is_text_control(e) || input_type(e).as_deref() == Some("password") {
+            return;
+        }
+        if let Some(p) = self.text_position_at(x, y)
+            && (p.node == f || doc.parent(p.node) == Some(f))
+        {
+            self.caret = p.offset;
+            self.update_caret();
+        }
+    }
+
+    /// Where the caret goes: after the value's character at `caret` in
+    /// the control's own text, or at the content box's start when there
+    /// is no text.
+    fn update_caret(&mut self) {
+        let mut caret = None;
+        if let (Some(doc), Some(tree), Some(f)) = (&self.doc, &self.layout, self.focus)
+            && let Some(e) = doc.element(f)
+            && is_text_control(e)
+        {
+            let value = self.control_value(f);
+            let mut off = self.caret.min(value.len());
+            while !value.is_char_boundary(off) {
+                off -= 1;
+            }
+            // A password shows one bullet per character.
+            let display = if input_type(e).as_deref() == Some("password") {
+                value[..off].chars().count() * '\u{2022}'.len_utf8()
+            } else {
+                off
+            };
+            let mut best: Option<(usize, Rect, f32)> = None;
+            tree.root.walk(&mut |frag| {
+                let browser_layout::FragmentContent::Text(t) = &frag.content else { return };
+                let mine = frag.node.is_some_and(|n| n == f || doc.parent(n) == Some(f));
+                if !mine || t.range.start > display || best.is_some_and(|(s, _, _)| s > t.range.start) {
+                    return;
+                }
+                let x = if display >= t.range.end {
+                    t.clusters.iter().map(|c| c.x + c.advance).fold(0.0, f32::max)
+                } else {
+                    t.clusters
+                        .iter()
+                        .find(|c| c.start <= display && display < c.end)
+                        .map_or(0.0, |c| c.x)
+                };
+                best = Some((t.range.start, frag.rect, x));
+            });
+            caret = match best {
+                Some((_, r, x)) => Some(Rect::new(r.x + x, r.y, 1.0, r.height)),
+                None => tree.first_rect(|n| n == f).map(|r| {
+                    let s = &self.styles[f];
+                    let (bl, bt, bb) = (s.border_width.left, s.border_width.top, s.border_width.bottom);
+                    let (pl, pt, pb) = (
+                        s.padding.left.resolve(r.width),
+                        s.padding.top.resolve(r.width),
+                        s.padding.bottom.resolve(r.width),
+                    );
+                    Rect::new(r.x + bl + pl, r.y + bt + pt, 1.0, (r.height - bt - bb - pt - pb).max(1.0))
+                }),
+            };
+        }
+        if caret != self.caret_rect {
+            self.caret_rect = caret;
+            self.needs_paint = true;
+        }
+    }
+
+    /// Flip a checkbox, or check a radio and clear the rest of its group
+    /// (same `name`, same form or document).
+    fn toggle_control(&mut self, id: NodeId) {
+        let Some(doc) = &mut self.doc else { return };
+        let Some(e) = doc.element(id) else { return };
+        if e.attr("disabled").is_some() {
+            return;
+        }
+        let radio = input_type(e).as_deref() == Some("radio");
+        let name = e.attr("name").map(str::to_owned);
+        if radio {
+            let mut scope = doc.root();
+            let mut cur = doc.parent(id);
+            while let Some(n) = cur {
+                if doc.element(n).is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("form")) {
+                    scope = n;
+                    break;
+                }
+                cur = doc.parent(n);
+            }
+            let group: Vec<NodeId> = doc
+                .descendants(scope)
+                .filter(|&n| {
+                    n != id
+                        && doc.element(n).is_some_and(|o| {
+                            input_type(o).as_deref() == Some("radio") && o.attr("name").map(str::to_owned) == name
+                        })
+                })
+                .collect();
+            for n in group {
+                if let Some(o) = doc.get_mut(n).as_element_mut() {
+                    o.remove_attr("checked");
+                }
+            }
+            if let Some(e) = doc.get_mut(id).as_element_mut() {
+                e.set_attr("checked", "");
+            }
+        } else if let Some(e) = doc.get_mut(id).as_element_mut() {
+            if e.attr("checked").is_some() {
+                e.remove_attr("checked");
+            } else {
+                e.set_attr("checked", "");
+            }
+        }
+        // `:checked` can restyle anything; the cascade runs again.
+        self.needs_style = true;
+    }
+
+    /// Arrow keys on a focused select move the chosen option.
+    fn step_select(&mut self, id: NodeId, down: bool) {
+        let Some(doc) = &mut self.doc else { return };
+        let options: Vec<NodeId> = doc
+            .descendants(id)
+            .filter(|&n| {
+                doc.element(n)
+                    .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("option"))
+            })
+            .collect();
+        if options.is_empty() {
+            return;
+        }
+        let current = options
+            .iter()
+            .position(|&o| doc.element(o).is_some_and(|e| e.attr("selected").is_some()))
+            .unwrap_or(0);
+        let next = if down {
+            (current + 1).min(options.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        if next == current && doc.element(options[current]).is_some_and(|e| e.attr("selected").is_some()) {
+            return;
+        }
+        for (i, &o) in options.iter().enumerate() {
+            if let Some(e) = doc.get_mut(o).as_element_mut() {
+                if i == next {
+                    e.set_attr("selected", "");
+                } else {
+                    e.remove_attr("selected");
+                }
+            }
+        }
+        self.needs_style = true;
     }
 
     // ----- keyboard focus -----
@@ -1077,7 +1383,13 @@ impl TabState {
         self.hover = hit;
 
         let over_link = hit.and_then(|h| self.ancestor_or_self(h, is_link)).is_some();
-        let over_text = raw.is_some_and(|n| self.doc.as_ref().is_some_and(|d| !d.get(n).is_element()));
+        // Text nodes, and the made-up text of a text control (whose
+        // fragments carry the control itself).
+        let over_text = raw.is_some_and(|n| {
+            self.doc
+                .as_ref()
+                .is_some_and(|d| !d.get(n).is_element() || d.element(n).is_some_and(is_text_control))
+        });
         let cursor = if over_link {
             Cursor::Pointer
         } else if over_text {
@@ -1115,12 +1427,15 @@ impl TabState {
         changed.dedup();
         if !same {
             self.restyle_for(changed, StateKind::Focus);
+            // A text control starts with the caret at its end.
+            self.caret = target.map(|t| self.control_value(t).len()).unwrap_or(0);
         }
         let ring = self.compute_focus_ring();
         if ring != self.focus_ring {
             self.focus_ring = ring;
             self.needs_paint = true;
         }
+        self.update_caret();
     }
 
     /// Restyle what a state change on `changed` can affect, per `reach`,
@@ -1413,6 +1728,8 @@ impl TabState {
         self.hover = None;
         self.focus = None;
         self.focus_ring.clear();
+        self.caret_rect = None;
+        self.press_control = None;
         self.press = None;
         self.selection = None;
         self.select_anchor = None;
@@ -1695,6 +2012,7 @@ impl TabState {
         }
         if self.focus.is_some() {
             self.focus_ring = self.compute_focus_ring();
+            self.update_caret();
         }
     }
 
@@ -1710,6 +2028,7 @@ impl TabState {
             matches: self.find.as_ref().map(|f| f.ranges.clone()).unwrap_or_default(),
             current_match: self.find.as_ref().map(|f| f.current_ranges.clone()).unwrap_or_default(),
             focus_ring: self.focus_ring.clone(),
+            caret: self.caret_rect,
         };
         paint(tree, &self.images, &options, &mut self.scene);
         if let Some(sb) = self.scrollbar() {
@@ -1752,6 +2071,40 @@ fn is_focusable(e: &browser_dom::Element) -> bool {
 /// The element's `tabindex`, if it has a valid one.
 fn tabindex(e: &browser_dom::Element) -> Option<i64> {
     e.attr("tabindex")?.trim().parse().ok()
+}
+
+/// Pixels one arrow key scrolls.
+const LINE_SCROLL: f32 = 40.0;
+
+/// An `<input>`'s type, lower-cased; `text` when absent. `None` for
+/// anything that is not an input.
+fn input_type(e: &browser_dom::Element) -> Option<String> {
+    (e.name.ns == ns!(html) && e.name.local == local_name!("input"))
+        .then(|| e.attr("type").map_or_else(|| "text".to_owned(), |t| t.trim().to_ascii_lowercase()))
+}
+
+fn is_textarea(e: &browser_dom::Element) -> bool {
+    e.name.ns == ns!(html) && e.name.local == local_name!("textarea")
+}
+
+fn is_select(e: &browser_dom::Element) -> bool {
+    e.name.ns == ns!(html) && e.name.local == local_name!("select")
+}
+
+/// A control whose value is typed: a textarea or a text-like input.
+fn is_text_control(e: &browser_dom::Element) -> bool {
+    is_textarea(e)
+        || input_type(e).is_some_and(|t| {
+            !matches!(
+                t.as_str(),
+                "checkbox" | "radio" | "submit" | "button" | "reset" | "image" | "file" | "hidden" | "range" | "color"
+            )
+        })
+}
+
+/// A checkbox or radio button.
+fn is_toggle(e: &browser_dom::Element) -> bool {
+    input_type(e).is_some_and(|t| t == "checkbox" || t == "radio")
 }
 
 /// Parse a `Refresh` value (`5`, `5; url=/next`, `0;URL='x'`) into the
@@ -2585,6 +2938,149 @@ mod tests {
         assert_eq!(h.state.focus, None);
         h.key(Key::Tab, false);
         assert_eq!(h.focus_outs(), vec![true, false, true], "nothing focusable: straight out");
+    }
+
+    const FORM: &str = "<!doctype html><style>body { margin: 0; color: black } input:checked + span { color: red }</style>\
+        <p><input id=t value='ab'> <input id=pw type=password> <textarea id=ta>hi</textarea></p>\
+        <p><input id=c type=checkbox><span id=cs>c</span> <input id=r1 type=radio name=g checked>\
+        <input id=r2 type=radio name=g> <select id=sel><option>One<option>Two<option>Three</select> \
+        <input id=d type=checkbox disabled></p>";
+
+    impl Harness {
+        fn has_attr(&self, id: &str, attr: &str) -> bool {
+            let doc = self.state.doc.as_ref().expect("document");
+            doc.element(self.by_id(id)).is_some_and(|e| e.attr(attr).is_some())
+        }
+
+        fn attr(&self, id: &str, attr: &str) -> Option<String> {
+            let doc = self.state.doc.as_ref().expect("document");
+            doc.element(self.by_id(id))?.attr(attr).map(str::to_owned)
+        }
+
+        /// Click near the right end of an element's first box.
+        fn click_end_of(&mut self, id: &str) {
+            let r = self.rect_of(self.by_id(id));
+            let (x, y) = (r.right() - 6.0, r.y + r.height / 2.0);
+            self.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+            self.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        }
+
+        fn click_id(&mut self, id: &str) {
+            let r = self.rect_of(self.by_id(id));
+            let (x, y) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+            self.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+            self.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        }
+
+        fn typed(&mut self, s: &str) {
+            for ch in s.chars() {
+                self.key(Key::Character(ch.to_string()), false);
+            }
+        }
+
+        /// The text laid out for a control (its value, placeholder or
+        /// chosen option).
+        fn control_text(&self, id: &str) -> String {
+            let node = self.by_id(id);
+            let mut out = String::new();
+            self.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+                if let browser_layout::FragmentContent::Text(t) = &f.content
+                    && f.node == Some(node)
+                {
+                    out.push_str(&t.text[t.range.clone()]);
+                }
+            });
+            out
+        }
+    }
+
+    #[test]
+    fn form_controls_toggle_edit_and_step() {
+        let mut h = Harness::load(FORM);
+        // Checkbox: a click toggles, and `:checked` restyles the sibling.
+        h.click_id("c");
+        assert!(h.has_attr("c", "checked"));
+        assert_eq!(h.color_of("cs"), [255, 0, 0, 255]);
+        h.click_id("c");
+        assert!(!h.has_attr("c", "checked"));
+        assert_eq!(h.color_of("cs"), [0, 0, 0, 255]);
+        // Space on the focused checkbox toggles too; a disabled one never.
+        h.key(Key::Space, false);
+        assert!(h.has_attr("c", "checked"));
+        h.click_id("d");
+        assert!(!h.has_attr("d", "checked"));
+        // Radios: one in the group at a time.
+        h.click_id("r2");
+        assert!(h.has_attr("r2", "checked") && !h.has_attr("r1", "checked"));
+        h.click_id("r1");
+        assert!(h.has_attr("r1", "checked") && !h.has_attr("r2", "checked"));
+
+        // Text input: the click puts the caret at the end; keys edit.
+        assert_eq!(h.control_text("t"), "ab");
+        h.click_end_of("t");
+        assert_eq!(h.focus_id().as_deref(), Some("t"));
+        assert_eq!(h.state.caret, 2);
+        let caret0 = h.state.caret_rect.expect("caret shown");
+        h.typed("x");
+        assert_eq!(h.attr("t", "value").as_deref(), Some("abx"));
+        assert_eq!(h.control_text("t"), "abx");
+        assert!(h.state.caret_rect.expect("caret").x > caret0.x, "the caret moved right");
+        h.key(Key::Backspace, false);
+        h.key(Key::Backspace, false);
+        h.key(Key::ArrowLeft, false);
+        h.typed("z");
+        assert_eq!(h.attr("t", "value").as_deref(), Some("za"));
+        h.key(Key::Home, false);
+        h.key(Key::Delete, false);
+        h.key(Key::End, false);
+        h.key(Key::Space, false);
+        assert_eq!(h.attr("t", "value").as_deref(), Some("a "));
+        assert_eq!(h.control_text("t"), "a ", "spaces are kept");
+        h.key(Key::Enter, false);
+        assert_eq!(h.attr("t", "value").as_deref(), Some("a "), "Enter does nothing in an input yet");
+        assert_eq!(h.state.history.len(), 1, "and does not navigate");
+
+        // Password shows bullets; a textarea takes newlines.
+        h.click_id("pw");
+        h.typed("pq");
+        assert_eq!(h.attr("pw", "value").as_deref(), Some("pq"));
+        assert_eq!(h.control_text("pw"), "\u{2022}\u{2022}");
+        h.click_end_of("ta");
+        h.key(Key::End, false);
+        h.key(Key::Enter, false);
+        h.typed("y");
+        let doc = h.state.doc.as_ref().expect("doc");
+        assert_eq!(doc.text_content(h.by_id("ta")), "hi\ny");
+        assert!(h.state.caret_rect.is_some_and(|c| c.y > 0.0), "the caret is on the second line");
+
+        // Select: arrows step the chosen option, and it shows.
+        assert_eq!(h.control_text("sel"), "One");
+        h.click_id("sel");
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.control_text("sel"), "Two");
+        h.key(Key::ArrowDown, false);
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.control_text("sel"), "Three", "stops at the last");
+        h.key(Key::ArrowUp, false);
+        assert_eq!(h.control_text("sel"), "Two");
+        assert_eq!(h.state.scroll_y, 0.0, "arrows on a select do not scroll");
+    }
+
+    #[test]
+    fn keys_scroll_when_nothing_takes_them() {
+        let mut h = Harness::load(TALL);
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.state.scroll_y, 40.0);
+        h.key(Key::PageDown, false);
+        assert_eq!(h.state.scroll_y, 580.0);
+        h.key(Key::Space, true);
+        assert_eq!(h.state.scroll_y, 40.0);
+        h.key(Key::End, false);
+        assert!(h.state.scroll_y > 900.0);
+        h.key(Key::Home, false);
+        assert_eq!(h.state.scroll_y, 0.0);
+        h.key(Key::Space, false);
+        assert_eq!(h.state.scroll_y, 540.0);
     }
 
     #[test]

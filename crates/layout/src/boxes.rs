@@ -4,11 +4,11 @@
 use std::sync::Arc;
 
 use browser_dom::{Document, NodeId, NodeKind};
-use browser_style::{ComputedStyle, Display, Float, ListStyleType, StyleMap, TextTransform, WhiteSpace};
+use browser_style::{ComputedStyle, Display, Float, ListStyleType, Rgba, StyleMap, TextTransform, WhiteSpace};
 use html5ever::{local_name, ns};
 use url::Url;
 
-use crate::{Fragment, ImageSizes};
+use crate::{Control, Fragment, ImageSizes};
 
 pub(crate) type TaffyId = taffy::NodeId;
 
@@ -32,6 +32,8 @@ pub(crate) struct BoxNode {
     /// True for boxes the engine invented (anonymous inline roots, markers).
     pub anonymous: bool,
     pub taffy: Option<TaffyId>,
+    /// A form control with its own drawing.
+    pub control: Option<Control>,
 }
 
 impl BoxNode {
@@ -43,6 +45,7 @@ impl BoxNode {
             children: Vec::new(),
             anonymous: false,
             taffy: None,
+            control: None,
         }
     }
 
@@ -168,6 +171,15 @@ impl InlineContent {
     }
 }
 
+/// The controls whose boxes are built specially.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlKind {
+    Check { radio: bool },
+    Text { password: bool },
+    ButtonInput,
+    Select,
+}
+
 /// Whitespace collapsing state while gathering one inline root.
 struct WsState {
     /// The last emitted character was a collapsible space.
@@ -208,8 +220,131 @@ impl BoxBuilder<'_> {
             .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("img"))
     }
 
+    /// What kind of form control an element is, if any.
+    fn control_kind(&self, id: NodeId) -> Option<ControlKind> {
+        let e = self.doc.element(id)?;
+        if e.name.ns != ns!(html) {
+            return None;
+        }
+        match e.name.local {
+            local_name!("input") => {
+                let kind = e.attr("type").map(|t| t.trim().to_ascii_lowercase()).unwrap_or_default();
+                Some(match kind.as_str() {
+                    "checkbox" => ControlKind::Check { radio: false },
+                    "radio" => ControlKind::Check { radio: true },
+                    "submit" | "button" | "reset" | "image" | "file" => ControlKind::ButtonInput,
+                    _ => ControlKind::Text {
+                        password: kind == "password",
+                    },
+                })
+            }
+            local_name!("select") => Some(ControlKind::Select),
+            _ => None,
+        }
+    }
+
+    /// A control's box with its contents made up here: a text input shows
+    /// its value or placeholder, a button input its label, a select its
+    /// chosen option; checkboxes and radios are drawn by the painter.
+    fn build_control(&self, id: NodeId, style: Arc<ComputedStyle>, kind: ControlKind) -> BoxNode {
+        let attr = |name: &str| self.doc.element(id).and_then(|e| e.attr(name));
+        match kind {
+            ControlKind::Check { radio } => {
+                let checked = attr("checked").is_some();
+                let mut b = BoxNode::new(BoxKind::Block, Some(id), style);
+                b.control = Some(if radio {
+                    Control::Radio { checked }
+                } else {
+                    Control::Checkbox { checked }
+                });
+                b
+            }
+            ControlKind::Text { password } => {
+                let value = attr("value").unwrap_or("");
+                let (text, dim) = if value.is_empty() {
+                    (attr("placeholder").unwrap_or("").to_owned(), true)
+                } else if password {
+                    ("\u{2022}".repeat(value.chars().count()), false)
+                } else {
+                    (value.to_owned(), false)
+                };
+                self.control_box(id, style, &text, dim, None)
+            }
+            ControlKind::ButtonInput => {
+                let kind = attr("type").map(|t| t.trim().to_ascii_lowercase()).unwrap_or_default();
+                let label = match attr("value") {
+                    Some(v) => v.to_owned(),
+                    None => match kind.as_str() {
+                        "submit" => "Submit".to_owned(),
+                        "reset" => "Reset".to_owned(),
+                        "file" => "Choose file".to_owned(),
+                        _ => String::new(),
+                    },
+                };
+                self.control_box(id, style, &label, false, None)
+            }
+            ControlKind::Select => {
+                let options: Vec<NodeId> = self
+                    .doc
+                    .descendants(id)
+                    .filter(|&n| {
+                        self.doc
+                            .element(n)
+                            .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("option"))
+                    })
+                    .collect();
+                let chosen = options
+                    .iter()
+                    .find(|&&o| self.doc.element(o).is_some_and(|e| e.attr("selected").is_some()))
+                    .or(options.first());
+                let text = chosen.map(|&o| self.doc.text_content(o)).unwrap_or_default();
+                self.control_box(id, style, text.trim(), false, Some(Control::Select))
+            }
+        }
+    }
+
+    /// A block box for a control with one line of made-up text inside,
+    /// kept on one line with spaces intact so caret offsets match the
+    /// value. `dim` draws it as a placeholder.
+    fn control_box(&self, id: NodeId, style: Arc<ComputedStyle>, text: &str, dim: bool, control: Option<Control>) -> BoxNode {
+        let mut b = BoxNode::new(BoxKind::Block, Some(id), style.clone());
+        b.control = control;
+        if text.is_empty() {
+            return b;
+        }
+        let mut container = ComputedStyle::anonymous_from(&style);
+        container.white_space = if control == Some(Control::Select) {
+            WhiteSpace::Nowrap
+        } else {
+            WhiteSpace::Pre
+        };
+        let container = Arc::new(container);
+        let mut text_style = (*container).clone();
+        if dim {
+            text_style.color = Rgba {
+                r: 0.46,
+                g: 0.46,
+                b: 0.46,
+                a: 1.0,
+            };
+        }
+        let mut content = InlineContent::new(container.clone());
+        let mut ws = WsState {
+            last_was_space: false,
+            at_line_start: true,
+        };
+        append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws);
+        let mut inline = BoxNode::new(BoxKind::Inline(content), None, container);
+        inline.anonymous = true;
+        b.children.push(inline);
+        b
+    }
+
     /// Build a block-level or atomic box for an element.
     fn build_element(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
+        if let Some(kind) = self.control_kind(id) {
+            return self.build_control(id, style, kind);
+        }
         if self.is_image(id) {
             let url = self
                 .doc
@@ -638,6 +773,63 @@ mod tests {
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["3. a", "7. b", "8. c", "\u{2022} d"]);
+    }
+
+    #[test]
+    fn controls_get_their_contents_made_up() {
+        let (doc, styles) = build(
+            "<body><input value='hello'><input placeholder='Type here'><input type=password value='abc'>\
+             <input type=checkbox checked><input type=radio><select><option>One<option selected>Two</select>\
+             <input type=submit><input type=button value='Go'><textarea>text\nhere</textarea><button>Push</button></body>",
+        );
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let root = builder.build_root().expect("root");
+        // Controls are inline-level, so they sit in the body's inline
+        // root as atomics; visit those too.
+        fn visit(b: &BoxNode, f: &mut impl FnMut(&BoxNode)) {
+            f(b);
+            if let BoxKind::Inline(c) = &b.kind {
+                for a in &c.atomics {
+                    visit(&a.node, f);
+                }
+            }
+            for c in &b.children {
+                visit(c, f);
+            }
+        }
+        let mut texts = Vec::new();
+        let mut found = Vec::new();
+        let mut owners = Vec::new();
+        visit(&root, &mut |b| {
+            found.extend(b.control);
+            if let BoxKind::Inline(c) = &b.kind {
+                if !c.text.trim().is_empty() {
+                    texts.push(c.text.clone());
+                }
+                // The made-up text belongs to the control, for hit testing
+                // and the caret.
+                owners.extend(
+                    c.spans
+                        .iter()
+                        .filter(|s| !c.text[s.start..s.end].trim().is_empty())
+                        .map(|s| s.node),
+                );
+            }
+        });
+        assert_eq!(
+            texts,
+            vec!["hello", "Type here", "\u{2022}\u{2022}\u{2022}", "Two", "Submit", "Go", "text\nhere", "Push"]
+        );
+        assert_eq!(
+            found,
+            vec![Control::Checkbox { checked: true }, Control::Radio { checked: false }, Control::Select]
+        );
+        let inputs: Vec<NodeId> = doc
+            .descendants(doc.root())
+            .filter(|&n| doc.element(n).is_some_and(|e| matches!(&*e.name.local, "input" | "select")))
+            .collect();
+        assert_eq!(owners[0], Some(inputs[0]));
+        assert_eq!(owners[3], Some(inputs[5]), "the select's text is the select's");
     }
 
     #[test]

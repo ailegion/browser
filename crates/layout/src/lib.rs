@@ -111,10 +111,21 @@ pub struct TextFragment {
     pub baseline: f32,
 }
 
+/// A form control the painter draws something particular for, beyond
+/// its box: the check mark, the radio dot, the drop-down arrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Checkbox { checked: bool },
+    Radio { checked: bool },
+    Select,
+}
+
 #[derive(Debug, Clone)]
 pub enum FragmentContent {
     /// An element's box: background and borders paint from `style`.
     Box,
+    /// A control's box: like `Box`, plus the control's own drawing.
+    Control(Control),
     /// Anonymous box: nothing of its own to paint.
     Anonymous,
     Text(TextFragment),

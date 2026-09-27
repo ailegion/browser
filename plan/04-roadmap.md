@@ -382,6 +382,45 @@ Work:
    the ring), Space or Enter on buttons and other controls (block 4),
    focus following the fragment target, `autofocus`, `accesskey`,
    arrow keys and Escape reaching the page.
+   **Block 4 done 2026-09-27: form controls rendered, no submission.**
+   The box builder (`crates/layout/src/boxes.rs`) makes up a control's
+   contents: a text-like input shows its `value` (bullets for a
+   password) or its `placeholder` in gray, on one line with spaces
+   kept (`white-space: pre`) so caret offsets match the value; a
+   submit, button, reset or file input shows its label; a select shows
+   its chosen option and its `<option>`s are not laid out. The made-up
+   text belongs to the control's node, so hit testing, the caret,
+   selection and find all reach it. Checkboxes, radios and selects are
+   `FragmentContent::Control` boxes the painter finishes: a 13px box
+   with a white check on blue when checked, a ring with a dot, a
+   chevron at the select's right. A textarea's text was already laid
+   out; the UA sheet gains inline-block selects and textareas,
+   `overflow: hidden` on text controls, sizes for button-like inputs
+   and a `:disabled` look. Interaction in the tab: a click (or Space
+   when focused) toggles a checkbox, checks a radio and clears the
+   rest of its group by `name` within the form; both restyle for
+   `:checked`. A focused text control takes keys: characters, Space,
+   Backspace, Delete, arrows, Home and End (per line in a textarea),
+   Enter as a newline in a textarea and nothing in an input; the value
+   lives in the `value` attribute (or the textarea's text) and the
+   control lays out again. A click puts the caret where it landed; the
+   caret's rectangle is kept with the focus ring and painted by
+   `PaintOptions::caret`. Arrows on a focused select step its option.
+   The shell now forwards every key it does not use itself to the
+   page, and the scroll keys (arrows, Page Up/Down, Space, Home, End)
+   moved into the tab, which scrolls only when no control takes them.
+   Tests: one box-tree test on the made-up contents and control kinds,
+   one paint pixel test (checked and unchecked box, caret), two tab
+   harness tests (toggle with `:checked`, radio groups, a disabled
+   box, editing an input, password bullets, a textarea newline, a
+   select stepping; keys scrolling). Not done: submission, a select's
+   drop-down list on click, `<label>` clicks, text selection and the
+   clipboard inside a control, scrolling a long value to keep the
+   caret in view, IME on the page, `input` types with their own UI
+   (range, color, date, number spinners), `:placeholder-shown` and
+   `[value]` selectors reacting to edits (only layout runs), caret
+   blink.
+   **Item 7 complete.**
 8. Media queries and custom properties in `style`.
 9. CI matrix: Windows, Linux, macOS builds. Note: on 2026-09-26 the owner
    turned automatic CI runs off (`.github/workflows/ci.yml` is

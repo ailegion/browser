@@ -88,6 +88,11 @@ impl Element {
             .split_ascii_whitespace()
     }
 
+    /// Drop an attribute; nothing happens if it is absent.
+    pub fn remove_attr(&mut self, name: &str) {
+        self.attrs.retain(|a| &*a.name.local != name);
+    }
+
     pub fn set_attr(&mut self, name: &str, value: &str) {
         if let Some(a) = self.attrs.iter_mut().find(|a| &*a.name.local == name) {
             a.value = value.into();
@@ -385,6 +390,18 @@ impl Document {
     }
 
     /// Detach `id` and free it and all its descendants.
+    /// Replace every child of `id` with one text node holding `text`
+    /// (an empty text leaves no children).
+    pub fn set_text_content(&mut self, id: NodeId, text: &str) {
+        while let Some(c) = self.nodes[id].first_child {
+            self.remove_subtree(c);
+        }
+        if !text.is_empty() {
+            let t = self.create_text(text);
+            self.append_child(id, t);
+        }
+    }
+
     pub fn remove_subtree(&mut self, id: NodeId) {
         self.detach(id);
         let mut stack = vec![id];

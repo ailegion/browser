@@ -461,10 +461,10 @@ impl LayoutEngine {
                     rect,
                     node: node.node,
                     style: node.style.clone(),
-                    content: if node.anonymous {
-                        FragmentContent::Anonymous
-                    } else {
-                        FragmentContent::Box
+                    content: match node.control {
+                        Some(c) => FragmentContent::Control(c),
+                        None if node.anonymous => FragmentContent::Anonymous,
+                        None => FragmentContent::Box,
                     },
                     children,
                 }

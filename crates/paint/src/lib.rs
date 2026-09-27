@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use browser_dom::NodeId;
-use browser_layout::{Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment};
+use browser_layout::{Control, Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment};
 use browser_style::{BorderStyle, ComputedStyle, Rgba, Visibility};
 use url::Url;
-use vello::kurbo::{Affine, Rect as KRect, RoundedRect, RoundedRectRadii, Shape as _};
+use vello::kurbo::{Affine, BezPath, Circle, Point, Rect as KRect, RoundedRect, RoundedRectRadii, Shape as _, Stroke};
 use vello::peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat, Mix};
 use vello::{Glyph, Scene};
 
@@ -141,10 +141,16 @@ pub struct PaintOptions {
     /// Page rectangles to draw the keyboard focus ring around, over
     /// everything else.
     pub focus_ring: Vec<Rect>,
+    /// The text caret of the focused control, in page coordinates.
+    pub caret: Option<Rect>,
 }
 
 /// The keyboard focus ring.
 const FOCUS_RING: Color = Color::from_rgb8(0x1a, 0x5f, 0xd6);
+/// Controls: the border, the fill of a checked box, and the marks.
+const CONTROL_BORDER: Color = Color::from_rgb8(0x76, 0x76, 0x76);
+const CONTROL_ON: Color = Color::from_rgb8(0x1a, 0x5f, 0xd6);
+const CONTROL_MARK: Color = Color::from_rgb8(0x30, 0x30, 0x38);
 const FOCUS_RING_WIDTH: f64 = 2.0;
 const FOCUS_RING_OFFSET: f64 = 1.0;
 
@@ -213,6 +219,11 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
     if let Some(html) = html {
         painter.fragment(html);
     }
+    if let Some(c) = &options.caret {
+        painter
+            .scene
+            .fill(Fill::NonZero, painter.transform, CONTROL_MARK, None, &krect(c));
+    }
     for r in &options.focus_ring {
         painter.focus_ring(r);
     }
@@ -268,6 +279,12 @@ impl Painter<'_> {
                     self.background_and_border(&f.rect, &f.style);
                 } else if !offscreen {
                     self.border(&f.rect, &f.style);
+                }
+            }
+            FragmentContent::Control(c) => {
+                if !offscreen {
+                    self.background_and_border(&f.rect, &f.style);
+                    self.control(&f.rect, *c);
                 }
             }
             FragmentContent::Anonymous | FragmentContent::Marker => {}
@@ -415,6 +432,58 @@ impl Painter<'_> {
                     );
                     self.scene.fill(Fill::NonZero, self.transform, color, None, &r);
                 }
+            }
+        }
+    }
+
+    /// The part of a control its box does not show: the check box and
+    /// its mark, the radio ring and dot, the select's arrow.
+    fn control(&mut self, rect: &Rect, control: Control) {
+        let r = krect(rect);
+        let t = self.transform;
+        match control {
+            Control::Checkbox { checked } => {
+                let outer = RoundedRect::from_rect(r, 2.0);
+                let (fill, border) = if checked { (CONTROL_ON, CONTROL_ON) } else { (Color::WHITE, CONTROL_BORDER) };
+                self.scene.fill(Fill::NonZero, t, border, None, &outer);
+                self.scene
+                    .fill(Fill::NonZero, t, fill, None, &RoundedRect::from_rect(r.inset(-1.0), 1.0));
+                if checked {
+                    let (w, h) = (r.width(), r.height());
+                    let mut path = BezPath::new();
+                    path.move_to((r.x0 + 0.22 * w, r.y0 + 0.52 * h));
+                    path.line_to((r.x0 + 0.42 * w, r.y0 + 0.72 * h));
+                    path.line_to((r.x0 + 0.78 * w, r.y0 + 0.3 * h));
+                    let stroke = Stroke::new((w * 0.14).max(1.0))
+                        .with_caps(vello::kurbo::Cap::Round)
+                        .with_join(vello::kurbo::Join::Round);
+                    self.scene.stroke(&stroke, t, Color::WHITE, None, &path);
+                }
+            }
+            Control::Radio { checked } => {
+                let center = Point::new((r.x0 + r.x1) / 2.0, (r.y0 + r.y1) / 2.0);
+                let radius = r.width().min(r.height()) / 2.0;
+                let border = if checked { CONTROL_ON } else { CONTROL_BORDER };
+                self.scene
+                    .fill(Fill::NonZero, t, border, None, &Circle::new(center, radius));
+                self.scene
+                    .fill(Fill::NonZero, t, Color::WHITE, None, &Circle::new(center, (radius - 1.0).max(0.0)));
+                if checked {
+                    self.scene
+                        .fill(Fill::NonZero, t, CONTROL_ON, None, &Circle::new(center, radius * 0.45));
+                }
+            }
+            Control::Select => {
+                let cy = (r.y0 + r.y1) / 2.0;
+                let x1 = r.x1 - 7.0;
+                let mut path = BezPath::new();
+                path.move_to((x1 - 8.0, cy - 2.0));
+                path.line_to((x1 - 4.0, cy + 2.0));
+                path.line_to((x1, cy - 2.0));
+                let stroke = Stroke::new(1.5)
+                    .with_caps(vello::kurbo::Cap::Round)
+                    .with_join(vello::kurbo::Join::Round);
+                self.scene.stroke(&stroke, t, CONTROL_MARK, None, &path);
             }
         }
     }
@@ -597,6 +666,58 @@ mod tests {
         assert_eq!(px(70, 48), [0x1a, 0x5f, 0xd6], "ring above the box");
         assert_eq!(px(70, 60), [255, 255, 255], "inside is untouched");
         assert_eq!(px(70, 44), [255, 255, 255], "outside the ring");
+    }
+
+    /// A checked box is filled blue, an unchecked one white, and the
+    /// caret is drawn where asked.
+    #[test]
+    fn controls_and_caret_paint() {
+        let html = b"<body style='margin:0'><input type=checkbox checked style='margin:0'><br>\
+            <input type=checkbox style='margin:0'></body>";
+        let doc = browser_dom::parse_html(html);
+        let mut stylist = browser_style::Stylist::new();
+        stylist.add_sheet(browser_style::ua::ua_stylesheet());
+        let vp = browser_style::Viewport {
+            width: 100.0,
+            height: 100.0,
+            scale_factor: 1.0,
+            prefers_dark: false,
+        };
+        let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+        let mut engine = browser_layout::LayoutEngine::new();
+        let images = ImageStore::new();
+        let tree = engine.layout(&doc, &styles, 100.0, 100.0, &images);
+        let mut boxes = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let FragmentContent::Control(c) = &f.content {
+                boxes.push((f.rect, *c));
+            }
+        });
+        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        assert_eq!(boxes[0].1, Control::Checkbox { checked: true });
+        assert_eq!((boxes[0].0.width, boxes[0].0.height), (13.0, 13.0));
+        let options = PaintOptions {
+            viewport_width: 100.0,
+            viewport_height: 100.0,
+            scale: 1.0,
+            caret: Some(browser_layout::Rect::new(60.0, 60.0, 1.0, 16.0)),
+            ..PaintOptions::default()
+        };
+        let mut scene = Scene::new();
+        paint(&tree, &images, &options, &mut scene);
+        let Some(pixels) = render_offscreen(&scene, 100, 100, Color::WHITE) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let px = |x: f32, y: f32| {
+            let i = (y as usize * 100 + x as usize) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        let (on, off) = (boxes[0].0, boxes[1].0);
+        assert_eq!(px(on.x + 2.0, on.y + 2.0), [0x1a, 0x5f, 0xd6], "checked: blue fill");
+        assert_eq!(px(off.x + 3.0, off.y + 3.0), [255, 255, 255], "unchecked: white inside");
+        assert_eq!(px(off.x, off.y + 6.0), [0x76, 0x76, 0x76], "unchecked: gray border");
+        assert_eq!(px(60.0, 68.0), [0x30, 0x30, 0x38], "the caret");
     }
 
     #[test]

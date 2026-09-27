@@ -947,7 +947,6 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let vp_h = self.viewport().map(|v| v.height).unwrap_or(600.0);
                 let ctrl = self.modifiers.state().control_key();
                 let shift = self.modifiers.state().shift_key();
                 let alt = self.modifiers.state().alt_key();
@@ -1024,28 +1023,36 @@ impl ApplicationHandler<UserEvent> for App {
                         let next = if shift { (self.current + count - 1) % count } else { (self.current + 1) % count };
                         self.activate(next);
                     }
-                    Key::Named(NamedKey::Tab) => self.send_to_current(ShellToTab::Key {
-                        key: PageKey::Tab,
-                        shift,
-                        ctrl,
-                        alt,
-                    }),
-                    Key::Named(NamedKey::Enter) => self.send_to_current(ShellToTab::Key {
-                        key: PageKey::Enter,
-                        shift,
-                        ctrl,
-                        alt,
-                    }),
-                    Key::Named(NamedKey::ArrowDown) => self.scroll(0.0, LINE_SCROLL_PX),
-                    Key::Named(NamedKey::ArrowUp) => self.scroll(0.0, -LINE_SCROLL_PX),
-                    Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll(0.0, vp_h * 0.9),
-                    Key::Named(NamedKey::PageUp) => self.scroll(0.0, -vp_h * 0.9),
-                    Key::Named(NamedKey::Home) => self.scroll(0.0, -1.0e9),
-                    Key::Named(NamedKey::End) => self.scroll(0.0, 1.0e9),
                     Key::Named(NamedKey::F5) => self.send_to_current(ShellToTab::Reload),
                     Key::Named(NamedKey::BrowserBack) => self.send_to_current(ShellToTab::GoBack),
                     Key::Named(NamedKey::BrowserForward) => self.send_to_current(ShellToTab::GoForward),
-                    _ => {}
+                    // Everything else is the page's: focus, editing, scrolling.
+                    key => {
+                        let page_key = match key {
+                            Key::Named(NamedKey::Tab) => Some(PageKey::Tab),
+                            Key::Named(NamedKey::Enter) => Some(PageKey::Enter),
+                            Key::Named(NamedKey::Escape) => Some(PageKey::Escape),
+                            Key::Named(NamedKey::Space) => Some(PageKey::Space),
+                            Key::Named(NamedKey::Backspace) => Some(PageKey::Backspace),
+                            Key::Named(NamedKey::Delete) => Some(PageKey::Delete),
+                            Key::Named(NamedKey::ArrowLeft) => Some(PageKey::ArrowLeft),
+                            Key::Named(NamedKey::ArrowRight) => Some(PageKey::ArrowRight),
+                            Key::Named(NamedKey::ArrowUp) => Some(PageKey::ArrowUp),
+                            Key::Named(NamedKey::ArrowDown) => Some(PageKey::ArrowDown),
+                            Key::Named(NamedKey::Home) => Some(PageKey::Home),
+                            Key::Named(NamedKey::End) => Some(PageKey::End),
+                            Key::Named(NamedKey::PageUp) => Some(PageKey::PageUp),
+                            Key::Named(NamedKey::PageDown) => Some(PageKey::PageDown),
+                            _ => event
+                                .text
+                                .as_ref()
+                                .filter(|t| !ctrl && !alt && !t.chars().all(char::is_control))
+                                .map(|t| PageKey::Character(t.to_string())),
+                        };
+                        if let Some(key) = page_key {
+                            self.send_to_current(ShellToTab::Key { key, shift, ctrl, alt });
+                        }
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
