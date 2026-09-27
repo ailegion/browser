@@ -23,12 +23,17 @@ jobs:
         run: cargo deny --all-features check bans
       - name: no native build steps
         # A second line of defense behind deny.toml: nothing may need cc,
-        # cmake, or pkg-config to build.
+        # cmake, or pkg-config to build, on any of the three platforms.
+        # Resolving for a target needs no toolchain for it.
         run: |
-          cargo tree -e build --all-features > build-deps.txt
-          if grep -Ei '^\s*[├└│ ]*(cc|cmake|pkg-config|vcpkg|bindgen) v' build-deps.txt; then
-            echo "native build dependency found"; exit 1
-          fi
+          fail=0
+          for target in x86_64-pc-windows-msvc x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            cargo tree -e build --all-features --target "$target" > "build-deps-$target.txt"
+            if grep -Ei '^\s*[├└│ ]*(cc|cmake|pkg-config|vcpkg|bindgen) v' "build-deps-$target.txt"; then
+              echo "native build dependency found for $target"; fail=1
+            fi
+          done
+          exit $fail
       - name: workspace crates forbid unsafe
         run: |
           fail=0
@@ -45,19 +50,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux and macOS join the matrix in Phase 2 (plan D12).
-        os: [windows-latest]
+        # All three platforms from Phase 2 on (plan D12). One toolchain,
+        # one build: nothing is compiled outside cargo on any of them.
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: linux runtime libraries
+        if: runner.os == 'Linux'
+        # Runtime only, nothing here is compiled or linked at build time: a
+        # software Vulkan device so the GPU tests run instead of skipping,
+        # the keyboard library winit opens at runtime, and a virtual display
+        # for the smoke render.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 libxkbcommon0 xvfb
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - name: smoke render
-        # Opens the window, renders one frame, exits. Needs a GPU-less
-        # fallback adapter; wgpu picks a software adapter on CI runners.
+        # Opens the window, renders one frame, exits. Windows uses the
+        # WARP software adapter, macOS Metal; Linux needs the virtual
+        # display above. Advisory: a runner without a usable adapter
+        # must not fail the build.
+        if: runner.os != 'Linux'
         run: cargo run -p browser-shell --locked -- --smoke
+        continue-on-error: true
+      - name: smoke render (virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo run -p browser-shell --locked -- --smoke
         continue-on-error: true
 
   unsafe-audit:

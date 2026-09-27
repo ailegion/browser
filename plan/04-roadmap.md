@@ -445,7 +445,20 @@ Work:
    turned automatic CI runs off (`.github/workflows/ci.yml` is
    `workflow_dispatch` only) to stop paying for runs during development.
    Do not restore `push`/`pull_request` triggers until the owner says so;
-   run the workflow by hand when a check is wanted.
+   run the workflow by hand when a check is wanted. **Done 2026-09-27,
+   pending a hand run.** The build job's matrix is now
+   `windows-latest`, `ubuntu-latest`, `macos-latest`: build, test, and
+   the smoke render, which on Linux runs under a virtual display. Linux
+   installs runtime libraries only (a software Vulkan device so the GPU
+   tests run rather than skip, the keyboard library winit opens at
+   runtime, xvfb); nothing is compiled outside cargo on any platform.
+   The policy job's native-build-step check now resolves the dependency
+   graph for all three targets, not just the runner's. Checked here on
+   Windows: the Linux and macOS graphs resolve with no `cc`, `cmake`,
+   `pkg-config`, `vcpkg` or `bindgen` build dependency. The trigger stays
+   manual; the first real Linux and macOS results come from the owner's
+   hand run, which is also what the Phase 2 exit criterion "on all three
+   platforms" rests on.
 
 Exit criteria:
 
