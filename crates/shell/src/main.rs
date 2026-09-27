@@ -1,9 +1,15 @@
 //! The browser executable.
 //!
-//! Phase 1 scope: open a window, own the wgpu device and vello renderer,
-//! run one tab on its own thread, show the frames it paints, forward
-//! resize, scroll and keyboard input. `--smoke` renders one frame and
-//! exits; `--screenshot FILE` saves the page once it has loaded and exits.
+//! Open a window, own the wgpu device and vello renderer, run tabs on
+//! their own threads, show the frames the active one paints, forward
+//! resize, scroll, pointer and keyboard input. `--smoke` renders one frame
+//! and exits; `--screenshot FILE` saves the page once it has loaded and
+//! exits.
+//!
+//! Until the tab strip lands (Phase 2 item 6) tabs are driven from the
+//! keyboard: Ctrl+T opens one at the start URL, Ctrl+W closes the current
+//! one, Ctrl+Tab and Ctrl+Shift+Tab cycle, Ctrl+1 to Ctrl+9 select. A
+//! middle click on a link opens it in a background tab.
 //!
 //! See plan/02-architecture.md, "Shell".
 
@@ -26,7 +32,7 @@ use vello::wgpu;
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
@@ -101,20 +107,30 @@ struct Active {
     frames_rendered: u64,
 }
 
+/// What the shell mirrors of one tab. Navigation truth lives in the tab.
+struct Tab {
+    handle: TabHandle,
+    /// Latest frame from the tab, in physical pixels.
+    page: Option<Scene>,
+    loading: bool,
+    title: Option<String>,
+    cursor: CursorIcon,
+}
+
 struct App {
     options: Options,
     context: RenderContext,
     proxy: EventLoopProxy<UserEvent>,
     net: Option<Arc<NetService>>,
     active: Option<Active>,
-    tab: Option<TabHandle>,
-    /// Latest frame from the tab, in physical pixels.
-    page: Option<Scene>,
-    page_loading: bool,
-    page_title: Option<String>,
+    tabs: Vec<Tab>,
+    /// Index into `tabs` of the one shown.
+    current: usize,
+    next_tab_id: u64,
     screenshot_deadline: Option<Instant>,
     /// Pointer position in logical pixels while it is over the window.
     cursor_pos: Option<(f32, f32)>,
+    modifiers: Modifiers,
     /// Set when startup fails so the process can exit non-zero from `main`.
     failure: Option<anyhow::Error>,
 }
@@ -127,14 +143,29 @@ impl App {
             proxy,
             net: None,
             active: None,
-            tab: None,
-            page: None,
-            page_loading: false,
-            page_title: None,
+            tabs: Vec::new(),
+            current: 0,
+            next_tab_id: 1,
             screenshot_deadline: None,
             cursor_pos: None,
+            modifiers: Modifiers::default(),
             failure: None,
         }
+    }
+
+    fn current_tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.current)
+    }
+
+    fn current_handle(&self) -> Option<&TabHandle> {
+        self.current_tab().map(|t| &t.handle)
+    }
+
+    fn start_url(&self) -> Url {
+        self.options
+            .url
+            .clone()
+            .unwrap_or_else(|| Url::parse(DEFAULT_URL).expect("static url"))
     }
 
     fn scale(&self) -> f32 {
@@ -199,12 +230,17 @@ impl App {
         });
 
         if !self.options.smoke {
-            self.open_tab()?;
+            let url = self.start_url();
+            self.open_tab(url, true)?;
+            if self.options.screenshot.is_some() {
+                self.screenshot_deadline = Some(Instant::now() + SCREENSHOT_TIMEOUT);
+            }
         }
         Ok(())
     }
 
-    fn open_tab(&mut self) -> Result<()> {
+    /// Start a tab thread on `url`; show it if `activate`.
+    fn open_tab(&mut self, url: Url, activate: bool) -> Result<()> {
         let net = match &self.net {
             Some(n) => n.clone(),
             None => {
@@ -218,24 +254,84 @@ impl App {
         let sink: browser_tab::OutputSink = Box::new(move |id, out| {
             let _ = proxy.send_event(UserEvent::Tab(id, out));
         });
-        let tab = spawn_tab(TabId(1), net, viewport, sink);
-        let url = self
-            .options
-            .url
-            .clone()
-            .unwrap_or_else(|| Url::parse(DEFAULT_URL).expect("static url"));
-        tab.send(ShellToTab::Navigate { url });
-        self.page_loading = true;
-        self.tab = Some(tab);
-        if self.options.screenshot.is_some() {
-            self.screenshot_deadline = Some(Instant::now() + SCREENSHOT_TIMEOUT);
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        let handle = spawn_tab(id, net, viewport, sink);
+        handle.send(ShellToTab::Navigate { url });
+        self.tabs.push(Tab {
+            handle,
+            page: None,
+            loading: true,
+            title: None,
+            cursor: CursorIcon::Default,
+        });
+        tracing::info!(tab = id.0, tabs = self.tabs.len(), "tab opened");
+        if activate {
+            self.activate(self.tabs.len() - 1);
+        } else {
+            self.update_title();
         }
         Ok(())
     }
 
+    /// Close the tab at `index`: its thread ends and its memory goes with
+    /// it. Closing the last tab closes the window.
+    fn close_tab(&mut self, index: usize, event_loop: &ActiveEventLoop) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(index);
+        let id = tab.handle.id();
+        tab.handle.close();
+        tracing::info!(tab = id.0, tabs = self.tabs.len(), "tab closed");
+        if self.tabs.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        // The one to the right takes over, or the new last one.
+        let next = if index < self.current || (index == self.current && index == self.tabs.len()) {
+            self.current.saturating_sub(1)
+        } else {
+            self.current
+        };
+        self.activate(next);
+    }
+
+    /// Show the tab at `index`.
+    fn activate(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if index != self.current
+            && let Some(old) = self.tabs.get(self.current)
+        {
+            old.handle.send(ShellToTab::MouseLeave);
+        }
+        self.current = index;
+        // Background tabs are not told about resizes; the one coming to
+        // the front lays out for the current window if it has to.
+        self.send_viewport();
+        if let Some((x, y)) = self.cursor_pos
+            && let Some(tab) = self.current_handle()
+        {
+            tab.send(ShellToTab::MouseMove { x, y });
+        }
+        if let Some(active) = &self.active {
+            active.window.set_cursor(self.current_tab().map(|t| t.cursor).unwrap_or_default());
+            active.window.request_redraw();
+        }
+        self.update_title();
+    }
+
     fn send_viewport(&self) {
-        if let (Some(tab), Some(vp)) = (&self.tab, self.viewport()) {
+        if let (Some(tab), Some(vp)) = (self.current_handle(), self.viewport()) {
             tab.send(ShellToTab::Resize(vp));
+        }
+    }
+
+    fn send_to_current(&self, msg: ShellToTab) {
+        if let Some(tab) = self.current_handle() {
+            tab.send(msg);
         }
     }
 
@@ -263,13 +359,15 @@ impl App {
         }
         let scale = active.window.scale_factor();
 
-        match &self.page {
+        let page = self.tabs.get(self.current).and_then(|t| t.page.as_ref());
+        match page {
             Some(page) => {
                 active.scene.reset();
                 active.scene.append(page, None);
             }
             None => build_placeholder_scene(&mut active.scene, width, height, scale),
         }
+        let has_page = page.is_some();
 
         let handle = &self.context.devices[active.surface.dev_id];
         let frame = match active.surface.surface.get_current_texture() {
@@ -296,7 +394,7 @@ impl App {
                 &active.scene,
                 &active.surface.target_view,
                 &RenderParams {
-                    base_color: if self.page.is_some() { Color::WHITE } else { CLEAR },
+                    base_color: if has_page { Color::WHITE } else { CLEAR },
                     width,
                     height,
                     antialiasing_method: AaConfig::Area,
@@ -325,18 +423,19 @@ impl App {
     }
 
     fn scroll(&self, dx: f32, dy: f32) {
-        if let Some(tab) = &self.tab {
-            tab.send(ShellToTab::Scroll { dx, dy });
-        }
+        self.send_to_current(ShellToTab::Scroll { dx, dy });
     }
 
     fn update_title(&self) {
         let Some(active) = &self.active else { return };
-        let mut title = self.page_title.clone().unwrap_or_default();
+        let mut title = self.current_tab().and_then(|t| t.title.clone()).unwrap_or_default();
         if title.is_empty() {
             title = self.options.url.as_ref().map(|u| u.to_string()).unwrap_or_default();
         }
-        let title = if title.is_empty() { "browser".to_owned() } else { format!("{title} - browser") };
+        let mut title = if title.is_empty() { "browser".to_owned() } else { format!("{title} - browser") };
+        if self.tabs.len() > 1 {
+            title.push_str(&format!(" [{}/{}]", self.current + 1, self.tabs.len()));
+        }
         active.window.set_title(&title);
     }
 
@@ -345,7 +444,7 @@ impl App {
         // delivers a few more events before it actually exits.
         let Some(path) = self.options.screenshot.take() else { return };
         self.screenshot_deadline = None;
-        let Some(page) = &self.page else {
+        let Some(page) = self.current_tab().and_then(|t| t.page.as_ref()) else {
             tracing::warn!("no frame to screenshot");
             return;
         };
@@ -397,43 +496,67 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Tab(_id, out) = event;
+        let UserEvent::Tab(id, out) = event;
+        // A closed tab's last messages may still be in flight.
+        let Some(index) = self.tabs.iter().position(|t| t.handle.id() == id) else {
+            return;
+        };
+        let is_current = index == self.current;
         match out {
             TabOutput::Frame(scene) => {
-                self.page = Some(scene);
-                if let Some(active) = &self.active {
-                    active.window.request_redraw();
-                }
-                if self.options.screenshot.is_some() && !self.page_loading {
-                    self.take_screenshot(event_loop);
+                let loading = {
+                    let tab = &mut self.tabs[index];
+                    tab.page = Some(scene);
+                    tab.loading
+                };
+                if is_current {
+                    if let Some(active) = &self.active {
+                        active.window.request_redraw();
+                    }
+                    if self.options.screenshot.is_some() && !loading {
+                        self.take_screenshot(event_loop);
+                    }
                 }
             }
             TabOutput::Message(TabToShell::StateChanged {
                 title, loading, url, ..
             }) => {
-                self.page_title = title.or_else(|| Some(url.to_string()));
-                let was_loading = self.page_loading;
-                self.page_loading = loading;
-                self.update_title();
-                if was_loading && !loading && self.options.screenshot.is_some() && self.page.is_some() {
-                    // The last frame painted may predate the final resource;
-                    // wait for the frame that follows this state change.
-                    self.screenshot_deadline = Some(Instant::now() + Duration::from_millis(500));
+                let (was_loading, has_page) = {
+                    let tab = &mut self.tabs[index];
+                    tab.title = title.or_else(|| Some(url.to_string()));
+                    let was = tab.loading;
+                    tab.loading = loading;
+                    (was, tab.page.is_some())
+                };
+                if is_current {
+                    self.update_title();
+                    if was_loading && !loading && self.options.screenshot.is_some() && has_page {
+                        // The last frame painted may predate the final resource;
+                        // wait for the frame that follows this state change.
+                        self.screenshot_deadline = Some(Instant::now() + Duration::from_millis(500));
+                    }
                 }
             }
             TabOutput::Message(TabToShell::Cursor(cursor)) => {
-                if let Some(active) = &self.active {
-                    active.window.set_cursor(match cursor {
-                        PageCursor::Default => CursorIcon::Default,
-                        PageCursor::Pointer => CursorIcon::Pointer,
-                        PageCursor::Text => CursorIcon::Text,
-                    });
+                let icon = match cursor {
+                    PageCursor::Default => CursorIcon::Default,
+                    PageCursor::Pointer => CursorIcon::Pointer,
+                    PageCursor::Text => CursorIcon::Text,
+                };
+                self.tabs[index].cursor = icon;
+                if is_current && let Some(active) = &self.active {
+                    active.window.set_cursor(icon);
+                }
+            }
+            TabOutput::Message(TabToShell::OpenInNewTab { url }) => {
+                if let Err(e) = self.open_tab(url, false) {
+                    tracing::error!("open tab: {e}");
                 }
             }
             TabOutput::Message(TabToShell::Crashed { message }) => {
-                tracing::error!("tab crashed: {message}");
-                self.page_title = Some(format!("Tab crashed: {message}"));
-                self.update_title();
+                // The tab thread goes on and shows its crash page; nothing
+                // to do here but note it, and fail a screenshot run.
+                tracing::error!(tab = id.0, "tab crashed: {message}");
                 if self.options.screenshot.is_some() {
                     self.failure = Some(anyhow::anyhow!("tab crashed: {message}"));
                     event_loop.exit();
@@ -484,54 +607,61 @@ impl ApplicationHandler<UserEvent> for App {
                 let scale = self.scale();
                 let (x, y) = (position.x as f32 / scale, position.y as f32 / scale);
                 self.cursor_pos = Some((x, y));
-                if let Some(tab) = &self.tab {
-                    tab.send(ShellToTab::MouseMove { x, y });
-                }
+                self.send_to_current(ShellToTab::MouseMove { x, y });
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_pos = None;
-                if let Some(tab) = &self.tab {
-                    tab.send(ShellToTab::MouseLeave);
-                }
+                self.send_to_current(ShellToTab::MouseLeave);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if let (Some(tab), Some((x, y))) = (&self.tab, self.cursor_pos) {
+                if let Some((x, y)) = self.cursor_pos {
                     let button = match button {
                         MouseButton::Left => PageButton::Left,
                         MouseButton::Right => PageButton::Right,
                         MouseButton::Middle => PageButton::Middle,
                         _ => PageButton::Other,
                     };
-                    tab.send(match state {
+                    self.send_to_current(match state {
                         ElementState::Pressed => ShellToTab::MouseDown { x, y, button },
                         ElementState::Released => ShellToTab::MouseUp { x, y, button },
                     });
                 }
             }
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m,
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let vp_h = self.viewport().map(|v| v.height).unwrap_or(600.0);
-                match event.logical_key {
+                let ctrl = self.modifiers.state().control_key();
+                let shift = self.modifiers.state().shift_key();
+                match &event.logical_key {
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => {
+                        let url = self.start_url();
+                        if let Err(e) = self.open_tab(url, true) {
+                            tracing::error!("open tab: {e}");
+                        }
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => {
+                        self.close_tab(self.current, event_loop);
+                    }
+                    Key::Character(c) if ctrl && c.len() == 1 && c.as_bytes()[0].is_ascii_digit() => {
+                        let n = usize::from(c.as_bytes()[0] - b'0');
+                        if n >= 1 {
+                            self.activate(n - 1);
+                        }
+                    }
+                    Key::Named(NamedKey::Tab) if ctrl && !self.tabs.is_empty() => {
+                        let count = self.tabs.len();
+                        let next = if shift { (self.current + count - 1) % count } else { (self.current + 1) % count };
+                        self.activate(next);
+                    }
                     Key::Named(NamedKey::ArrowDown) => self.scroll(0.0, LINE_SCROLL_PX),
                     Key::Named(NamedKey::ArrowUp) => self.scroll(0.0, -LINE_SCROLL_PX),
                     Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => self.scroll(0.0, vp_h * 0.9),
                     Key::Named(NamedKey::PageUp) => self.scroll(0.0, -vp_h * 0.9),
                     Key::Named(NamedKey::Home) => self.scroll(0.0, -1.0e9),
                     Key::Named(NamedKey::End) => self.scroll(0.0, 1.0e9),
-                    Key::Named(NamedKey::F5) => {
-                        if let Some(tab) = &self.tab {
-                            tab.send(ShellToTab::Reload);
-                        }
-                    }
-                    Key::Named(NamedKey::BrowserBack) => {
-                        if let Some(tab) = &self.tab {
-                            tab.send(ShellToTab::GoBack);
-                        }
-                    }
-                    Key::Named(NamedKey::BrowserForward) => {
-                        if let Some(tab) = &self.tab {
-                            tab.send(ShellToTab::GoForward);
-                        }
-                    }
+                    Key::Named(NamedKey::F5) => self.send_to_current(ShellToTab::Reload),
+                    Key::Named(NamedKey::BrowserBack) => self.send_to_current(ShellToTab::GoBack),
+                    Key::Named(NamedKey::BrowserForward) => self.send_to_current(ShellToTab::GoForward),
                     _ => {}
                 }
             }
@@ -569,8 +699,8 @@ fn main() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let mut app = App::new(options, proxy);
     event_loop.run_app(&mut app).context("event loop")?;
-    if let Some(tab) = app.tab.take() {
-        tab.close();
+    for tab in app.tabs.drain(..) {
+        tab.handle.close();
     }
     match app.failure.take() {
         Some(e) => Err(e),

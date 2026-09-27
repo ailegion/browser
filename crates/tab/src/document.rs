@@ -110,9 +110,10 @@ pub(crate) struct TabState {
     deps: InteractionDeps,
     hover: Option<NodeId>,
     focus: Option<NodeId>,
-    /// The link the primary button went down on; released on the same
-    /// link, it is followed.
-    press: Option<NodeId>,
+    /// The link a button went down on; released on the same link, the
+    /// primary button follows it and the middle button opens it in a new
+    /// tab.
+    press: Option<(NodeId, MouseButton)>,
     /// Last pointer position in viewport coordinates while over the page.
     mouse: Option<(f32, f32)>,
     /// The pointer or the scroll moved since hover was last evaluated.
@@ -261,12 +262,14 @@ impl TabState {
             ShellToTab::MouseDown { x, y, button } => {
                 self.mouse = Some((x, y));
                 self.update_hover();
+                let hit = self.hover;
                 if button == MouseButton::Left {
-                    let hit = self.hover;
                     self.set_active(hit);
                     let focus = hit.and_then(|h| self.focusable_ancestor(h));
                     self.set_focus(focus);
-                    self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link));
+                }
+                if matches!(button, MouseButton::Left | MouseButton::Middle) {
+                    self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
                 }
             }
             ShellToTab::MouseUp { x, y, button } => {
@@ -274,11 +277,16 @@ impl TabState {
                 self.update_hover();
                 if button == MouseButton::Left {
                     self.set_active(None);
-                    let released_on = self.hover.and_then(|h| self.ancestor_or_self(h, is_link));
-                    if let (Some(pressed), Some(released)) = (self.press.take(), released_on)
-                        && pressed == released
-                    {
-                        self.follow_link(pressed);
+                }
+                let released_on = self.hover.and_then(|h| self.ancestor_or_self(h, is_link));
+                if let (Some((pressed, pressed_button)), Some(released)) = (self.press.take(), released_on)
+                    && pressed == released
+                    && pressed_button == button
+                {
+                    match button {
+                        MouseButton::Left => self.follow_link(pressed),
+                        MouseButton::Middle => self.open_link_in_new_tab(pressed),
+                        _ => {}
                     }
                 }
             }
@@ -288,20 +296,34 @@ impl TabState {
 
     // ----- navigation -----
 
-    /// Follow a link the user clicked.
-    fn follow_link(&mut self, link: NodeId) {
-        let Some(doc) = &self.doc else { return };
-        let Some(href) = doc.element(link).and_then(|e| e.attr("href")) else { return };
+    /// The URL a link leads to, if it is one this browser opens.
+    fn link_target(&self, link: NodeId) -> Option<Url> {
+        let doc = self.doc.as_ref()?;
+        let href = doc.element(link).and_then(|e| e.attr("href"))?;
         let Some(url) = doc.resolve_url(href) else {
             tracing::debug!(tab = self.id.0, "unresolvable href {href:?}");
-            return;
+            return None;
         };
-        if !matches!(url.scheme(), "http" | "https" | "data") {
+        if !matches!(url.scheme(), "http" | "https" | "data" | "about") {
             // javascript:, mailto: and the rest are not ours to open.
             tracing::debug!(tab = self.id.0, "ignoring link to {url}");
-            return;
+            return None;
         }
-        self.go(url, NavKind::Push);
+        Some(url)
+    }
+
+    /// Follow a link the user clicked.
+    fn follow_link(&mut self, link: NodeId) {
+        if let Some(url) = self.link_target(link) {
+            self.go(url, NavKind::Push);
+        }
+    }
+
+    /// Ask the shell for a new tab on the link (middle click).
+    fn open_link_in_new_tab(&mut self, link: NodeId) {
+        if let Some(url) = self.link_target(link) {
+            self.send(TabToShell::OpenInNewTab { url });
+        }
     }
 
     /// Go to `url`. A change of fragment within the displayed document
@@ -634,7 +656,11 @@ impl TabState {
         if kind == NavKind::Reload {
             request.cache = CacheMode::NoCache;
         }
-        let id = self.fetch(request, PendingKind::Main);
+        let id = if url.scheme() == "about" {
+            self.fetch_about(request.url)
+        } else {
+            self.fetch(request, PendingKind::Main)
+        };
         self.nav = Some(PendingNav {
             url,
             request: id,
@@ -657,6 +683,41 @@ impl TabState {
             },
         );
         self.net.fetch(id, request, self.net_sink.clone());
+        id
+    }
+
+    /// Internal pages. `about:blank` is an empty document; `about:crash`
+    /// panics the tab thread on purpose, to exercise crash recovery.
+    /// Answered through the net sink like a `data:` URL, so the load goes
+    /// through the same commit path as any other.
+    fn fetch_about(&mut self, url: Url) -> RequestId {
+        let id = RequestId(self.next_request);
+        self.next_request += 1;
+        self.pending.insert(
+            id,
+            Pending {
+                kind: PendingKind::Main,
+                status: 0,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        match url.path() {
+            "blank" => {
+                (self.net_sink)(NetToTab::ResponseStart {
+                    id,
+                    status: 200,
+                    headers: vec![("content-type".to_owned(), "text/html".to_owned())],
+                    final_url: url,
+                });
+                (self.net_sink)(NetToTab::ResponseEnd { id });
+            }
+            "crash" => panic!("about:crash: deliberate tab panic"),
+            other => (self.net_sink)(NetToTab::Failed {
+                id,
+                error: format!("no such page: about:{other}"),
+            }),
+        }
         id
     }
 
@@ -1460,6 +1521,63 @@ mod tests {
         assert_eq!(h.state.history.len(), 1);
     }
 
+    #[test]
+    fn middle_click_asks_the_shell_for_a_new_tab() {
+        let mut h = Harness::load(&format!("<title>First</title><p><a href='{}'>go</a></p>", second_page_href()));
+        let (x, y) = h.center("a");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Middle });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Middle });
+        // This tab stays where it is; the shell gets the request.
+        assert_eq!(h.title().as_deref(), Some("First"));
+        assert_eq!(h.state.history.len(), 1);
+        let opened: Vec<Url> = h
+            .messages
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|m| match m {
+                TabToShell::OpenInNewTab { url } => Some(url.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].as_str().starts_with("data:"));
+        // Middle down on the link, left up on it: not a click of either kind.
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Middle });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(h.title().as_deref(), Some("First"));
+        assert_eq!(h.messages.lock().expect("lock").iter().filter(|m| matches!(m, TabToShell::OpenInNewTab { .. })).count(), 1);
+    }
+
+    #[test]
+    fn about_blank_is_an_empty_document_with_a_history_entry() {
+        let mut h = Harness::load("<title>First</title>");
+        h.send(ShellToTab::Navigate {
+            url: Url::parse("about:blank").expect("url"),
+        });
+        assert_eq!(h.title(), None);
+        assert!(h.state.doc.is_some());
+        assert_eq!(h.state.url.as_ref().map(|u| u.as_str()), Some("about:blank"));
+        assert_eq!(h.state.history.len(), 2);
+        assert_eq!(h.last_state().map(|s| s.1), Some(false), "not loading");
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.title().as_deref(), Some("First"));
+        // An unknown about: page is an error page, like a failed load.
+        h.send(ShellToTab::Navigate {
+            url: Url::parse("about:nothing").expect("url"),
+        });
+        assert_eq!(h.title().as_deref(), Some("Cannot load page"));
+    }
+
+    #[test]
+    #[should_panic(expected = "about:crash")]
+    fn about_crash_panics_the_tab() {
+        let mut h = Harness::load("<title>First</title>");
+        h.send(ShellToTab::Navigate {
+            url: Url::parse("about:crash").expect("url"),
+        });
+    }
+
     const TALL: &str = "<title>Tall</title><style>body { margin: 0 } div { height: 1500px } h2:target { color: red }</style>\
         <p><a href='#end'>down</a> <a href='#top'>top</a></p><div></div><h2 id=end>The end</h2>";
 
@@ -1613,7 +1731,7 @@ mod tests {
     }
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

@@ -211,7 +211,29 @@ Work:
    requests), the public suffix list, caching of redirect responses,
    `document.cookie` (Phase 3), persistence on tab close (Phase 4).
 5. Multiple tabs: one thread each, `catch_unwind` at the boundary, crashed
-   tab page, thread and memory released on close (leak test).
+   tab page, thread and memory released on close (leak test). **Done
+   2026-09-27.** The shell keeps a list of tabs and shows the current
+   one's frames; the others keep their last frame and are not told about
+   resizes until they come to the front. Until the tab strip (item 6)
+   they are driven from the keyboard: Ctrl+T opens a tab at the start
+   URL, Ctrl+W closes the current one (the last one closes the window),
+   Ctrl+Tab and Ctrl+Shift+Tab cycle, Ctrl+1 to Ctrl+9 select; the window
+   title shows `[n/total]`. A middle click on a link asks the shell for a
+   background tab (`TabToShell::OpenInNewTab`). Crash: the tab thread's
+   `catch_unwind` reports `Crashed`, drops the unwound state whole, and
+   runs on with a fresh state showing a crash page (the panic message and
+   a "Try again" link to the last URL the tab reported), so the tab can
+   be navigated or closed like any other. `about:blank` is an empty
+   document and `about:crash` panics the tab on purpose, so the exit
+   criterion can be exercised by hand. Close: `TabHandle::close` joins
+   the thread; the leak test holds a `Weak` to something the tab's sink
+   owns and the `Arc` count of the net service, and checks both are
+   released after close. Tests: two thread-level tests in
+   `crates/tab/src/lib.rs` (leak; two tabs, one crashes, both go on),
+   three harness tests (middle click, `about:blank`, `about:crash`). Not
+   done: the crash page does not keep the tab's history (the state that
+   held it is what unwound), and `target=_blank` links still open in the
+   same tab.
 6. `chrome`: widgets (button, text input with cursor/selection/clipboard/IME,
    tab strip, menu, tooltip, scrollbar, progress), laid out with taffy,
    drawn with vello. Address bar, back, forward, reload, new tab, close tab,

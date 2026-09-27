@@ -77,6 +77,8 @@ pub enum TabToShell {
     },
     /// What the pointer is over calls for a different cursor.
     Cursor(Cursor),
+    /// The user asked for a link in a new tab (middle click).
+    OpenInNewTab { url: Url },
     /// The tab thread panicked and was unwound; the shell shows a crashed page.
     Crashed { message: String },
     Closed,
