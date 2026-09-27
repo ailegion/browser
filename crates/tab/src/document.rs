@@ -68,6 +68,17 @@ struct PendingNav {
     committed: bool,
 }
 
+/// Find in page: the query, its matches in tree order, and what to
+/// highlight, kept ready for every repaint.
+struct Find {
+    query: String,
+    matches: Vec<(TextPos, TextPos)>,
+    /// Index into `matches`.
+    current: Option<usize>,
+    ranges: SelectionRanges,
+    current_ranges: SelectionRanges,
+}
+
 /// One author stylesheet in cascade order, possibly still loading.
 struct SheetSlot {
     url: Option<Url>,
@@ -136,6 +147,8 @@ pub(crate) struct TabState {
     /// While a selection drag holds the pointer outside the viewport, the
     /// page scrolls a step at each of these instants.
     autoscroll: Option<std::time::Instant>,
+    /// Find in page, while the find bar is open with a query.
+    find: Option<Find>,
 
     history: Vec<Url>,
     history_index: usize,
@@ -192,6 +205,7 @@ impl TabState {
             select_anchor: None,
             last_click: None,
             autoscroll: None,
+            find: None,
             history: Vec::new(),
             history_index: 0,
             pending_fragment: false,
@@ -371,8 +385,120 @@ impl TabState {
                     self.send(TabToShell::CopyText { text });
                 }
             }
+            ShellToTab::Find { query } => self.find(query),
+            ShellToTab::FindNext { forward } => self.find_next(forward),
+            ShellToTab::FindClose => {
+                if self.find.take().is_some() {
+                    self.needs_paint = true;
+                }
+            }
             ShellToTab::Close => {}
         }
+    }
+
+    // ----- find in page -----
+
+    /// A new query. The current match stays where it was if a match still
+    /// starts there or later (typing more of a word keeps its place);
+    /// otherwise the first match is current.
+    fn find(&mut self, query: String) {
+        if query.is_empty() {
+            if self.find.take().is_some() {
+                self.needs_paint = true;
+            }
+            self.send(TabToShell::FindResult {
+                current: None,
+                total: 0,
+            });
+            return;
+        }
+        let prefer = self.current_match_start();
+        self.find = Some(Find {
+            query,
+            matches: Vec::new(),
+            current: None,
+            ranges: SelectionRanges::default(),
+            current_ranges: SelectionRanges::default(),
+        });
+        self.refresh_find(prefer, true);
+    }
+
+    fn current_match_start(&self) -> Option<TextPos> {
+        let f = self.find.as_ref()?;
+        f.matches.get(f.current?).map(|m| m.0)
+    }
+
+    /// Search the current layout again and pick the current match: the
+    /// first one starting at or after `prefer`, else the first.
+    fn refresh_find(&mut self, prefer: Option<TextPos>, scroll: bool) {
+        let Some(tree) = self.layout.as_ref() else { return };
+        let Some(f) = self.find.as_mut() else { return };
+        f.matches = selection::find_all(tree, &f.query);
+        f.current = if f.matches.is_empty() {
+            None
+        } else {
+            let mut positions: Vec<TextPos> = f.matches.iter().map(|m| m.0).collect();
+            positions.extend(prefer);
+            let keys = selection::position_keys(tree, &positions);
+            let index = prefer.and_then(|_| {
+                let wanted = keys.last().copied().flatten()?;
+                keys[..f.matches.len()].iter().position(|k| k.is_some_and(|k| k >= wanted))
+            });
+            Some(index.unwrap_or(0))
+        };
+        f.ranges = selection::ranges_of_all(tree, &f.matches);
+        f.current_ranges = match f.current.and_then(|i| f.matches.get(i)) {
+            Some(&(a, b)) => selection::selection_ranges(tree, a, b),
+            None => SelectionRanges::default(),
+        };
+        self.needs_paint = true;
+        if scroll {
+            self.scroll_to_current_match();
+        }
+        self.report_find();
+    }
+
+    fn find_next(&mut self, forward: bool) {
+        let Some(tree) = self.layout.as_ref() else { return };
+        let Some(f) = self.find.as_mut() else { return };
+        let n = f.matches.len();
+        if n == 0 {
+            return;
+        }
+        let i = f.current.unwrap_or(0);
+        let next = if forward { (i + 1) % n } else { (i + n - 1) % n };
+        f.current = Some(next);
+        let (a, b) = f.matches[next];
+        f.current_ranges = selection::selection_ranges(tree, a, b);
+        self.needs_paint = true;
+        self.scroll_to_current_match();
+        self.report_find();
+    }
+
+    /// Bring the current match into the viewport, a third of the way down.
+    fn scroll_to_current_match(&mut self) {
+        let Some(tree) = self.layout.as_ref() else { return };
+        let Some((a, b)) = self.find.as_ref().and_then(|f| f.current.map(|i| f.matches[i])) else {
+            return;
+        };
+        let Some(rect) = selection::first_rect(tree, a, b) else { return };
+        let (w, h) = (self.viewport.width, self.viewport.height);
+        if rect.y < self.scroll_y || rect.bottom() > self.scroll_y + h {
+            self.scroll_y = rect.y - h / 3.0;
+        }
+        if rect.x < self.scroll_x || rect.right() > self.scroll_x + w {
+            self.scroll_x = rect.x - w / 3.0;
+        }
+        self.clamp_scroll();
+        self.hover_dirty = true;
+    }
+
+    fn report_find(&mut self) {
+        let (current, total) = match &self.find {
+            Some(f) => (f.current.map(|i| i + 1), f.matches.len()),
+            None => (None, 0),
+        };
+        self.send(TabToShell::FindResult { current, total });
     }
 
     // ----- text selection -----
@@ -1105,6 +1231,14 @@ impl TabState {
         self.selection = None;
         self.select_anchor = None;
         self.autoscroll = None;
+        // The query outlives the page; the matches are found again after
+        // the new document's first layout.
+        if let Some(f) = &mut self.find {
+            f.matches.clear();
+            f.current = None;
+            f.ranges = SelectionRanges::default();
+            f.current_ranges = SelectionRanges::default();
+        }
         self.collect_stylesheets();
         self.collect_images();
         self.pending_fragment = self.url.as_ref().is_some_and(|u| u.fragment().is_some());
@@ -1369,6 +1503,10 @@ impl TabState {
         );
         self.layout = Some(tree);
         self.clamp_scroll();
+        if self.find.is_some() {
+            let prefer = self.current_match_start();
+            self.refresh_find(prefer, false);
+        }
     }
 
     fn repaint(&mut self) {
@@ -1380,6 +1518,8 @@ impl TabState {
             viewport_height: self.viewport.height,
             scale: self.viewport.scale_factor,
             selection: self.selection_ranges(),
+            matches: self.find.as_ref().map(|f| f.ranges.clone()).unwrap_or_default(),
+            current_match: self.find.as_ref().map(|f| f.current_ranges.clone()).unwrap_or_default(),
         };
         paint(tree, &self.images, &options, &mut self.scene);
         if let Some(sb) = self.scrollbar() {
@@ -2042,6 +2182,85 @@ mod tests {
         assert!(h.selected().is_some());
         h.send(ShellToTab::Navigate { url: data_url("<p>other</p>", None) });
         assert_eq!(h.selected(), None);
+    }
+
+    impl Harness {
+        /// The last (current, total) the tab reported for find.
+        fn find_result(&self) -> Option<(Option<usize>, usize)> {
+            self.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    TabToShell::FindResult { current, total } => Some((*current, *total)),
+                    _ => None,
+                })
+        }
+
+        fn current_match_text(&self) -> Option<String> {
+            let f = self.state.find.as_ref()?;
+            let (a, b) = f.matches.get(f.current?)?;
+            Some(selection::selection_text(self.state.layout.as_ref()?, *a, *b))
+        }
+    }
+
+    #[test]
+    fn find_highlights_steps_wraps_and_scrolls() {
+        let mut h = Harness::load(TALL);
+        h.send(ShellToTab::Find { query: "TOP".into() });
+        assert_eq!(h.find_result(), Some((Some(1), 1)), "case-insensitive");
+        assert_eq!(h.current_match_text().as_deref(), Some("top"));
+        assert!(!h.state.find.as_ref().expect("find").ranges.is_empty());
+        assert_eq!(h.state.scroll_y, 0.0, "already in view");
+
+        // "end" is in the heading far below: the page scrolls to it.
+        h.send(ShellToTab::Find { query: "end".into() });
+        assert_eq!(h.find_result(), Some((Some(1), 1)));
+        assert!(h.state.scroll_y > 900.0, "scrolled to the match, got {}", h.state.scroll_y);
+
+        // Two matches of "o": down, top. Next wraps; previous goes back.
+        h.send(ShellToTab::Find { query: "o".into() });
+        assert_eq!(h.find_result(), Some((Some(1), 2)));
+        assert!(h.state.scroll_y < 100.0, "scrolled back up to the first match");
+        h.send(ShellToTab::FindNext { forward: true });
+        assert_eq!(h.find_result(), Some((Some(2), 2)));
+        h.send(ShellToTab::FindNext { forward: true });
+        assert_eq!(h.find_result(), Some((Some(1), 2)), "wrapped");
+        h.send(ShellToTab::FindNext { forward: false });
+        assert_eq!(h.find_result(), Some((Some(2), 2)));
+        assert_eq!(h.current_match_text().as_deref(), Some("o"));
+
+        // A new query keeps the place: the first match at or after the
+        // current one's start. After the o of "top" the next t is "The".
+        h.send(ShellToTab::Find { query: "t".into() });
+        assert_eq!(h.find_result(), Some((Some(2), 2)));
+        assert_eq!(h.current_match_text().as_deref(), Some("T"));
+        h.send(ShellToTab::Find { query: "th".into() });
+        assert_eq!(h.find_result(), Some((Some(1), 1)));
+        assert_eq!(h.current_match_text().as_deref(), Some("Th"));
+
+        // No match, empty query, close.
+        h.send(ShellToTab::Find { query: "zzz".into() });
+        assert_eq!(h.find_result(), Some((None, 0)));
+        h.send(ShellToTab::FindNext { forward: true });
+        assert_eq!(h.find_result(), Some((None, 0)));
+        h.send(ShellToTab::Find { query: String::new() });
+        assert!(h.state.find.is_none());
+        h.send(ShellToTab::Find { query: "top".into() });
+        h.send(ShellToTab::FindClose);
+        assert!(h.state.find.is_none());
+    }
+
+    #[test]
+    fn find_follows_the_page_across_a_navigation() {
+        let mut h = Harness::load(TEXT_PAGE);
+        h.send(ShellToTab::Find { query: "paragraph".into() });
+        assert_eq!(h.find_result(), Some((Some(1), 1)));
+        h.send(ShellToTab::Navigate { url: data_url("<p>a paragraph and a paragraph</p>", None) });
+        assert_eq!(h.find_result(), Some((Some(1), 2)), "found again on the new page");
+        h.send(ShellToTab::Navigate { url: data_url("<p>nothing here</p>", None) });
+        assert_eq!(h.find_result(), Some((None, 0)));
     }
 
     #[test]

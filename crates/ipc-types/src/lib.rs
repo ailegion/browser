@@ -66,6 +66,14 @@ pub enum ShellToTab {
     /// Put the selected text on the clipboard, if there is any
     /// (answered with `TabToShell::CopyText`).
     Copy,
+    /// Find in page: search for this text, highlight every match and
+    /// scroll to the current one. Answered with `TabToShell::FindResult`;
+    /// an empty query clears the matches.
+    Find { query: String },
+    /// Move to the next (or previous) match, wrapping around.
+    FindNext { forward: bool },
+    /// The find bar closed: drop the matches and their highlights.
+    FindClose,
     Close,
 }
 
@@ -86,6 +94,8 @@ pub enum TabToShell {
     OpenInNewTab { url: Url },
     /// Text the user copied; the shell owns the clipboard.
     CopyText { text: String },
+    /// How many find matches there are and which is current (1-based).
+    FindResult { current: Option<usize>, total: usize },
     /// The tab thread panicked and was unwound; the shell shows a crashed page.
     Crashed { message: String },
     Closed,

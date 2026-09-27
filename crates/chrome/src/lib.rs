@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+mod find;
 mod input;
 mod menu;
 pub mod scrollbar;
@@ -35,6 +36,7 @@ use vello::Scene;
 use vello::kurbo::{Affine, Rect, RoundedRect};
 use vello::peniko::{Color, Fill};
 
+use find::{FindBar, FindPart};
 use input::{InputEvent, TextInput, rounded_box};
 use menu::{Menu, MenuAction, MenuItem};
 use widgets::{Button, Icon, TextLine, draw_icon, draw_progress, draw_spinner, draw_text, draw_tooltip, scale_rect};
@@ -140,6 +142,12 @@ pub enum ChromeAction {
     NewTab,
     SelectTab(TabId),
     CloseTab(TabId),
+    /// Find in page: the box's text changed.
+    Find(String),
+    /// Step to the next or previous match.
+    FindNext { forward: bool },
+    /// The find bar closed.
+    FindClose,
 }
 
 /// What the tab strip shows for one tab.
@@ -161,6 +169,7 @@ enum Part {
     Address,
     Tab(TabId),
     TabClose(TabId),
+    Find(FindPart),
 }
 
 struct TabSlot {
@@ -209,6 +218,8 @@ pub struct Chrome {
     /// When the current tab started loading, for the animation.
     loading_since: Option<Instant>,
     menu: Option<Menu>,
+    /// The find bar, while open.
+    find: Option<FindBar>,
     hover: Option<Part>,
     /// When the pointer arrived on `hover`, and where it is.
     hover_since: Option<Instant>,
@@ -389,6 +400,7 @@ impl Chrome {
             loading: false,
             loading_since: None,
             menu: None,
+            find: None,
             hover: None,
             hover_since: None,
             mouse: (0.0, 0.0),
@@ -412,6 +424,9 @@ impl Chrome {
         self.width = width.max(0.0);
         self.scale = scale.max(0.01);
         self.address.set_scale(self.scale);
+        if let Some(f) = &mut self.find {
+            f.input.set_scale(self.scale);
+        }
         self.menu = None;
         self.relayout();
     }
@@ -442,7 +457,105 @@ impl Chrome {
         for tab in &mut self.tabs {
             tab.rect = rect_of(&self.taffy, tab.node, (0.0, 0.0));
         }
+        if let Some(f) = &mut self.find {
+            f.layout(self.width, TABSTRIP_HEIGHT + TOOLBAR_HEIGHT);
+        }
         self.dirty = true;
+    }
+
+    // ----- find bar -----
+
+    /// Open the find bar, or bring focus back to it, with its text
+    /// selected (Ctrl+F).
+    pub fn open_find(&mut self) {
+        self.close_menu();
+        if self.address.focused {
+            self.blur();
+        }
+        let scale = self.scale;
+        let f = self.find.get_or_insert_with(|| FindBar::new(scale));
+        f.input.focused = true;
+        f.input.select_all(&mut self.fonts, &mut self.lcx);
+        f.layout(self.width, TABSTRIP_HEIGHT + TOOLBAR_HEIGHT);
+        self.dirty = true;
+    }
+
+    /// Close the find bar (Escape, its close button). The action tells
+    /// the tab to drop its matches.
+    pub fn close_find(&mut self) -> Vec<ChromeAction> {
+        if self.find.take().is_none() {
+            return Vec::new();
+        }
+        if matches!(self.hover, Some(Part::Find(_))) {
+            self.hover = None;
+            self.hover_since = None;
+            self.tooltip_shown = false;
+        }
+        self.dirty = true;
+        vec![ChromeAction::FindClose]
+    }
+
+    pub fn find_open(&self) -> bool {
+        self.find.is_some()
+    }
+
+    fn find_focused(&self) -> bool {
+        self.find.as_ref().is_some_and(|f| f.input.focused)
+    }
+
+    /// The tab's answer to the last query: the current match and the total.
+    pub fn set_find_result(&mut self, current: Option<usize>, total: usize) {
+        if let Some(f) = &mut self.find {
+            f.set_result(current, total);
+            self.dirty = true;
+        }
+    }
+
+    /// The find panel in logical pixels, while open.
+    pub fn find_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let r = self.find.as_ref()?.rect;
+        Some((r.x0 as f32, r.y0 as f32, r.width() as f32, r.height() as f32))
+    }
+
+    /// Centers of the find bar's previous, next and close buttons.
+    pub fn find_button_centers(&self) -> Option<[(f32, f32); 3]> {
+        let f = self.find.as_ref()?;
+        let c = |r: Rect| (((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
+        Some([c(f.prev.rect), c(f.next.rect), c(f.close.rect)])
+    }
+
+    /// What the find bar shows beside the box: "2/5", "No results", or
+    /// nothing yet.
+    pub fn find_status(&self) -> Option<String> {
+        self.find.as_ref().map(FindBar::count_text)
+    }
+
+    /// A key while the find box has focus.
+    fn find_key(&mut self, input: KeyInput) -> Vec<ChromeAction> {
+        self.dirty = true;
+        match input.key {
+            Key::Enter => return vec![ChromeAction::FindNext { forward: !input.shift }],
+            Key::Escape => return self.close_find(),
+            Key::Tab => {
+                self.blur();
+                return Vec::new();
+            }
+            _ => {}
+        }
+        let Some(f) = &mut self.find else { return Vec::new() };
+        let before = f.input.text();
+        let event = f.input.key(&mut self.fonts, &mut self.lcx, &input);
+        let mut actions = Vec::new();
+        match event {
+            Some(InputEvent::Copy(text)) => actions.push(ChromeAction::CopyText(text)),
+            Some(InputEvent::RequestPaste) => actions.push(ChromeAction::RequestPaste),
+            _ => {}
+        }
+        let after = f.input.text();
+        if after != before {
+            actions.push(ChromeAction::Find(after));
+        }
+        actions
     }
 
     /// The address box in logical pixels, for tests and the shell.
@@ -540,15 +653,15 @@ impl Chrome {
         security_icon(self.url.as_ref()) == Some(Icon::LockClosed)
     }
 
-    /// The address bar has keyboard focus.
+    /// The address bar or the find box has keyboard focus.
     pub fn has_focus(&self) -> bool {
-        self.address.focused
+        self.address.focused || self.find_focused()
     }
 
-    /// The chrome wants the keyboard: the address bar is focused or a
-    /// menu is open.
+    /// The chrome wants the keyboard: a text box is focused or a menu is
+    /// open.
     pub fn wants_keys(&self) -> bool {
-        self.address.focused || self.menu.is_some()
+        self.has_focus() || self.menu.is_some()
     }
 
     /// A menu is open.
@@ -573,10 +686,13 @@ impl Chrome {
     /// Keyboard focus goes back to the page; an edit in progress is
     /// kept in the box, as browsers do, until the tab reports a URL.
     pub fn blur(&mut self) {
-        if self.address.focused {
+        if self.has_focus() {
             self.dirty = true;
         }
         self.address.blur(&mut self.fonts, &mut self.lcx);
+        if let Some(f) = &mut self.find {
+            f.input.blur(&mut self.fonts, &mut self.lcx);
+        }
     }
 
     /// Whether something changed since the last draw. Clears the flag.
@@ -622,18 +738,26 @@ impl Chrome {
     /// The area the IME should keep clear, in logical pixels, when the
     /// address bar is focused.
     pub fn ime_cursor_area(&mut self) -> Option<(f32, f32, f32, f32)> {
-        self.address
-            .focused
-            .then(|| self.address.ime_cursor_area(&mut self.fonts, &mut self.lcx))
+        if self.address.focused {
+            return Some(self.address.ime_cursor_area(&mut self.fonts, &mut self.lcx));
+        }
+        match &mut self.find {
+            Some(f) if f.input.focused => Some(f.input.ime_cursor_area(&mut self.fonts, &mut self.lcx)),
+            _ => None,
+        }
     }
 
-    /// Whether a point is on the chrome rather than the page. With a menu
-    /// open the chrome takes every point, to close it on a click outside.
-    pub fn contains(&self, _x: f32, y: f32) -> bool {
-        self.menu.is_some() || y < self.height()
+    /// Whether a point is on the chrome rather than the page: the bars,
+    /// the find panel hanging under them. With a menu open the chrome
+    /// takes every point, to close it on a click outside.
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        self.menu.is_some() || y < self.height() || self.find.as_ref().is_some_and(|f| f.contains(x, y))
     }
 
     fn part_at(&self, x: f32, y: f32) -> Option<Part> {
+        if let Some(part) = self.find.as_ref().and_then(|f| f.part_at(x, y)) {
+            return Some(Part::Find(part));
+        }
         if self.address.contains(x, y) {
             return Some(Part::Address);
         }
@@ -698,13 +822,24 @@ impl Chrome {
             self.dirty = true;
         }
         self.address.mouse_move(&mut self.fonts, &mut self.lcx, x, y);
-        if self.pressed == Some(Part::Address) {
+        if let Some(f) = &mut self.find {
+            f.input.mouse_move(&mut self.fonts, &mut self.lcx, x, y);
+        }
+        if matches!(self.pressed, Some(Part::Address | Part::Find(FindPart::Input))) {
             self.dirty = true;
         }
         match part {
-            Some(Part::Address) => Cursor::Text,
+            Some(Part::Address | Part::Find(FindPart::Input)) => Cursor::Text,
             Some(Part::Back) if self.back.enabled => Cursor::Pointer,
             Some(Part::Forward) if self.forward.enabled => Cursor::Pointer,
+            Some(Part::Find(FindPart::Prev | FindPart::Next)) => {
+                if self.find.as_ref().is_some_and(|f| f.total > 0) {
+                    Cursor::Pointer
+                } else {
+                    Cursor::Default
+                }
+            }
+            Some(Part::Find(FindPart::Close)) => Cursor::Pointer,
             Some(Part::Reload | Part::NewTab | Part::Menu | Part::Tab(_) | Part::TabClose(_)) => Cursor::Pointer,
             _ => Cursor::Default,
         }
@@ -739,11 +874,26 @@ impl Chrome {
         let part = self.part_at(x, y);
         match (button, part) {
             (MouseButton::Left, Some(Part::Address)) => {
+                if self.find_focused() {
+                    self.blur();
+                }
                 self.address.mouse_down(&mut self.fonts, &mut self.lcx, x, y, shift);
                 self.pressed = Some(Part::Address);
             }
-            (MouseButton::Left, Some(p)) => {
+            (MouseButton::Left, Some(Part::Find(FindPart::Input))) => {
                 if self.address.focused {
+                    self.blur();
+                }
+                if let Some(f) = &mut self.find {
+                    f.input.mouse_down(&mut self.fonts, &mut self.lcx, x, y, shift);
+                }
+                self.pressed = Some(Part::Find(FindPart::Input));
+            }
+            // The panel and its buttons leave the find box's focus alone.
+            (MouseButton::Left, Some(Part::Find(FindPart::Panel))) => {}
+            (MouseButton::Left, Some(p @ Part::Find(_))) => self.pressed = Some(p),
+            (MouseButton::Left, Some(p)) => {
+                if self.has_focus() {
                     self.blur();
                 }
                 self.pressed = Some(p);
@@ -752,7 +902,7 @@ impl Chrome {
                 return vec![ChromeAction::CloseTab(id)];
             }
             _ => {
-                if self.address.focused {
+                if self.has_focus() {
                     self.blur();
                 }
             }
@@ -764,6 +914,9 @@ impl Chrome {
     pub fn mouse_up(&mut self, x: f32, y: f32, button: MouseButton) -> Vec<ChromeAction> {
         let pressed = self.pressed.take();
         self.address.mouse_up();
+        if let Some(f) = &mut self.find {
+            f.input.mouse_up();
+        }
         self.dirty = true;
         if button != MouseButton::Left {
             return Vec::new();
@@ -792,6 +945,16 @@ impl Chrome {
                 }
                 Part::Tab(id) if self.current != Some(id) => vec![ChromeAction::SelectTab(id)],
                 Part::TabClose(id) => vec![ChromeAction::CloseTab(id)],
+                Part::Find(FindPart::Prev | FindPart::Next) => {
+                    if self.find.as_ref().is_some_and(|f| f.total > 0) {
+                        vec![ChromeAction::FindNext {
+                            forward: p == Part::Find(FindPart::Next),
+                        }]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Part::Find(FindPart::Close) => self.close_find(),
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -840,6 +1003,17 @@ impl Chrome {
             }
             return Vec::new();
         }
+        // Ctrl+F from anywhere in the chrome opens or refocuses find.
+        if input.ctrl
+            && let Key::Character(c) = &input.key
+            && c.eq_ignore_ascii_case("f")
+        {
+            self.open_find();
+            return Vec::new();
+        }
+        if self.find_focused() {
+            return self.find_key(input);
+        }
         if !self.address.focused {
             return Vec::new();
         }
@@ -870,26 +1044,46 @@ impl Chrome {
         actions
     }
 
-    /// Clipboard text for a `RequestPaste`.
-    pub fn paste(&mut self, text: &str) {
+    /// Clipboard text for a `RequestPaste`. Into the find box it is a
+    /// new query.
+    pub fn paste(&mut self, text: &str) -> Vec<ChromeAction> {
         if self.address.focused {
             self.address.paste(&mut self.fonts, &mut self.lcx, text);
             self.dirty = true;
+        } else if let Some(f) = &mut self.find
+            && f.input.focused
+        {
+            f.input.paste(&mut self.fonts, &mut self.lcx, text);
+            self.dirty = true;
+            return vec![ChromeAction::Find(f.input.text())];
         }
+        Vec::new()
     }
 
     pub fn ime_preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) {
         if self.address.focused {
             self.address.ime_preedit(&mut self.fonts, &mut self.lcx, text, cursor);
             self.dirty = true;
+        } else if let Some(f) = &mut self.find
+            && f.input.focused
+        {
+            f.input.ime_preedit(&mut self.fonts, &mut self.lcx, text, cursor);
+            self.dirty = true;
         }
     }
 
-    pub fn ime_commit(&mut self, text: &str) {
+    pub fn ime_commit(&mut self, text: &str) -> Vec<ChromeAction> {
         if self.address.focused {
             self.address.ime_commit(&mut self.fonts, &mut self.lcx, text);
             self.dirty = true;
+        } else if let Some(f) = &mut self.find
+            && f.input.focused
+        {
+            f.input.ime_commit(&mut self.fonts, &mut self.lcx, text);
+            self.dirty = true;
+            return vec![ChromeAction::Find(f.input.text())];
         }
+        Vec::new()
     }
 
     /// Draw the chrome at the top of `scene`, in physical pixels. A menu
@@ -950,6 +1144,18 @@ impl Chrome {
             let phase = now.duration_since(since).as_secs_f64() / 1.4;
             let bar = Rect::new(0.0, total_h - 3.0 * s, w, total_h);
             draw_progress(scene, bar, phase, ACCENT);
+        }
+
+        if let Some(f) = &mut self.find {
+            let hover = match self.hover {
+                Some(Part::Find(p)) => Some(p),
+                _ => None,
+            };
+            let pressed = match self.pressed {
+                Some(Part::Find(p)) => Some(p),
+                _ => None,
+            };
+            f.draw(&mut self.fonts, &mut self.lcx, scene, self.scale, hover, pressed);
         }
 
         if let Some(menu) = &self.menu {
@@ -1031,7 +1237,10 @@ fn tooltip_for(part: Part) -> Option<&'static str> {
         Part::Menu => Some("Menu"),
         Part::TabClose(_) => Some("Close tab"),
         Part::Tab(_) => Some(""),
-        Part::Address => None,
+        Part::Find(FindPart::Prev) => Some("Previous match (Shift+Enter)"),
+        Part::Find(FindPart::Next) => Some("Next match (Enter)"),
+        Part::Find(FindPart::Close) => Some("Close (Escape)"),
+        Part::Address | Part::Find(FindPart::Input | FindPart::Panel) => None,
     }
 }
 
@@ -1442,6 +1651,76 @@ mod tests {
         click(&mut c, menu_btn);
         let menu_rect = c.menu.as_ref().unwrap().rect;
         c.mouse_move(menu_rect.x0 as f32 + 10.0, menu_rect.y0 as f32 + 20.0);
+        c.draw(&mut scene);
+    }
+
+    #[test]
+    fn find_bar_opens_types_steps_and_closes() {
+        let mut c = chrome();
+        assert!(!c.find_open());
+        assert!(c.key(KeyInput::typed("x")).is_empty());
+        c.open_find();
+        assert!(c.find_open() && c.has_focus() && c.wants_keys());
+        let (x, y, w, h) = c.find_rect().unwrap();
+        assert!(y >= c.height() && x + w <= 800.0, "hangs under the toolbar at the right");
+        assert!(c.contains(x + 5.0, y + 5.0), "the panel is chrome");
+        assert!(!c.contains(x - 5.0, y + 5.0) && !c.contains(x + 5.0, y + h + 5.0), "the page around it is not");
+        assert_eq!(c.find_status().as_deref(), Some(""));
+
+        // Typing reports each change; Enter and Shift+Enter step.
+        assert_eq!(
+            type_str(&mut c, "ab"),
+            vec![ChromeAction::Find("a".into()), ChromeAction::Find("ab".into())]
+        );
+        assert_eq!(c.key(KeyInput::plain(Key::Enter)), vec![ChromeAction::FindNext { forward: true }]);
+        assert_eq!(c.key(KeyInput::shift(Key::Enter)), vec![ChromeAction::FindNext { forward: false }]);
+        assert_eq!(c.find_status().as_deref(), Some(""), "no result yet");
+        c.set_find_result(Some(2), 5);
+        assert_eq!(c.find_status().as_deref(), Some("2/5"));
+        type_str(&mut c, "c");
+        assert_eq!(c.find_status().as_deref(), Some(""), "the count was for the old text");
+        c.set_find_result(None, 0);
+        assert_eq!(c.find_status().as_deref(), Some("No results"));
+
+        // Buttons: disabled without matches, then they step; close closes.
+        let [prev, next, close] = c.find_button_centers().unwrap();
+        assert!(click(&mut c, next).is_empty());
+        assert_eq!(c.mouse_move(next.0, next.1), Cursor::Default);
+        c.set_find_result(Some(1), 3);
+        assert_eq!(c.mouse_move(next.0, next.1), Cursor::Pointer);
+        assert_eq!(click(&mut c, next), vec![ChromeAction::FindNext { forward: true }]);
+        assert_eq!(click(&mut c, prev), vec![ChromeAction::FindNext { forward: false }]);
+        assert!(c.has_focus(), "the buttons leave the box focused");
+        assert_eq!(click(&mut c, close), vec![ChromeAction::FindClose]);
+        assert!(!c.find_open() && !c.has_focus());
+
+        // Ctrl+F from the address bar opens it; Escape closes it; a click
+        // into the address bar takes focus from it.
+        c.focus_address();
+        assert!(c.key(KeyInput::ctrl(Key::Character("f".into()))).is_empty());
+        assert!(c.find_open() && c.has_focus());
+        assert_eq!(c.key(KeyInput::typed("q")), vec![ChromeAction::Find("q".into())]);
+        assert_eq!(c.address_text(), "", "typing went to the find box");
+        assert_eq!(c.key(KeyInput::plain(Key::Escape)), vec![ChromeAction::FindClose]);
+        assert!(!c.find_open());
+        assert!(c.close_find().is_empty(), "already closed");
+        c.open_find();
+        let (ax, ay, _, ah) = c.address_rect();
+        click(&mut c, (ax + 40.0, ay + ah / 2.0));
+        assert!(c.find_open() && !c.key(KeyInput::typed("z")).contains(&ChromeAction::Find("z".into())));
+        assert_eq!(c.address_text(), "z");
+        // Paste into the box is a query too.
+        c.open_find();
+        assert_eq!(c.paste("pasted"), vec![ChromeAction::Find("pasted".into())]);
+        assert_eq!(c.ime_commit("!"), vec![ChromeAction::Find("pasted!".into())]);
+        // Draw in every state.
+        let mut scene = Scene::new();
+        c.draw(&mut scene);
+        c.set_find_result(None, 0);
+        c.mouse_move(close.0, close.1);
+        c.draw(&mut scene);
+        c.resize(300.0, 2.0);
+        assert!(c.find_open());
         c.draw(&mut scene);
     }
 

@@ -115,7 +115,7 @@ pub fn render_html(html: &[u8], width: u32, height: u32, scale: f32) -> Option<V
             viewport_width: logical_w,
             viewport_height: logical_h,
             scale,
-            selection: SelectionRanges::default(),
+            ..Default::default()
         },
         &mut scene,
     );
@@ -123,7 +123,7 @@ pub fn render_html(html: &[u8], width: u32, height: u32, scale: f32) -> Option<V
 }
 
 /// What the painter needs besides the tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PaintOptions {
     /// Scroll offset in page pixels; content moves up by `scroll_y`.
     pub scroll_x: f32,
@@ -135,10 +135,16 @@ pub struct PaintOptions {
     pub scale: f32,
     /// Text to highlight as selected.
     pub selection: SelectionRanges,
+    /// Find-in-page matches, and the current one, drawn over the selection.
+    pub matches: SelectionRanges,
+    pub current_match: SelectionRanges,
 }
 
 /// Behind selected text.
 const SELECTION: Color = Color::from_rgb8(0xb4, 0xd5, 0xfe);
+/// Behind find matches, and behind the current one.
+const MATCH: Color = Color::from_rgb8(0xff, 0xf1, 0x76);
+const CURRENT_MATCH: Color = Color::from_rgb8(0xff, 0x96, 0x32);
 
 /// Record the tree into `scene` (which is reset first).
 pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, scene: &mut Scene) {
@@ -190,7 +196,11 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         visible,
         transform,
         skip_background_of,
-        selection: &options.selection,
+        highlights: [
+            (&options.selection, SELECTION),
+            (&options.matches, MATCH),
+            (&options.current_match, CURRENT_MATCH),
+        ],
     };
     if let Some(html) = html {
         painter.fragment(html);
@@ -204,7 +214,8 @@ struct Painter<'a> {
     transform: Affine,
     /// Elements whose background the canvas already painted.
     skip_background_of: Vec<NodeId>,
-    selection: &'a SelectionRanges,
+    /// Text highlights in paint order: later ones cover earlier ones.
+    highlights: [(&'a SelectionRanges, Color); 3],
 }
 
 fn color(c: Rgba) -> Color {
@@ -366,31 +377,34 @@ impl Painter<'_> {
         }
     }
 
-    /// The highlight behind the selected clusters of a text fragment.
+    /// The highlights behind the selected or matched clusters of a text
+    /// fragment.
     fn selection_highlight(&mut self, rect: &Rect, t: &TextFragment, node: Option<NodeId>) {
-        let Some((a, b)) = node.and_then(|n| self.selection.get(n)) else {
-            return;
-        };
-        // Merge runs of adjacent selected clusters into one rectangle each.
-        let mut runs: Vec<(f32, f32)> = Vec::new();
-        for c in &t.clusters {
-            if c.start >= b || c.end <= a {
-                continue;
+        let Some(node) = node else { return };
+        for (ranges, color) in self.highlights {
+            for &(a, b) in ranges.get(node) {
+                // Merge runs of adjacent clusters into one rectangle each.
+                let mut runs: Vec<(f32, f32)> = Vec::new();
+                for c in &t.clusters {
+                    if c.start >= b || c.end <= a {
+                        continue;
+                    }
+                    let (x0, x1) = (c.x, c.x + c.advance);
+                    match runs.last_mut() {
+                        Some(last) if (last.1 - x0).abs() < 0.01 => last.1 = x1,
+                        _ => runs.push((x0, x1)),
+                    }
+                }
+                for (x0, x1) in runs {
+                    let r = KRect::new(
+                        (rect.x + x0) as f64,
+                        rect.y as f64,
+                        (rect.x + x1) as f64,
+                        rect.bottom() as f64,
+                    );
+                    self.scene.fill(Fill::NonZero, self.transform, color, None, &r);
+                }
             }
-            let (x0, x1) = (c.x, c.x + c.advance);
-            match runs.last_mut() {
-                Some(last) if (last.1 - x0).abs() < 0.01 => last.1 = x1,
-                _ => runs.push((x0, x1)),
-            }
-        }
-        for (x0, x1) in runs {
-            let r = KRect::new(
-                (rect.x + x0) as f64,
-                rect.y as f64,
-                (rect.x + x1) as f64,
-                rect.bottom() as f64,
-            );
-            self.scene.fill(Fill::NonZero, self.transform, SELECTION, None, &r);
         }
     }
 
@@ -505,6 +519,7 @@ mod tests {
             viewport_height: 100.0,
             scale: 1.0,
             selection: browser_layout::selection::selection_ranges(&tree, a, b),
+            ..Default::default()
         };
         let mut scene = Scene::new();
         paint(&tree, &images, &options, &mut scene);
@@ -528,6 +543,18 @@ mod tests {
         paint(&tree, &images, &options, &mut scene);
         let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
         assert_eq!([pixels[800], pixels[801], pixels[802]], [255, 255, 255]);
+
+        // A find match is yellow; the current one orange, over a selection.
+        let found = browser_layout::selection::find_all(&tree, "hello");
+        options.matches = browser_layout::selection::ranges_of_all(&tree, &found);
+        paint(&tree, &images, &options, &mut scene);
+        let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
+        assert_eq!([pixels[800], pixels[801], pixels[802]], [0xff, 0xf1, 0x76]);
+        options.selection = browser_layout::selection::selection_ranges(&tree, a, b);
+        options.current_match = browser_layout::selection::selection_ranges(&tree, found[0].0, found[0].1);
+        paint(&tree, &images, &options, &mut scene);
+        let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
+        assert_eq!([pixels[800], pixels[801], pixels[802]], [0xff, 0x96, 0x32]);
     }
 
     #[test]

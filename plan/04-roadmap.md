@@ -325,6 +325,35 @@ Work:
    done: Shift+click and keyboard extension of the selection, selection
    in images or form controls, a context menu, right-to-left highlight
    order is untested.
+   **Block 2 done 2026-09-27: find in page.** Ctrl+F opens a find bar
+   (`crates/chrome/src/find.rs`): a panel hanging under the toolbar at
+   the right with a text box, the match count ("2/5" or "No results",
+   shown only once the tab has answered for the current text), previous
+   and next buttons and close. Every change of the box's text (typing,
+   paste, IME commit) is a `ChromeAction::Find`; Enter and Shift+Enter,
+   the buttons and F3/Shift+F3 step; Escape or the close button close
+   it; switching tabs closes it. The shell relays these as
+   `ShellToTab::Find`, `FindNext` and `FindClose` and shows the tab's
+   `TabToShell::FindResult`. The tab searches the laid-out text
+   (`browser_layout::selection::find_all`: case-folded per character,
+   non-overlapping, never across an inline root), keeps the matches as
+   text positions with their highlight ranges precomputed
+   (`SelectionRanges` now holds many ranges per node), scrolls the
+   current match a third of the way down the viewport, and on a new
+   query keeps the first match starting at or after the old current
+   one, so typing on does not jump. The query outlives a navigation:
+   the new document is searched after its first layout, and every
+   relayout re-finds. Paint draws matches yellow and the current one
+   orange, over any selection. Tests: one layout test (case folding,
+   a match across two text nodes, no cross-block matches, no overlap,
+   ranges and rects), the paint pixel test extended to both colors,
+   two tab harness tests (highlight, step, wrap, scroll, keeping the
+   place, no result, close; re-finding across a navigation), one
+   chrome test (open, type, Enter, count, buttons, Ctrl+F from the
+   address bar, Escape, paste, drawing). Not done: whole-word or
+   match-case options, matching across block boundaries, a find bar
+   per tab (it closes on tab switch), scrolling horizontally to a match
+   inside an `overflow: hidden` box.
 8. Media queries and custom properties in `style`.
 9. CI matrix: Windows, Linux, macOS builds. Note: on 2026-09-26 the owner
    turned automatic CI runs off (`.github/workflows/ci.yml` is

@@ -20,11 +20,12 @@ pub struct TextPos {
     pub offset: usize,
 }
 
-/// What a selection covers, per text node: a byte range of the node's
-/// inline root text. Nodes wholly inside get `0..usize::MAX`.
+/// What to highlight, per text node: byte ranges of the node's inline
+/// root text. A node wholly inside a span gets `0..usize::MAX`. One
+/// selection yields one range per node; find matches yield many.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionRanges {
-    by_node: HashMap<NodeId, (usize, usize)>,
+    by_node: HashMap<NodeId, Vec<(usize, usize)>>,
 }
 
 impl SelectionRanges {
@@ -32,8 +33,19 @@ impl SelectionRanges {
         self.by_node.is_empty()
     }
 
-    pub fn get(&self, node: NodeId) -> Option<(usize, usize)> {
-        self.by_node.get(&node).copied()
+    pub fn get(&self, node: NodeId) -> &[(usize, usize)] {
+        self.by_node.get(&node).map_or(&[], Vec::as_slice)
+    }
+
+    fn add(&mut self, node: NodeId, start: usize, end: usize) {
+        self.by_node.entry(node).or_default().push((start, end));
+    }
+
+    /// Take every range of `other` as well.
+    pub fn extend(&mut self, other: SelectionRanges) {
+        for (node, ranges) in other.by_node {
+            self.by_node.entry(node).or_default().extend(ranges);
+        }
     }
 }
 
@@ -154,26 +166,33 @@ fn key(first: &HashMap<NodeId, usize>, pos: TextPos) -> Option<(usize, usize)> {
     first.get(&pos.node).map(|&i| (i, pos.offset))
 }
 
-fn ranges_of(texts: &[TextRef<'_>], first: &HashMap<NodeId, usize>, a: TextPos, b: TextPos) -> SelectionRanges {
-    let mut out = SelectionRanges::default();
+/// Add the span between two positions, in either order, to `out`.
+fn add_span(out: &mut SelectionRanges, texts: &[TextRef<'_>], first: &HashMap<NodeId, usize>, a: TextPos, b: TextPos) {
     let (Some(ka), Some(kb)) = (key(first, a), key(first, b)) else {
-        return out;
+        return;
     };
     let (ka, kb) = if ka <= kb { (ka, kb) } else { (kb, ka) };
     if ka == kb {
-        return out;
+        return;
     }
+    let mut done: Option<NodeId> = None;
     for t in texts {
         let ord = first[&t.node];
-        if ord < ka.0 || ord > kb.0 || out.by_node.contains_key(&t.node) {
+        if ord < ka.0 || ord > kb.0 || done == Some(t.node) {
             continue;
         }
+        done = Some(t.node);
         let start = if ord == ka.0 { ka.1 } else { 0 };
         let end = if ord == kb.0 { kb.1 } else { usize::MAX };
         if start < end {
-            out.by_node.insert(t.node, (start, end));
+            out.add(t.node, start, end);
         }
     }
+}
+
+fn ranges_of(texts: &[TextRef<'_>], first: &HashMap<NodeId, usize>, a: TextPos, b: TextPos) -> SelectionRanges {
+    let mut out = SelectionRanges::default();
+    add_span(&mut out, texts, first, a, b);
     out
 }
 
@@ -183,6 +202,102 @@ pub fn selection_ranges(tree: &LayoutTree, a: TextPos, b: TextPos) -> SelectionR
     let texts = texts(tree);
     let first = first_index(&texts);
     ranges_of(&texts, &first, a, b)
+}
+
+/// The highlight for many spans at once (find matches), computed with one
+/// pass over the tree.
+pub fn ranges_of_all(tree: &LayoutTree, spans: &[(TextPos, TextPos)]) -> SelectionRanges {
+    let texts = texts(tree);
+    let first = first_index(&texts);
+    let mut out = SelectionRanges::default();
+    for &(a, b) in spans {
+        add_span(&mut out, &texts, &first, a, b);
+    }
+    out
+}
+
+/// Sort keys of positions: tree order, then offset. `None` for a position
+/// whose node has no text in the layout. Keys from one call compare with
+/// each other; not across layouts.
+pub fn position_keys(tree: &LayoutTree, positions: &[TextPos]) -> Vec<Option<(usize, usize)>> {
+    let texts = texts(tree);
+    let first = first_index(&texts);
+    positions.iter().map(|&p| key(&first, p)).collect()
+}
+
+/// The page rectangle of the first highlighted run between two
+/// positions, for scrolling it into view.
+pub fn first_rect(tree: &LayoutTree, a: TextPos, b: TextPos) -> Option<Rect> {
+    let texts = texts(tree);
+    let first = first_index(&texts);
+    let ranges = ranges_of(&texts, &first, a, b);
+    for t in &texts {
+        for &(sa, sb) in ranges.get(t.node) {
+            let hit = t.text.clusters.iter().filter(|c| c.start < sb && c.end > sa);
+            let (mut x0, mut x1) = (f32::MAX, f32::MIN);
+            for c in hit {
+                x0 = x0.min(c.x);
+                x1 = x1.max(c.x + c.advance);
+            }
+            if x0 <= x1 {
+                return Some(Rect::new(t.rect.x + x0, t.rect.y, x1 - x0, t.rect.height));
+            }
+        }
+    }
+    None
+}
+
+/// Case-insensitive, non-overlapping matches of `query` in the page's
+/// text, in tree order. A match does not cross inline roots (blocks).
+pub fn find_all(tree: &LayoutTree, query: &str) -> Vec<(TextPos, TextPos)> {
+    let needle: Vec<char> = query.chars().map(fold_case).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let texts = texts(tree);
+    let mut seen: Vec<Arc<str>> = Vec::new();
+    let mut out = Vec::new();
+    for (i, t) in texts.iter().enumerate() {
+        let root = &t.text.text;
+        if seen.iter().any(|s| Arc::ptr_eq(s, root)) {
+            continue;
+        }
+        seen.push(root.clone());
+        let members: Vec<&TextRef<'_>> = texts[i..].iter().filter(|m| Arc::ptr_eq(&m.text.text, root)).collect();
+        for (s, e) in matches_in(root, &needle) {
+            let a = members.iter().find(|m| m.text.range.end > s).or(members.last());
+            let b = members.iter().rev().find(|m| m.text.range.start < e).or(members.first());
+            if let (Some(a), Some(b)) = (a, b) {
+                out.push((
+                    TextPos { node: a.node, offset: s },
+                    TextPos { node: b.node, offset: e },
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn fold_case(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Byte ranges of the folded needle in `text`, left to right, without
+/// overlap.
+fn matches_in(text: &str, needle: &[char]) -> Vec<(usize, usize)> {
+    let chars: Vec<(usize, char)> = text.char_indices().map(|(i, c)| (i, fold_case(c))).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= chars.len() {
+        if chars[i..i + needle.len()].iter().zip(needle).all(|((_, c), n)| c == n) {
+            let end = chars.get(i + needle.len()).map_or(text.len(), |(o, _)| *o);
+            out.push((chars[i].0, end));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// The selected text, as it would be copied: each inline root contributes
@@ -207,20 +322,21 @@ pub fn selection_text(tree: &LayoutTree, a: TextPos, b: TextPos) -> String {
         }
     };
     for t in &texts {
-        let Some((sa, sb)) = ranges.get(t.node) else { continue };
-        let lo = t.text.range.start.max(sa);
-        let hi = t.text.range.end.min(sb);
-        if lo >= hi {
-            continue;
-        }
-        match &mut current {
-            Some((text, clo, chi)) if Arc::ptr_eq(text, &t.text.text) => {
-                *clo = (*clo).min(lo);
-                *chi = (*chi).max(hi);
+        for &(sa, sb) in ranges.get(t.node) {
+            let lo = t.text.range.start.max(sa);
+            let hi = t.text.range.end.min(sb);
+            if lo >= hi {
+                continue;
             }
-            _ => {
-                flush(&mut current, &mut out);
-                current = Some((&t.text.text, lo, hi));
+            match &mut current {
+                Some((text, clo, chi)) if Arc::ptr_eq(text, &t.text.text) => {
+                    *clo = (*clo).min(lo);
+                    *chi = (*chi).max(hi);
+                }
+                _ => {
+                    flush(&mut current, &mut out);
+                    current = Some((&t.text.text, lo, hi));
+                }
             }
         }
     }
@@ -359,9 +475,12 @@ mod tests {
         assert_eq!(selection_text(&tree, a, b), "llo big world\nSe");
         assert_eq!(selection_text(&tree, b, a), "llo big world\nSe", "order does not matter");
         let ranges = selection_ranges(&tree, a, b);
-        assert_eq!(ranges.get(a.node), Some((2, usize::MAX)));
-        assert_eq!(ranges.get(b.node), Some((0, 2)));
-        assert!(ranges.get(texts[1].node).is_some(), "the bold node in between");
+        assert_eq!(ranges.get(a.node), &[(2, usize::MAX)]);
+        assert_eq!(ranges.get(b.node), &[(0, 2)]);
+        assert!(!ranges.get(texts[1].node).is_empty(), "the bold node in between");
+        // The first highlighted run: "llo" on the first line.
+        let r = first_rect(&tree, a, b).expect("rect");
+        assert!((r.x - h_mid + 0.1).abs() < 0.5 && r.y == 0.0 && r.height == 20.0, "{r:?}");
 
         // A collapsed selection is nothing.
         assert!(selection_ranges(&tree, a, a).is_empty());
@@ -396,6 +515,34 @@ mod tests {
         // The paragraph around the bold word is the whole first line.
         let (a, b) = paragraph_at(&tree, TextPos { node: texts[1].node, offset: 7 }).expect("para");
         assert_eq!(selection_text(&tree, a, b), "Hello big world");
+    }
+
+    #[test]
+    fn find_matches_case_insensitively_within_blocks() {
+        let (_doc, tree) = layout(
+            "<body style='margin:0;font-size:16px;line-height:20px'>\
+             <p style='margin:0'>Hello <b>hel</b>lo HELLO</p><p style='margin:0'>hel</p><p style='margin:0'>lo</p></body>",
+        );
+        let found = find_all(&tree, "hello");
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(selection_text(&tree, found[0].0, found[0].1), "Hello");
+        assert_eq!(selection_text(&tree, found[1].0, found[1].1), "hello", "a match spanning two nodes");
+        assert_ne!(found[1].0.node, found[1].1.node);
+        assert_eq!(selection_text(&tree, found[2].0, found[2].1), "HELLO");
+        assert!(find_all(&tree, "").is_empty());
+        assert!(find_all(&tree, "zzz").is_empty());
+        // Eight l's on the page; "ll" once per word, without overlap.
+        assert_eq!(find_all(&tree, "l").len(), 8);
+        assert_eq!(find_all(&tree, "ll").len(), 3);
+
+        let all = ranges_of_all(&tree, &found);
+        assert_eq!(all.get(found[1].1.node).len(), 2, "two matches touch the \"lo HELLO\" node");
+        let keys = position_keys(&tree, &[found[0].0, found[1].0, found[2].0]);
+        assert!(keys[0] < keys[1] && keys[1] < keys[2]);
+        // The rect of the third match sits after the others on the line.
+        let r0 = first_rect(&tree, found[0].0, found[0].1).expect("rect");
+        let r2 = first_rect(&tree, found[2].0, found[2].1).expect("rect");
+        assert!(r2.x > r0.right() && r2.y == r0.y);
     }
 
     #[test]

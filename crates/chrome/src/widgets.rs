@@ -21,6 +21,9 @@ pub(crate) enum Icon {
     LockOpen,
     /// Three dots, for the settings menu.
     Menu,
+    /// Previous and next match in the find bar.
+    ChevronUp,
+    ChevronDown,
 }
 
 /// Stroke `icon` centered in `rect` (physical pixels) with `size` as the
@@ -87,6 +90,16 @@ pub(crate) fn draw_icon(scene: &mut Scene, icon: Icon, rect: Rect, size: f64, co
                 scene.fill(Fill::NonZero, t, color, None, &Circle::new(Point::new(0.5, y), 0.09));
             }
             return;
+        }
+        Icon::ChevronUp => {
+            path.move_to((0.22, 0.62));
+            path.line_to((0.5, 0.34));
+            path.line_to((0.78, 0.62));
+        }
+        Icon::ChevronDown => {
+            path.move_to((0.22, 0.38));
+            path.line_to((0.5, 0.66));
+            path.line_to((0.78, 0.38));
         }
         Icon::LockClosed | Icon::LockOpen => {
             let body = RoundedRect::new(0.18, 0.45, 0.82, 0.92, 0.08);

@@ -222,9 +222,13 @@ impl App {
                 ChromeAction::RequestPaste => {
                     let text = self.clipboard().and_then(|cb| cb.get_text().ok());
                     if let Some(text) = text {
-                        self.chrome.paste(&text);
+                        let more = self.chrome.paste(&text);
+                        self.handle_chrome_actions(more, event_loop);
                     }
                 }
+                ChromeAction::Find(query) => self.send_to_current(ShellToTab::Find { query }),
+                ChromeAction::FindNext { forward } => self.send_to_current(ShellToTab::FindNext { forward }),
+                ChromeAction::FindClose => self.send_to_current(ShellToTab::FindClose),
             }
         }
         self.sync_ime();
@@ -438,6 +442,10 @@ impl App {
             && let Some(old) = self.tabs.get(self.current)
         {
             old.handle.send(ShellToTab::MouseLeave);
+            // The find bar belongs to the tab it searched.
+            if !self.chrome.close_find().is_empty() {
+                old.handle.send(ShellToTab::FindClose);
+            }
         }
         self.current = index;
         // Background tabs are not told about resizes; the one coming to
@@ -730,6 +738,14 @@ impl ApplicationHandler<UserEvent> for App {
                     tracing::warn!("clipboard write: {e}");
                 }
             }
+            TabOutput::Message(TabToShell::FindResult { current, total }) => {
+                if is_current {
+                    self.chrome.set_find_result(current, total);
+                    if let Some(active) = &self.active {
+                        active.window.request_redraw();
+                    }
+                }
+            }
             TabOutput::Message(TabToShell::Crashed { message }) => {
                 // The tab thread goes on and shows its crash page; nothing
                 // to do here but note it, and fail a screenshot run.
@@ -895,7 +911,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(ime) => {
                 match ime {
                     Ime::Preedit(text, cursor) => self.chrome.ime_preedit(&text, cursor),
-                    Ime::Commit(text) => self.chrome.ime_commit(&text),
+                    Ime::Commit(text) => {
+                        let actions = self.chrome.ime_commit(&text);
+                        self.handle_chrome_actions(actions, event_loop);
+                    }
                     Ime::Enabled | Ime::Disabled => {}
                 }
                 self.sync_ime();
@@ -916,7 +935,15 @@ impl ApplicationHandler<UserEvent> for App {
                 let ctrl = self.modifiers.state().control_key();
                 let shift = self.modifiers.state().shift_key();
                 let alt = self.modifiers.state().alt_key();
-                // The address bar or an open menu takes the keyboard.
+                // F3 steps through find matches wherever focus is.
+                if matches!(event.logical_key, Key::Named(NamedKey::F3)) {
+                    if self.chrome.find_open() {
+                        self.send_to_current(ShellToTab::FindNext { forward: !shift });
+                    }
+                    return;
+                }
+                // The address bar, the find box or an open menu takes the
+                // keyboard.
                 if self.chrome.wants_keys() {
                     let key = match &event.logical_key {
                         Key::Named(NamedKey::Backspace) => Some(ChromeKey::Backspace),
@@ -954,6 +981,14 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("c") => {
                         self.send_to_current(ShellToTab::Copy);
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("f") => {
+                        self.chrome.open_find();
+                        self.sync_ime();
+                    }
+                    Key::Named(NamedKey::Escape) if self.chrome.find_open() => {
+                        let actions = self.chrome.close_find();
+                        self.handle_chrome_actions(actions, event_loop);
                     }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => {
                         self.send_to_current(ShellToTab::SelectAll);
