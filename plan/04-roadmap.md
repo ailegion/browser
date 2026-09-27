@@ -258,9 +258,27 @@ Work:
    IP or `localhost`; anything else does nothing since there is no
    search engine (O6). The IME candidate window is positioned at the
    caret (`set_ime_cursor_area`). A thin accent line under the box shows
-   loading. Eight unit tests in the chrome crate. Not yet: buttons, tab
-   strip, menus, tooltip, scrollbar, HTTPS indicator (later blocks);
-   caret blink; a `drop`-style URL suggestion list.
+   loading. Eight unit tests in the chrome crate. Not yet: caret blink;
+   a URL suggestion list.
+   **Block 2 done 2026-09-27: buttons, tab strip, HTTPS indicator.** A
+   34px tab strip above the 44px toolbar; taffy lays out both rows
+   (`crates/chrome/src/lib.rs`), icons are kurbo paths and buttons a
+   small widget (`widgets.rs`). Toolbar: back, forward (enabled from the
+   tab's history state), reload which becomes stop while loading, then
+   the address box. Strip: one tab per open tab with its title (or "New
+   tab"), a loading dot, a close mark, the current one joined to the
+   toolbar; tabs shrink between 48 and 220px; a `+` at the end. Buttons
+   act on release over the part pressed; middle click closes a tab. The
+   shell mirrors titles, loading and history state into the chrome
+   (`sync_chrome_tabs`) and answers `Back`, `Forward`, `Reload`, `Stop`,
+   `NewTab` (an `about:blank` tab with the address bar focused, also
+   Ctrl+T), `SelectTab` and `CloseTab`. HTTPS indicator: a closed lock
+   in the address box for `https`, an open one for `http`, nothing for
+   internal pages; the text starts after it. Hover states redraw only
+   when the part under the pointer changes (`take_dirty`). Twelve unit
+   tests in the chrome crate. Not yet: menus, tooltip, scrollbar,
+   progress bar, settings menu (block 3); a spinner instead of the
+   loading dot; tab drag to reorder.
 7. Text selection and copy on pages. Find in page. Keyboard focus and tab
    order. Form controls rendered (no submission yet).
 8. Media queries and custom properties in `style`.

@@ -18,6 +18,8 @@ pub(crate) struct TextInput {
     pub focused: bool,
     /// Box in logical pixels, set by layout.
     pub rect: Rect,
+    /// Logical space kept free at the left of the box, for an indicator.
+    pub pad_left: f32,
     /// How far the text is shifted left so the caret stays visible, in
     /// physical pixels.
     scroll_x: f64,
@@ -54,6 +56,7 @@ impl TextInput {
             editor,
             focused: false,
             rect: Rect::ZERO,
+            pad_left: PAD_X,
             scroll_x: 0.0,
             scale: 1.0,
             placeholder: placeholder.to_owned(),
@@ -80,7 +83,7 @@ impl TextInput {
 
     /// Text position of a logical point, in physical layout coordinates.
     fn layout_point(&self, x: f32, y: f32) -> (f32, f32) {
-        let px = (x as f64 - self.rect.x0 - PAD_X as f64) * self.scale as f64 + self.scroll_x;
+        let px = (x as f64 - self.rect.x0 - self.pad_left as f64) * self.scale as f64 + self.scroll_x;
         let py = (y as f64 - self.rect.y0) * self.scale as f64;
         (px as f32, py as f32)
     }
@@ -217,7 +220,7 @@ impl TextInput {
         self.editor.refresh_layout(fonts, lcx);
         let area = self.editor.ime_cursor_area();
         let s = self.scale as f64;
-        let x = self.rect.x0 + PAD_X as f64 + (area.x0 - self.scroll_x) / s;
+        let x = self.rect.x0 + self.pad_left as f64 + (area.x0 - self.scroll_x) / s;
         let y = self.rect.y0 + self.text_top() / s;
         ((x as f32), (y as f32), ((area.x1 - area.x0) / s) as f32, ((area.y1 - area.y0) / s) as f32)
     }
@@ -238,7 +241,7 @@ impl TextInput {
     pub fn draw(&mut self, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>, scene: &mut Scene) {
         let s = self.scale as f64;
         let inner = Rect::new(
-            (self.rect.x0 + PAD_X as f64) * s,
+            (self.rect.x0 + self.pad_left as f64) * s,
             self.rect.y0 * s,
             (self.rect.x1 - PAD_X as f64) * s,
             self.rect.y1 * s,

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use browser_chrome::{Chrome, ChromeAction, Key as ChromeKey, KeyInput};
+use browser_chrome::{Chrome, ChromeAction, Key as ChromeKey, KeyInput, TabInfo};
 use browser_ipc_types::{Cursor as PageCursor, MouseButton as PageButton, ShellToTab, TabId, TabToShell, Viewport};
 use browser_net::NetService;
 use browser_tab::{TabHandle, TabOutput, spawn_tab};
@@ -116,6 +116,8 @@ struct Tab {
     loading: bool,
     title: Option<String>,
     url: Option<Url>,
+    can_go_back: bool,
+    can_go_forward: bool,
     cursor: CursorIcon,
 }
 
@@ -186,10 +188,25 @@ impl App {
     }
 
     /// Do what the chrome asked for after an interaction.
-    fn handle_chrome_actions(&mut self, actions: Vec<ChromeAction>) {
+    fn handle_chrome_actions(&mut self, actions: Vec<ChromeAction>, event_loop: &ActiveEventLoop) {
         for action in actions {
             match action {
                 ChromeAction::Navigate(url) => self.send_to_current(ShellToTab::Navigate { url }),
+                ChromeAction::Back => self.send_to_current(ShellToTab::GoBack),
+                ChromeAction::Forward => self.send_to_current(ShellToTab::GoForward),
+                ChromeAction::Reload => self.send_to_current(ShellToTab::Reload),
+                ChromeAction::Stop => self.send_to_current(ShellToTab::Stop),
+                ChromeAction::NewTab => self.new_tab(),
+                ChromeAction::SelectTab(id) => {
+                    if let Some(i) = self.tab_index(id) {
+                        self.activate(i);
+                    }
+                }
+                ChromeAction::CloseTab(id) => {
+                    if let Some(i) = self.tab_index(id) {
+                        self.close_tab(i, event_loop);
+                    }
+                }
                 ChromeAction::CopyText(text) => {
                     if let Some(cb) = self.clipboard()
                         && let Err(e) = cb.set_text(text)
@@ -333,15 +350,55 @@ impl App {
             loading: true,
             title: None,
             url: None,
+            can_go_back: false,
+            can_go_forward: false,
             cursor: CursorIcon::Default,
         });
         tracing::info!(tab = id.0, tabs = self.tabs.len(), "tab opened");
         if activate {
             self.activate(self.tabs.len() - 1);
         } else {
+            self.sync_chrome_tabs();
             self.update_title();
         }
         Ok(())
+    }
+
+    /// A fresh empty tab with the address bar ready for typing.
+    fn new_tab(&mut self) {
+        let url = Url::parse("about:blank").expect("static url");
+        if let Err(e) = self.open_tab(url, true) {
+            tracing::error!("open tab: {e}");
+            return;
+        }
+        self.chrome.focus_address();
+        self.sync_ime();
+    }
+
+    /// Mirror the tab list into the strip.
+    fn sync_chrome_tabs(&mut self) {
+        let infos: Vec<TabInfo> = self
+            .tabs
+            .iter()
+            .map(|t| TabInfo {
+                id: t.handle.id(),
+                title: t
+                    .title
+                    .clone()
+                    .or_else(|| t.url.as_ref().map(|u| u.to_string()))
+                    .unwrap_or_default(),
+                loading: t.loading,
+            })
+            .collect();
+        let current = self.tabs.get(self.current).map(|t| t.handle.id());
+        self.chrome.set_tabs(infos, current);
+        if let Some(active) = &self.active {
+            active.window.request_redraw();
+        }
+    }
+
+    fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.handle.id() == id)
     }
 
     /// Close the tab at `index`: its thread ends and its memory goes with
@@ -391,12 +448,15 @@ impl App {
         // The address bar shows the new tab; an edit in progress is dropped.
         self.chrome.blur();
         if let Some(tab) = self.current_tab() {
-            let (url, loading) = (tab.url.clone(), tab.loading);
-            if let Some(url) = url {
-                self.chrome.set_url(&url);
+            let (url, loading, back, forward) = (tab.url.clone(), tab.loading, tab.can_go_back, tab.can_go_forward);
+            match url {
+                Some(url) => self.chrome.set_url(&url),
+                None => self.chrome.set_url(&Url::parse("about:blank").expect("static url")),
             }
             self.chrome.set_loading(loading);
+            self.chrome.set_nav_state(back, forward);
         }
+        self.sync_chrome_tabs();
         if let Some(active) = &self.active {
             active.window.set_cursor(self.current_tab().map(|t| t.cursor).unwrap_or_default());
             active.window.request_redraw();
@@ -613,22 +673,27 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             TabOutput::Message(TabToShell::StateChanged {
-                title, loading, url, ..
+                title,
+                loading,
+                url,
+                can_go_back,
+                can_go_forward,
             }) => {
                 let (was_loading, has_page) = {
                     let tab = &mut self.tabs[index];
                     tab.title = title.or_else(|| Some(url.to_string()));
                     tab.url = Some(url.clone());
+                    tab.can_go_back = can_go_back;
+                    tab.can_go_forward = can_go_forward;
                     let was = tab.loading;
                     tab.loading = loading;
                     (was, tab.page.is_some())
                 };
+                self.sync_chrome_tabs();
                 if is_current {
                     self.chrome.set_url(&url);
                     self.chrome.set_loading(loading);
-                    if let Some(active) = &self.active {
-                        active.window.request_redraw();
-                    }
+                    self.chrome.set_nav_state(can_go_back, can_go_forward);
                     self.update_title();
                     if was_loading && !loading && self.options.screenshot.is_some() && has_page {
                         // The last frame painted may predate the final resource;
@@ -715,13 +780,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if (self.chrome.contains(x, y) && !self.pointer_on_page) || self.press_in_chrome {
                     let cursor = self.chrome.mouse_move(x, y);
+                    let dirty = self.chrome.take_dirty();
                     if let Some(active) = &self.active {
                         active.window.set_cursor(match cursor {
                             PageCursor::Text => CursorIcon::Text,
                             PageCursor::Pointer => CursorIcon::Pointer,
                             PageCursor::Default => CursorIcon::Default,
                         });
-                        if self.press_in_chrome {
+                        if dirty {
                             active.window.request_redraw();
                         }
                     }
@@ -739,6 +805,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_pos = None;
                 self.chrome.mouse_leave();
+                if self.chrome.take_dirty()
+                    && let Some(active) = &self.active
+                {
+                    active.window.request_redraw();
+                }
                 if self.pointer_on_page {
                     self.send_to_current(ShellToTab::MouseLeave);
                     self.pointer_on_page = false;
@@ -755,20 +826,23 @@ impl ApplicationHandler<UserEvent> for App {
                         ElementState::Released => self.press_in_chrome,
                     };
                     if in_chrome {
-                        if button == MouseButton::Left {
-                            match state {
-                                ElementState::Pressed => {
-                                    let shift = self.modifiers.state().shift_key();
-                                    let actions = self.chrome.mouse_down(x, y, shift);
-                                    self.handle_chrome_actions(actions);
-                                }
-                                ElementState::Released => {
-                                    self.chrome.mouse_up(x, y);
-                                    self.press_in_chrome = false;
-                                    self.sync_ime();
-                                }
+                        let chrome_button = match button {
+                            MouseButton::Left => PageButton::Left,
+                            MouseButton::Right => PageButton::Right,
+                            MouseButton::Middle => PageButton::Middle,
+                            _ => PageButton::Other,
+                        };
+                        let actions = match state {
+                            ElementState::Pressed => {
+                                let shift = self.modifiers.state().shift_key();
+                                self.chrome.mouse_down(x, y, chrome_button, shift)
                             }
-                        }
+                            ElementState::Released => {
+                                self.press_in_chrome = false;
+                                self.chrome.mouse_up(x, y, chrome_button)
+                            }
+                        };
+                        self.handle_chrome_actions(actions, event_loop);
                     } else {
                         if state == ElementState::Pressed && self.chrome.has_focus() {
                             // A click on the page takes focus from the address bar.
@@ -798,6 +872,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.sync_ime();
             }
+            WindowEvent::Focused(false) => {
+                // Losing the window drops any press in progress.
+                self.press_in_chrome = false;
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let vp_h = self.viewport().map(|v| v.height).unwrap_or(600.0);
                 let ctrl = self.modifiers.state().control_key();
@@ -824,7 +902,7 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     if let Some(key) = key {
                         let actions = self.chrome.key(KeyInput { key, ctrl, shift, alt });
-                        self.handle_chrome_actions(actions);
+                        self.handle_chrome_actions(actions, event_loop);
                     }
                     return;
                 }
@@ -837,12 +915,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.chrome.focus_address();
                         self.sync_ime();
                     }
-                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => {
-                        let url = self.start_url();
-                        if let Err(e) = self.open_tab(url, true) {
-                            tracing::error!("open tab: {e}");
-                        }
-                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => self.new_tab(),
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => {
                         self.close_tab(self.current, event_loop);
                     }

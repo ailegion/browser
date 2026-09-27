@@ -1,12 +1,14 @@
-//! Browser chrome: the toolbar above the page, drawn with vello, laid out
-//! with taffy, text through parley (plan D05). Phase 2 item 6.
+//! Browser chrome: the tab strip and toolbar above the page, drawn with
+//! vello, laid out with taffy, text through parley (plan D05). Phase 2
+//! item 6.
 //!
-//! Block 1: the toolbar frame and the address bar. Its text editing
-//! (cursor, selection, word moves, IME preedit) is parley's
-//! `PlainEditor`; this crate adds focus, drawing, the URL rules on Enter,
-//! and the clipboard hand-off to the shell. The shell owns the window and
-//! translates winit events into the small `Key` and mouse vocabulary here;
-//! the chrome answers with `ChromeAction`s.
+//! The address bar's text editing (cursor, selection, word moves, IME
+//! preedit) is parley's `PlainEditor`; this crate adds focus, drawing,
+//! the URL rules on Enter and the clipboard hand-off to the shell. The
+//! shell owns the window and translates winit events into the small
+//! `Key` and mouse vocabulary here; the chrome answers with
+//! `ChromeAction`s. Navigation truth stays in the tabs: the shell mirrors
+//! titles, URLs and history state into the chrome for display.
 //!
 //! Coordinates coming in are logical pixels within the window; the scene
 //! drawn is in physical pixels, like the page's.
@@ -14,27 +16,40 @@
 #![forbid(unsafe_code)]
 
 mod input;
+mod widgets;
 
-use browser_ipc_types::Cursor;
+use browser_ipc_types::{Cursor, MouseButton, TabId};
 use parley::{FontContext, LayoutContext};
 use taffy::prelude::*;
 use url::Url;
 use vello::Scene;
-use vello::kurbo::{Affine, Rect};
+use vello::kurbo::{Affine, Rect, RoundedRect};
 use vello::peniko::{Color, Fill};
 
 use input::{InputEvent, TextInput, rounded_box};
+use widgets::{Button, Icon, TextLine, draw_dot, draw_icon, draw_text, scale_rect};
 
-/// Height of the toolbar in logical pixels. The page starts below it.
+/// Height of the tab strip in logical pixels.
+pub const TABSTRIP_HEIGHT: f32 = 34.0;
+/// Height of the toolbar row in logical pixels.
 pub const TOOLBAR_HEIGHT: f32 = 44.0;
 const ADDRESS_HEIGHT: f32 = 30.0;
+const BUTTON_SIZE: f32 = 32.0;
+const TAB_HEIGHT: f32 = 30.0;
 const FONT_SIZE: f32 = 14.0;
+const TAB_FONT_SIZE: f32 = 13.0;
+/// Space the security indicator takes at the left of the address box.
+const INDICATOR_WIDTH: f32 = 26.0;
 
+const STRIP_BG: Color = Color::from_rgb8(0xe2, 0xe2, 0xe8);
 const BAR_BG: Color = Color::from_rgb8(0xf0, 0xf0, 0xf4);
 const BAR_LINE: Color = Color::from_rgb8(0xd4, 0xd4, 0xdc);
 const BOX_BG: Color = Color::from_rgb8(0xff, 0xff, 0xff);
 const BOX_BORDER: Color = Color::from_rgb8(0xc4, 0xc4, 0xcc);
 const ACCENT: Color = Color::from_rgb8(0x4a, 0x7b, 0xd8);
+const TAB_HOVER: Color = Color::from_rgb8(0xea, 0xea, 0xf0);
+const TEXT: [u8; 4] = [0x30, 0x30, 0x38, 0xff];
+const TEXT_DIM: [u8; 4] = [0x70, 0x70, 0x78, 0xff];
 
 /// Parley brush: a color.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -102,29 +117,87 @@ pub enum ChromeAction {
     CopyText(String),
     /// Read the clipboard and hand it to `paste`.
     RequestPaste,
+    Back,
+    Forward,
+    Reload,
+    Stop,
+    NewTab,
+    SelectTab(TabId),
+    CloseTab(TabId),
 }
 
-/// The toolbar and everything in it.
+/// What the tab strip shows for one tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabInfo {
+    pub id: TabId,
+    pub title: String,
+    pub loading: bool,
+}
+
+/// Things the pointer can be on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Back,
+    Forward,
+    Reload,
+    NewTab,
+    Address,
+    Tab(TabId),
+    TabClose(TabId),
+}
+
+struct TabSlot {
+    info: TabInfo,
+    node: NodeId,
+    /// Logical pixels.
+    rect: Rect,
+}
+
+impl TabSlot {
+    /// The close mark at the tab's right end.
+    fn close_rect(&self) -> Rect {
+        let size = 18.0;
+        let x1 = self.rect.x1 - 6.0;
+        let cy = (self.rect.y0 + self.rect.y1) / 2.0;
+        Rect::new(x1 - size, cy - size / 2.0, x1, cy + size / 2.0)
+    }
+}
+
+/// The tab strip and toolbar and everything in them.
 pub struct Chrome {
     fonts: FontContext,
     lcx: LayoutContext<Brush>,
     taffy: TaffyTree<()>,
     root: NodeId,
+    strip: NodeId,
     address_node: NodeId,
+    back_node: NodeId,
+    forward_node: NodeId,
+    reload_node: NodeId,
+    new_tab_node: NodeId,
     width: f32,
     scale: f32,
     address: TextInput,
+    back: Button,
+    forward: Button,
+    reload: Button,
+    new_tab: Button,
+    tabs: Vec<TabSlot>,
+    current: Option<TabId>,
     /// The current tab's URL as the tab reported it.
     url: Option<Url>,
     loading: bool,
-    /// The pointer is over the address box.
-    over_address: bool,
+    hover: Option<Part>,
+    pressed: Option<Part>,
+    /// Something changed that a redraw must show.
+    dirty: bool,
 }
 
 impl std::fmt::Debug for Chrome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Chrome")
             .field("width", &self.width)
+            .field("tabs", &self.tabs.len())
             .field("focused", &self.address.focused)
             .finish()
     }
@@ -136,33 +209,70 @@ impl Default for Chrome {
     }
 }
 
+fn square(side: f32) -> Style {
+    Style {
+        size: Size {
+            width: length(side),
+            height: length(side),
+        },
+        flex_shrink: 0.0,
+        ..Default::default()
+    }
+}
+
+fn tab_style() -> Style {
+    Style {
+        flex_grow: 1.0,
+        flex_shrink: 1.0,
+        flex_basis: length(200.0),
+        min_size: Size {
+            width: length(48.0),
+            height: auto(),
+        },
+        max_size: Size {
+            width: length(220.0),
+            height: auto(),
+        },
+        size: Size {
+            width: auto(),
+            height: length(TAB_HEIGHT),
+        },
+        ..Default::default()
+    }
+}
+
 impl Chrome {
     pub fn new() -> Self {
         let mut taffy: TaffyTree<()> = TaffyTree::new();
-        let address_node = taffy
-            .new_leaf(Style {
+        let leaf = |taffy: &mut TaffyTree<()>, style: Style| taffy.new_leaf(style).expect("taffy leaf");
+        let back_node = leaf(&mut taffy, square(BUTTON_SIZE));
+        let forward_node = leaf(&mut taffy, square(BUTTON_SIZE));
+        let reload_node = leaf(&mut taffy, square(BUTTON_SIZE));
+        let address_node = leaf(
+            &mut taffy,
+            Style {
                 flex_grow: 1.0,
                 size: Size {
                     width: auto(),
                     height: length(ADDRESS_HEIGHT),
                 },
                 ..Default::default()
-            })
-            .expect("taffy leaf");
-        let root = taffy
+            },
+        );
+        let toolbar = taffy
             .new_with_children(
                 Style {
                     display: Display::Flex,
                     flex_direction: FlexDirection::Row,
                     align_items: Some(AlignItems::CENTER),
                     padding: taffy::Rect {
-                        left: length(8.0),
+                        left: length(6.0),
                         right: length(8.0),
                         top: length(0.0),
                         bottom: length(0.0),
                     },
                     gap: Size {
-                        width: length(8.0),
+                        width: length(4.0),
                         height: length(0.0),
                     },
                     size: Size {
@@ -171,7 +281,58 @@ impl Chrome {
                     },
                     ..Default::default()
                 },
-                &[address_node],
+                &[back_node, forward_node, reload_node, address_node],
+            )
+            .expect("taffy toolbar");
+        let new_tab_node = leaf(
+            &mut taffy,
+            Style {
+                margin: taffy::Rect {
+                    left: length(4.0),
+                    right: length(0.0),
+                    top: length(0.0),
+                    bottom: length(2.0),
+                },
+                ..square(28.0)
+            },
+        );
+        let strip = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    align_items: Some(AlignItems::FLEX_END),
+                    padding: taffy::Rect {
+                        left: length(8.0),
+                        right: length(8.0),
+                        top: length(0.0),
+                        bottom: length(0.0),
+                    },
+                    gap: Size {
+                        width: length(2.0),
+                        height: length(0.0),
+                    },
+                    size: Size {
+                        width: percent(1.0),
+                        height: length(TABSTRIP_HEIGHT),
+                    },
+                    ..Default::default()
+                },
+                &[new_tab_node],
+            )
+            .expect("taffy strip");
+        let root = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    size: Size {
+                        width: percent(1.0),
+                        height: length(TABSTRIP_HEIGHT + TOOLBAR_HEIGHT),
+                    },
+                    ..Default::default()
+                },
+                &[strip, toolbar],
             )
             .expect("taffy root");
         let mut chrome = Self {
@@ -179,21 +340,36 @@ impl Chrome {
             lcx: LayoutContext::new(),
             taffy,
             root,
+            strip,
             address_node,
+            back_node,
+            forward_node,
+            reload_node,
+            new_tab_node,
             width: 0.0,
             scale: 1.0,
             address: TextInput::new(FONT_SIZE, "Enter an address"),
+            back: Button::new(Icon::Back),
+            forward: Button::new(Icon::Forward),
+            reload: Button::new(Icon::Reload),
+            new_tab: Button::new(Icon::Plus),
+            tabs: Vec::new(),
+            current: None,
             url: None,
             loading: false,
-            over_address: false,
+            hover: None,
+            pressed: None,
+            dirty: true,
         };
+        chrome.back.enabled = false;
+        chrome.forward.enabled = false;
         chrome.resize(800.0, 1.0);
         chrome
     }
 
-    /// Toolbar height in logical pixels.
+    /// Total chrome height in logical pixels. The page starts below it.
     pub fn height(&self) -> f32 {
-        TOOLBAR_HEIGHT
+        TABSTRIP_HEIGHT + TOOLBAR_HEIGHT
     }
 
     /// The window's logical width and scale factor changed.
@@ -201,21 +377,35 @@ impl Chrome {
         self.width = width.max(0.0);
         self.scale = scale.max(0.01);
         self.address.set_scale(self.scale);
+        self.relayout();
+    }
+
+    fn relayout(&mut self) {
         let _ = self.taffy.compute_layout(
             self.root,
             Size {
                 width: AvailableSpace::Definite(self.width),
-                height: AvailableSpace::Definite(TOOLBAR_HEIGHT),
+                height: AvailableSpace::Definite(self.height()),
             },
         );
-        if let Ok(l) = self.taffy.layout(self.address_node) {
-            self.address.rect = Rect::new(
-                l.location.x as f64,
-                l.location.y as f64,
-                (l.location.x + l.size.width) as f64,
-                (l.location.y + l.size.height) as f64,
-            );
+        let rect_of = |taffy: &TaffyTree<()>, node: NodeId, parent_offset: (f32, f32)| -> Rect {
+            let l = taffy.layout(node).copied().unwrap_or_default();
+            let x = l.location.x + parent_offset.0;
+            let y = l.location.y + parent_offset.1;
+            Rect::new(x as f64, y as f64, (x + l.size.width) as f64, (y + l.size.height) as f64)
+        };
+        // Children are located within their parent; the strip sits at the
+        // top and the toolbar below it.
+        let toolbar_top = TABSTRIP_HEIGHT;
+        self.back.rect = rect_of(&self.taffy, self.back_node, (0.0, toolbar_top));
+        self.forward.rect = rect_of(&self.taffy, self.forward_node, (0.0, toolbar_top));
+        self.reload.rect = rect_of(&self.taffy, self.reload_node, (0.0, toolbar_top));
+        self.address.rect = rect_of(&self.taffy, self.address_node, (0.0, toolbar_top));
+        self.new_tab.rect = rect_of(&self.taffy, self.new_tab_node, (0.0, 0.0));
+        for tab in &mut self.tabs {
+            tab.rect = rect_of(&self.taffy, tab.node, (0.0, 0.0));
         }
+        self.dirty = true;
     }
 
     /// The address box in logical pixels, for tests and the shell.
@@ -224,20 +414,86 @@ impl Chrome {
         (r.x0 as f32, r.y0 as f32, r.width() as f32, r.height() as f32)
     }
 
+    /// Centers of the toolbar buttons, for tests: back, forward, reload,
+    /// new tab.
+    pub fn button_centers(&self) -> [(f32, f32); 4] {
+        let c = |r: Rect| (((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
+        [c(self.back.rect), c(self.forward.rect), c(self.reload.rect), c(self.new_tab.rect)]
+    }
+
+    /// Center of a tab in the strip, and of its close mark.
+    pub fn tab_centers(&self, id: TabId) -> Option<((f32, f32), (f32, f32))> {
+        let tab = self.tabs.iter().find(|t| t.info.id == id)?;
+        let c = |r: Rect| (((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
+        Some((c(tab.rect), c(tab.close_rect())))
+    }
+
+    /// The tabs to show, in order, and which is current.
+    pub fn set_tabs(&mut self, tabs: Vec<TabInfo>, current: Option<TabId>) {
+        let same_set = self.tabs.len() == tabs.len() && self.tabs.iter().zip(&tabs).all(|(a, b)| a.info.id == b.id);
+        if same_set {
+            for (slot, info) in self.tabs.iter_mut().zip(tabs) {
+                slot.info = info;
+            }
+        } else {
+            for slot in self.tabs.drain(..) {
+                let _ = self.taffy.remove(slot.node);
+            }
+            for info in tabs {
+                let node = self.taffy.new_leaf(tab_style()).expect("taffy leaf");
+                self.tabs.push(TabSlot {
+                    info,
+                    node,
+                    rect: Rect::ZERO,
+                });
+            }
+            let mut children: Vec<NodeId> = self.tabs.iter().map(|t| t.node).collect();
+            children.push(self.new_tab_node);
+            let _ = self.taffy.set_children(self.strip, &children);
+            self.relayout();
+        }
+        self.current = current;
+        self.dirty = true;
+    }
+
+    /// The current tab's history state, for the back and forward buttons.
+    pub fn set_nav_state(&mut self, can_go_back: bool, can_go_forward: bool) {
+        if self.back.enabled != can_go_back || self.forward.enabled != can_go_forward {
+            self.back.enabled = can_go_back;
+            self.forward.enabled = can_go_forward;
+            self.dirty = true;
+        }
+    }
+
     /// The tab reported a URL. Shown unless the user is editing.
     pub fn set_url(&mut self, url: &Url) {
         self.url = Some(url.clone());
         if !self.address.focused {
             self.address.set_text(display_url(url).as_str());
         }
+        self.address.pad_left = if security_icon(Some(url)).is_some() {
+            INDICATOR_WIDTH + 4.0
+        } else {
+            10.0
+        };
+        self.dirty = true;
     }
 
     pub fn set_loading(&mut self, loading: bool) {
-        self.loading = loading;
+        if self.loading != loading {
+            self.loading = loading;
+            self.reload.icon = if loading { Icon::Stop } else { Icon::Reload };
+            self.dirty = true;
+        }
     }
 
     pub fn address_text(&self) -> String {
         self.address.text()
+    }
+
+    /// Whether the current URL is served over HTTPS (the lock).
+    pub fn is_secure(&self) -> bool {
+        security_icon(self.url.as_ref()) == Some(Icon::LockClosed)
     }
 
     /// The address bar has keyboard focus.
@@ -249,12 +505,21 @@ impl Chrome {
     pub fn focus_address(&mut self) {
         self.address.focused = true;
         self.address.select_all(&mut self.fonts, &mut self.lcx);
+        self.dirty = true;
     }
 
     /// Keyboard focus goes back to the page; an edit in progress is
     /// kept in the box, as browsers do, until the tab reports a URL.
     pub fn blur(&mut self) {
+        if self.address.focused {
+            self.dirty = true;
+        }
         self.address.blur(&mut self.fonts, &mut self.lcx);
+    }
+
+    /// Whether something changed since the last draw. Clears the flag.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 
     /// The area the IME should keep clear, in logical pixels, when the
@@ -267,31 +532,111 @@ impl Chrome {
 
     /// Whether a point is on the chrome rather than the page.
     pub fn contains(&self, _x: f32, y: f32) -> bool {
-        y < TOOLBAR_HEIGHT
+        y < self.height()
+    }
+
+    fn part_at(&self, x: f32, y: f32) -> Option<Part> {
+        if self.address.contains(x, y) {
+            return Some(Part::Address);
+        }
+        if self.back.contains(x, y) {
+            return Some(Part::Back);
+        }
+        if self.forward.contains(x, y) {
+            return Some(Part::Forward);
+        }
+        if self.reload.contains(x, y) {
+            return Some(Part::Reload);
+        }
+        if self.new_tab.contains(x, y) {
+            return Some(Part::NewTab);
+        }
+        for tab in &self.tabs {
+            if tab.close_rect().contains((x as f64, y as f64)) {
+                return Some(Part::TabClose(tab.info.id));
+            }
+            if tab.rect.contains((x as f64, y as f64)) {
+                return Some(Part::Tab(tab.info.id));
+            }
+        }
+        None
     }
 
     pub fn mouse_move(&mut self, x: f32, y: f32) -> Cursor {
-        self.over_address = self.address.contains(x, y);
+        let part = self.part_at(x, y);
+        if part != self.hover {
+            self.hover = part;
+            self.dirty = true;
+        }
         self.address.mouse_move(&mut self.fonts, &mut self.lcx, x, y);
-        if self.over_address { Cursor::Text } else { Cursor::Default }
+        if self.pressed == Some(Part::Address) {
+            self.dirty = true;
+        }
+        match part {
+            Some(Part::Address) => Cursor::Text,
+            Some(Part::Back) if self.back.enabled => Cursor::Pointer,
+            Some(Part::Forward) if self.forward.enabled => Cursor::Pointer,
+            Some(Part::Reload | Part::NewTab | Part::Tab(_) | Part::TabClose(_)) => Cursor::Pointer,
+            _ => Cursor::Default,
+        }
     }
 
     pub fn mouse_leave(&mut self) {
-        self.over_address = false;
+        if self.hover.is_some() {
+            self.hover = None;
+            self.dirty = true;
+        }
     }
 
-    /// Primary button down at a point on the chrome.
-    pub fn mouse_down(&mut self, x: f32, y: f32, shift: bool) -> Vec<ChromeAction> {
-        if self.address.contains(x, y) {
-            self.address.mouse_down(&mut self.fonts, &mut self.lcx, x, y, shift);
-        } else if self.address.focused {
-            self.blur();
+    /// A button went down at a point on the chrome.
+    pub fn mouse_down(&mut self, x: f32, y: f32, button: MouseButton, shift: bool) -> Vec<ChromeAction> {
+        let part = self.part_at(x, y);
+        self.dirty = true;
+        match (button, part) {
+            (MouseButton::Left, Some(Part::Address)) => {
+                self.address.mouse_down(&mut self.fonts, &mut self.lcx, x, y, shift);
+                self.pressed = Some(Part::Address);
+            }
+            (MouseButton::Left, Some(p)) => {
+                if self.address.focused {
+                    self.blur();
+                }
+                self.pressed = Some(p);
+            }
+            (MouseButton::Middle, Some(Part::Tab(id) | Part::TabClose(id))) => {
+                return vec![ChromeAction::CloseTab(id)];
+            }
+            _ => {
+                if self.address.focused {
+                    self.blur();
+                }
+            }
         }
         Vec::new()
     }
 
-    pub fn mouse_up(&mut self, _x: f32, _y: f32) {
+    /// The button came up. Buttons act on release over the part pressed.
+    pub fn mouse_up(&mut self, x: f32, y: f32, button: MouseButton) -> Vec<ChromeAction> {
+        let pressed = self.pressed.take();
         self.address.mouse_up();
+        self.dirty = true;
+        if button != MouseButton::Left {
+            return Vec::new();
+        }
+        let released = self.part_at(x, y);
+        match pressed {
+            Some(p) if Some(p) == released => match p {
+                Part::Back if self.back.enabled => vec![ChromeAction::Back],
+                Part::Forward if self.forward.enabled => vec![ChromeAction::Forward],
+                Part::Reload if self.loading => vec![ChromeAction::Stop],
+                Part::Reload => vec![ChromeAction::Reload],
+                Part::NewTab => vec![ChromeAction::NewTab],
+                Part::Tab(id) if self.current != Some(id) => vec![ChromeAction::SelectTab(id)],
+                Part::TabClose(id) => vec![ChromeAction::CloseTab(id)],
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
     }
 
     /// A key while the chrome has focus.
@@ -299,6 +644,7 @@ impl Chrome {
         if !self.address.focused {
             return Vec::new();
         }
+        self.dirty = true;
         let event = self.address.key(&mut self.fonts, &mut self.lcx, &input);
         let mut actions = Vec::new();
         match event {
@@ -329,50 +675,141 @@ impl Chrome {
     pub fn paste(&mut self, text: &str) {
         if self.address.focused {
             self.address.paste(&mut self.fonts, &mut self.lcx, text);
+            self.dirty = true;
         }
     }
 
     pub fn ime_preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) {
         if self.address.focused {
             self.address.ime_preedit(&mut self.fonts, &mut self.lcx, text, cursor);
+            self.dirty = true;
         }
     }
 
     pub fn ime_commit(&mut self, text: &str) {
         if self.address.focused {
             self.address.ime_commit(&mut self.fonts, &mut self.lcx, text);
+            self.dirty = true;
         }
     }
 
-    /// Draw the toolbar at the top of `scene`, in physical pixels.
+    /// Draw the chrome at the top of `scene`, in physical pixels.
     pub fn draw(&mut self, scene: &mut Scene) {
+        self.dirty = false;
         let s = self.scale as f64;
         let w = self.width as f64 * s;
-        let h = TOOLBAR_HEIGHT as f64 * s;
-        scene.fill(Fill::NonZero, Affine::IDENTITY, BAR_BG, None, &Rect::new(0.0, 0.0, w, h));
+        let strip_h = TABSTRIP_HEIGHT as f64 * s;
+        let total_h = self.height() as f64 * s;
+
+        // Backgrounds: strip, toolbar, bottom line.
+        scene.fill(Fill::NonZero, Affine::IDENTITY, STRIP_BG, None, &Rect::new(0.0, 0.0, w, strip_h));
+        scene.fill(Fill::NonZero, Affine::IDENTITY, BAR_BG, None, &Rect::new(0.0, strip_h, w, total_h));
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
             BAR_LINE,
             None,
-            &Rect::new(0.0, h - s.max(1.0), w, h),
+            &Rect::new(0.0, total_h - s.max(1.0), w, total_h),
         );
 
-        let r = self.address.rect;
-        let box_rect = Rect::new(r.x0 * s, r.y0 * s, r.x1 * s, r.y1 * s);
+        self.draw_tabs(scene);
+
+        // Toolbar buttons.
+        for (button, part) in [
+            (&self.back, Part::Back),
+            (&self.forward, Part::Forward),
+            (&self.reload, Part::Reload),
+        ] {
+            button.draw(scene, s, self.hover == Some(part), self.pressed == Some(part));
+        }
+
+        // Address box.
+        let box_rect = scale_rect(self.address.rect, s);
         let (border, width) = if self.address.focused {
             (ACCENT, 2.0 * s)
         } else {
             (BOX_BORDER, s.max(1.0))
         };
         rounded_box(scene, box_rect, 8.0 * s, BOX_BG, border, width);
+        if let Some(icon) = security_icon(self.url.as_ref()) {
+            let r = Rect::new(box_rect.x0, box_rect.y0, box_rect.x0 + INDICATOR_WIDTH as f64 * s, box_rect.y1);
+            let color = if icon == Icon::LockClosed {
+                Color::from_rgb8(0x2e, 0x7d, 0x32)
+            } else {
+                Color::from_rgb8(0xc0, 0x6a, 0x00)
+            };
+            draw_icon(scene, icon, r, 15.0 * s, color);
+        }
         self.address.draw(&mut self.fonts, &mut self.lcx, scene);
-
         if self.loading {
             // A thin accent line along the bottom of the address box.
             let line = Rect::new(box_rect.x0 + 8.0 * s, box_rect.y1 - 3.0 * s, box_rect.x1 - 8.0 * s, box_rect.y1 - s);
             scene.fill(Fill::NonZero, Affine::IDENTITY, ACCENT, None, &line);
         }
+    }
+
+    fn draw_tabs(&mut self, scene: &mut Scene) {
+        let s = self.scale as f64;
+        let strip_h = TABSTRIP_HEIGHT as f64 * s;
+        for tab in &self.tabs {
+            let r = scale_rect(tab.rect, s);
+            let is_current = self.current == Some(tab.info.id);
+            let hovered = matches!(self.hover, Some(Part::Tab(id) | Part::TabClose(id)) if id == tab.info.id);
+            if is_current {
+                // Rounded top, joined to the toolbar below.
+                let shape = RoundedRect::new(r.x0, r.y0, r.x1, strip_h + 8.0 * s, 8.0 * s);
+                scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &Rect::new(r.x0, r.y0, r.x1, strip_h));
+                scene.fill(Fill::NonZero, Affine::IDENTITY, BAR_BG, None, &shape);
+                scene.pop_layer();
+            } else if hovered {
+                let shape = RoundedRect::from_rect(Rect::new(r.x0, r.y0, r.x1, r.y1 - 2.0 * s), 8.0 * s);
+                scene.fill(Fill::NonZero, Affine::IDENTITY, TAB_HOVER, None, &shape);
+            }
+            let close = scale_rect(tab.close_rect(), s);
+            let mut text_x = r.x0 + 10.0 * s;
+            if tab.info.loading {
+                draw_dot(scene, (text_x + 4.0 * s, (r.y0 + r.y1) / 2.0), 4.0 * s, ACCENT);
+                text_x += 16.0 * s;
+            }
+            let title = if tab.info.title.is_empty() { "New tab" } else { tab.info.title.as_str() };
+            let color = if is_current { TEXT } else { TEXT_DIM };
+            draw_text(
+                &mut self.fonts,
+                &mut self.lcx,
+                scene,
+                TextLine {
+                    text: title,
+                    font_size: TAB_FONT_SIZE,
+                    scale: self.scale,
+                    color,
+                    origin: (text_x, r.y0),
+                    max_width: (close.x0 - 4.0 * s - text_x).max(0.0),
+                    height: r.height(),
+                },
+            );
+            if self.hover == Some(Part::TabClose(tab.info.id)) {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    Color::from_rgb8(0xd0, 0xd0, 0xd8),
+                    None,
+                    &RoundedRect::from_rect(close, 4.0 * s),
+                );
+            }
+            draw_icon(scene, Icon::Close, close, 12.0 * s, Color::from_rgba8(color[0], color[1], color[2], color[3]));
+        }
+        self.new_tab
+            .draw(scene, s, self.hover == Some(Part::NewTab), self.pressed == Some(Part::NewTab));
+    }
+}
+
+/// The security indicator for a URL: a closed lock for HTTPS, an open
+/// one for plain HTTP, nothing for internal pages.
+fn security_icon(url: Option<&Url>) -> Option<Icon> {
+    match url?.scheme() {
+        "https" => Some(Icon::LockClosed),
+        "http" => Some(Icon::LockOpen),
+        _ => None,
     }
 }
 
@@ -434,15 +871,123 @@ mod tests {
         out
     }
 
+    fn click(c: &mut Chrome, (x, y): (f32, f32)) -> Vec<ChromeAction> {
+        let mut out = c.mouse_down(x, y, MouseButton::Left, false);
+        out.extend(c.mouse_up(x, y, MouseButton::Left));
+        out
+    }
+
+    fn tabs(n: u64) -> Vec<TabInfo> {
+        (1..=n)
+            .map(|i| TabInfo {
+                id: TabId(i),
+                title: format!("Tab {i}"),
+                loading: false,
+            })
+            .collect()
+    }
+
     #[test]
-    fn layout_puts_the_address_box_in_the_toolbar() {
-        let c = chrome();
+    fn layout_puts_the_strip_above_the_toolbar_and_buttons_before_the_box() {
+        let mut c = chrome();
+        assert_eq!(c.height(), TABSTRIP_HEIGHT + TOOLBAR_HEIGHT);
+        let [back, forward, reload, new_tab] = c.button_centers();
         let (x, y, w, h) = c.address_rect();
-        assert_eq!(x, 8.0);
-        assert_eq!(w, 800.0 - 16.0);
-        assert_eq!(h, ADDRESS_HEIGHT);
-        assert_eq!(y, (TOOLBAR_HEIGHT - ADDRESS_HEIGHT) / 2.0);
-        assert!(c.contains(100.0, 10.0) && !c.contains(100.0, TOOLBAR_HEIGHT + 1.0));
+        assert!(back.0 < forward.0 && forward.0 < reload.0 && reload.0 < x);
+        assert!(y > TABSTRIP_HEIGHT && y + h <= c.height());
+        assert!(x + w <= 800.0);
+        assert!(new_tab.1 < TABSTRIP_HEIGHT, "the + lives in the strip");
+        assert!(c.contains(100.0, 10.0) && !c.contains(100.0, c.height() + 1.0));
+
+        c.set_tabs(tabs(3), Some(TabId(2)));
+        let (t1, _) = c.tab_centers(TabId(1)).unwrap();
+        let (t3, close3) = c.tab_centers(TabId(3)).unwrap();
+        assert!(t1.0 < t3.0 && t3.0 < close3.0 && close3.0 < c.button_centers()[3].0);
+        assert!(t1.1 < TABSTRIP_HEIGHT);
+        // Tabs shrink to fit: twenty of them still end before the + button.
+        c.set_tabs(tabs(20), Some(TabId(1)));
+        let (t20, _) = c.tab_centers(TabId(20)).unwrap();
+        assert!(t20.0 < c.button_centers()[3].0);
+    }
+
+    #[test]
+    fn buttons_act_on_release_and_respect_their_state() {
+        let mut c = chrome();
+        let [back, forward, reload, new_tab] = c.button_centers();
+        assert!(click(&mut c, back).is_empty(), "nothing to go back to");
+        assert!(click(&mut c, forward).is_empty());
+        assert_eq!(c.mouse_move(back.0, back.1), Cursor::Default, "disabled: no pointer cursor");
+        c.set_nav_state(true, false);
+        assert_eq!(c.mouse_move(back.0, back.1), Cursor::Pointer);
+        assert_eq!(click(&mut c, back), vec![ChromeAction::Back]);
+        assert!(click(&mut c, forward).is_empty());
+        assert_eq!(click(&mut c, reload), vec![ChromeAction::Reload]);
+        c.set_loading(true);
+        assert_eq!(click(&mut c, reload), vec![ChromeAction::Stop]);
+        assert_eq!(click(&mut c, new_tab), vec![ChromeAction::NewTab]);
+        // Press on one button, release on another: nothing.
+        assert!(c.mouse_down(back.0, back.1, MouseButton::Left, false).is_empty());
+        assert!(c.mouse_up(reload.0, reload.1, MouseButton::Left).is_empty());
+        // A click on a button takes focus from the address bar.
+        c.focus_address();
+        click(&mut c, reload);
+        assert!(!c.has_focus());
+    }
+
+    #[test]
+    fn tab_strip_selects_and_closes() {
+        let mut c = chrome();
+        c.set_tabs(tabs(3), Some(TabId(1)));
+        let (t2, close2) = c.tab_centers(TabId(2)).unwrap();
+        let (t1, _) = c.tab_centers(TabId(1)).unwrap();
+        assert_eq!(click(&mut c, t2), vec![ChromeAction::SelectTab(TabId(2))]);
+        assert!(click(&mut c, t1).is_empty(), "the current tab is already selected");
+        assert_eq!(click(&mut c, close2), vec![ChromeAction::CloseTab(TabId(2))]);
+        assert_eq!(
+            c.mouse_down(t2.0, t2.1, MouseButton::Middle, false),
+            vec![ChromeAction::CloseTab(TabId(2))]
+        );
+        assert_eq!(c.mouse_move(t2.0, t2.1), Cursor::Pointer);
+        // Same ids in the same order: titles update without a relayout.
+        let mut renamed = tabs(3);
+        renamed[1].title = "Renamed".into();
+        renamed[1].loading = true;
+        c.set_tabs(renamed, Some(TabId(2)));
+        assert_eq!(c.tab_centers(TabId(2)).unwrap().0, t2);
+        c.set_tabs(tabs(1), Some(TabId(1)));
+        assert!(c.tab_centers(TabId(3)).is_none());
+    }
+
+    #[test]
+    fn security_indicator_follows_the_scheme() {
+        let mut c = chrome();
+        c.set_url(&Url::parse("https://example.com/").unwrap());
+        assert!(c.is_secure());
+        let (x1, ..) = c.address_rect();
+        c.set_url(&Url::parse("http://example.com/").unwrap());
+        assert!(!c.is_secure());
+        c.set_url(&Url::parse("about:blank").unwrap());
+        assert!(!c.is_secure());
+        assert_eq!(c.address_rect().0, x1, "the box does not move; the text inside does");
+    }
+
+    #[test]
+    fn hover_and_changes_mark_the_chrome_dirty() {
+        let mut c = chrome();
+        let mut scene = Scene::new();
+        c.draw(&mut scene);
+        assert!(!c.take_dirty());
+        let [back, ..] = c.button_centers();
+        c.mouse_move(back.0, back.1);
+        assert!(c.take_dirty());
+        c.mouse_move(back.0 + 1.0, back.1);
+        assert!(!c.take_dirty(), "still on the same part");
+        c.mouse_leave();
+        assert!(c.take_dirty());
+        c.set_loading(true);
+        assert!(c.take_dirty());
+        c.set_loading(true);
+        assert!(!c.take_dirty());
     }
 
     #[test]
@@ -544,34 +1089,54 @@ mod tests {
         let mut c = chrome();
         c.set_url(&Url::parse("https://example.com/").unwrap());
         let (x, y, _, h) = c.address_rect();
-        assert_eq!(c.mouse_move(x + 5.0, y + h / 2.0), Cursor::Text);
-        assert_eq!(c.mouse_move(x + 5.0, 2.0), Cursor::Default);
-        c.mouse_down(x + 5.0, y + h / 2.0, false);
-        c.mouse_up(x + 5.0, y + h / 2.0);
+        let inside = (x + INDICATOR_WIDTH + 40.0, y + h / 2.0);
+        assert_eq!(c.mouse_move(inside.0, inside.1), Cursor::Text);
+        assert_eq!(c.mouse_move(inside.0, TABSTRIP_HEIGHT + 2.0), Cursor::Default);
+        click(&mut c, inside);
         assert!(c.has_focus());
         type_str(&mut c, "z");
         assert_eq!(c.address_text(), "z", "first click selected everything");
-        // Draw once so the layout exists, then click at the far left: the
+        // Draw once so the layout exists, then click at the far left (far
+        // enough from the first click not to be a double click): the
         // caret lands before the z and typing goes there.
         let mut scene = Scene::new();
         c.draw(&mut scene);
-        c.mouse_down(x + 11.0, y + h / 2.0, false);
-        c.mouse_up(x + 11.0, y + h / 2.0);
+        click(&mut c, (x + INDICATOR_WIDTH + 5.0, y + h / 2.0));
         type_str(&mut c, "a");
         assert_eq!(c.address_text(), "az");
         // A click on the bar outside the box takes focus away.
-        c.mouse_down(x + 5.0, 2.0, false);
+        click(&mut c, (inside.0, TABSTRIP_HEIGHT + 2.0));
         assert!(!c.has_focus());
     }
 
     #[test]
-    fn draws_focused_unfocused_empty_and_loading_without_panicking() {
+    fn draws_every_state_without_panicking() {
         let mut c = chrome();
         let mut scene = Scene::new();
         c.draw(&mut scene);
+        c.set_tabs(
+            vec![
+                TabInfo {
+                    id: TabId(1),
+                    title: "A rather long title that will not fit in a tab".into(),
+                    loading: true,
+                },
+                TabInfo {
+                    id: TabId(2),
+                    title: String::new(),
+                    loading: false,
+                },
+            ],
+            Some(TabId(1)),
+        );
+        c.set_nav_state(true, true);
         c.set_loading(true);
-        c.set_url(&Url::parse("https://example.com/a/very/long/path/that/goes/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on").unwrap());
+        c.set_url(&Url::parse("http://example.com/a/very/long/path/that/goes/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on/and/on").unwrap());
         c.resize(300.0, 2.0);
+        let (t2, close2) = c.tab_centers(TabId(2)).unwrap();
+        c.mouse_move(t2.0, t2.1);
+        c.draw(&mut scene);
+        c.mouse_move(close2.0, close2.1);
         c.draw(&mut scene);
         c.focus_address();
         c.key(KeyInput::plain(Key::End));
