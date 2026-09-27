@@ -154,7 +154,9 @@ Work:
    form controls and `tabindex` elements; keyboard focus and tab order are
    item 7. The tab reports the cursor to show (`TabToShell::Cursor`).
    Tests: three tab-level tests drive a `data:` document through mouse
-   events (see O15 for what is not yet measured).
+   events. Restyle cost was measured and cut on 2026-09-27 (O15): the
+   restyle is filtered by selector subject keys, and pointer events are
+   coalesced per batch.
 2. Link navigation, redirects, `<meta http-equiv=refresh>`, fragment scroll.
    **Done 2026-09-26.** A primary-button press and release on the same
    link follows it (`http`, `https`, `data` only; `javascript:` and

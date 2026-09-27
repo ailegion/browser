@@ -18,7 +18,7 @@ use crate::computed::{ComputedStyle, DeclaredValues, Viewport, compute};
 use crate::custom::{expand_pending, resolve_customs};
 use crate::properties::{CustomValue, Declaration, DeclaredValue};
 use crate::selector_impl::{BrowserSelectors, ElementRef, PseudoClass};
-use crate::state::{ElementStates, InteractionDeps, NO_STATES, Reach};
+use crate::state::{ElementStates, InteractionDeps, NO_STATES, Reach, SubjectKeys};
 use crate::stylesheet::{Origin, Rule, StyleRule, Stylesheet, parse_declaration_block};
 
 /// Computed style per element. Text nodes have no entry; use the parent's.
@@ -168,34 +168,79 @@ pub fn compute_styles_with(
     let Some(root) = doc.document_element() else {
         return styles;
     };
-    let mut restyler = Restyler::new(doc, stylist, viewport, states);
+    let mut restyler = Restyler::new(doc, stylist, viewport, states, &[], None);
     restyler.restyle_subtree(root, &mut styles, true);
     styles
 }
 
-/// Recompute the styles of `roots`, and of their descendants when
-/// `descendants`, in place after a change in interaction state. Parents
-/// keep their current styles. Returns whether any computed style changed,
-/// which is when layout has to run again.
+/// What an incremental restyle did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Restyled {
+    /// Some computed style changed, so layout has to run again.
+    pub moved: bool,
+    /// Elements whose style was recomputed.
+    pub styled: usize,
+}
+
+/// One interaction state changed on `changed`; `reach` is how far that
+/// state reaches under the sheets and `subjects` the subjects of the
+/// selectors that carry any state past a combinator.
+#[derive(Debug, Clone, Copy)]
+pub struct StateChange<'a> {
+    pub changed: &'a [NodeId],
+    pub reach: Reach,
+    pub subjects: &'a SubjectKeys,
+}
+
+/// Recompute, in place, the styles a state change can affect: the changed
+/// elements, the elements in reach whose key is in the subjects, and every
+/// descendant of an element whose computed style did change, since it may
+/// inherit from it. Everything else keeps its style.
 pub fn restyle(
     doc: &Document,
     stylist: &Stylist,
     viewport: &Viewport,
     states: &ElementStates,
     styles: &mut StyleMap,
-    roots: &[NodeId],
-    descendants: bool,
-) -> bool {
-    let mut restyler = Restyler::new(doc, stylist, viewport, states);
-    let mut changed = false;
-    for &root in roots {
+    change: StateChange<'_>,
+) -> Restyled {
+    let StateChange {
+        changed,
+        reach,
+        subjects,
+    } = change;
+    if changed.is_empty() || reach == Reach::None {
+        return Restyled::default();
+    }
+    let (roots, descendants): (Vec<NodeId>, bool) = match reach {
+        Reach::None => return Restyled::default(),
+        Reach::Element => (changed.to_vec(), false),
+        Reach::Subtree => (changed.to_vec(), true),
+        Reach::Parent => {
+            let mut parents: Vec<NodeId> = changed
+                .iter()
+                .map(|&n| doc.parent(n).filter(|&p| doc.get(p).is_element()).unwrap_or(n))
+                .collect();
+            parents.sort();
+            parents.dedup();
+            (parents, true)
+        }
+        Reach::Document => (doc.document_element().into_iter().collect(), true),
+    };
+    let mut must = changed.to_vec();
+    must.sort();
+    must.dedup();
+    let mut restyler = Restyler::new(doc, stylist, viewport, states, &must, Some(subjects));
+    let mut result = Restyled::default();
+    for &root in &roots {
         // A root inside another root's subtree is covered by it.
         if descendants && roots.iter().any(|&other| other != root && is_inside(doc, root, other)) {
             continue;
         }
-        changed |= restyler.restyle_subtree(root, styles, descendants);
+        result.moved |= restyler.restyle_subtree(root, styles, descendants);
     }
-    changed
+    result.styled = restyler.styled;
+    result
 }
 
 fn is_inside(doc: &Document, node: NodeId, ancestor: NodeId) -> bool {
@@ -219,10 +264,23 @@ struct Restyler<'a> {
     viewport: &'a Viewport,
     states: &'a ElementStates,
     initial: Arc<ComputedStyle>,
+    /// Elements whose own state changed: always recomputed. Sorted.
+    must: &'a [NodeId],
+    /// When set, other elements are recomputed only if their key is here
+    /// or their parent's style changed.
+    subjects: Option<&'a SubjectKeys>,
+    styled: usize,
 }
 
 impl<'a> Restyler<'a> {
-    fn new(doc: &'a Document, stylist: &'a Stylist, viewport: &'a Viewport, states: &'a ElementStates) -> Self {
+    fn new(
+        doc: &'a Document,
+        stylist: &'a Stylist,
+        viewport: &'a Viewport,
+        states: &'a ElementStates,
+        must: &'a [NodeId],
+        subjects: Option<&'a SubjectKeys>,
+    ) -> Self {
         Self {
             doc,
             index: RuleIndex::build(stylist.active_rules(viewport)),
@@ -236,41 +294,56 @@ impl<'a> Restyler<'a> {
             viewport,
             states,
             initial: Arc::new(ComputedStyle::initial()),
+            must,
+            subjects,
+            styled: 0,
         }
     }
 
-    /// Style `root` and, when `descendants`, everything below it, in
-    /// pre-order so parents are computed before children. Returns whether
+    /// Style `root` and, when `descendants`, what is below it, in
+    /// pre-order so parents are computed before children. Below the root
+    /// an element is recomputed if its parent's style changed (it may
+    /// inherit from it), if its own state changed, or if it is a subject
+    /// candidate; with no subject filter, everything is. Returns whether
     /// any style in `styles` changed.
     fn restyle_subtree(&mut self, root: NodeId, styles: &mut StyleMap, descendants: bool) -> bool {
         let doc = self.doc;
         let doc_root = doc.document_element();
         let mut changed = false;
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
+        // (element, parent's style changed)
+        let mut stack = vec![(root, true)];
+        while let Some((id, forced)) = stack.pop() {
             let Some(element) = doc.element(id) else { continue };
-            let is_root = Some(id) == doc_root;
-            let parent_style = doc
-                .parent(id)
-                .and_then(|p| styles.get(p))
-                .cloned()
-                .unwrap_or_else(|| self.initial.clone());
-            let root_font_size = if is_root {
-                None
-            } else {
-                doc_root.and_then(|r| styles.get(r)).map(|s| s.font_size)
-            };
-            let computed = self.style_element(id, element, &parent_style, root_font_size, is_root);
-            if styles.get(id).is_none_or(|old| **old != computed) {
-                styles.insert(id, Arc::new(computed));
-                changed = true;
+            let recompute = forced
+                || self.must.binary_search(&id).is_ok()
+                || self.subjects.is_none_or(|keys| keys.matches(element));
+            let mut changed_here = false;
+            if recompute {
+                let is_root = Some(id) == doc_root;
+                let parent_style = doc
+                    .parent(id)
+                    .and_then(|p| styles.get(p))
+                    .cloned()
+                    .unwrap_or_else(|| self.initial.clone());
+                let root_font_size = if is_root {
+                    None
+                } else {
+                    doc_root.and_then(|r| styles.get(r)).map(|s| s.font_size)
+                };
+                let computed = self.style_element(id, element, &parent_style, root_font_size, is_root);
+                self.styled += 1;
+                if styles.get(id).is_none_or(|old| **old != computed) {
+                    styles.insert(id, Arc::new(computed));
+                    changed = true;
+                    changed_here = true;
+                }
             }
-            if descendants {
+            if descendants || changed_here {
                 // `display: none` subtrees still get styles (cheap, and
                 // needed if a later change shows them).
                 let kids: Vec<NodeId> = doc.children(id).filter(|&c| doc.get(c).is_element()).collect();
                 for c in kids.into_iter().rev() {
-                    stack.push(c);
+                    stack.push((c, changed_here));
                 }
             }
         }
@@ -385,7 +458,9 @@ impl Stylist {
                 match r {
                     Rule::Style(s) => {
                         for selector in s.selectors.slice() {
-                            scan_selector(selector.iter_raw_match_order(), Reach::Element, deps);
+                            if scan_selector(selector.iter_raw_match_order(), Reach::Element, deps) {
+                                add_subject_key(selector, &mut deps.subjects);
+                            }
                         }
                     }
                     Rule::Media(_, inner) => walk(inner, deps),
@@ -402,12 +477,15 @@ impl Stylist {
 
 /// Scan a selector's components in match order (right to left). `reach` is
 /// what a pseudo-class in the rightmost compound would need; each
-/// combinator crossed widens it for the compounds to its left.
+/// combinator crossed widens it for the compounds to its left. Returns
+/// whether a state pseudo-class was found beyond the subject, in which
+/// case a state change elsewhere can change what the subject matches.
 fn scan_selector<'a>(
     components: impl Iterator<Item = &'a Component<BrowserSelectors>>,
     mut reach: Reach,
     deps: &mut InteractionDeps,
-) {
+) -> bool {
+    let mut beyond_subject = false;
     for c in components {
         match c {
             Component::Combinator(comb) => {
@@ -417,29 +495,63 @@ fn scan_selector<'a>(
                     _ => reach,
                 });
             }
-            Component::NonTSPseudoClass(pc) => match pc {
-                PseudoClass::Hover => deps.hover = deps.hover.max(reach),
-                PseudoClass::Active => deps.active = deps.active.max(reach),
-                PseudoClass::Focus | PseudoClass::FocusVisible | PseudoClass::FocusWithin => {
-                    deps.focus = deps.focus.max(reach)
+            Component::NonTSPseudoClass(pc) => {
+                let state = match pc {
+                    PseudoClass::Hover => Some(&mut deps.hover),
+                    PseudoClass::Active => Some(&mut deps.active),
+                    PseudoClass::Focus | PseudoClass::FocusVisible | PseudoClass::FocusWithin => Some(&mut deps.focus),
+                    PseudoClass::Target => Some(&mut deps.target),
+                    _ => None,
+                };
+                if let Some(state) = state {
+                    *state = (*state).max(reach);
+                    beyond_subject |= reach > Reach::Element;
                 }
-                PseudoClass::Target => deps.target = deps.target.max(reach),
-                _ => {}
-            },
+            }
             Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
                 for s in list.slice() {
-                    scan_selector(s.iter_raw_match_order(), reach, deps);
+                    beyond_subject |= scan_selector(s.iter_raw_match_order(), reach, deps);
                 }
             }
             // `:has()` looks down and sideways, so a state change there
             // affects the subject above it.
             Component::Has(list) => {
                 for rs in list.iter() {
-                    scan_selector(rs.selector.iter_raw_match_order(), Reach::Document, deps);
+                    beyond_subject |= scan_selector(rs.selector.iter_raw_match_order(), Reach::Document, deps);
                 }
             }
             _ => {}
         }
+    }
+    beyond_subject
+}
+
+/// Record the key of a selector's subject, its rightmost compound: id,
+/// else first class, else tag, else universal. A pseudo-element belongs
+/// to the element before it, so its compound does not end the subject.
+fn add_subject_key(selector: &selectors::parser::Selector<BrowserSelectors>, keys: &mut SubjectKeys) {
+    let mut id = None;
+    let mut class = None;
+    let mut tag = None;
+    for c in selector.iter_raw_match_order() {
+        match c {
+            Component::Combinator(
+                Combinator::Child | Combinator::Descendant | Combinator::NextSibling | Combinator::LaterSibling,
+            ) => break,
+            Component::ID(i) => id = Some(i.0.to_string()),
+            Component::Class(c) if class.is_none() => class = Some(c.0.to_string()),
+            Component::LocalName(ln) => tag = Some(ln.lower_name.0.clone()),
+            _ => {}
+        }
+    }
+    if let Some(id) = id {
+        keys.ids.insert(id);
+    } else if let Some(class) = class {
+        keys.classes.insert(class);
+    } else if let Some(tag) = tag {
+        keys.tags.insert(tag);
+    } else {
+        keys.universal = true;
     }
 }
 
@@ -664,18 +776,99 @@ mod tests {
         assert_eq!(full[a].font_weight, 700);
         assert_eq!(full[span].color.to_rgba8(), [0, 0, 255, 255]);
 
-        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, &changed, true));
+        let deps = stylist.interaction_deps();
+        assert_eq!(deps.hover, Reach::Subtree);
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        assert!(r.moved);
         for (id, s) in full.iter() {
             assert_eq!(**s, *styles[id]);
         }
-        assert!(!restyle(&doc, &stylist, &vp, &states, &mut styles, &changed, true), "nothing left to change");
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        assert!(!r.moved, "nothing left to change");
 
         // Leaving: the same roots, back to the plain styles.
         let changed = states.set_chain(&doc, None, ElementStates::HOVER);
-        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, &changed, true));
+        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects }).moved);
         assert_eq!(styles[a].background_color.to_rgba8(), [0, 0, 0, 0]);
         assert_eq!(styles[a].font_weight, 700, "focus is separate from hover");
         assert_eq!(styles[span].color.to_rgba8(), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn subtree_restyle_recomputes_only_subjects_changed_elements_and_inheritors() {
+        // Only `.x` and `li` are subjects of combinator selectors; `a`
+        // changes state; a's span inherits from it. The second p, its
+        // span and the ul must be left alone.
+        let doc = parse_html(
+            b"<div><p class=x>1</p><p>2<span>s</span></p><ul><li>a</li><li>b</li></ul><a href=x><span>t</span></a></div>",
+        );
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            "div:hover .x { color: red } a:hover { color: blue } li:hover + li { color: green }",
+            Origin::Author,
+        )));
+        let deps = stylist.interaction_deps();
+        assert_eq!(deps.hover, Reach::Parent);
+        assert!(deps.subjects.classes.contains("x"));
+        assert!(deps.subjects.tags.contains(&LocalName::from("li")));
+        assert!(!deps.subjects.universal);
+
+        let vp = Viewport::default();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let a = find(&doc, "a");
+        let mut states = ElementStates::default();
+        let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
+        let full = compute_styles_with(&doc, &stylist, &vp, &states);
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        assert!(r.moved);
+        for (id, s) in full.iter() {
+            assert_eq!(**s, *styles[id]);
+        }
+        let span_in_a = doc.children(a).find(|&c| doc.get(c).is_element()).expect("span");
+        assert_eq!(styles[span_in_a].color.to_rgba8(), [0, 0, 255, 255], "inherited from the hovered link");
+        // Reach is Parent, so the root is the chain's topmost parent, html:
+        // html, head, body, div, p.x, li, li, a, span = 9 at most.
+        assert!(r.styled <= 9, "recomputed {} elements", r.styled);
+    }
+
+    #[test]
+    fn universal_subject_recomputes_the_subtree() {
+        let doc = parse_html(b"<div><p>1</p><p>2</p></div>");
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse("div:hover * { color: red }", Origin::Author)));
+        let deps = stylist.interaction_deps();
+        assert!(deps.subjects.universal);
+        let vp = Viewport::default();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let div = find(&doc, "div");
+        let mut states = ElementStates::default();
+        let changed = states.set_chain(&doc, Some(div), ElementStates::HOVER);
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        assert!(r.moved);
+        for p in doc.children(div).filter(|&c| doc.get(c).is_element()) {
+            assert_eq!(styles[p].color.to_rgba8(), [255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn element_reach_still_propagates_inheritance() {
+        let doc = parse_html(b"<a href=x><span>t</span></a>");
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse("a:hover { color: red }", Origin::Author)));
+        let deps = stylist.interaction_deps();
+        assert_eq!(deps.hover, Reach::Element);
+        assert!(deps.subjects.is_empty());
+        let vp = Viewport::default();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let (a, span) = (find(&doc, "a"), find(&doc, "span"));
+        let mut states = ElementStates::default();
+        let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, reach: deps.hover, subjects: &deps.subjects });
+        assert!(r.moved);
+        assert_eq!(styles[span].color.to_rgba8(), [255, 0, 0, 255]);
     }
 
     #[test]
@@ -691,8 +884,23 @@ mod tests {
         assert_eq!((d.hover, d.active), (Reach::Subtree, Reach::Element));
         assert_eq!(deps("a:hover + .tip { }").hover, Reach::Parent);
         assert_eq!(deps("nav:hover li ~ li { }").hover, Reach::Parent);
-        assert_eq!(deps("div:has(a:hover) { }").hover, Reach::Document);
-        assert_eq!(deps(":is(a:focus, .x) span { }").focus, Reach::Subtree);
+        let d = deps("div:has(a:hover) { }");
+        assert_eq!(d.hover, Reach::Document);
+        assert!(d.subjects.tags.contains(&LocalName::from("div")));
+        let d = deps(":is(a:focus, .x) span { }");
+        assert_eq!(d.focus, Reach::Subtree);
+        assert!(d.subjects.tags.contains(&LocalName::from("span")));
+        let d = deps("#m:hover .item, .n:hover > b.c { }");
+        assert!(d.subjects.classes.contains("item") && d.subjects.classes.contains("c"));
+        assert!(d.subjects.tags.is_empty() && !d.subjects.universal);
+        assert!(deps("a:hover, .x:focus { }").subjects.is_empty(), "no combinator, no subject key");
+        // A pseudo-element does not end the subject compound, and a
+        // `:has()` without a state inside is not a state dependency.
+        let d = deps(".m:hover > .n::after, .q:has(.r):active + .s::before { }");
+        assert!(d.subjects.classes.contains("n") && d.subjects.classes.contains("s"));
+        assert!(!d.subjects.universal);
+        assert!(deps("a:has(+ .x)::after { }").subjects.is_empty());
+        assert_eq!(deps("a:has(+ .x)::after { }").hover, Reach::None);
         assert_eq!(deps("@media (min-width: 1px) { .x:not(:focus-within) { } }").focus, Reach::Element);
         assert_eq!(deps("h2:target { color: red }").target, Reach::Element);
         assert_eq!(ua_stylesheet().origin, Origin::UserAgent);

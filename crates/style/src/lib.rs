@@ -20,8 +20,8 @@ pub mod stylesheet;
 pub mod ua;
 pub mod values;
 
-pub use cascade::{StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
-pub use state::{ElementStates, InteractionDeps, Reach};
+pub use cascade::{Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
+pub use state::{ElementStates, InteractionDeps, Reach, SubjectKeys};
 pub use computed::{ComputedStyle, LineHeight, Viewport};
 pub use properties::*;
 pub use media::MediaQueryList;

@@ -12,7 +12,8 @@ use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
-    ElementStates, InteractionDeps, Origin, Reach, Rule, StyleMap, Stylesheet, Stylist, compute_styles_with, restyle,
+    ElementStates, InteractionDeps, Origin, Reach, Rule, StateChange, StyleMap, Stylesheet, Stylist, compute_styles_with,
+    restyle,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -114,6 +115,8 @@ pub(crate) struct TabState {
     press: Option<NodeId>,
     /// Last pointer position in viewport coordinates while over the page.
     mouse: Option<(f32, f32)>,
+    /// The pointer or the scroll moved since hover was last evaluated.
+    hover_dirty: bool,
     cursor: Cursor,
 
     history: Vec<Url>,
@@ -164,6 +167,7 @@ impl TabState {
             focus: None,
             press: None,
             mouse: None,
+            hover_dirty: false,
             cursor: Cursor::Default,
             history: Vec::new(),
             history_index: 0,
@@ -237,20 +241,22 @@ impl TabState {
                     self.needs_style = true;
                 }
             }
+            // Pointer moves and scrolls arrive in bursts; hover is
+            // re-evaluated once per batch, in `flush`, at the final position.
             ShellToTab::Scroll { dx, dy } => {
                 self.scroll_x += dx;
                 self.scroll_y += dy;
                 self.clamp_scroll();
                 self.needs_paint = true;
-                self.update_hover();
+                self.hover_dirty = true;
             }
             ShellToTab::MouseMove { x, y } => {
                 self.mouse = Some((x, y));
-                self.update_hover();
+                self.hover_dirty = true;
             }
             ShellToTab::MouseLeave => {
                 self.mouse = None;
-                self.update_hover();
+                self.hover_dirty = true;
             }
             ShellToTab::MouseDown { x, y, button } => {
                 self.mouse = Some((x, y));
@@ -532,6 +538,7 @@ impl TabState {
 
     /// Re-evaluate what is under the pointer; restyle if it changed.
     fn update_hover(&mut self) {
+        self.hover_dirty = false;
         let raw = self.mouse.and_then(|(x, y)| self.hit_node(x, y));
         let hit = raw.and_then(|n| self.element_of(n));
         if hit == self.hover {
@@ -587,34 +594,31 @@ impl TabState {
             return;
         }
         let Some(doc) = &self.doc else { return };
-        let (roots, descendants) = match reach {
-            Reach::None => return,
-            Reach::Element => (changed, false),
-            Reach::Subtree => (changed, true),
-            Reach::Parent => {
-                let mut parents: Vec<NodeId> = changed
-                    .iter()
-                    .map(|&n| doc.parent(n).filter(|&p| doc.get(p).is_element()).unwrap_or(n))
-                    .collect();
-                parents.sort();
-                parents.dedup();
-                (parents, true)
-            }
-            Reach::Document => (doc.document_element().into_iter().collect(), true),
-        };
         let started = std::time::Instant::now();
         let stylist = self.stylist();
         let vp = self.style_viewport();
-        let moved = restyle(doc, &stylist, &vp, &self.states, &mut self.styles, &roots, descendants);
+        let result = restyle(
+            doc,
+            &stylist,
+            &vp,
+            &self.states,
+            &mut self.styles,
+            StateChange {
+                changed: &changed,
+                reach,
+                subjects: &self.deps.subjects,
+            },
+        );
         tracing::debug!(
             tab = self.id.0,
-            roots = roots.len(),
+            changed = changed.len(),
             ?reach,
-            moved,
+            styled = result.styled,
+            moved = result.moved,
             ms = started.elapsed().as_millis(),
             "restyle for interaction"
         );
-        if moved {
+        if result.moved {
             self.needs_layout = true;
         }
     }
@@ -1024,6 +1028,9 @@ impl TabState {
             if self.doc.is_none() {
                 break;
             }
+            if self.hover_dirty && !self.needs_style && !self.needs_layout {
+                self.update_hover();
+            }
             if self.needs_style {
                 self.restyle_all();
                 self.needs_style = false;
@@ -1344,6 +1351,27 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn a_burst_of_pointer_moves_restyles_once_at_the_final_position() {
+        let mut h = Harness::load(PAGE);
+        let (x, y) = h.center("a");
+        // Over the link, off it, over it again, then off: no flush between.
+        h.state.handle_shell(ShellToTab::MouseMove { x, y });
+        h.state.handle_shell(ShellToTab::MouseMove { x: 10.0, y: 10.0 });
+        h.state.handle_shell(ShellToTab::MouseMove { x, y });
+        h.state.handle_shell(ShellToTab::MouseMove { x: 10.0, y: 10.0 });
+        assert!(h.state.hover_dirty);
+        assert!(h.cursors().is_empty(), "nothing evaluated before the batch ends");
+        h.pump();
+        assert!(!h.state.hover_dirty);
+        assert!(h.cursors().is_empty(), "the final position is not over the link");
+        assert_eq!(h.style("a").background_color.to_rgba8(), [255, 255, 255, 255]);
+        // A click resolves hover at once, since it acts on it.
+        h.state.handle_shell(ShellToTab::MouseMove { x, y });
+        h.state.handle_shell(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        assert_eq!(h.style("a").color.to_rgba8(), [0, 128, 0, 255], ":active applied before the batch ends");
     }
 
     const PAGE: &str = "<!doctype html><style>body { margin: 0; color: black } \

@@ -2,9 +2,11 @@
 //! `:focus-within`), and how far a change in it can reach through the
 //! stylesheets, so the tab restyles only what the change can affect.
 
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use browser_dom::{Document, NodeId};
+use html5ever::LocalName;
 use slotmap::SecondaryMap;
 
 /// Which interaction pseudo-classes currently apply to which elements.
@@ -101,13 +103,46 @@ pub enum Reach {
     Document,
 }
 
-/// The reach of each state under the current stylesheets.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The reach of each state under the current stylesheets, and which
+/// elements beyond the changed ones a state change can restyle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InteractionDeps {
     pub hover: Reach,
     pub active: Reach,
     pub focus: Reach,
     pub target: Reach,
+    /// Subjects of the selectors that put an interaction pseudo-class to
+    /// the left of a combinator or inside `:has()`: the only elements,
+    /// other than the ones whose state changed, whose matching can change.
+    pub subjects: SubjectKeys,
+}
+
+/// Keys of selector subjects (the rightmost compound), one per selector:
+/// its id if it has one, else its first class, else its tag, else it is
+/// universal. An element matching a subject matches at least its key, so
+/// testing the key is a cheap superset test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubjectKeys {
+    /// Some subject has no id, class or tag (`.menu:hover *`), so every
+    /// element is a candidate.
+    pub universal: bool,
+    pub ids: HashSet<String>,
+    pub classes: HashSet<String>,
+    pub tags: HashSet<LocalName>,
+}
+
+impl SubjectKeys {
+    /// Whether `element` could be the subject of one of the selectors.
+    pub fn matches(&self, element: &browser_dom::Element) -> bool {
+        self.universal
+            || self.tags.contains(&element.name.local)
+            || element.id().is_some_and(|id| self.ids.contains(id))
+            || element.classes().any(|c| self.classes.contains(c))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.universal && self.ids.is_empty() && self.classes.is_empty() && self.tags.is_empty()
+    }
 }
 
 #[cfg(test)]
