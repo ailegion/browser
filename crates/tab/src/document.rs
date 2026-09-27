@@ -7,6 +7,7 @@ use std::sync::Arc;
 use browser_dom::{Document, HtmlParser, NodeId};
 use browser_ipc_types::{Cursor, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
 use browser_layout::{LayoutEngine, LayoutTree};
+use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_style::media::MediaQueryList;
@@ -118,6 +119,9 @@ pub(crate) struct TabState {
     mouse: Option<(f32, f32)>,
     /// The pointer or the scroll moved since hover was last evaluated.
     hover_dirty: bool,
+    /// The scrollbar thumb is being dragged: where in the thumb it was
+    /// grabbed, in logical pixels from its top.
+    scroll_drag: Option<f32>,
     cursor: Cursor,
 
     history: Vec<Url>,
@@ -169,6 +173,7 @@ impl TabState {
             press: None,
             mouse: None,
             hover_dirty: false,
+            scroll_drag: None,
             cursor: Cursor::Default,
             history: Vec::new(),
             history_index: 0,
@@ -253,7 +258,15 @@ impl TabState {
             }
             ShellToTab::MouseMove { x, y } => {
                 self.mouse = Some((x, y));
-                self.hover_dirty = true;
+                if let Some(grab) = self.scroll_drag {
+                    if let Some(sb) = self.scrollbar() {
+                        self.scroll_y = sb.offset_for_thumb_top(y - grab);
+                        self.clamp_scroll();
+                        self.needs_paint = true;
+                    }
+                } else {
+                    self.hover_dirty = true;
+                }
             }
             ShellToTab::MouseLeave => {
                 self.mouse = None;
@@ -261,6 +274,20 @@ impl TabState {
             }
             ShellToTab::MouseDown { x, y, button } => {
                 self.mouse = Some((x, y));
+                if button == MouseButton::Left
+                    && let Some(sb) = self.scrollbar()
+                    && let Some(hit) = sb.hit(x, y)
+                {
+                    // The scrollbar is above the page: no click reaches it.
+                    match hit {
+                        ScrollbarHit::Thumb => self.scroll_drag = Some(y - sb.thumb().y0 as f32),
+                        ScrollbarHit::Before => self.scroll_y -= self.viewport.height * 0.9,
+                        ScrollbarHit::After => self.scroll_y += self.viewport.height * 0.9,
+                    }
+                    self.clamp_scroll();
+                    self.needs_paint = true;
+                    return;
+                }
                 self.update_hover();
                 let hit = self.hover;
                 if button == MouseButton::Left {
@@ -274,6 +301,11 @@ impl TabState {
             }
             ShellToTab::MouseUp { x, y, button } => {
                 self.mouse = Some((x, y));
+                if self.scroll_drag.take().is_some() {
+                    self.needs_paint = true;
+                    self.hover_dirty = true;
+                    return;
+                }
                 self.update_hover();
                 if button == MouseButton::Left {
                     self.set_active(None);
@@ -558,9 +590,25 @@ impl TabState {
     }
 
     /// Re-evaluate what is under the pointer; restyle if it changed.
+    /// The page's vertical scrollbar, if the content overflows.
+    fn scrollbar(&self) -> Option<Scrollbar> {
+        let content_height = self.layout.as_ref()?.content_height;
+        Scrollbar::vertical(self.viewport.width, self.viewport.height, content_height, self.scroll_y)
+    }
+
+    fn over_scrollbar(&self) -> bool {
+        self.mouse
+            .is_some_and(|(x, y)| self.scrollbar().is_some_and(|sb| sb.contains(x, y)))
+    }
+
     fn update_hover(&mut self) {
         self.hover_dirty = false;
-        let raw = self.mouse.and_then(|(x, y)| self.hit_node(x, y));
+        // The scrollbar covers the page under it.
+        let raw = if self.over_scrollbar() {
+            None
+        } else {
+            self.mouse.and_then(|(x, y)| self.hit_node(x, y))
+        };
         let hit = raw.and_then(|n| self.element_of(n));
         if hit == self.hover {
             return;
@@ -1171,6 +1219,10 @@ impl TabState {
             scale: self.viewport.scale_factor,
         };
         paint(tree, &self.images, &options, &mut self.scene);
+        if let Some(sb) = self.scrollbar() {
+            let active = self.scroll_drag.is_some() || self.over_scrollbar();
+            sb.draw(&mut self.scene, self.viewport.scale_factor, active);
+        }
         let scene = std::mem::take(&mut self.scene);
         (self.output)(self.id, TabOutput::Frame(scene));
     }
@@ -1409,6 +1461,31 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn scrollbar_pages_drags_and_covers_the_page() {
+        let mut h = Harness::load(TALL);
+        let sb = h.state.scrollbar().expect("tall page has a scrollbar");
+        let x = (sb.track.x0 + sb.track.x1) as f32 / 2.0;
+        // Click on the track below the thumb: a page down.
+        h.send(ShellToTab::MouseDown { x, y: 500.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y: 500.0, button: MouseButton::Left });
+        assert_eq!(h.state.scroll_y, 540.0);
+        assert!(h.state.hover.is_none(), "the link under the track was not hit");
+        // Drag the thumb back to the top.
+        let thumb = h.state.scrollbar().expect("bar").thumb();
+        let grab_y = (thumb.y0 + 5.0) as f32;
+        h.send(ShellToTab::MouseDown { x, y: grab_y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseMove { x, y: 5.0 });
+        assert_eq!(h.state.scroll_y, 0.0);
+        h.send(ShellToTab::MouseMove { x, y: 5.0 + 100.0 });
+        assert!(h.state.scroll_y > 0.0 && h.state.scroll_y < 1500.0, "{}", h.state.scroll_y);
+        h.send(ShellToTab::MouseUp { x, y: 105.0, button: MouseButton::Left });
+        assert!(h.state.scroll_drag.is_none());
+        // A short page has no bar.
+        let h2 = Harness::load("<p>short</p>");
+        assert!(h2.state.scrollbar().is_none());
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub(crate) enum Icon {
     Close,
     LockClosed,
     LockOpen,
+    /// Three dots, for the settings menu.
+    Menu,
 }
 
 /// Stroke `icon` centered in `rect` (physical pixels) with `size` as the
@@ -79,6 +81,12 @@ pub(crate) fn draw_icon(scene: &mut Scene, icon: Icon, rect: Rect, size: f64, co
             path.line_to((0.72, 0.72));
             path.move_to((0.72, 0.28));
             path.line_to((0.28, 0.72));
+        }
+        Icon::Menu => {
+            for y in [0.22, 0.5, 0.78] {
+                scene.fill(Fill::NonZero, t, color, None, &Circle::new(Point::new(0.5, y), 0.09));
+            }
+            return;
         }
         Icon::LockClosed | Icon::LockOpen => {
             let body = RoundedRect::new(0.18, 0.45, 0.82, 0.92, 0.08);
@@ -148,14 +156,71 @@ pub(crate) fn scale_rect(r: Rect, s: f64) -> Rect {
     Rect::new(r.x0 * s, r.y0 * s, r.x1 * s, r.y1 * s)
 }
 
-/// A small filled dot, for "loading" in a tab.
-pub(crate) fn draw_dot(scene: &mut Scene, center: (f64, f64), radius: f64, color: Color) {
+/// A spinning three-quarter arc, for "loading" in a tab. `phase` is in
+/// turns.
+pub(crate) fn draw_spinner(scene: &mut Scene, center: (f64, f64), radius: f64, phase: f64, color: Color) {
+    let arc = Arc::new(
+        Point::new(center.0, center.1),
+        (radius, radius),
+        phase * std::f64::consts::TAU,
+        std::f64::consts::TAU * 0.75,
+        0.0,
+    );
+    let mut path = BezPath::new();
+    path.extend(arc.path_elements(0.1));
+    let stroke = Stroke::new((radius * 0.4).max(1.0)).with_caps(vello::kurbo::Cap::Round);
+    scene.stroke(&stroke, Affine::IDENTITY, color, None, &path);
+}
+
+/// A sweeping indeterminate progress bar across `rect`. `phase` is in
+/// sweeps.
+pub(crate) fn draw_progress(scene: &mut Scene, rect: Rect, phase: f64, color: Color) {
+    let w = rect.width();
+    let seg = (w * 0.3).max(1.0);
+    let t = phase.fract();
+    let x0 = rect.x0 - seg + t * (w + seg);
+    let bar = Rect::new(x0.max(rect.x0), rect.y0, (x0 + seg).min(rect.x1), rect.y1);
+    if bar.width() > 0.0 {
+        scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &bar);
+    }
+}
+
+/// A tooltip label at `at` (physical pixels, its top-left), kept inside
+/// `max_x`.
+pub(crate) fn draw_tooltip(
+    fonts: &mut FontContext,
+    lcx: &mut LayoutContext<Brush>,
+    scene: &mut Scene,
+    text: &str,
+    at: (f64, f64),
+    scale: f32,
+    max_x: f64,
+) {
+    let s = f64::from(scale);
+    let width = (text.chars().count() as f64 * 7.0 + 20.0) * s;
+    let height = 24.0 * s;
+    let x0 = at.0.min(max_x - width).max(0.0);
+    let r = Rect::new(x0, at.1, x0 + width, at.1 + height);
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
-        color,
+        Color::from_rgba8(0x30, 0x30, 0x38, 0xf0),
         None,
-        &Circle::new(Point::new(center.0, center.1), radius),
+        &RoundedRect::from_rect(r, 4.0 * s),
+    );
+    draw_text(
+        fonts,
+        lcx,
+        scene,
+        TextLine {
+            text,
+            font_size: 12.0,
+            scale,
+            color: [0xf4, 0xf4, 0xf8, 0xff],
+            origin: (r.x0 + 10.0 * s, r.y0),
+            max_width: r.width() - 10.0 * s,
+            height: r.height(),
+        },
     );
 }
 

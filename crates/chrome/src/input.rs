@@ -198,6 +198,8 @@ impl TextInput {
             }
             Key::Escape => return Some(InputEvent::Cancel),
             Key::Tab => return Some(InputEvent::Blur),
+            // One line: nothing above or below.
+            Key::ArrowUp | Key::ArrowDown => {}
         }
         None
     }

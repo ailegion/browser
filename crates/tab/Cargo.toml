@@ -16,6 +16,7 @@ browser-style.workspace = true
 browser-layout.workspace = true
 browser-paint.workspace = true
 browser-net.workspace = true
+browser-chrome.workspace = true
 vello.workspace = true
 url.workspace = true
 html5ever.workspace = true

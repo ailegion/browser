@@ -707,6 +707,7 @@ dependencies = [
 name = "browser-tab"
 version = "0.0.1"
 dependencies = [
+ "browser-chrome",
  "browser-dom",
  "browser-ipc-types",
  "browser-layout",

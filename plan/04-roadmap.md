@@ -276,9 +276,25 @@ Work:
    in the address box for `https`, an open one for `http`, nothing for
    internal pages; the text starts after it. Hover states redraw only
    when the part under the pointer changes (`take_dirty`). Twelve unit
-   tests in the chrome crate. Not yet: menus, tooltip, scrollbar,
-   progress bar, settings menu (block 3); a spinner instead of the
-   loading dot; tab drag to reorder.
+   tests in the chrome crate. Not yet: tab drag to reorder.
+   **Block 3 done 2026-09-27: menu, tooltips, scrollbar, progress.**
+   A menu button at the toolbar's right opens a popup (`menu.rs`: New
+   tab, Close tab, Reload or Stop, a version note) driven by mouse or
+   Up/Down/Enter/Escape; while open the chrome takes every pointer event
+   so a click outside closes it. Tooltips appear 600 ms after the
+   pointer settles on a button or tab; the shell learns when to wake
+   through `Chrome::next_wake` and calls `tick`, which also drives the
+   loading animation: a sweeping progress bar along the chrome's bottom
+   edge and a spinner in a loading tab. The page scrollbar is a widget
+   (`chrome::scrollbar`) the tab drives: overlay style at the right edge
+   when the content overflows, thumb drag, track click for a page,
+   hover and drag highlight, and it covers the page under it so links
+   there are not hit. Tests: two on the scrollbar geometry, one tab
+   harness test that pages, drags and shields the page, and chrome
+   tests for the menu and for tooltip and animation timing (15 in the
+   chrome crate). **Item 6 complete.** Not done: horizontal scrollbar,
+   a settings page behind the menu (Phase 4 has the settings), tab drag
+   to reorder.
 7. Text selection and copy on pages. Find in page. Keyboard focus and tab
    order. Form controls rendered (no submission yet).
 8. Media queries and custom properties in `style`.

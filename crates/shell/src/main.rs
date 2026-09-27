@@ -732,13 +732,26 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(deadline) = self.screenshot_deadline {
-            if Instant::now() >= deadline {
-                self.take_screenshot(event_loop);
-            } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            }
+        let now = Instant::now();
+        if let Some(deadline) = self.screenshot_deadline
+            && now >= deadline
+        {
+            self.take_screenshot(event_loop);
         }
+        // Animations and tooltips in the chrome.
+        if self.chrome.tick(now)
+            && let Some(active) = &self.active
+        {
+            active.window.request_redraw();
+        }
+        let next = [self.screenshot_deadline, self.chrome.next_wake()]
+            .into_iter()
+            .flatten()
+            .min();
+        event_loop.set_control_flow(match next {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn window_event(
@@ -873,16 +886,22 @@ impl ApplicationHandler<UserEvent> for App {
                 self.sync_ime();
             }
             WindowEvent::Focused(false) => {
-                // Losing the window drops any press in progress.
+                // Losing the window drops any press in progress and any menu.
                 self.press_in_chrome = false;
+                self.chrome.close_menu();
+                if self.chrome.take_dirty()
+                    && let Some(active) = &self.active
+                {
+                    active.window.request_redraw();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let vp_h = self.viewport().map(|v| v.height).unwrap_or(600.0);
                 let ctrl = self.modifiers.state().control_key();
                 let shift = self.modifiers.state().shift_key();
                 let alt = self.modifiers.state().alt_key();
-                // The address bar takes the keyboard while it has focus.
-                if self.chrome.has_focus() {
+                // The address bar or an open menu takes the keyboard.
+                if self.chrome.wants_keys() {
                     let key = match &event.logical_key {
                         Key::Named(NamedKey::Backspace) => Some(ChromeKey::Backspace),
                         Key::Named(NamedKey::Delete) => Some(ChromeKey::Delete),
@@ -893,6 +912,8 @@ impl ApplicationHandler<UserEvent> for App {
                         Key::Named(NamedKey::Enter) => Some(ChromeKey::Enter),
                         Key::Named(NamedKey::Escape) => Some(ChromeKey::Escape),
                         Key::Named(NamedKey::Tab) => Some(ChromeKey::Tab),
+                        Key::Named(NamedKey::ArrowUp) => Some(ChromeKey::ArrowUp),
+                        Key::Named(NamedKey::ArrowDown) => Some(ChromeKey::ArrowDown),
                         Key::Character(c) if ctrl => Some(ChromeKey::Character(c.to_string())),
                         _ => event
                             .text

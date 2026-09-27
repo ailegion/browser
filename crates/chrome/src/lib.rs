@@ -10,13 +10,22 @@
 //! `ChromeAction`s. Navigation truth stays in the tabs: the shell mirrors
 //! titles, URLs and history state into the chrome for display.
 //!
+//! Time-driven parts (the loading animation, tooltips) run off
+//! `next_wake` and `tick`: the shell waits until the next wake, ticks, and
+//! redraws if asked. The page's scrollbar is a widget here
+//! (`scrollbar`) that the tab drives.
+//!
 //! Coordinates coming in are logical pixels within the window; the scene
 //! drawn is in physical pixels, like the page's.
 
 #![forbid(unsafe_code)]
 
 mod input;
+mod menu;
+pub mod scrollbar;
 mod widgets;
+
+use std::time::{Duration, Instant};
 
 use browser_ipc_types::{Cursor, MouseButton, TabId};
 use parley::{FontContext, LayoutContext};
@@ -27,7 +36,8 @@ use vello::kurbo::{Affine, Rect, RoundedRect};
 use vello::peniko::{Color, Fill};
 
 use input::{InputEvent, TextInput, rounded_box};
-use widgets::{Button, Icon, TextLine, draw_dot, draw_icon, draw_text, scale_rect};
+use menu::{Menu, MenuAction, MenuItem};
+use widgets::{Button, Icon, TextLine, draw_icon, draw_progress, draw_spinner, draw_text, draw_tooltip, scale_rect};
 
 /// Height of the tab strip in logical pixels.
 pub const TABSTRIP_HEIGHT: f32 = 34.0;
@@ -40,6 +50,10 @@ const FONT_SIZE: f32 = 14.0;
 const TAB_FONT_SIZE: f32 = 13.0;
 /// Space the security indicator takes at the left of the address box.
 const INDICATOR_WIDTH: f32 = 26.0;
+/// Hover this long before a tooltip shows.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(600);
+/// Frame interval for the loading animation.
+const ANIMATION_FRAME: Duration = Duration::from_millis(33);
 
 const STRIP_BG: Color = Color::from_rgb8(0xe2, 0xe2, 0xe8);
 const BAR_BG: Color = Color::from_rgb8(0xf0, 0xf0, 0xf4);
@@ -64,6 +78,8 @@ pub enum Key {
     Delete,
     ArrowLeft,
     ArrowRight,
+    ArrowUp,
+    ArrowDown,
     Home,
     End,
     Enter,
@@ -141,6 +157,7 @@ enum Part {
     Forward,
     Reload,
     NewTab,
+    Menu,
     Address,
     Tab(TabId),
     TabClose(TabId),
@@ -174,6 +191,7 @@ pub struct Chrome {
     back_node: NodeId,
     forward_node: NodeId,
     reload_node: NodeId,
+    menu_node: NodeId,
     new_tab_node: NodeId,
     width: f32,
     scale: f32,
@@ -181,13 +199,21 @@ pub struct Chrome {
     back: Button,
     forward: Button,
     reload: Button,
+    menu_button: Button,
     new_tab: Button,
     tabs: Vec<TabSlot>,
     current: Option<TabId>,
     /// The current tab's URL as the tab reported it.
     url: Option<Url>,
     loading: bool,
+    /// When the current tab started loading, for the animation.
+    loading_since: Option<Instant>,
+    menu: Option<Menu>,
     hover: Option<Part>,
+    /// When the pointer arrived on `hover`, and where it is.
+    hover_since: Option<Instant>,
+    mouse: (f32, f32),
+    tooltip_shown: bool,
     pressed: Option<Part>,
     /// Something changed that a redraw must show.
     dirty: bool,
@@ -199,6 +225,7 @@ impl std::fmt::Debug for Chrome {
             .field("width", &self.width)
             .field("tabs", &self.tabs.len())
             .field("focused", &self.address.focused)
+            .field("menu", &self.menu.is_some())
             .finish()
     }
 }
@@ -248,6 +275,7 @@ impl Chrome {
         let back_node = leaf(&mut taffy, square(BUTTON_SIZE));
         let forward_node = leaf(&mut taffy, square(BUTTON_SIZE));
         let reload_node = leaf(&mut taffy, square(BUTTON_SIZE));
+        let menu_node = leaf(&mut taffy, square(BUTTON_SIZE));
         let address_node = leaf(
             &mut taffy,
             Style {
@@ -267,7 +295,7 @@ impl Chrome {
                     align_items: Some(AlignItems::CENTER),
                     padding: taffy::Rect {
                         left: length(6.0),
-                        right: length(8.0),
+                        right: length(6.0),
                         top: length(0.0),
                         bottom: length(0.0),
                     },
@@ -281,7 +309,7 @@ impl Chrome {
                     },
                     ..Default::default()
                 },
-                &[back_node, forward_node, reload_node, address_node],
+                &[back_node, forward_node, reload_node, address_node, menu_node],
             )
             .expect("taffy toolbar");
         let new_tab_node = leaf(
@@ -345,6 +373,7 @@ impl Chrome {
             back_node,
             forward_node,
             reload_node,
+            menu_node,
             new_tab_node,
             width: 0.0,
             scale: 1.0,
@@ -352,12 +381,18 @@ impl Chrome {
             back: Button::new(Icon::Back),
             forward: Button::new(Icon::Forward),
             reload: Button::new(Icon::Reload),
+            menu_button: Button::new(Icon::Menu),
             new_tab: Button::new(Icon::Plus),
             tabs: Vec::new(),
             current: None,
             url: None,
             loading: false,
+            loading_since: None,
+            menu: None,
             hover: None,
+            hover_since: None,
+            mouse: (0.0, 0.0),
+            tooltip_shown: false,
             pressed: None,
             dirty: true,
         };
@@ -377,6 +412,7 @@ impl Chrome {
         self.width = width.max(0.0);
         self.scale = scale.max(0.01);
         self.address.set_scale(self.scale);
+        self.menu = None;
         self.relayout();
     }
 
@@ -400,6 +436,7 @@ impl Chrome {
         self.back.rect = rect_of(&self.taffy, self.back_node, (0.0, toolbar_top));
         self.forward.rect = rect_of(&self.taffy, self.forward_node, (0.0, toolbar_top));
         self.reload.rect = rect_of(&self.taffy, self.reload_node, (0.0, toolbar_top));
+        self.menu_button.rect = rect_of(&self.taffy, self.menu_node, (0.0, toolbar_top));
         self.address.rect = rect_of(&self.taffy, self.address_node, (0.0, toolbar_top));
         self.new_tab.rect = rect_of(&self.taffy, self.new_tab_node, (0.0, 0.0));
         for tab in &mut self.tabs {
@@ -414,11 +451,17 @@ impl Chrome {
         (r.x0 as f32, r.y0 as f32, r.width() as f32, r.height() as f32)
     }
 
-    /// Centers of the toolbar buttons, for tests: back, forward, reload,
-    /// new tab.
-    pub fn button_centers(&self) -> [(f32, f32); 4] {
+    /// Centers of the buttons, for tests: back, forward, reload, new tab,
+    /// menu.
+    pub fn button_centers(&self) -> [(f32, f32); 5] {
         let c = |r: Rect| (((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32);
-        [c(self.back.rect), c(self.forward.rect), c(self.reload.rect), c(self.new_tab.rect)]
+        [
+            c(self.back.rect),
+            c(self.forward.rect),
+            c(self.reload.rect),
+            c(self.new_tab.rect),
+            c(self.menu_button.rect),
+        ]
     }
 
     /// Center of a tab in the strip, and of its close mark.
@@ -482,6 +525,7 @@ impl Chrome {
     pub fn set_loading(&mut self, loading: bool) {
         if self.loading != loading {
             self.loading = loading;
+            self.loading_since = loading.then(Instant::now);
             self.reload.icon = if loading { Icon::Stop } else { Icon::Reload };
             self.dirty = true;
         }
@@ -501,8 +545,26 @@ impl Chrome {
         self.address.focused
     }
 
+    /// The chrome wants the keyboard: the address bar is focused or a
+    /// menu is open.
+    pub fn wants_keys(&self) -> bool {
+        self.address.focused || self.menu.is_some()
+    }
+
+    /// A menu is open.
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
+    }
+
+    pub fn close_menu(&mut self) {
+        if self.menu.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
     /// Focus the address bar with its text selected (Ctrl+L).
     pub fn focus_address(&mut self) {
+        self.close_menu();
         self.address.focused = true;
         self.address.select_all(&mut self.fonts, &mut self.lcx);
         self.dirty = true;
@@ -522,6 +584,41 @@ impl Chrome {
         std::mem::take(&mut self.dirty)
     }
 
+    /// When the shell should call `tick` next: the next animation frame
+    /// while loading, or when a tooltip is due.
+    pub fn next_wake(&self) -> Option<Instant> {
+        let mut next: Option<Instant> = None;
+        let animating = self.loading || self.tabs.iter().any(|t| t.info.loading);
+        if animating {
+            next = Some(Instant::now() + ANIMATION_FRAME);
+        }
+        if !self.tooltip_shown
+            && let Some(since) = self.hover_since
+            && self.hover.is_some_and(|p| tooltip_for(p).is_some())
+        {
+            let due = since + TOOLTIP_DELAY;
+            next = Some(next.map_or(due, |n| n.min(due)));
+        }
+        next
+    }
+
+    /// Time passed: returns whether a redraw is needed.
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let mut redraw = self.loading || self.tabs.iter().any(|t| t.info.loading);
+        if !self.tooltip_shown
+            && let Some(since) = self.hover_since
+            && now >= since + TOOLTIP_DELAY
+            && self.hover.is_some_and(|p| tooltip_for(p).is_some())
+        {
+            self.tooltip_shown = true;
+            redraw = true;
+        }
+        if redraw {
+            self.dirty = true;
+        }
+        redraw
+    }
+
     /// The area the IME should keep clear, in logical pixels, when the
     /// address bar is focused.
     pub fn ime_cursor_area(&mut self) -> Option<(f32, f32, f32, f32)> {
@@ -530,9 +627,10 @@ impl Chrome {
             .then(|| self.address.ime_cursor_area(&mut self.fonts, &mut self.lcx))
     }
 
-    /// Whether a point is on the chrome rather than the page.
+    /// Whether a point is on the chrome rather than the page. With a menu
+    /// open the chrome takes every point, to close it on a click outside.
     pub fn contains(&self, _x: f32, y: f32) -> bool {
-        y < self.height()
+        self.menu.is_some() || y < self.height()
     }
 
     fn part_at(&self, x: f32, y: f32) -> Option<Part> {
@@ -548,6 +646,9 @@ impl Chrome {
         if self.reload.contains(x, y) {
             return Some(Part::Reload);
         }
+        if self.menu_button.contains(x, y) {
+            return Some(Part::Menu);
+        }
         if self.new_tab.contains(x, y) {
             return Some(Part::NewTab);
         }
@@ -562,10 +663,38 @@ impl Chrome {
         None
     }
 
+    fn tooltip_text(&self, part: Part) -> Option<String> {
+        match part {
+            Part::Reload if self.loading => Some("Stop loading".to_owned()),
+            Part::Tab(id) => self
+                .tabs
+                .iter()
+                .find(|t| t.info.id == id)
+                .map(|t| t.info.title.clone())
+                .filter(|t| !t.is_empty()),
+            other => tooltip_for(other).map(str::to_owned),
+        }
+    }
+
     pub fn mouse_move(&mut self, x: f32, y: f32) -> Cursor {
+        self.mouse = (x, y);
+        if let Some(menu) = &mut self.menu {
+            let over = menu.item_at(x, y);
+            if over != menu.hover {
+                menu.hover = over;
+                menu.keyed = None;
+                self.dirty = true;
+            }
+            return if over.is_some() { Cursor::Pointer } else { Cursor::Default };
+        }
         let part = self.part_at(x, y);
         if part != self.hover {
             self.hover = part;
+            self.hover_since = part.map(|_| Instant::now());
+            self.tooltip_shown = false;
+            self.dirty = true;
+        } else if self.tooltip_shown {
+            // The tooltip follows the pointer.
             self.dirty = true;
         }
         self.address.mouse_move(&mut self.fonts, &mut self.lcx, x, y);
@@ -576,22 +705,38 @@ impl Chrome {
             Some(Part::Address) => Cursor::Text,
             Some(Part::Back) if self.back.enabled => Cursor::Pointer,
             Some(Part::Forward) if self.forward.enabled => Cursor::Pointer,
-            Some(Part::Reload | Part::NewTab | Part::Tab(_) | Part::TabClose(_)) => Cursor::Pointer,
+            Some(Part::Reload | Part::NewTab | Part::Menu | Part::Tab(_) | Part::TabClose(_)) => Cursor::Pointer,
             _ => Cursor::Default,
         }
     }
 
     pub fn mouse_leave(&mut self) {
-        if self.hover.is_some() {
+        if self.hover.is_some() || self.tooltip_shown {
             self.hover = None;
+            self.hover_since = None;
+            self.tooltip_shown = false;
             self.dirty = true;
         }
     }
 
     /// A button went down at a point on the chrome.
     pub fn mouse_down(&mut self, x: f32, y: f32, button: MouseButton, shift: bool) -> Vec<ChromeAction> {
-        let part = self.part_at(x, y);
         self.dirty = true;
+        self.tooltip_shown = false;
+        self.hover_since = None;
+        if let Some(menu) = &self.menu {
+            // A click on a row chooses it on release; anywhere else closes.
+            if !menu.contains(x, y) {
+                self.close_menu();
+                // The menu button itself toggles: swallow the press.
+                if self.menu_button.contains(x, y) {
+                    self.pressed = None;
+                    return Vec::new();
+                }
+            }
+            return Vec::new();
+        }
+        let part = self.part_at(x, y);
         match (button, part) {
             (MouseButton::Left, Some(Part::Address)) => {
                 self.address.mouse_down(&mut self.fonts, &mut self.lcx, x, y, shift);
@@ -623,6 +768,16 @@ impl Chrome {
         if button != MouseButton::Left {
             return Vec::new();
         }
+        if let Some(menu) = &self.menu {
+            let chosen = menu.item_at(x, y).and_then(|i| menu.items[i].action);
+            return match chosen {
+                Some(action) => {
+                    self.close_menu();
+                    self.menu_action(action)
+                }
+                None => Vec::new(),
+            };
+        }
         let released = self.part_at(x, y);
         match pressed {
             Some(p) if Some(p) == released => match p {
@@ -631,6 +786,10 @@ impl Chrome {
                 Part::Reload if self.loading => vec![ChromeAction::Stop],
                 Part::Reload => vec![ChromeAction::Reload],
                 Part::NewTab => vec![ChromeAction::NewTab],
+                Part::Menu => {
+                    self.open_menu();
+                    Vec::new()
+                }
                 Part::Tab(id) if self.current != Some(id) => vec![ChromeAction::SelectTab(id)],
                 Part::TabClose(id) => vec![ChromeAction::CloseTab(id)],
                 _ => Vec::new(),
@@ -639,8 +798,48 @@ impl Chrome {
         }
     }
 
-    /// A key while the chrome has focus.
+    fn open_menu(&mut self) {
+        self.blur();
+        let items = vec![
+            MenuItem::new("New tab", Some("Ctrl+T"), MenuAction::NewTab),
+            MenuItem::new("Close tab", Some("Ctrl+W"), MenuAction::CloseTab),
+            MenuItem::new(if self.loading { "Stop" } else { "Reload" }, Some("F5"), MenuAction::Reload),
+            MenuItem::SEPARATOR,
+            MenuItem::note(concat!("browser ", env!("CARGO_PKG_VERSION"))),
+        ];
+        self.menu = Some(Menu::open(items, self.menu_button.rect, self.width));
+        self.hover = None;
+        self.tooltip_shown = false;
+        self.dirty = true;
+    }
+
+    fn menu_action(&mut self, action: MenuAction) -> Vec<ChromeAction> {
+        match action {
+            MenuAction::NewTab => vec![ChromeAction::NewTab],
+            MenuAction::CloseTab => self.current.map(ChromeAction::CloseTab).into_iter().collect(),
+            MenuAction::Reload => vec![if self.loading { ChromeAction::Stop } else { ChromeAction::Reload }],
+        }
+    }
+
+    /// A key while the chrome wants them.
     pub fn key(&mut self, input: KeyInput) -> Vec<ChromeAction> {
+        if let Some(menu) = &mut self.menu {
+            self.dirty = true;
+            match input.key {
+                Key::ArrowDown => menu.step(true),
+                Key::ArrowUp => menu.step(false),
+                Key::Enter => {
+                    let chosen = menu.keyed.or(menu.hover).and_then(|i| menu.items[i].action);
+                    if let Some(action) = chosen {
+                        self.close_menu();
+                        return self.menu_action(action);
+                    }
+                }
+                Key::Escape => self.close_menu(),
+                _ => {}
+            }
+            return Vec::new();
+        }
         if !self.address.focused {
             return Vec::new();
         }
@@ -693,9 +892,11 @@ impl Chrome {
         }
     }
 
-    /// Draw the chrome at the top of `scene`, in physical pixels.
+    /// Draw the chrome at the top of `scene`, in physical pixels. A menu
+    /// or tooltip extends below it, over the page.
     pub fn draw(&mut self, scene: &mut Scene) {
         self.dirty = false;
+        let now = Instant::now();
         let s = self.scale as f64;
         let w = self.width as f64 * s;
         let strip_h = TABSTRIP_HEIGHT as f64 * s;
@@ -712,15 +913,17 @@ impl Chrome {
             &Rect::new(0.0, total_h - s.max(1.0), w, total_h),
         );
 
-        self.draw_tabs(scene);
+        self.draw_tabs(scene, now);
 
         // Toolbar buttons.
         for (button, part) in [
             (&self.back, Part::Back),
             (&self.forward, Part::Forward),
             (&self.reload, Part::Reload),
+            (&self.menu_button, Part::Menu),
         ] {
-            button.draw(scene, s, self.hover == Some(part), self.pressed == Some(part));
+            let pressed = self.pressed == Some(part) || (part == Part::Menu && self.menu.is_some());
+            button.draw(scene, s, self.hover == Some(part), pressed);
         }
 
         // Address box.
@@ -741,16 +944,31 @@ impl Chrome {
             draw_icon(scene, icon, r, 15.0 * s, color);
         }
         self.address.draw(&mut self.fonts, &mut self.lcx, scene);
-        if self.loading {
-            // A thin accent line along the bottom of the address box.
-            let line = Rect::new(box_rect.x0 + 8.0 * s, box_rect.y1 - 3.0 * s, box_rect.x1 - 8.0 * s, box_rect.y1 - s);
-            scene.fill(Fill::NonZero, Affine::IDENTITY, ACCENT, None, &line);
+
+        // Progress: a sweep along the bottom edge of the chrome.
+        if let Some(since) = self.loading_since.filter(|_| self.loading) {
+            let phase = now.duration_since(since).as_secs_f64() / 1.4;
+            let bar = Rect::new(0.0, total_h - 3.0 * s, w, total_h);
+            draw_progress(scene, bar, phase, ACCENT);
+        }
+
+        if let Some(menu) = &self.menu {
+            menu.draw(&mut self.fonts, &mut self.lcx, scene, self.scale);
+        } else if self.tooltip_shown
+            && let Some(text) = self.hover.and_then(|p| self.tooltip_text(p))
+        {
+            let at = ((self.mouse.0 as f64 + 12.0) * s, (self.mouse.1 as f64 + 20.0) * s);
+            draw_tooltip(&mut self.fonts, &mut self.lcx, scene, &text, at, self.scale, w);
         }
     }
 
-    fn draw_tabs(&mut self, scene: &mut Scene) {
+    fn draw_tabs(&mut self, scene: &mut Scene, now: Instant) {
         let s = self.scale as f64;
         let strip_h = TABSTRIP_HEIGHT as f64 * s;
+        let spin_phase = self
+            .loading_since
+            .map(|since| now.duration_since(since).as_secs_f64())
+            .unwrap_or(0.0);
         for tab in &self.tabs {
             let r = scale_rect(tab.rect, s);
             let is_current = self.current == Some(tab.info.id);
@@ -768,8 +986,8 @@ impl Chrome {
             let close = scale_rect(tab.close_rect(), s);
             let mut text_x = r.x0 + 10.0 * s;
             if tab.info.loading {
-                draw_dot(scene, (text_x + 4.0 * s, (r.y0 + r.y1) / 2.0), 4.0 * s, ACCENT);
-                text_x += 16.0 * s;
+                draw_spinner(scene, (text_x + 5.0 * s, (r.y0 + r.y1) / 2.0), 5.0 * s, spin_phase, ACCENT);
+                text_x += 18.0 * s;
             }
             let title = if tab.info.title.is_empty() { "New tab" } else { tab.info.title.as_str() };
             let color = if is_current { TEXT } else { TEXT_DIM };
@@ -800,6 +1018,20 @@ impl Chrome {
         }
         self.new_tab
             .draw(scene, s, self.hover == Some(Part::NewTab), self.pressed == Some(Part::NewTab));
+    }
+}
+
+/// The fixed tooltip of a part; tabs and the reload button vary.
+fn tooltip_for(part: Part) -> Option<&'static str> {
+    match part {
+        Part::Back => Some("Back"),
+        Part::Forward => Some("Forward"),
+        Part::Reload => Some("Reload"),
+        Part::NewTab => Some("New tab"),
+        Part::Menu => Some("Menu"),
+        Part::TabClose(_) => Some("Close tab"),
+        Part::Tab(_) => Some(""),
+        Part::Address => None,
     }
 }
 
@@ -891,11 +1123,11 @@ mod tests {
     fn layout_puts_the_strip_above_the_toolbar_and_buttons_before_the_box() {
         let mut c = chrome();
         assert_eq!(c.height(), TABSTRIP_HEIGHT + TOOLBAR_HEIGHT);
-        let [back, forward, reload, new_tab] = c.button_centers();
+        let [back, forward, reload, new_tab, menu] = c.button_centers();
         let (x, y, w, h) = c.address_rect();
         assert!(back.0 < forward.0 && forward.0 < reload.0 && reload.0 < x);
+        assert!(x + w < menu.0 && menu.0 < 800.0, "the menu button is right of the box");
         assert!(y > TABSTRIP_HEIGHT && y + h <= c.height());
-        assert!(x + w <= 800.0);
         assert!(new_tab.1 < TABSTRIP_HEIGHT, "the + lives in the strip");
         assert!(c.contains(100.0, 10.0) && !c.contains(100.0, c.height() + 1.0));
 
@@ -913,7 +1145,7 @@ mod tests {
     #[test]
     fn buttons_act_on_release_and_respect_their_state() {
         let mut c = chrome();
-        let [back, forward, reload, new_tab] = c.button_centers();
+        let [back, forward, reload, new_tab, _] = c.button_centers();
         assert!(click(&mut c, back).is_empty(), "nothing to go back to");
         assert!(click(&mut c, forward).is_empty());
         assert_eq!(c.mouse_move(back.0, back.1), Cursor::Default, "disabled: no pointer cursor");
@@ -956,6 +1188,68 @@ mod tests {
         assert_eq!(c.tab_centers(TabId(2)).unwrap().0, t2);
         c.set_tabs(tabs(1), Some(TabId(1)));
         assert!(c.tab_centers(TabId(3)).is_none());
+    }
+
+    #[test]
+    fn menu_opens_from_its_button_and_answers_clicks_keys_and_escape() {
+        let mut c = chrome();
+        c.set_tabs(tabs(2), Some(TabId(2)));
+        let menu_btn = c.button_centers()[4];
+        assert!(click(&mut c, menu_btn).is_empty());
+        assert!(c.menu_open() && c.wants_keys() && !c.has_focus());
+        assert!(c.contains(400.0, 600.0), "with a menu open the chrome takes every point");
+        // Keyboard: down twice is "Close tab", Enter chooses it.
+        c.key(KeyInput::plain(Key::ArrowDown));
+        c.key(KeyInput::plain(Key::ArrowDown));
+        assert_eq!(c.key(KeyInput::plain(Key::Enter)), vec![ChromeAction::CloseTab(TabId(2))]);
+        assert!(!c.menu_open());
+        // Mouse: the first row is "New tab".
+        click(&mut c, menu_btn);
+        let row = c.menu.as_ref().unwrap().rect;
+        let first = ((row.x0 + 20.0) as f32, (row.y0 + 6.0 + 15.0) as f32);
+        assert_eq!(c.mouse_move(first.0, first.1), Cursor::Pointer);
+        assert_eq!(click(&mut c, first), vec![ChromeAction::NewTab]);
+        assert!(!c.menu_open());
+        // Escape closes; a click outside closes without acting; the
+        // button toggles it closed.
+        click(&mut c, menu_btn);
+        c.key(KeyInput::plain(Key::Escape));
+        assert!(!c.menu_open());
+        click(&mut c, menu_btn);
+        assert!(click(&mut c, (100.0, 400.0)).is_empty());
+        assert!(!c.menu_open());
+        click(&mut c, menu_btn);
+        assert!(click(&mut c, menu_btn).is_empty());
+        assert!(!c.menu_open());
+        // Up from nothing lands on the last enabled row (Reload).
+        click(&mut c, menu_btn);
+        c.key(KeyInput::plain(Key::ArrowUp));
+        assert_eq!(c.key(KeyInput::plain(Key::Enter)), vec![ChromeAction::Reload]);
+    }
+
+    #[test]
+    fn tooltips_appear_after_a_pause_and_loading_animates() {
+        let mut c = chrome();
+        let [back, ..] = c.button_centers();
+        assert!(c.next_wake().is_none(), "nothing to wait for");
+        c.mouse_move(back.0, back.1);
+        let wake = c.next_wake().expect("a tooltip is pending");
+        assert!(!c.tick(Instant::now()), "not yet");
+        assert!(c.tick(wake + Duration::from_millis(1)));
+        assert!(c.tooltip_shown);
+        let mut scene = Scene::new();
+        c.draw(&mut scene);
+        c.mouse_move(back.0 + 100.0, back.1);
+        assert!(!c.tooltip_shown, "leaving the part hides it");
+        c.mouse_leave();
+        assert!(c.next_wake().is_none());
+        c.set_loading(true);
+        let wake = c.next_wake().expect("animation frames while loading");
+        assert!(wake <= Instant::now() + ANIMATION_FRAME);
+        assert!(c.tick(Instant::now()));
+        c.draw(&mut scene);
+        c.set_loading(false);
+        assert!(c.next_wake().is_none());
     }
 
     #[test]
@@ -1137,11 +1431,17 @@ mod tests {
         c.mouse_move(t2.0, t2.1);
         c.draw(&mut scene);
         c.mouse_move(close2.0, close2.1);
+        c.tick(Instant::now() + TOOLTIP_DELAY * 2);
         c.draw(&mut scene);
         c.focus_address();
         c.key(KeyInput::plain(Key::End));
         c.draw(&mut scene);
         c.ime_preedit("あい", Some((0, 6)));
+        c.draw(&mut scene);
+        let menu_btn = c.button_centers()[4];
+        click(&mut c, menu_btn);
+        let menu_rect = c.menu.as_ref().unwrap().rect;
+        c.mouse_move(menu_rect.x0 as f32 + 10.0, menu_rect.y0 as f32 + 20.0);
         c.draw(&mut scene);
     }
 
