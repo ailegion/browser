@@ -152,6 +152,9 @@ enum NavKind {
     Push,
     /// The current entry is loaded again and overwritten.
     Reload,
+    /// The current entry is overwritten by another URL
+    /// (`location.replace`); unlike a reload the cache is used as usual.
+    Replace,
     /// Back or forward to the entry at the index.
     Traverse(usize),
 }
@@ -1283,7 +1286,7 @@ impl TabState {
                 self.history.push(url.clone());
                 self.history_index = self.history.len() - 1;
             }
-            NavKind::Reload => match self.history.get_mut(self.history_index) {
+            NavKind::Reload | NavKind::Replace => match self.history.get_mut(self.history_index) {
                 Some(entry) => *entry = url.clone(),
                 None => {
                     self.history.push(url.clone());
@@ -2003,7 +2006,15 @@ impl TabState {
         } else {
             "complete"
         };
-        host.set_document_info(self.url.clone(), title.unwrap_or_default(), ready);
+        // A document not decoded from bytes (`about:`) counts as UTF-8.
+        let (encoding, quirks) = match (&self.parser, &self.doc) {
+            (Some(parser), _) => (parser.encoding(), parser.document().quirks_mode),
+            (None, Some(doc)) => (doc.encoding, doc.quirks_mode),
+            (None, None) => (None, browser_dom::QuirksMode::NoQuirks),
+        };
+        let charset = encoding.map_or("UTF-8", |e| e.name());
+        let quirks = quirks == browser_dom::QuirksMode::Quirks;
+        host.set_document_info(self.url.clone(), title.unwrap_or_default(), ready, charset, quirks);
     }
 
     /// Act on what a script asked of the document or the tab.
@@ -2018,14 +2029,11 @@ impl TabState {
                     }
                     self.state_dirty = true;
                 }
-                // A replace overwrites the current history entry, which is
-                // what `NavKind::Reload` does (it also revalidates the
-                // cache, a small inaccuracy until history gets its own kind).
                 HostRequest::Navigate { url, replace } => {
                     if !matches!(url.scheme(), "http" | "https" | "data" | "about") {
                         continue;
                     }
-                    self.go(url, if replace { NavKind::Reload } else { NavKind::Push });
+                    self.go(url, if replace { NavKind::Replace } else { NavKind::Push });
                     // Later requests belong to a document that is going away.
                     break;
                 }
@@ -3786,6 +3794,36 @@ mod tests {
         assert_eq!(h.title().as_deref(), Some("Second"), "location.assign navigated");
         assert_eq!(console_texts(&h).last().map(String::as_str), Some("loading Second"));
         assert_eq!(h.state.history.len(), 2, "assign pushed an entry");
+    }
+
+    #[test]
+    fn document_reports_its_encoding_mode_and_domain() {
+        // No doctype puts the document in quirks mode; the meta charset
+        // is honoured by the prescan. The inline script reads through the
+        // blocked parser, the deferred one through the finished document.
+        let probe = "console.log(document.characterSet, document.inputEncoding, document.compatMode, JSON.stringify(document.domain), JSON.stringify(document.referrer))";
+        let html = format!(
+            "<meta charset=windows-1252><script>{probe}</script>\
+             <script defer src=\"data:text/javascript,{probe}\"></script>"
+        );
+        let h = Harness::load(&html);
+        let t = console_texts(&h);
+        assert_eq!(t, ["windows-1252 windows-1252 BackCompat \"\" \"\"", "windows-1252 windows-1252 BackCompat \"\" \"\""]);
+
+        let h = Harness::load(&format!("<!DOCTYPE html><script>{probe}</script>"));
+        assert_eq!(console_texts(&h), ["UTF-8 UTF-8 CSS1Compat \"\" \"\""]);
+    }
+
+    #[test]
+    fn location_replace_overwrites_the_entry_without_bypassing_the_cache() {
+        let target = data_url("<title>Replaced</title>", None);
+        let mut h = Harness::load(&format!("<title>First</title><script>setTimeout(() => location.replace('{target}'), 0)</script>"));
+        assert_eq!(h.state.history.len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.pump();
+        assert_eq!(h.title().as_deref(), Some("Replaced"));
+        assert_eq!(h.state.history, vec![target], "replace overwrote the only entry");
+        assert_eq!(h.state.doc_cache, CacheMode::Default, "a replace is not a reload");
     }
 
     /// Console text so far, in order.

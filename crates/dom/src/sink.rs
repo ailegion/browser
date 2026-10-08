@@ -381,9 +381,12 @@ impl HtmlParser {
     /// an aborted load, and scripts of an aborted document do not run.
     pub fn finish(mut self) -> Document {
         self.end_input();
+        let encoding = self.encoding();
         // `Parser::finish` runs the tree builder to the end, ignoring
         // script stops, then feeds the end of file.
-        self.inner.finish()
+        let mut doc = self.inner.finish();
+        doc.encoding = encoding;
+        doc
     }
 }
 

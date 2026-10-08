@@ -166,6 +166,9 @@ pub struct Document {
     pub quirks_mode: QuirksMode,
     /// URL the document was loaded from; used to resolve relative URLs.
     pub base_url: Option<Url>,
+    /// The encoding the bytes were decoded with, set when the parser
+    /// finishes; `None` for a document that was not parsed from bytes.
+    pub encoding: Option<&'static encoding_rs::Encoding>,
 }
 
 impl Default for Document {
@@ -183,6 +186,7 @@ impl Document {
             root,
             quirks_mode: QuirksMode::NoQuirks,
             base_url: None,
+            encoding: None,
         }
     }
 

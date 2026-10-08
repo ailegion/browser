@@ -445,6 +445,11 @@ pub struct DocumentInfo {
     /// `loading`, `interactive` or `complete`.
     pub ready_state: String,
     pub user_agent: String,
+    /// The encoding the document was decoded with, by its standard name
+    /// (`UTF-8`, `windows-1252`).
+    pub charset: String,
+    /// Whether the parser put the document in quirks mode.
+    pub quirks: bool,
 }
 
 /// Something a script asked of the document or the tab, collected for
@@ -552,6 +557,9 @@ fn location_set(_: &JsValue, args: &[JsValue], what: &u8, context: &mut Context)
 const DOC_URL: u8 = 0;
 const DOC_READY_STATE: u8 = 1;
 const DOC_TITLE: u8 = 2;
+const DOC_CHARSET: u8 = 3;
+const DOC_COMPAT_MODE: u8 = 4;
+const DOC_DOMAIN: u8 = 5;
 
 fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) -> JsResult<JsValue> {
     let host = host_state(context)?;
@@ -559,8 +567,32 @@ fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) ->
     Ok(match *part {
         DOC_URL => js_str(current_url(info).as_str()),
         DOC_READY_STATE => js_str(&info.ready_state),
+        DOC_CHARSET => js_str(&info.charset),
+        DOC_COMPAT_MODE => js_str(if info.quirks { "BackCompat" } else { "CSS1Compat" }),
+        // The origin's host; an opaque origin (`data:`, `about:`) has none.
+        DOC_DOMAIN => {
+            let url = current_url(info);
+            js_str(match url.scheme() {
+                "http" | "https" => url.host_str().unwrap_or(""),
+                _ => "",
+            })
+        }
         _ => js_str(&info.title),
     })
+}
+
+/// `document.domain = ` is deprecated and does nothing here: there is one
+/// origin per document and no frames to relax it against.
+fn document_set_domain(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
+}
+
+fn string_list_item(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::null())
+}
+
+fn string_list_contains(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(false))
 }
 
 fn document_set_title(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -639,6 +671,13 @@ fn register_window(context: &mut Context) -> JsResult<()> {
         js_string!("toString"),
         0,
     );
+    // No frames yet, so the list of ancestor origins is always empty.
+    let ancestor_origins = ObjectInitializer::new(init.context())
+        .property(js_string!("length"), 0, fixed)
+        .function(NativeFunction::from_fn_ptr(string_list_item), js_string!("item"), 1)
+        .function(NativeFunction::from_fn_ptr(string_list_contains), js_string!("contains"), 1)
+        .build();
+    init.property(js_string!("ancestorOrigins"), ancestor_origins, fixed);
     let location = init.build();
 
     // navigator
@@ -671,7 +710,15 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     // document
     let global = context.global_object();
     let mut init = ObjectInitializer::new(context);
-    for (name, part) in [("URL", DOC_URL), ("documentURI", DOC_URL), ("readyState", DOC_READY_STATE)] {
+    for (name, part) in [
+        ("URL", DOC_URL),
+        ("documentURI", DOC_URL),
+        ("readyState", DOC_READY_STATE),
+        ("characterSet", DOC_CHARSET),
+        ("charset", DOC_CHARSET),
+        ("inputEncoding", DOC_CHARSET),
+        ("compatMode", DOC_COMPAT_MODE),
+    ] {
         let get = getter(
             init.context(),
             name,
@@ -685,13 +732,19 @@ fn register_window(context: &mut Context) -> JsResult<()> {
         NativeFunction::from_copy_closure_with_captures(document_get, DOC_TITLE),
     );
     let set_title = setter(init.context(), "title", NativeFunction::from_fn_ptr(document_set_title));
+    let get_domain = getter(
+        init.context(),
+        "domain",
+        NativeFunction::from_copy_closure_with_captures(document_get, DOC_DOMAIN),
+    );
+    let set_domain = setter(init.context(), "domain", NativeFunction::from_fn_ptr(document_set_domain));
     init.accessor(js_string!("title"), Some(get_title), Some(set_title), attr)
+        .accessor(js_string!("domain"), Some(get_domain), Some(set_domain), attr)
         .property(js_string!("location"), location.clone(), fixed)
         .property(js_string!("defaultView"), global.clone(), fixed)
-        .property(js_string!("characterSet"), js_str("UTF-8"), fixed)
-        .property(js_string!("charset"), js_str("UTF-8"), fixed)
         .property(js_string!("contentType"), js_str("text/html"), fixed)
-        .property(js_string!("compatMode"), js_str("CSS1Compat"), fixed);
+        // Nothing sends a `Referer` header yet, so no document has one.
+        .property(js_string!("referrer"), js_str(""), fixed);
     let document = init.build();
 
     // These are [Replaceable] in browsers: a page's `var frames` wins.
@@ -741,6 +794,8 @@ impl ScriptHost {
                 title: String::new(),
                 ready_state: "loading".to_owned(),
                 user_agent: user_agent.to_owned(),
+                charset: "UTF-8".to_owned(),
+                quirks: false,
             },
             requests: Vec::new(),
         }));
@@ -787,12 +842,16 @@ impl ScriptHost {
         })
     }
 
-    /// Keep what `location` and `document` report current.
-    pub fn set_document_info(&mut self, url: Option<Url>, title: String, ready_state: &str) {
+    /// Keep what `location` and `document` report current. `charset` is
+    /// the encoding's standard name; `quirks` whether the parser put the
+    /// document in quirks mode.
+    pub fn set_document_info(&mut self, url: Option<Url>, title: String, ready_state: &str, charset: &str, quirks: bool) {
         let mut state = self.host.borrow_mut();
         state.info.url = url;
         state.info.title = title;
         state.info.ready_state = ready_state.to_owned();
+        state.info.charset = charset.to_owned();
+        state.info.quirks = quirks;
     }
 
     /// What scripts asked of the document or tab since the last call.
@@ -1027,6 +1086,8 @@ mod tests {
             Some(url("https://user@example.test:8443/a/b.html?q=1#frag")),
             "Hello".to_owned(),
             "interactive",
+            "windows-1252",
+            true,
         );
         assert_eq!(h.eval_to_string("window === globalThis && self === window && top === window && frames === window && parent === window").as_deref(), Ok("true"));
         assert_eq!(
@@ -1035,8 +1096,16 @@ mod tests {
         );
         assert_eq!(
             h.eval_to_string("[document.URL === location.href, document.location === location, document.defaultView === window, document.readyState, document.title, document.characterSet, navigator.userAgent, navigator.language, navigator.languages.length, navigator.onLine, navigator.cookieEnabled, typeof navigator.platform].join('|')").as_deref(),
-            Ok("\"true|true|true|interactive|Hello|UTF-8|browser/test|en-US|2|true|true|string\"")
+            Ok("\"true|true|true|interactive|Hello|windows-1252|browser/test|en-US|2|true|true|string\"")
         );
+        // Encoding and mode come from the parser; the domain is the
+        // origin's host and cannot be changed; no frames, no ancestors.
+        assert_eq!(
+            h.eval_to_string("document.domain = 'example.test'; [document.charset, document.inputEncoding, document.compatMode, document.domain, document.referrer, document.contentType, location.ancestorOrigins.length, String(location.ancestorOrigins.item(0)), location.ancestorOrigins.contains('x')].join('|')").as_deref(),
+            Ok("\"windows-1252|windows-1252|BackCompat|example.test||text/html|0|null|false\"")
+        );
+        h.set_document_info(Some(url("https://user@example.test:8443/a/b.html?q=1#frag")), "Hello".to_owned(), "interactive", "UTF-8", false);
+        assert_eq!(h.eval_to_string("document.compatMode + '|' + document.characterSet").as_deref(), Ok("\"CSS1Compat|UTF-8\""));
         h.run_script(
             "document.title = 'New'; console.log(document.title); \
              location.assign('../c.html'); location.replace('https://other.test/'); location.hash = 'x'; location.href = '/root'; location.reload(); \
@@ -1058,7 +1127,10 @@ mod tests {
         assert!(h.take_requests().is_empty());
         // Without a document URL, `location` is about:blank.
         let mut blank = ScriptHost::new(None, "ua").expect("host");
-        assert_eq!(blank.eval_to_string("location.href + '|' + location.origin").as_deref(), Ok("\"about:blank|null\""));
+        assert_eq!(
+            blank.eval_to_string("[location.href, location.origin, document.domain, document.characterSet, document.compatMode].join('|')").as_deref(),
+            Ok("\"about:blank|null||UTF-8|CSS1Compat\"")
+        );
     }
 
     fn url(s: &str) -> Url {

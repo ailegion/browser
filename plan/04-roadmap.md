@@ -558,7 +558,7 @@ Work:
    (html5ever's default `scripting_enabled` is true, so it is fine).
 3. Bindings in this order, each unlocking more of the web:
    1. `window`, `document`, `console`, timers, `location`, `navigator`.
-      **Done 2026-09-27 (lean).** `console` and timers came with item 1.
+      **Done 2026-09-27; finished 2026-10-09.** `console` and timers came with item 1.
       `crates/script` registers the global object as `window`, `self`,
       `frames`, `parent` and `top` (writable, as browsers' replaceable
       attributes are); `location` with `href` (settable), `protocol`,
@@ -581,12 +581,30 @@ Work:
       a reload through the shell's path; a bad URL throws
       `SyntaxError`. Tests: one script test over every property and
       request, one tab harness test (readiness at each stage, title
-      from script, `location.assign` from a timer pushing history). Not
-      done: `history` (item 3.6), `window.open`, `alert`/`confirm`/
-      `prompt` (shell dialogs), `screen`, `devicePixelRatio`,
-      `innerWidth`/`innerHeight`/scroll positions (item 3.4),
-      `document.domain`/`referrer`/`cookie`, `location.ancestorOrigins`,
-      `navigator.sendBeacon`/`clipboard`, `import.meta`.
+      from script, `location.assign` from a timer pushing history).
+      Finishing pass 2026-10-09: `document.characterSet`/`charset`/
+      `inputEncoding` report the encoding the parser actually used
+      (`Document.encoding`, set by `HtmlParser::finish`; the blocked
+      parser answers while the document is parsing) and `compatMode`
+      reports `BackCompat` in quirks mode; `document.domain` is the
+      origin's host (empty for opaque origins) and its setter does
+      nothing; `document.referrer` is the empty string because nothing
+      sends a `Referer` header yet; `location.ancestorOrigins` is an
+      empty list; `location.replace` has its own `NavKind::Replace`, so
+      it overwrites the entry without the reload's cache bypass. Tests:
+      the script test covers the new properties; two tab harness tests
+      (encoding and mode through the blocked parser and the finished
+      document, quirks against a doctype; replace keeping one entry with
+      the default cache mode). Left to the items that own them:
+      `history` (3.6); `innerWidth`/`innerHeight`, scroll positions,
+      `devicePixelRatio`, `screen` (3.4, they need the viewport from the
+      tab); `navigator.sendBeacon` (3.5, fetch); `navigator.clipboard`
+      (Phase 5); `import.meta.url` (item 2's list). Needing an owner
+      decision before they exist: `document.cookie` (the jar is in
+      `NetService` on another thread and a script cannot block on it),
+      `alert`/`confirm`/`prompt` and `window.open` (shell dialogs;
+      `confirm`/`prompt` need a synchronous answer), referrer tracking
+      (a `Referer` header is a privacy choice).
    2. `Node`, `Element`, `Text`, `Document`: traversal, mutation,
       `querySelector*`, attributes, `classList`, `innerHTML` (fragment
       parser), `textContent`, `dataset`.
