@@ -3,9 +3,10 @@
 //! loop"). Phase 3 items 1 and 2.
 //!
 //! JavaScript sees only what this crate registers (plan D01). So far that
-//! is the language itself, `console`, `queueMicrotask`, the timers and
-//! `requestAnimationFrame`. Everything runs on the tab thread; the
-//! `Context` is `!Send` and never leaves it.
+//! is the language itself, `console`, `queueMicrotask`, the timers,
+//! `requestAnimationFrame`, `window`/`location`/`navigator`/`document`
+//! (item 3.1) and the DOM node classes (`dom.rs`, item 3.2). Everything
+//! runs on the tab thread; the `Context` is `!Send` and never leaves it.
 //!
 //! The web event loop in miniature:
 //!
@@ -31,6 +32,8 @@
 
 #![forbid(unsafe_code)]
 
+mod dom;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -50,7 +53,10 @@ use boa_engine::{
 use boa_gc::{Finalize, Trace};
 use boa_runtime::extensions::{ConsoleExtension, MicrotaskExtension, TimeoutExtension};
 use boa_runtime::{ConsoleState, Logger};
+use browser_dom::Document;
 use url::Url;
+
+use crate::dom::{Dom, SharedDom};
 
 /// What a console call was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,7 +492,7 @@ fn current_url(info: &DocumentInfo) -> Url {
         .unwrap_or_else(|| Url::parse("about:blank").expect("static url"))
 }
 
-fn js_str(s: &str) -> JsValue {
+pub(crate) fn js_str(s: &str) -> JsValue {
     JsString::from(s).into()
 }
 
@@ -554,14 +560,14 @@ fn location_set(_: &JsValue, args: &[JsValue], what: &u8, context: &mut Context)
 }
 
 // Parts of `document`.
-const DOC_URL: u8 = 0;
-const DOC_READY_STATE: u8 = 1;
-const DOC_TITLE: u8 = 2;
-const DOC_CHARSET: u8 = 3;
-const DOC_COMPAT_MODE: u8 = 4;
-const DOC_DOMAIN: u8 = 5;
+pub(crate) const DOC_URL: u8 = 0;
+pub(crate) const DOC_READY_STATE: u8 = 1;
+pub(crate) const DOC_TITLE: u8 = 2;
+pub(crate) const DOC_CHARSET: u8 = 3;
+pub(crate) const DOC_COMPAT_MODE: u8 = 4;
+pub(crate) const DOC_DOMAIN: u8 = 5;
 
-fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) -> JsResult<JsValue> {
+pub(crate) fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) -> JsResult<JsValue> {
     let host = host_state(context)?;
     let info = &host.borrow().info;
     Ok(match *part {
@@ -583,7 +589,7 @@ fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) ->
 
 /// `document.domain = ` is deprecated and does nothing here: there is one
 /// origin per document and no frames to relax it against.
-fn document_set_domain(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+pub(crate) fn document_set_domain(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
 
@@ -595,7 +601,7 @@ fn string_list_contains(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult
     Ok(JsValue::from(false))
 }
 
-fn document_set_title(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+pub(crate) fn document_set_title(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let title = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
     let host = host_state(context)?;
     let mut state = host.borrow_mut();
@@ -604,14 +610,14 @@ fn document_set_title(_: &JsValue, args: &[JsValue], context: &mut Context) -> J
     Ok(JsValue::undefined())
 }
 
-fn getter(context: &mut Context, name: &str, f: NativeFunction) -> JsFunction {
+pub(crate) fn getter(context: &mut Context, name: &str, f: NativeFunction) -> JsFunction {
     FunctionObjectBuilder::new(context.realm(), f)
         .name(JsString::from(format!("get {name}")))
         .length(0)
         .build()
 }
 
-fn setter(context: &mut Context, name: &str, f: NativeFunction) -> JsFunction {
+pub(crate) fn setter(context: &mut Context, name: &str, f: NativeFunction) -> JsFunction {
     FunctionObjectBuilder::new(context.realm(), f)
         .name(JsString::from(format!("set {name}")))
         .length(1)
@@ -707,53 +713,16 @@ fn register_window(context: &mut Context) -> JsResult<()> {
         .property(js_string!("hardwareConcurrency"), threads as i32, fixed)
         .build();
 
-    // document
-    let global = context.global_object();
-    let mut init = ObjectInitializer::new(context);
-    for (name, part) in [
-        ("URL", DOC_URL),
-        ("documentURI", DOC_URL),
-        ("readyState", DOC_READY_STATE),
-        ("characterSet", DOC_CHARSET),
-        ("charset", DOC_CHARSET),
-        ("inputEncoding", DOC_CHARSET),
-        ("compatMode", DOC_COMPAT_MODE),
-    ] {
-        let get = getter(
-            init.context(),
-            name,
-            NativeFunction::from_copy_closure_with_captures(document_get, part),
-        );
-        init.accessor(JsString::from(name), Some(get), None, attr);
-    }
-    let get_title = getter(
-        init.context(),
-        "title",
-        NativeFunction::from_copy_closure_with_captures(document_get, DOC_TITLE),
-    );
-    let set_title = setter(init.context(), "title", NativeFunction::from_fn_ptr(document_set_title));
-    let get_domain = getter(
-        init.context(),
-        "domain",
-        NativeFunction::from_copy_closure_with_captures(document_get, DOC_DOMAIN),
-    );
-    let set_domain = setter(init.context(), "domain", NativeFunction::from_fn_ptr(document_set_domain));
-    init.accessor(js_string!("title"), Some(get_title), Some(set_title), attr)
-        .accessor(js_string!("domain"), Some(get_domain), Some(set_domain), attr)
-        .property(js_string!("location"), location.clone(), fixed)
-        .property(js_string!("defaultView"), global.clone(), fixed)
-        .property(js_string!("contentType"), js_str("text/html"), fixed)
-        // Nothing sends a `Referer` header yet, so no document has one.
-        .property(js_string!("referrer"), js_str(""), fixed);
-    let document = init.build();
-
     // These are [Replaceable] in browsers: a page's `var frames` wins.
+    let global = context.global_object();
     for name in ["window", "self", "frames", "parent", "top"] {
         context.register_global_property(JsString::from(name), global.clone(), Attribute::all())?;
     }
     context.register_global_property(js_string!("location"), location, fixed)?;
     context.register_global_property(js_string!("navigator"), navigator, fixed)?;
-    context.register_global_property(js_string!("document"), document, fixed)?;
+    // `document` and the node classes; `Document.prototype` carries the
+    // document properties of item 3.1 and reads `location` from the global.
+    dom::register(context)?;
     Ok(())
 }
 
@@ -765,6 +734,7 @@ pub struct ScriptHost {
     console: Rc<RefCell<Vec<ConsoleLine>>>,
     modules: Rc<ModuleMap>,
     host: SharedHost,
+    dom: SharedDom,
 }
 
 impl std::fmt::Debug for ScriptHost {
@@ -815,8 +785,10 @@ impl ScriptHost {
         )
         .map_err(|e| e.to_string())?;
         let frames: SharedFrames = Rc::new(RefCell::new(Frames::default()));
+        let dom: SharedDom = Rc::new(RefCell::new(Dom::default()));
         context.insert_data(frames.clone());
         context.insert_data(host.clone());
+        context.insert_data(dom.clone());
         register_window(&mut context).map_err(|e| e.to_string())?;
         context
             .register_global_builtin_callable(
@@ -839,7 +811,21 @@ impl ScriptHost {
             console,
             modules,
             host,
+            dom,
         })
+    }
+
+    /// Give the bindings the document to read and write. Call before
+    /// anything that runs script and `reclaim_document` after; a host
+    /// serves one document for its whole life (node wrappers are cached
+    /// by `NodeId`), so always lend the same one.
+    pub fn lend_document(&mut self, doc: Document) {
+        self.dom.borrow_mut().lend(doc);
+    }
+
+    /// Take the lent document back; the bindings keep an empty one.
+    pub fn reclaim_document(&mut self) -> Document {
+        self.dom.borrow_mut().reclaim()
     }
 
     /// Keep what `location` and `document` report current. `charset` is
@@ -1135,6 +1121,86 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).expect("url")
+    }
+
+    #[test]
+    fn dom_wrappers_traverse_and_read_the_lent_document() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><html><head><title>T</title></head>\
+              <body id=b class='x y'><p id=p class=' a  b a '>Hello <b>world</b><!-- c --></p>\
+              <svg><circle r=1></circle></svg></body></html>",
+        );
+        h.lend_document(doc);
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+
+        // The document node and the classes.
+        assert_eq!(
+            s(&mut h, "[document.nodeType, document.nodeName, document.documentElement.tagName, document.body.id, document.head.firstChild.nodeName, document.head.firstChild.textContent, document.firstChild.nodeType, document.firstChild.nodeName, String(document.firstChild.textContent)].join('|')").as_deref(),
+            Ok("\"9|#document|HTML|b|TITLE|T|10|html|null\"")
+        );
+        assert_eq!(
+            s(&mut h, "var p = document.body.firstElementChild, b = p.firstElementChild, svg = p.nextElementSibling; \
+                       [document instanceof Document, document instanceof Node, !(document instanceof Element), document.body instanceof HTMLElement, document.body instanceof Element, \
+                        p.firstChild instanceof Text, p.firstChild instanceof CharacterData, p.firstChild instanceof Node, p.lastChild instanceof Comment, \
+                        svg instanceof Element, !(svg instanceof HTMLElement), p.classList instanceof DOMTokenList, Object.getPrototypeOf(document) === Document.prototype].every(Boolean)").as_deref(),
+            Ok("true")
+        );
+        // One wrapper per node.
+        assert_eq!(
+            s(&mut h, "[document.body === document.body, p === document.body.firstChild, document.body.parentNode === document.documentElement, document.documentElement.parentNode === document, document.ownerDocument === null, p.ownerDocument === document, p.isSameNode(document.body.firstChild), !p.isSameNode(b)].every(Boolean)").as_deref(),
+            Ok("true")
+        );
+        // Traversal.
+        assert_eq!(
+            s(&mut h, "[p.childNodes.length, p.children.length, p.childElementCount, JSON.stringify(p.firstChild.nodeValue), p.firstChild.data, p.firstChild.length, p.textContent, JSON.stringify(p.lastChild.data), String(p.lastChild.nodeValue), b.previousSibling.nodeType, b.nextSibling.nodeType, p.lastElementChild.tagName, p.firstElementChild === b, String(p.previousSibling), String(p.previousElementSibling), String(svg.nextElementSibling), p.parentElement.id, p.hasChildNodes(), b.firstChild.hasChildNodes(), p.isConnected, document.isConnected].join('|')").as_deref(),
+            Ok("\"3|1|1|\\\"Hello \\\"|Hello |6|Hello world|\\\" c \\\"| c |3|8|B|true|null|null|null|b|true|false|true|true\"")
+        );
+        assert_eq!(
+            s(&mut h, "[document.contains(p), p.contains(p), p.contains(b.firstChild), !p.contains(document.body), !p.contains(null), document.contains(document)].every(Boolean)").as_deref(),
+            Ok("true")
+        );
+        // Attributes and classes.
+        assert_eq!(
+            s(&mut h, "[p.getAttribute('ID'), String(p.getAttribute('nope')), p.hasAttribute('class'), p.hasAttribute('CLASS'), p.hasAttributes(), b.hasAttributes(), p.getAttributeNames().join(','), JSON.stringify(p.className), p.id, b.id, p.classList.length, p.classList.contains('b'), p.classList.contains('c'), p.classList.item(0), p.classList.item(1), String(p.classList.item(2)), String(p.classList.item(-1)), JSON.stringify(String(p.classList)), JSON.stringify(p.classList.value)].join('|')").as_deref(),
+            Ok("\"p|null|true|true|true|false|id,class|\\\" a  b a \\\"|p||2|true|false|a|b|null|null|\\\" a  b a \\\"|\\\" a  b a \\\"\"")
+        );
+        // Namespaces and names.
+        assert_eq!(
+            s(&mut h, "[svg.tagName, svg.localName, svg.namespaceURI, svg.firstElementChild.tagName, svg.firstElementChild.getAttribute('r'), p.localName, p.namespaceURI, p.nodeName].join('|')").as_deref(),
+            Ok("\"svg|svg|http://www.w3.org/2000/svg|circle|1|p|http://www.w3.org/1999/xhtml|P\"")
+        );
+        // Constants, constructors and wrong receivers.
+        assert_eq!(
+            s(&mut h, "[Node.ELEMENT_NODE, p.ELEMENT_NODE, Node.TEXT_NODE, Node.DOCUMENT_NODE, Element.prototype instanceof Node, Object.getPrototypeOf(HTMLElement) === Element].join('|')").as_deref(),
+            Ok("\"1|1|3|9|true|true\"")
+        );
+        assert_eq!(
+            s(&mut h, "var errs = []; try { new Node() } catch (e) { errs.push(e.name) } try { new Element() } catch (e) { errs.push(e.name) } \
+                       try { Object.getOwnPropertyDescriptor(Node.prototype, 'nodeType').get.call({}) } catch (e) { errs.push(e.name) } \
+                       try { Node.prototype.contains.call(1, p) } catch (e) { errs.push(e.name) } errs.join(',')").as_deref(),
+            Ok("\"TypeError,TypeError,TypeError,TypeError\"")
+        );
+        // Item 3.1's document properties still live, now on the prototype.
+        assert_eq!(
+            s(&mut h, "[document.readyState, document.location === location, document.defaultView === window, document.characterSet, document.compatMode, document.contentType, document.referrer === ''].join('|')").as_deref(),
+            Ok("\"loading|true|true|UTF-8|CSS1Compat|text/html|true\"")
+        );
+
+        // The tab takes the document back and changes it; a wrapper whose
+        // node is gone reads as detached and empty, the rest go on.
+        let mut doc = h.reclaim_document();
+        assert_eq!(doc.title().as_deref(), Some("T"));
+        let p_id = doc.children(doc.body().expect("body")).next().expect("p");
+        doc.remove_subtree(p_id);
+        assert_eq!(h.eval_to_string("String(document.body)").as_deref(), Ok("\"null\""), "nothing is lent between calls");
+        h.lend_document(doc);
+        assert_eq!(
+            s(&mut h, "[String(p.parentNode), JSON.stringify(p.textContent), p.childNodes.length, p.nodeType, p.isConnected, String(p.getAttribute('id')), p.classList.length, document.body.firstElementChild === svg, !document.contains(p), svg.isConnected].join('|')").as_deref(),
+            Ok("\"null|\\\"\\\"|0|0|false|null|0|true|true|true\"")
+        );
+        let doc = h.reclaim_document();
+        assert_eq!(doc.children(doc.body().expect("body")).count(), 1);
     }
 
     fn lines(h: &mut ScriptHost) -> Vec<String> {

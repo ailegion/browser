@@ -1417,18 +1417,25 @@ impl TabState {
         }
         // Script timers, then an animation frame if one is due: each
         // callback is a task with its own microtask checkpoint.
-        if let Some(s) = &mut self.script
-            && s.next_wake().is_some_and(|w| now >= w)
+        if self
+            .script
+            .as_ref()
+            .and_then(ScriptHost::next_wake)
+            .is_some_and(|w| now >= w)
         {
-            s.run_timers(now);
+            self.sync_document_info();
+            self.with_script(|s| {
+                s.run_timers(now);
+            });
             self.after_script();
         }
         if self.frame_due.is_some_and(|due| now >= due) {
             self.frame_due = None;
             let time_ms = self.doc_started.elapsed().as_secs_f64() * 1000.0;
-            if let Some(s) = &mut self.script {
+            self.sync_document_info();
+            self.with_script(|s| {
                 s.run_animation_frames(time_ms);
-            }
+            });
             self.needs_paint = true;
             self.after_script();
         }
@@ -1989,6 +1996,29 @@ impl TabState {
         };
     }
 
+    /// Run `f` on the script host with the document lent to it, so the
+    /// DOM bindings can read and write it, and take the document back
+    /// after. The document is moved, not borrowed: it comes out of the
+    /// blocked parser while the page parses and out of `doc` after, and
+    /// goes back to the same place. Nothing else touches it meanwhile,
+    /// since `f` only sees the host.
+    fn with_script(&mut self, f: impl FnOnce(&mut ScriptHost)) {
+        let Some(host) = &mut self.script else { return };
+        let doc = match (&mut self.parser, &mut self.doc) {
+            (Some(parser), _) => std::mem::take(&mut *parser.document_mut()),
+            (None, Some(doc)) => std::mem::take(doc),
+            (None, None) => Document::new(),
+        };
+        host.lend_document(doc);
+        f(host);
+        let doc = host.reclaim_document();
+        match (&mut self.parser, &mut self.doc) {
+            (Some(parser), _) => *parser.document_mut() = doc,
+            (None, Some(slot)) => *slot = doc,
+            (None, None) => {}
+        }
+    }
+
     /// Tell the bindings where the document stands before a script runs:
     /// its URL, its title so far, and its readiness (`loading` while it
     /// parses, `interactive` while deferred scripts remain, `complete`).
@@ -2069,9 +2099,7 @@ impl TabState {
             match self.prepare_script(node) {
                 Prepared::Run(source) => {
                     self.sync_document_info();
-                    if let Some(host) = &mut self.script {
-                        host.run_script(&source);
-                    }
+                    self.with_script(|host| host.run_script(&source));
                     self.after_script();
                 }
                 Prepared::Blocking => return,
@@ -2274,14 +2302,12 @@ impl TabState {
     /// Run a ready script as a task, or report why it cannot run.
     fn execute_script(&mut self, load: ScriptLoad) {
         self.sync_document_info();
-        if let Some(host) = &mut self.script {
-            match load.state {
-                LoadState::Classic(source) => host.run_script_from(&source, load.url.as_ref()),
-                LoadState::Module(m) => host.run_module(m),
-                LoadState::Failed(why) => host.report_error(why),
-                LoadState::Fetching => {}
-            }
-        }
+        self.with_script(|host| match load.state {
+            LoadState::Classic(source) => host.run_script_from(&source, load.url.as_ref()),
+            LoadState::Module(m) => host.run_module(m),
+            LoadState::Failed(why) => host.report_error(why),
+            LoadState::Fetching => {}
+        });
         self.after_script();
     }
 
@@ -3794,6 +3820,27 @@ mod tests {
         assert_eq!(h.title().as_deref(), Some("Second"), "location.assign navigated");
         assert_eq!(console_texts(&h).last().map(String::as_str), Some("loading Second"));
         assert_eq!(h.state.history.len(), 2, "assign pushed an entry");
+    }
+
+    #[test]
+    fn dom_bindings_see_the_tree_while_parsing_and_after() {
+        // The inline script runs with the parser blocked on it: the tree
+        // ends at the script element. The deferred script and the timer
+        // see the finished document, through the same wrappers.
+        let html = "<!DOCTYPE html><title>Tree</title><body class='a b'><p id=first>one</p>\
+            <script>var firstP = document.body.firstElementChild; \
+            console.log([document.body.childNodes.length, document.body.lastChild.tagName, document.body.lastChild.previousSibling.id, String(document.body.nextSibling), document.body.classList.contains('b'), document.readyState, document.documentElement.parentNode === document].join('|'))</script>\
+            <p id=second>two</p>\
+            <script defer src='data:text/javascript,console.log(document.body.children.length, document.body.children[2].id, document.readyState)'></script>\
+            <script>setTimeout(() => console.log(document.body.children.length, document.readyState, document.body.firstElementChild === firstP, firstP.textContent), 0)</script>";
+        let mut h = Harness::load(html);
+        assert_eq!(h.title().as_deref(), Some("Tree"));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.pump();
+        assert_eq!(
+            console_texts(&h),
+            ["2|SCRIPT|first|null|true|loading|true", "5 second interactive", "5 complete true one"]
+        );
     }
 
     #[test]

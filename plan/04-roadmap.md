@@ -608,6 +608,46 @@ Work:
    2. `Node`, `Element`, `Text`, `Document`: traversal, mutation,
       `querySelector*`, attributes, `classList`, `innerHTML` (fragment
       parser), `textContent`, `dataset`.
+      **Block 1 done 2026-10-09: wrappers, traversal, read-only
+      properties.** `crates/script/src/dom.rs`. The tab lends the
+      document to the host around every call that runs script
+      (`TabState::with_script`: the `Document` is moved out of the
+      blocked parser or out of `doc`, into the host's `Dom`, and moved
+      back after; a move is a slotmap handle, so it costs nothing and
+      needs no borrowed reference inside Boa, which would need unsafe
+      code). Wrappers: one `JsObject` per node, made on first access and
+      cached by `NodeId` (`a.parentNode === a.parentNode`), held
+      strongly (O18). Classes through `boa_engine::class::Class` with
+      throwing constructors, chained `HTMLElement` → `Element` → `Node`,
+      `Text`/`Comment` → `CharacterData` → `Node`, `Document` → `Node`,
+      and `DOMTokenList`; `document` is the document node's wrapper and
+      item 3.1's properties moved onto `Document.prototype`. `Node`:
+      `nodeType`, `nodeName`, `nodeValue`, `parentNode`, `parentElement`,
+      `childNodes`, `firstChild`, `lastChild`, `previousSibling`,
+      `nextSibling`, `ownerDocument`, `isConnected`, `textContent`
+      (getter), `hasChildNodes`, `contains`, `isSameNode`, the `*_NODE`
+      constants. `Element`: `tagName`, `localName`, `namespaceURI`,
+      `id`, `className`, `classList` (`length`, `value`, `item`,
+      `contains`, `toString`), `children`, `firstElementChild`,
+      `lastElementChild`, `previousElementSibling`,
+      `nextElementSibling`, `childElementCount`, `getAttribute`,
+      `hasAttribute`, `hasAttributes`, `getAttributeNames` (HTML
+      elements match names case-insensitively). `CharacterData`:
+      `data`, `length`. `Document`: `documentElement`, `head`, `body`.
+      A wrapper whose node was freed from the arena reads as detached
+      and empty rather than panicking. Timer and frame callbacks now
+      get `sync_document_info` before they run, so `readyState` and
+      `title` are current in them too. Tests: one script test over the
+      surface with a parsed document lent in, then changed by the tab
+      between lends; one tab harness test reading the tree from an
+      inline script mid-parse (the tree ends at the script element),
+      from a deferred script and from a timer, with wrapper identity
+      across lends. Simplifications to revisit: `childNodes` and
+      `children` are plain arrays, not live `NodeList`/`HTMLCollection`;
+      `classList` makes a new `DOMTokenList` per access; `Element`
+      methods called on a non-element wrapper answer as if the element
+      had nothing rather than throwing. Blocks 2 (mutation) and 3
+      (selectors, `innerHTML`, `dataset`) follow.
    3. `EventTarget`, `Event`, `MouseEvent`, `KeyboardEvent`, `InputEvent`,
       capture and bubble, `preventDefault`, `addEventListener` options.
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,
