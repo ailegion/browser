@@ -349,6 +349,16 @@ impl Document {
         self.create_node(NodeKind::Text(text.into()))
     }
 
+    /// An element in the HTML namespace with no attributes, detached.
+    pub fn create_html_element(&mut self, local: &str) -> NodeId {
+        self.create_element(QualName::new(None, ns!(html), LocalName::from(local)), Vec::new())
+    }
+
+    /// Whether `id` is in the tree under the document node.
+    pub fn is_connected(&self, id: NodeId) -> bool {
+        id == self.root || self.ancestors(id).any(|a| a == self.root)
+    }
+
     /// Append `child` as the last child of `parent`. `child` must be detached.
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
         debug_assert!(self.nodes[child].parent.is_none());

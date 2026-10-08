@@ -2004,12 +2004,13 @@ impl TabState {
     /// since `f` only sees the host.
     fn with_script(&mut self, f: impl FnOnce(&mut ScriptHost)) {
         let Some(host) = &mut self.script else { return };
+        let parsing = self.parser.is_some();
         let doc = match (&mut self.parser, &mut self.doc) {
             (Some(parser), _) => std::mem::take(&mut *parser.document_mut()),
             (None, Some(doc)) => std::mem::take(doc),
             (None, None) => Document::new(),
         };
-        host.lend_document(doc);
+        host.lend_document(doc, parsing);
         f(host);
         let doc = host.reclaim_document();
         match (&mut self.parser, &mut self.doc) {
@@ -2325,6 +2326,7 @@ impl TabState {
         let Some(host) = &mut self.script else { return };
         let requests = host.take_module_requests();
         let host_requests = host.take_requests();
+        let mutated = host.take_dom_mutated();
         for line in host.take_console() {
             match line.level {
                 ConsoleLevel::Warn | ConsoleLevel::Error => {
@@ -2349,7 +2351,64 @@ impl TabState {
         for url in requests {
             self.fetch_module_source(url);
         }
+        if mutated {
+            self.dom_changed();
+        }
         self.apply_host_requests(host_requests);
+    }
+
+    /// A script changed the tree: restyle the whole document (per-node
+    /// invalidation is later), lay out and paint again, tell the shell
+    /// (the title may have changed), and drop every node reference the
+    /// change may have made stale: a freed node, or one no longer in the
+    /// document. Hover is found again after layout.
+    fn dom_changed(&mut self) {
+        self.needs_style = true;
+        self.needs_layout = true;
+        self.state_dirty = true;
+        let live = |doc: &Document, id: NodeId| doc.contains(id) && doc.is_connected(id);
+        let (focus_lost, hover_lost, press_control_lost, press_lost) = match (&self.parser, &self.doc) {
+            (Some(parser), _) => {
+                let doc = parser.document();
+                self.states.retain_live(&doc);
+                (
+                    self.focus.is_some_and(|f| !live(&doc, f)),
+                    self.hover.is_some_and(|h| !live(&doc, h)),
+                    self.press_control.is_some_and(|p| !live(&doc, p)),
+                    self.press.is_some_and(|(p, _)| !live(&doc, p)),
+                )
+            }
+            (None, Some(doc)) => {
+                self.states.retain_live(doc);
+                (
+                    self.focus.is_some_and(|f| !live(doc, f)),
+                    self.hover.is_some_and(|h| !live(doc, h)),
+                    self.press_control.is_some_and(|p| !live(doc, p)),
+                    self.press.is_some_and(|(p, _)| !live(doc, p)),
+                )
+            }
+            (None, None) => return,
+        };
+        if focus_lost {
+            self.focus = None;
+            self.focus_ring.clear();
+            self.caret_rect = None;
+            self.states.set_single(None, ElementStates::FOCUS);
+            self.states.set_single(None, ElementStates::FOCUS_VISIBLE);
+            self.states.set_single(None, ElementStates::FOCUS_WITHIN);
+        }
+        if hover_lost {
+            self.hover = None;
+            self.states.set_single(None, ElementStates::HOVER);
+            self.hover_dirty = true;
+        }
+        if press_control_lost {
+            self.press_control = None;
+        }
+        if press_lost {
+            self.press = None;
+            self.states.set_single(None, ElementStates::ACTIVE);
+        }
     }
 
     fn collect_stylesheets(&mut self) {
@@ -3841,6 +3900,58 @@ mod tests {
             console_texts(&h),
             ["2|SCRIPT|first|null|true|loading|true", "5 second interactive", "5 complete true one"]
         );
+    }
+
+    #[test]
+    fn dom_mutation_from_script_restyles_relays_out_and_drops_stale_focus() {
+        // While parsing: emptying the body detaches the running script's
+        // element without freeing it, and the parser goes on under body.
+        let html = "<!DOCTYPE html><title>Mut</title><style>.big { height: 100px } p { height: 10px }</style>\
+            <body><p>gone</p><script>document.body.textContent = ''</script><p id=kept>kept</p>\
+            <a id=link href='#x'>link</a><div id=root></div>\
+            <script>setTimeout(() => { \
+                var p = document.createElement('p'); p.textContent = 'two'; p.classList.add('big'); \
+                document.getElementById === undefined; \
+                var root = document.body.children[2]; root.appendChild(p); \
+                document.body.firstElementChild.remove(); \
+                document.body.children[0].remove(); \
+                document.title = 'Changed'; \
+                console.log(document.body.children.length, root.firstChild.tagName, root.firstChild.className); }, 30)</script>";
+        let mut h = Harness::load(html);
+        // After the parse: the first <p> and the first script are gone, the
+        // rest was built under the (now empty) body.
+        {
+            let doc = h.state.doc.as_ref().expect("document");
+            let body = doc.body().expect("body");
+            let tags: Vec<String> = doc
+                .children(body)
+                .filter_map(|c| doc.element(c).map(|e| e.name.local.to_string()))
+                .collect();
+            assert_eq!(tags, ["p", "a", "div", "script"]);
+        }
+        // Focus the link from the keyboard, then let the timer remove it.
+        h.key(Key::Tab, false);
+        assert_eq!(h.state.focus, Some(h.by_id("link")));
+        assert!(!h.state.focus_ring.is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        h.pump();
+        assert_eq!(console_texts(&h).last().map(String::as_str), Some("2 P big"));
+        assert_eq!(h.state.focus, None, "the focused link left the document");
+        assert!(h.state.focus_ring.is_empty());
+        assert!(!h.state.needs_style && !h.state.needs_layout, "the flush ran");
+        assert_eq!(h.title().as_deref(), Some("Changed"));
+        let root = h.by_id("root");
+        let p = {
+            let doc = h.state.doc.as_ref().expect("document");
+            doc.children(root).next().expect("the appended p")
+        };
+        assert_eq!(h.rect_of(p).height, 100.0, "the new element was styled and laid out");
+        {
+            let doc = h.state.doc.as_ref().expect("document");
+            let body = doc.body().expect("body");
+            assert_eq!(doc.children(body).count(), 2, "the removed elements are out of the tree");
+            assert!(doc.descendants(doc.root()).all(|n| doc.element(n).is_none_or(|e| e.id() != Some("link"))));
+        }
     }
 
     #[test]

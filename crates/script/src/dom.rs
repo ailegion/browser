@@ -48,18 +48,52 @@ pub(crate) struct Dom {
     wrappers: HashMap<NodeId, JsObject>,
     /// The wrapper of the document node, which is the `document` global.
     document: Option<JsObject>,
+    /// A script changed the connected tree since the tab last asked.
+    mutated: bool,
+    /// The parser is still building the document: nodes it may hold open
+    /// must stay in the arena, so nothing is freed while this is set.
+    parsing: bool,
 }
 
 pub(crate) type SharedDom = Rc<RefCell<Dom>>;
 
 impl Dom {
-    pub(crate) fn lend(&mut self, doc: Document) {
+    pub(crate) fn lend(&mut self, doc: Document, parsing: bool) {
         self.doc = doc;
+        self.parsing = parsing;
     }
 
     pub(crate) fn reclaim(&mut self) -> Document {
         std::mem::take(&mut self.doc)
     }
+
+    pub(crate) fn take_mutated(&mut self) -> bool {
+        std::mem::take(&mut self.mutated)
+    }
+
+    /// Detach `id`, and free its subtree when nothing can reach it any
+    /// more: no wrapper names a node in it and the parser is not running
+    /// (its open elements may be in there). A subtree a script holds
+    /// stays, detached, as a browser keeps a node a reference points at.
+    fn discard(&mut self, id: NodeId) {
+        self.doc.detach(id);
+        if self.parsing || self.wrappers.contains_key(&id) {
+            return;
+        }
+        if self.doc.descendants(id).any(|d| self.wrappers.contains_key(&d)) {
+            return;
+        }
+        self.doc.remove_subtree(id);
+    }
+}
+
+/// An error with a `DOMException` name (`NotFoundError`,
+/// `HierarchyRequestError`, ...). Boa has no `DOMException` class; this is
+/// an `Error` whose `name` is set, which is what code checks.
+fn dom_exception(name: &str, message: &str, context: &mut Context) -> boa_engine::JsError {
+    let error = JsNativeError::error().with_message(message.to_owned()).into_opaque(context);
+    let _ = error.set(js_string!("name"), js_str(name), false, context);
+    boa_engine::JsError::from_opaque(error.into())
 }
 
 fn dom(context: &mut Context) -> JsResult<SharedDom> {
@@ -189,6 +223,20 @@ fn add_getter(class: &mut ClassBuilder<'_>, name: &str, prop: Prop) {
     class.accessor(JsString::from(name), Some(get), None, ATTR);
 }
 
+fn add_accessor(class: &mut ClassBuilder<'_>, name: &str, prop: Prop, set_prop: SetProp) {
+    let get = getter(
+        class.context(),
+        name,
+        NativeFunction::from_copy_closure_with_captures(get, prop),
+    );
+    let set = setter(
+        class.context(),
+        name,
+        NativeFunction::from_copy_closure_with_captures(set, set_prop),
+    );
+    class.accessor(JsString::from(name), Some(get), Some(set), ATTR);
+}
+
 fn add_method(class: &mut ClassBuilder<'_>, name: &str, length: usize, method: Method) {
     class.method(
         JsString::from(name),
@@ -197,11 +245,18 @@ fn add_method(class: &mut ClassBuilder<'_>, name: &str, length: usize, method: M
     );
 }
 
+fn add_mutator(class: &mut ClassBuilder<'_>, name: &str, length: usize, method: MutMethod) {
+    class.method(
+        JsString::from(name),
+        length,
+        NativeFunction::from_copy_closure_with_captures(mutate_call, method),
+    );
+}
+
 fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     for (name, prop) in [
         ("nodeType", Prop::NodeType),
         ("nodeName", Prop::NodeName),
-        ("nodeValue", Prop::NodeValue),
         ("parentNode", Prop::ParentNode),
         ("parentElement", Prop::ParentElement),
         ("childNodes", Prop::ChildNodes),
@@ -211,13 +266,18 @@ fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         ("nextSibling", Prop::NextSibling),
         ("ownerDocument", Prop::OwnerDocument),
         ("isConnected", Prop::IsConnected),
-        ("textContent", Prop::TextContent),
     ] {
         add_getter(class, name, prop);
     }
+    add_accessor(class, "nodeValue", Prop::NodeValue, SetProp::NodeValue);
+    add_accessor(class, "textContent", Prop::TextContent, SetProp::TextContent);
     add_method(class, "hasChildNodes", 0, Method::HasChildNodes);
     add_method(class, "contains", 1, Method::Contains);
     add_method(class, "isSameNode", 1, Method::IsSameNode);
+    add_mutator(class, "appendChild", 1, MutMethod::AppendChild);
+    add_mutator(class, "insertBefore", 2, MutMethod::InsertBefore);
+    add_mutator(class, "removeChild", 1, MutMethod::RemoveChild);
+    add_mutator(class, "replaceChild", 2, MutMethod::ReplaceChild);
     for (name, value) in [
         ("ELEMENT_NODE", 1),
         ("ATTRIBUTE_NODE", 2),
@@ -240,8 +300,6 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         ("tagName", Prop::TagName),
         ("localName", Prop::LocalName),
         ("namespaceURI", Prop::NamespaceUri),
-        ("id", Prop::Id),
-        ("className", Prop::ClassName),
         ("classList", Prop::ClassList),
         ("children", Prop::Children),
         ("firstElementChild", Prop::FirstElementChild),
@@ -252,16 +310,23 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     ] {
         add_getter(class, name, prop);
     }
+    add_accessor(class, "id", Prop::Id, SetProp::Id);
+    add_accessor(class, "className", Prop::ClassName, SetProp::ClassName);
     add_method(class, "getAttribute", 1, Method::GetAttribute);
     add_method(class, "hasAttribute", 1, Method::HasAttribute);
     add_method(class, "hasAttributes", 0, Method::HasAttributes);
     add_method(class, "getAttributeNames", 0, Method::GetAttributeNames);
+    add_mutator(class, "setAttribute", 2, MutMethod::SetAttribute);
+    add_mutator(class, "removeAttribute", 1, MutMethod::RemoveAttribute);
+    add_mutator(class, "toggleAttribute", 1, MutMethod::ToggleAttribute);
+    add_mutator(class, "remove", 0, MutMethod::Remove);
     Ok(())
 }
 
 fn init_character_data(class: &mut ClassBuilder<'_>) -> JsResult<()> {
-    add_getter(class, "data", Prop::Data);
+    add_accessor(class, "data", Prop::Data, SetProp::Data);
     add_getter(class, "length", Prop::Length);
+    add_mutator(class, "remove", 0, MutMethod::Remove);
     Ok(())
 }
 
@@ -273,6 +338,9 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     ] {
         add_getter(class, name, prop);
     }
+    add_mutator(class, "createElement", 1, MutMethod::CreateElement);
+    add_mutator(class, "createTextNode", 1, MutMethod::CreateTextNode);
+    add_mutator(class, "createComment", 1, MutMethod::CreateComment);
     // Item 3.1's properties, which read the tab's `DocumentInfo`.
     for (name, part) in [
         ("URL", DOC_URL),
@@ -330,6 +398,10 @@ fn init_token_list(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         ("item", 1, TokenMethod::Item),
         ("contains", 1, TokenMethod::Contains),
         ("toString", 0, TokenMethod::ToString),
+        ("add", 0, TokenMethod::Add),
+        ("remove", 0, TokenMethod::Remove),
+        ("toggle", 1, TokenMethod::Toggle),
+        ("replace", 2, TokenMethod::Replace),
     ] {
         class.method(
             JsString::from(name),
@@ -544,7 +616,7 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
         PreviousSibling => Out::Node(node.prev_sibling),
         NextSibling => Out::Node(node.next_sibling),
         OwnerDocument => Out::Node((id != doc.root()).then(|| doc.root())),
-        IsConnected => Out::Value((id == doc.root() || doc.ancestors(id).any(|a| a == doc.root())).into()),
+        IsConnected => Out::Value(doc.is_connected(id).into()),
         TagName => Out::Value(element.map_or(JsValue::null(), |e| js_str(&element_name(e)))),
         LocalName => Out::Value(element.map_or(JsValue::null(), |e| js_str(&e.name.local))),
         NamespaceUri => Out::Value(element.map_or(JsValue::null(), |e| js_str(&e.name.ns))),
@@ -646,6 +718,313 @@ fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context
     })
 }
 
+// ----- mutation -----
+
+/// Why a mutation was refused: a `DOMException` by name, or a `TypeError`.
+enum Fail {
+    Dom(&'static str, String),
+    Type(String),
+}
+
+impl Fail {
+    fn hierarchy(msg: &str) -> Self {
+        Fail::Dom("HierarchyRequestError", msg.to_owned())
+    }
+
+    fn into_error(self, context: &mut Context) -> boa_engine::JsError {
+        match self {
+            Fail::Dom(name, msg) => dom_exception(name, &msg, context),
+            Fail::Type(msg) => JsNativeError::typ().with_message(msg).into(),
+        }
+    }
+}
+
+/// Replace the text of a text, comment or processing instruction node.
+fn set_data(doc: &mut Document, id: NodeId, text: String) {
+    match &mut doc.get_mut(id).kind {
+        NodeKind::Text(t) | NodeKind::Comment(t) | NodeKind::ProcessingInstruction { data: t, .. } => *t = text,
+        _ => {}
+    }
+}
+
+/// Replace every child of `id` with one text node (none for empty text).
+fn replace_children_with_text(dom: &mut Dom, id: NodeId, text: &str) {
+    let children: Vec<NodeId> = dom.doc.children(id).collect();
+    for c in children {
+        dom.discard(c);
+    }
+    if !text.is_empty() {
+        let t = dom.doc.create_text(text);
+        dom.doc.append_child(id, t);
+    }
+}
+
+/// An attribute name a script may set: not empty, no whitespace or
+/// markup characters.
+fn valid_attribute_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || matches!(c, '"' | '\'' | '>' | '/' | '='))
+}
+
+/// An element name `createElement` accepts: a letter, then name
+/// characters.
+fn valid_element_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') || !c.is_ascii())
+}
+
+#[derive(Clone, Trace, Finalize)]
+enum SetProp {
+    NodeValue,
+    TextContent,
+    Data,
+    Id,
+    ClassName,
+}
+
+fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) -> JsResult<JsValue> {
+    let node = this_node(this)?;
+    let value = args.get_or_undefined(0);
+    // `nodeValue` and `textContent` take null as the empty string.
+    let text = if value.is_null_or_undefined() && matches!(prop, SetProp::NodeValue | SetProp::TextContent) {
+        String::new()
+    } else {
+        value.to_string(context)?.to_std_string_escaped()
+    };
+    let shared = dom(context)?;
+    let mut dom = shared.borrow_mut();
+    let Some(id) = node.resolve(&dom.doc) else {
+        return Ok(JsValue::undefined());
+    };
+    let connected = dom.doc.is_connected(id);
+    let is_element = dom.doc.get(id).is_element();
+    match prop {
+        SetProp::TextContent if is_element => replace_children_with_text(&mut dom, id, &text),
+        SetProp::TextContent | SetProp::NodeValue | SetProp::Data => set_data(&mut dom.doc, id, text),
+        SetProp::Id | SetProp::ClassName => {
+            let name = if matches!(prop, SetProp::Id) { "id" } else { "class" };
+            if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
+                e.set_attr(name, &text);
+            }
+        }
+    }
+    if connected {
+        dom.mutated = true;
+    }
+    Ok(JsValue::undefined())
+}
+
+#[derive(Clone, Trace, Finalize)]
+enum MutMethod {
+    AppendChild,
+    InsertBefore,
+    RemoveChild,
+    ReplaceChild,
+    Remove,
+    SetAttribute,
+    RemoveAttribute,
+    ToggleAttribute,
+    CreateElement,
+    CreateTextNode,
+    CreateComment,
+}
+
+/// The node argument at `index`, which must be a node wrapper whose node
+/// still exists.
+fn node_arg(args: &[JsValue], index: usize, doc: &Document) -> Result<NodeId, Fail> {
+    arg_node(args, index)
+        .and_then(|n| n.resolve(doc))
+        .ok_or_else(|| Fail::Type(format!("parameter {} is not of type 'Node'", index + 1)))
+}
+
+/// The DOM's pre-insert checks for putting `child` under `parent`, before
+/// `reference` when given. Returns the reference to use (a node inserted
+/// before itself goes before its next sibling).
+fn check_insert(
+    doc: &Document,
+    parent: NodeId,
+    child: NodeId,
+    reference: Option<NodeId>,
+) -> Result<Option<NodeId>, Fail> {
+    if !matches!(doc.get(parent).kind, NodeKind::Document | NodeKind::Element(_)) {
+        return Err(Fail::hierarchy("the parent cannot have children"));
+    }
+    if child == parent || doc.ancestors(parent).any(|a| a == child) {
+        return Err(Fail::hierarchy("the new child contains the parent"));
+    }
+    if child == doc.root() {
+        return Err(Fail::hierarchy("a document cannot be inserted"));
+    }
+    if let Some(r) = reference
+        && doc.parent(r) != Some(parent)
+    {
+        return Err(Fail::Dom("NotFoundError", "the reference node is not a child of the parent".to_owned()));
+    }
+    if parent == doc.root() {
+        match &doc.get(child).kind {
+            NodeKind::Text(_) => return Err(Fail::hierarchy("a text node cannot be a child of the document")),
+            NodeKind::Element(_) if doc.children(parent).any(|c| c != child && doc.get(c).is_element()) => {
+                return Err(Fail::hierarchy("the document already has a document element"));
+            }
+            _ => {}
+        }
+    }
+    Ok(if reference == Some(child) { doc.next_sibling(child) } else { reference })
+}
+
+/// Put `child` under `parent` before `reference`, moving it if attached.
+fn insert(doc: &mut Document, parent: NodeId, child: NodeId, reference: Option<NodeId>) {
+    doc.detach(child);
+    match reference {
+        Some(r) => doc.insert_before(r, child),
+        None => doc.append_child(parent, child),
+    }
+}
+
+fn mutate_call(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &mut Context) -> JsResult<JsValue> {
+    use MutMethod::*;
+    let node = this_node(this)?;
+    // String arguments are converted before the borrow: that can run script.
+    let strings: Vec<String> = match method {
+        SetAttribute => vec![
+            args.get_or_undefined(0).to_string(context)?.to_std_string_escaped(),
+            args.get_or_undefined(1).to_string(context)?.to_std_string_escaped(),
+        ],
+        RemoveAttribute | ToggleAttribute | CreateElement | CreateTextNode | CreateComment => {
+            vec![args.get_or_undefined(0).to_string(context)?.to_std_string_escaped()]
+        }
+        _ => Vec::new(),
+    };
+    let force = match method {
+        ToggleAttribute => args.get(1).filter(|v| !v.is_undefined()).map(JsValue::to_boolean),
+        _ => None,
+    };
+    let shared = dom(context)?;
+    let result = {
+        let mut dom = shared.borrow_mut();
+        mutate(&mut dom, node, args, method, &strings, force)
+    };
+    match result {
+        Ok(out) => finish(out, context),
+        Err(fail) => Err(fail.into_error(context)),
+    }
+}
+
+fn mutate(
+    dom: &mut Dom,
+    node: DomNode,
+    args: &[JsValue],
+    method: &MutMethod,
+    strings: &[String],
+    force: Option<bool>,
+) -> Result<Out, Fail> {
+    use MutMethod::*;
+    // Creating a detached node changes nothing the tab can see.
+    match method {
+        CreateElement => {
+            let name = strings[0].to_ascii_lowercase();
+            if !valid_element_name(&name) {
+                return Err(Fail::Dom("InvalidCharacterError", format!("'{}' is not a valid element name", strings[0])));
+            }
+            return Ok(Out::Node(Some(dom.doc.create_html_element(&name))));
+        }
+        CreateTextNode => return Ok(Out::Node(Some(dom.doc.create_text(strings[0].clone())))),
+        CreateComment => return Ok(Out::Node(Some(dom.doc.create_node(NodeKind::Comment(strings[0].clone()))))),
+        _ => {}
+    }
+    let Some(id) = node.resolve(&dom.doc) else {
+        return Err(Fail::hierarchy("the node is gone"));
+    };
+    let mut connected = dom.doc.is_connected(id);
+    let out = match method {
+        AppendChild | InsertBefore => {
+            let child = node_arg(args, 0, &dom.doc)?;
+            let reference = match method {
+                InsertBefore if !args.get_or_undefined(1).is_null_or_undefined() => Some(node_arg(args, 1, &dom.doc)?),
+                _ => None,
+            };
+            let reference = check_insert(&dom.doc, id, child, reference)?;
+            connected |= dom.doc.is_connected(child);
+            insert(&mut dom.doc, id, child, reference);
+            Out::Node(Some(child))
+        }
+        ReplaceChild => {
+            let new = node_arg(args, 0, &dom.doc)?;
+            let old = node_arg(args, 1, &dom.doc)?;
+            if dom.doc.parent(old) != Some(id) {
+                return Err(Fail::Dom("NotFoundError", "the node to be replaced is not a child of this node".to_owned()));
+            }
+            let reference = check_insert(&dom.doc, id, new, Some(old))?;
+            connected |= dom.doc.is_connected(new);
+            // The reference is `old` itself unless `new` is `old`; the
+            // node after `old` is where `new` goes once `old` is out.
+            let reference = if reference == Some(old) { dom.doc.next_sibling(old) } else { reference };
+            dom.doc.detach(old);
+            insert(&mut dom.doc, id, new, reference);
+            Out::Node(Some(old))
+        }
+        RemoveChild => {
+            let child = node_arg(args, 0, &dom.doc)?;
+            if dom.doc.parent(child) != Some(id) {
+                return Err(Fail::Dom("NotFoundError", "the node to be removed is not a child of this node".to_owned()));
+            }
+            // Returned to the caller, so it is held and stays in the arena.
+            dom.doc.detach(child);
+            Out::Node(Some(child))
+        }
+        Remove => {
+            dom.doc.detach(id);
+            Out::Value(JsValue::undefined())
+        }
+        SetAttribute | RemoveAttribute | ToggleAttribute => {
+            let Some(e) = dom.doc.get_mut(id).as_element_mut() else {
+                return Ok(Out::Value(JsValue::undefined()));
+            };
+            let name = if e.is_html() { strings[0].to_ascii_lowercase() } else { strings[0].clone() };
+            if !matches!(method, RemoveAttribute) && !valid_attribute_name(&name) {
+                return Err(Fail::Dom("InvalidCharacterError", format!("'{}' is not a valid attribute name", strings[0])));
+            }
+            match method {
+                SetAttribute => {
+                    e.set_attr(&name, &strings[1]);
+                    Out::Value(JsValue::undefined())
+                }
+                RemoveAttribute => {
+                    connected &= e.attr(&name).is_some();
+                    e.remove_attr(&name);
+                    Out::Value(JsValue::undefined())
+                }
+                _ => {
+                    let present = e.attr(&name).is_some();
+                    let keep = match (present, force) {
+                        (true, Some(true)) | (false, Some(false)) => {
+                            connected = false;
+                            present
+                        }
+                        (true, _) => {
+                            e.remove_attr(&name);
+                            false
+                        }
+                        (false, _) => {
+                            e.set_attr(&name, "");
+                            true
+                        }
+                    };
+                    Out::Value(keep.into())
+                }
+            }
+        }
+        CreateElement | CreateTextNode | CreateComment => unreachable!("handled above"),
+    };
+    if connected {
+        dom.mutated = true;
+    }
+    Ok(out)
+}
+
 // ----- DOMTokenList (classList) -----
 
 /// A live view of an element's `class` attribute as a token set.
@@ -666,6 +1045,10 @@ enum TokenMethod {
     Item,
     Contains,
     ToString,
+    Add,
+    Remove,
+    Toggle,
+    Replace,
 }
 
 fn this_token_list(this: &JsValue) -> JsResult<TokenList> {
@@ -705,35 +1088,140 @@ fn token_get(this: &JsValue, _: &[JsValue], prop: &TokenProp, context: &mut Cont
     })
 }
 
+/// A token for `add`, `remove` and friends: not empty, no whitespace.
+fn check_token(token: &str) -> Result<(), Fail> {
+    if token.is_empty() {
+        Err(Fail::Dom("SyntaxError", "the token provided must not be empty".to_owned()))
+    } else if token.chars().any(|c| c.is_ascii_whitespace()) {
+        Err(Fail::Dom("InvalidCharacterError", format!("the token '{token}' contains whitespace")))
+    } else {
+        Ok(())
+    }
+}
+
 fn token_call(this: &JsValue, args: &[JsValue], method: &TokenMethod, context: &mut Context) -> JsResult<JsValue> {
+    use TokenMethod::*;
     let list = this_token_list(this)?;
-    let arg = match method {
-        TokenMethod::Item => Some(args.get_or_undefined(0).to_number(context)?),
+    let index = match method {
+        Item => Some(args.get_or_undefined(0).to_number(context)?),
         _ => None,
     };
-    let token = match method {
-        TokenMethod::Contains => Some(args.get_or_undefined(0).to_string(context)?.to_std_string_escaped()),
+    // String arguments are converted before the borrow: that can run script.
+    let count = match method {
+        Contains | Toggle => 1,
+        Replace => 2,
+        Add | Remove => args.len(),
+        Item | ToString => 0,
+    };
+    let mut strings = Vec::with_capacity(count);
+    for i in 0..count {
+        strings.push(args.get_or_undefined(i).to_string(context)?.to_std_string_escaped());
+    }
+    let force = match method {
+        Toggle => args.get(1).filter(|v| !v.is_undefined()).map(JsValue::to_boolean),
         _ => None,
     };
     let shared = dom(context)?;
-    let dom = shared.borrow();
-    let tokens = tokens(&dom.doc, list.id);
-    Ok(match method {
-        TokenMethod::Item => {
-            let index = arg.unwrap_or(f64::NAN);
+    let result = {
+        let mut dom = shared.borrow_mut();
+        token_mutate(&mut dom, list.id, method, index, &strings, force)
+    };
+    result.map_err(|fail| fail.into_error(context))
+}
+
+fn token_mutate(
+    dom: &mut Dom,
+    id: NodeId,
+    method: &TokenMethod,
+    index: Option<f64>,
+    strings: &[String],
+    force: Option<bool>,
+) -> Result<JsValue, Fail> {
+    use TokenMethod::*;
+    let mut tokens = tokens(&dom.doc, id);
+    let class_attr = |dom: &Dom| {
+        dom.doc
+            .contains(id)
+            .then(|| dom.doc.get(id).as_element().and_then(|e| e.attr("class").map(str::to_owned)))
+            .flatten()
+    };
+    let result = match method {
+        Item => {
+            let index = index.unwrap_or(f64::NAN);
             if index >= 0.0 && index < tokens.len() as f64 {
                 js_str(&tokens[index as usize])
             } else {
                 JsValue::null()
             }
         }
-        TokenMethod::Contains => tokens.iter().any(|t| Some(t) == token.as_ref()).into(),
-        TokenMethod::ToString => js_str(
-            dom.doc
-                .contains(list.id)
-                .then(|| dom.doc.get(list.id).as_element().and_then(|e| e.attr("class")))
-                .flatten()
-                .unwrap_or(""),
-        ),
-    })
+        Contains => tokens.iter().any(|t| t == &strings[0]).into(),
+        ToString => js_str(class_attr(dom).as_deref().unwrap_or("")),
+        Add => {
+            for t in strings {
+                check_token(t)?;
+            }
+            for t in strings {
+                if !tokens.contains(t) {
+                    tokens.push(t.clone());
+                }
+            }
+            JsValue::undefined()
+        }
+        Remove => {
+            for t in strings {
+                check_token(t)?;
+            }
+            tokens.retain(|t| !strings.contains(t));
+            JsValue::undefined()
+        }
+        Toggle => {
+            let token = &strings[0];
+            check_token(token)?;
+            let present = tokens.contains(token);
+            match (present, force) {
+                (true, Some(true)) => true.into(),
+                (false, Some(false)) => false.into(),
+                (true, _) => {
+                    tokens.retain(|t| t != token);
+                    false.into()
+                }
+                (false, _) => {
+                    tokens.push(token.clone());
+                    true.into()
+                }
+            }
+        }
+        Replace => {
+            check_token(&strings[0])?;
+            check_token(&strings[1])?;
+            match tokens.iter().position(|t| t == &strings[0]) {
+                Some(at) => {
+                    tokens[at] = strings[1].clone();
+                    // The replacement may already be in the set: keep one.
+                    let mut seen = Vec::new();
+                    tokens.retain(|t| {
+                        let new = !seen.contains(t);
+                        seen.push(t.clone());
+                        new
+                    });
+                    true.into()
+                }
+                None => false.into(),
+            }
+        }
+    };
+    if matches!(method, Add | Remove | Toggle | Replace) {
+        // The update steps: an empty set with no attribute stays absent.
+        let serialized = tokens.join(" ");
+        let had_attr = class_attr(dom).is_some();
+        if (had_attr || !tokens.is_empty()) && class_attr(dom).as_deref() != Some(&serialized) {
+            if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
+                e.set_attr("class", &serialized);
+            }
+            if dom.doc.contains(id) && dom.doc.is_connected(id) {
+                dom.mutated = true;
+            }
+        }
+    }
+    Ok(result)
 }

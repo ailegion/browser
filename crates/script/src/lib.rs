@@ -818,14 +818,23 @@ impl ScriptHost {
     /// Give the bindings the document to read and write. Call before
     /// anything that runs script and `reclaim_document` after; a host
     /// serves one document for its whole life (node wrappers are cached
-    /// by `NodeId`), so always lend the same one.
-    pub fn lend_document(&mut self, doc: Document) {
-        self.dom.borrow_mut().lend(doc);
+    /// by `NodeId`), so always lend the same one. `parsing` says the
+    /// parser is still building it: nodes it may hold open are then
+    /// detached rather than freed when a script removes them.
+    pub fn lend_document(&mut self, doc: Document, parsing: bool) {
+        self.dom.borrow_mut().lend(doc, parsing);
     }
 
     /// Take the lent document back; the bindings keep an empty one.
     pub fn reclaim_document(&mut self) -> Document {
         self.dom.borrow_mut().reclaim()
+    }
+
+    /// Whether a script changed the connected tree (structure, text or
+    /// attributes) since the last call: the tab restyles and lays out
+    /// again, and drops node references the change may have invalidated.
+    pub fn take_dom_mutated(&mut self) -> bool {
+        self.dom.borrow_mut().take_mutated()
     }
 
     /// Keep what `location` and `document` report current. `charset` is
@@ -1131,7 +1140,7 @@ mod tests {
               <body id=b class='x y'><p id=p class=' a  b a '>Hello <b>world</b><!-- c --></p>\
               <svg><circle r=1></circle></svg></body></html>",
         );
-        h.lend_document(doc);
+        h.lend_document(doc, false);
         let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
 
         // The document node and the classes.
@@ -1194,7 +1203,7 @@ mod tests {
         let p_id = doc.children(doc.body().expect("body")).next().expect("p");
         doc.remove_subtree(p_id);
         assert_eq!(h.eval_to_string("String(document.body)").as_deref(), Ok("\"null\""), "nothing is lent between calls");
-        h.lend_document(doc);
+        h.lend_document(doc, false);
         assert_eq!(
             s(&mut h, "[String(p.parentNode), JSON.stringify(p.textContent), p.childNodes.length, p.nodeType, p.isConnected, String(p.getAttribute('id')), p.classList.length, document.body.firstElementChild === svg, !document.contains(p), svg.isConnected].join('|')").as_deref(),
             Ok("\"null|\\\"\\\"|0|0|false|null|0|true|true|true\"")
@@ -1205,6 +1214,99 @@ mod tests {
 
     fn lines(h: &mut ScriptHost) -> Vec<String> {
         h.take_console().into_iter().map(|l| l.text).collect()
+    }
+
+    #[test]
+    fn dom_mutation_moves_nodes_edits_attributes_and_reports_changes() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><html><head></head><body><div id=a><p id=p>one</p><span id=s>two</span></div><div id=b></div></body></html>",
+        );
+        let before = doc.node_count();
+        h.lend_document(doc, false);
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+
+        // Creating detached nodes is not a change the tab needs to see.
+        assert_eq!(
+            s(&mut h, "var a = document.getElementById; var A = document.body.firstElementChild, B = A.nextElementSibling, p = A.firstElementChild, sp = p.nextElementSibling; \
+                       var n = document.createElement('P'), t = document.createTextNode('new'), c = document.createComment('x'); \
+                       [n.tagName, n instanceof HTMLElement, String(n.parentNode), n.isConnected, t.data, t instanceof Text, c.nodeType].join('|')").as_deref(),
+            Ok("\"P|true|null|false|new|true|8\"")
+        );
+        assert!(!h.take_dom_mutated());
+        // appendChild attaches and returns the child; a connected node is moved.
+        assert_eq!(
+            s(&mut h, "[n.appendChild(t) === t, n.textContent, B.appendChild(n) === n, n.parentNode === B, n.isConnected, B.appendChild(p) === p, A.children.length, B.children.length, B.lastChild === p].join('|')").as_deref(),
+            Ok("\"true|new|true|true|true|true|1|2|true\"")
+        );
+        assert!(h.take_dom_mutated());
+        assert!(!h.take_dom_mutated(), "reported once");
+        // insertBefore with and without a reference, before itself, and replaceChild.
+        assert_eq!(
+            s(&mut h, "[A.insertBefore(p, sp) === p, A.firstChild === p, A.insertBefore(p, p) === p, A.firstChild === p, A.insertBefore(n, null) === n, A.lastChild === n, \
+                       B.children.length, A.replaceChild(c, sp) === sp, String(sp.parentNode), A.childNodes[1] === c, A.replaceChild(c, c) === c, A.childNodes.length].join('|')").as_deref(),
+            Ok("\"true|true|true|true|true|true|0|true|null|true|true|3\"")
+        );
+        // removeChild returns the node, which lives on detached; remove() too.
+        assert_eq!(
+            s(&mut h, "var r = A.removeChild(n); n.remove(); [r === n, String(n.parentNode), n.textContent, A.childNodes.length, (c.remove(), A.childNodes.length), c.isConnected].join('|')").as_deref(),
+            Ok("\"true|null|new|2|1|false\"")
+        );
+        assert!(h.take_dom_mutated());
+        // Errors by DOMException name, or TypeError for a non-node.
+        assert_eq!(
+            s(&mut h, "var errs = []; var tryit = f => { try { f() } catch (e) { errs.push(e.name) } }; \
+                       tryit(() => A.appendChild(document.body)); tryit(() => p.appendChild(p)); tryit(() => A.appendChild(document)); \
+                       tryit(() => A.insertBefore(n, sp)); tryit(() => A.removeChild(sp)); tryit(() => A.replaceChild(n, sp)); \
+                       tryit(() => A.appendChild({})); tryit(() => A.appendChild(null)); tryit(() => p.firstChild.appendChild(n)); \
+                       tryit(() => document.appendChild(t)); tryit(() => document.appendChild(n)); tryit(() => document.createElement('1x')); \
+                       tryit(() => A.setAttribute('a b', '1')); tryit(() => A.classList.add('')); tryit(() => A.classList.add('a b')); errs.join(',')").as_deref(),
+            Ok("\"HierarchyRequestError,HierarchyRequestError,HierarchyRequestError,NotFoundError,NotFoundError,NotFoundError,TypeError,TypeError,HierarchyRequestError,HierarchyRequestError,HierarchyRequestError,InvalidCharacterError,InvalidCharacterError,SyntaxError,InvalidCharacterError\"")
+        );
+        assert!(!h.take_dom_mutated(), "refused changes change nothing");
+        // Attributes, id, className, classList.
+        assert_eq!(
+            s(&mut h, "A.setAttribute('DATA-X', '1'); A.id = 'A'; A.className = 'q'; \
+                       [A.getAttribute('data-x'), A.id, A.getAttribute('class'), A.toggleAttribute('hidden'), A.hasAttribute('hidden'), A.toggleAttribute('hidden', true), A.toggleAttribute('hidden'), A.hasAttribute('hidden'), A.toggleAttribute('hidden', false), \
+                        (A.removeAttribute('data-x'), A.hasAttribute('data-x')), A.getAttributeNames().join(',')].join('|')").as_deref(),
+            Ok("\"1|A|q|true|true|true|false|false|false|false|id,class\"")
+        );
+        assert_eq!(
+            s(&mut h, "A.classList.add('x', 'y', 'x'); A.classList.remove('q'); \
+                       [A.className, A.classList.toggle('x'), A.classList.toggle('x'), A.classList.toggle('y', true), A.classList.toggle('z', false), A.classList.replace('y', 'w'), A.classList.replace('nope', 'v'), A.classList.replace('x', 'w'), A.className, A.classList.length, \
+                        (A.classList.remove('w'), JSON.stringify(A.className)), (B.classList.remove('nothing'), B.hasAttribute('class'))].join('|')").as_deref(),
+            Ok("\"x y|false|true|true|false|true|false|true|w|1|\\\"\\\"|false\"")
+        );
+        assert!(h.take_dom_mutated());
+        // textContent, data and nodeValue setters.
+        assert_eq!(
+            s(&mut h, "p.textContent = 'uno'; var tx = p.firstChild; tx.data = 'un'; tx.nodeValue = tx.nodeValue + 'o!'; p.appendChild(document.createTextNode('?')); \
+                       var kept = p.lastChild; p.textContent = null; sp.textContent = 'x'; \
+                       [tx.data, tx.length, String(tx.parentNode), kept.data, p.childNodes.length, JSON.stringify(p.textContent), sp.textContent, (document.textContent = 'z', String(document.textContent))].join('|')").as_deref(),
+            Ok("\"uno!|4|null|?|0|\\\"\\\"|x|null\"")
+        );
+        // Freed or kept: `p.textContent = null` freed nothing a wrapper
+        // holds (both text nodes have one); `A.textContent = ''` frees the
+        // unwrapped nodes under it only.
+        let doc = h.reclaim_document();
+        let after = doc.node_count();
+        h.lend_document(doc, false);
+        assert_eq!(s(&mut h, "A.textContent = ''; [A.childNodes.length, String(p.parentNode), p.isConnected, tx.data].join('|')").as_deref(), Ok("\"0|null|false|uno!\""));
+        let doc = h.reclaim_document();
+        assert_eq!(doc.node_count(), after, "wrapped subtrees are detached, not freed");
+        assert!(doc.node_count() >= before - 1);
+
+        // While the parser is running nothing is freed, even unwrapped.
+        let mut doc = browser_dom::parse_html(b"<body><div id=x><i>a</i><i>b</i></div></body>");
+        let count = doc.node_count();
+        h.lend_document(std::mem::take(&mut doc), true);
+        assert_eq!(s(&mut h, "var X = document.body.firstElementChild; X.textContent = ''; X.childNodes.length").as_deref(), Ok("0"));
+        let doc = h.reclaim_document();
+        assert_eq!(doc.node_count(), count, "nodes stay for the parser");
+        h.lend_document(doc, false);
+        assert_eq!(s(&mut h, "X.textContent = 'fresh'; X.textContent = ''; X.childNodes.length").as_deref(), Ok("0"));
+        let doc = h.reclaim_document();
+        assert_eq!(doc.node_count(), count, "an unwrapped text node is freed once the parser is done");
     }
 
     #[test]

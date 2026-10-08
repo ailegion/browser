@@ -646,8 +646,51 @@ Work:
       `children` are plain arrays, not live `NodeList`/`HTMLCollection`;
       `classList` makes a new `DOMTokenList` per access; `Element`
       methods called on a non-element wrapper answer as if the element
-      had nothing rather than throwing. Blocks 2 (mutation) and 3
-      (selectors, `innerHTML`, `dataset`) follow.
+      had nothing rather than throwing.
+      **Block 2 done 2026-10-09: mutation, wired to restyle.** `Node`:
+      `appendChild`, `insertBefore`, `removeChild`, `replaceChild`,
+      `textContent` and `nodeValue` setters; `Element` and
+      `CharacterData`: `remove`; `Element`: `setAttribute`,
+      `removeAttribute`, `toggleAttribute`, `id` and `className`
+      setters; `CharacterData`: `data` setter; `Document`:
+      `createElement` (HTML namespace, name lower-cased),
+      `createTextNode`, `createComment`; `DOMTokenList`: `add`,
+      `remove`, `toggle`, `replace` (an ordered set, written back as
+      the `class` attribute per the update steps). The DOM's pre-insert
+      checks apply (a node cannot contain its parent, a reference must
+      be a child, a document takes one element and no text) and refuse
+      with an `Error` whose `name` is the `DOMException` name
+      (`HierarchyRequestError`, `NotFoundError`,
+      `InvalidCharacterError`, `SyntaxError`); a non-node argument is a
+      `TypeError`. A connected node passed to an insertion is moved.
+      Freeing: a removed node a script holds (`removeChild` and
+      `remove` return or keep it) stays in the arena detached, as a
+      browser keeps a referenced node; `textContent = ` frees the
+      replaced subtree when no wrapper names a node in it and the
+      parser is not running, otherwise it is only detached
+      (`Dom::discard`) because the tree builder's open elements may be
+      in it, and html5ever indexes them by `NodeId`. The host reports
+      whether a script changed the connected tree
+      (`take_dom_mutated`; creating detached nodes or refused changes
+      do not count) and the tab then restyles the whole document, lays
+      out and paints again, resends state (title), prunes
+      `ElementStates` of freed nodes, and clears focus, hover, the
+      pressed control or link when their node is freed or no longer
+      in the document (`TabState::dom_changed`). Tests: one script test
+      (moves, insertion before self, replace, errors by name, every
+      attribute and token method, the setters, what is freed and what
+      is kept, nothing freed while parsing); one tab harness test (a
+      script empties `body` mid-parse without breaking the parser, a
+      timer builds a styled element and removes the focused link:
+      restyle and layout run, the ring and focus are dropped, the
+      title reaches the shell). Not done: a `<style>` or `<link>`
+      inserted by script is not collected as a stylesheet (and a
+      changed `<style>` text is not re-parsed) until later;
+      `cloneNode`, `DocumentFragment`, `append`/`prepend`/`before`/
+      `after`/`replaceWith`, `insertAdjacentElement`, `normalize`,
+      `createElementNS`; detached subtrees a script dropped are not
+      freed before navigation (O18). Block 3 (selectors, `innerHTML`,
+      `dataset`) follows.
    3. `EventTarget`, `Event`, `MouseEvent`, `KeyboardEvent`, `InputEvent`,
       capture and bubble, `preventDefault`, `addEventListener` options.
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,

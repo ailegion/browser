@@ -88,6 +88,11 @@ impl ElementStates {
         self.flags.is_empty()
     }
 
+    /// Forget elements that are no longer in the document's arena.
+    pub fn retain_live(&mut self, doc: &Document) {
+        self.flags.retain(|id, _| doc.contains(id));
+    }
+
     /// Whether any element has `flag`.
     pub fn has_any(&self, flag: u8) -> bool {
         self.flags.values().any(|f| f & flag != 0)
