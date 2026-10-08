@@ -538,6 +538,74 @@ pub fn parse_selectors(input: &mut cssparser::Parser<'_, '_>) -> Option<Selector
     SelectorList::parse(&SelectorParser, input, parser::ParseRelative::No).ok()
 }
 
+/// Parse a selector list from text, as `querySelector` and `matches`
+/// take it. `None` if any of it does not parse.
+pub fn parse_selector_list(text: &str) -> Option<Selectors> {
+    let mut input = cssparser::ParserInput::new(text);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let list = parse_selectors(&mut parser)?;
+    parser.expect_exhausted().ok()?;
+    Some(list)
+}
+
+fn quirks_of(doc: &Document) -> selectors::context::QuirksMode {
+    use selectors::context::QuirksMode;
+    match doc.quirks_mode {
+        browser_dom::QuirksMode::Quirks => QuirksMode::Quirks,
+        browser_dom::QuirksMode::LimitedQuirks => QuirksMode::LimitedQuirks,
+        browser_dom::QuirksMode::NoQuirks => QuirksMode::NoQuirks,
+    }
+}
+
+/// Whether element `id` matches `list` (`Element.matches`).
+pub fn element_matches(list: &Selectors, doc: &Document, id: NodeId, states: &ElementStates) -> bool {
+    use selectors::context::{MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, SelectorCaches};
+    let mut caches = SelectorCaches::default();
+    let mut ctx = MatchingContext::new(
+        MatchingMode::Normal,
+        None,
+        &mut caches,
+        quirks_of(doc),
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
+    selectors::matching::matches_selector_list(list, &ElementRef::with_states(doc, id, states), &mut ctx)
+}
+
+/// The element descendants of `scope` that match `list`, in document
+/// order (`querySelectorAll`), or only the first (`querySelector`).
+pub fn query_selector(
+    list: &Selectors,
+    doc: &Document,
+    scope: NodeId,
+    states: &ElementStates,
+    first_only: bool,
+) -> Vec<NodeId> {
+    use selectors::context::{MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, SelectorCaches};
+    let mut caches = SelectorCaches::default();
+    let mut ctx = MatchingContext::new(
+        MatchingMode::Normal,
+        None,
+        &mut caches,
+        quirks_of(doc),
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
+    let mut found = Vec::new();
+    for id in doc.descendants(scope) {
+        if !doc.get(id).is_element() {
+            continue;
+        }
+        if selectors::matching::matches_selector_list(list, &ElementRef::with_states(doc, id, states), &mut ctx) {
+            found.push(id);
+            if first_only {
+                break;
+            }
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

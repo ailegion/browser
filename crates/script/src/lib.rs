@@ -821,8 +821,8 @@ impl ScriptHost {
     /// by `NodeId`), so always lend the same one. `parsing` says the
     /// parser is still building it: nodes it may hold open are then
     /// detached rather than freed when a script removes them.
-    pub fn lend_document(&mut self, doc: Document, parsing: bool) {
-        self.dom.borrow_mut().lend(doc, parsing);
+    pub fn lend_document(&mut self, doc: Document, parsing: bool, states: browser_style::ElementStates) {
+        self.dom.borrow_mut().lend(doc, parsing, states);
     }
 
     /// Take the lent document back; the bindings keep an empty one.
@@ -1140,7 +1140,7 @@ mod tests {
               <body id=b class='x y'><p id=p class=' a  b a '>Hello <b>world</b><!-- c --></p>\
               <svg><circle r=1></circle></svg></body></html>",
         );
-        h.lend_document(doc, false);
+        h.lend_document(doc, false, Default::default());
         let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
 
         // The document node and the classes.
@@ -1203,7 +1203,7 @@ mod tests {
         let p_id = doc.children(doc.body().expect("body")).next().expect("p");
         doc.remove_subtree(p_id);
         assert_eq!(h.eval_to_string("String(document.body)").as_deref(), Ok("\"null\""), "nothing is lent between calls");
-        h.lend_document(doc, false);
+        h.lend_document(doc, false, Default::default());
         assert_eq!(
             s(&mut h, "[String(p.parentNode), JSON.stringify(p.textContent), p.childNodes.length, p.nodeType, p.isConnected, String(p.getAttribute('id')), p.classList.length, document.body.firstElementChild === svg, !document.contains(p), svg.isConnected].join('|')").as_deref(),
             Ok("\"null|\\\"\\\"|0|0|false|null|0|true|true|true\"")
@@ -1223,7 +1223,7 @@ mod tests {
             b"<!DOCTYPE html><html><head></head><body><div id=a><p id=p>one</p><span id=s>two</span></div><div id=b></div></body></html>",
         );
         let before = doc.node_count();
-        h.lend_document(doc, false);
+        h.lend_document(doc, false, Default::default());
         let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
 
         // Creating detached nodes is not a change the tab needs to see.
@@ -1290,7 +1290,7 @@ mod tests {
         // unwrapped nodes under it only.
         let doc = h.reclaim_document();
         let after = doc.node_count();
-        h.lend_document(doc, false);
+        h.lend_document(doc, false, Default::default());
         assert_eq!(s(&mut h, "A.textContent = ''; [A.childNodes.length, String(p.parentNode), p.isConnected, tx.data].join('|')").as_deref(), Ok("\"0|null|false|uno!\""));
         let doc = h.reclaim_document();
         assert_eq!(doc.node_count(), after, "wrapped subtrees are detached, not freed");
@@ -1299,14 +1299,89 @@ mod tests {
         // While the parser is running nothing is freed, even unwrapped.
         let mut doc = browser_dom::parse_html(b"<body><div id=x><i>a</i><i>b</i></div></body>");
         let count = doc.node_count();
-        h.lend_document(std::mem::take(&mut doc), true);
+        h.lend_document(std::mem::take(&mut doc), true, Default::default());
         assert_eq!(s(&mut h, "var X = document.body.firstElementChild; X.textContent = ''; X.childNodes.length").as_deref(), Ok("0"));
         let doc = h.reclaim_document();
         assert_eq!(doc.node_count(), count, "nodes stay for the parser");
-        h.lend_document(doc, false);
+        h.lend_document(doc, false, Default::default());
         assert_eq!(s(&mut h, "X.textContent = 'fresh'; X.textContent = ''; X.childNodes.length").as_deref(), Ok("0"));
         let doc = h.reclaim_document();
         assert_eq!(doc.node_count(), count, "an unwrapped text node is freed once the parser is done");
+    }
+
+    #[test]
+    fn dom_lookups_inner_html_and_dataset() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><html><head><title>Q</title></head>\
+              <body><div id=main class='a b'><p class='x y' lang=en data-foo-bar='1' data-x='2'>one</p><p>two</p><a href=#>l</a>\
+              <ul><li>1</li><li class=x>2</li></ul></div><div id=other><svg><circle></circle></svg></div></body></html>",
+        );
+        let mut states = browser_style::ElementStates::default();
+        let link = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "a"))
+            .expect("a");
+        states.set_chain(&doc, Some(link), browser_style::ElementStates::HOVER);
+        h.lend_document(doc, false, states);
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+
+        // Selectors go through the style crate's matcher, states included.
+        assert_eq!(
+            s(&mut h, "var main = document.getElementById('main'); \
+                       [main.id, String(document.getElementById('nope')), document.querySelector('p.x').textContent, document.querySelectorAll('p').length, main.querySelectorAll('li').length, \
+                        document.querySelector('#main > p + p').textContent, document.querySelectorAll('.x').length, main.querySelectorAll('.x, li').length, \
+                        String(document.querySelector('.nope')), document.querySelectorAll('.nope').length, document.querySelector('a:hover') !== null, String(document.querySelector('p:hover')), \
+                        document.querySelector('[lang=en]').className, document.querySelector('li:nth-child(2)').textContent, main.querySelector('div') === null].join('|')").as_deref(),
+            Ok("\"main|null|one|2|2|two|2|3|null|0|true|null|x y|2|true\"")
+        );
+        assert_eq!(
+            s(&mut h, "var p = document.querySelector('p'); \
+                       [p.matches('p.x'), p.matches('.nope'), p.matches('#main p:first-child'), p.closest('div').id, p.closest('p') === p, String(p.closest('.nope')), p.closest('body').tagName, \
+                        p.firstChild.nodeType, document.querySelector('circle').namespaceURI].join('|')").as_deref(),
+            Ok("\"true|false|true|main|true|null|BODY|3|http://www.w3.org/2000/svg\"")
+        );
+        assert_eq!(
+            s(&mut h, "var errs = []; try { document.querySelector('p[') } catch (e) { errs.push(e.name) } try { p.matches('') } catch (e) { errs.push(e.name) } try { document.querySelectorAll(':nope') } catch (e) { errs.push(e.name) } errs.join(',')").as_deref(),
+            Ok("\"SyntaxError,SyntaxError,SyntaxError\"")
+        );
+        // getElementsBy*.
+        assert_eq!(
+            s(&mut h, "[document.getElementsByClassName('x').length, document.getElementsByClassName('x y').length, document.getElementsByClassName('y x')[0] === p, document.getElementsByClassName('').length, main.getElementsByClassName('a').length, \
+                        document.getElementsByTagName('p').length, document.getElementsByTagName('P').length, document.getElementsByTagName('*').length, main.getElementsByTagName('li').length, document.getElementsByTagName('circle').length, document.getElementsByTagName('nope').length].join('|')").as_deref(),
+            Ok("\"2|1|true|0|0|2|2|14|2|1|0\"")
+        );
+        // innerHTML and outerHTML.
+        assert_eq!(
+            s(&mut h, "[p.innerHTML, p.outerHTML, main.querySelector('ul').innerHTML, document.querySelector('svg').outerHTML, document.createElement('br').outerHTML].join('|')").as_deref(),
+            Ok("\"one|<p class=\\\"x y\\\" lang=\\\"en\\\" data-foo-bar=\\\"1\\\" data-x=\\\"2\\\">one</p>|<li>1</li><li class=\\\"x\\\">2</li>|<svg><circle></circle></svg>|<br>\"")
+        );
+        assert!(!h.take_dom_mutated());
+        assert_eq!(
+            s(&mut h, "var li = main.querySelector('li'); var ul = li.parentNode; ul.innerHTML = '<li id=n>new</li> text &amp; <b>bold</b>'; \
+                       [ul.childNodes.length, ul.children.length, ul.firstChild.id, ul.firstChild.textContent, ul.childNodes[1].data, ul.innerHTML, String(li.parentNode), ul.querySelector('b').innerHTML, \
+                        (ul.innerHTML = '', ul.childNodes.length), (ul.innerHTML = 'plain', ul.firstChild.nodeType), (document.body.innerHTML.indexOf('<div id=\"main\"') === 0)].join('|')").as_deref(),
+            Ok("\"3|2|n|new| text & |<li id=\\\"n\\\">new</li> text &amp; <b>bold</b>|null|bold|0|3|true\"")
+        );
+        assert!(h.take_dom_mutated());
+        // The fragment parser takes the context into account.
+        assert_eq!(
+            s(&mut h, "var t = document.createElement('table'); t.innerHTML = '<tr><td>c</td></tr>'; var sc = document.createElement('script'); sc.innerHTML = 'if (a < b) {}'; var tm = document.createElement('template'); tm.innerHTML = '<p>in</p>'; \
+                       [t.innerHTML, t.firstChild.tagName, sc.firstChild.data, sc.innerHTML, tm.childNodes.length, tm.innerHTML].join('|')").as_deref(),
+            Ok("\"<tbody><tr><td>c</td></tr></tbody>|TBODY|if (a < b) {}|if (a < b) {}|0|<p>in</p>\"")
+        );
+        assert!(!h.take_dom_mutated(), "detached elements change nothing visible");
+        // dataset: live, camelCase both ways, write through, delete, keys.
+        assert_eq!(
+            s(&mut h, "var ds = p.dataset; ds.newOne = 5; delete ds.x; \
+                       [ds.fooBar, 'fooBar' in ds, 'x' in ds, String(ds.x), p.getAttribute('data-new-one'), Object.keys(ds).join(','), JSON.stringify(ds), p.dataset.fooBar === ds.fooBar, (p.setAttribute('data-late', 'L'), ds.late), typeof ds.toString].join('|')").as_deref(),
+            Ok("\"1|true|false|undefined|5|fooBar,newOne|{\\\"fooBar\\\":\\\"1\\\",\\\"newOne\\\":\\\"5\\\"}|true|L|function\"")
+        );
+        assert!(h.take_dom_mutated());
+        assert_eq!(
+            s(&mut h, "var e = []; try { ds['-bad'] = 1 } catch (x) { e.push(x.name) } try { ds['a b'] = 1 } catch (x) { e.push(x.name) } ds['a-B'] = 1; [e.join(','), p.getAttribute('data-a--b')].join('|')").as_deref(),
+            Ok("\"SyntaxError,InvalidCharacterError|1\"")
+        );
     }
 
     #[test]

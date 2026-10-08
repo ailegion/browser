@@ -40,6 +40,11 @@ impl Sink {
         }
     }
 
+    /// A sink over an existing document, for fragment parsing into it.
+    pub(crate) fn with_document(doc: Document) -> Self {
+        Self { doc: RefCell::new(doc) }
+    }
+
     /// The document as built so far.
     fn document(&self) -> Ref<'_, Document> {
         self.doc.borrow()

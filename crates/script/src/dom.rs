@@ -27,13 +27,16 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use boa_engine::class::{Class, ClassBuilder};
-use boa_engine::object::builtins::JsArray;
+use boa_engine::object::ObjectInitializer;
+use boa_engine::object::builtins::{JsArray, JsProxy};
 use boa_engine::property::Attribute;
 use boa_engine::{
     Context, JsArgs, JsData, JsNativeError, JsObject, JsResult, JsString, JsValue, NativeFunction, js_string,
 };
 use boa_gc::{Finalize, Trace};
 use browser_dom::{Document, NodeId, NodeKind};
+use browser_style::ElementStates;
+use browser_style::selector_impl::{Selectors, element_matches, parse_selector_list, query_selector};
 
 use crate::{
     DOC_CHARSET, DOC_COMPAT_MODE, DOC_DOMAIN, DOC_READY_STATE, DOC_TITLE, DOC_URL, document_get, document_set_domain,
@@ -53,15 +56,39 @@ pub(crate) struct Dom {
     /// The parser is still building the document: nodes it may hold open
     /// must stay in the arena, so nothing is freed while this is set.
     parsing: bool,
+    /// The tab's interaction state, so `:hover`, `:focus` and friends
+    /// match in `querySelector` as they do in the cascade.
+    states: ElementStates,
+    /// Selector lists already parsed, by their text: pages query the
+    /// same selectors over and over.
+    selectors: HashMap<String, Selectors>,
+}
+
+/// How many parsed selector lists are kept before the cache is emptied.
+const SELECTOR_CACHE_LIMIT: usize = 512;
+
+/// The parsed form of `text` from the cache, parsing it once. `None` if
+/// it is not a valid selector list.
+fn cached_selector<'a>(cache: &'a mut HashMap<String, Selectors>, text: &str) -> Option<&'a Selectors> {
+    if !cache.contains_key(text) {
+        let list = parse_selector_list(text)?;
+        if cache.len() >= SELECTOR_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(text.to_owned(), list);
+    }
+    cache.get(text)
 }
 
 pub(crate) type SharedDom = Rc<RefCell<Dom>>;
 
 impl Dom {
-    pub(crate) fn lend(&mut self, doc: Document, parsing: bool) {
+    pub(crate) fn lend(&mut self, doc: Document, parsing: bool, states: ElementStates) {
         self.doc = doc;
         self.parsing = parsing;
+        self.states = states;
     }
+
 
     pub(crate) fn reclaim(&mut self) -> Document {
         std::mem::take(&mut self.doc)
@@ -253,6 +280,22 @@ fn add_mutator(class: &mut ClassBuilder<'_>, name: &str, length: usize, method: 
     );
 }
 
+fn add_query(class: &mut ClassBuilder<'_>, name: &str, method: QueryMethod) {
+    class.method(
+        JsString::from(name),
+        1,
+        NativeFunction::from_copy_closure_with_captures(query_call, method),
+    );
+}
+
+/// The `ParentNode` mixin's lookups, on `Element` and `Document`.
+fn init_parent_node(class: &mut ClassBuilder<'_>) {
+    add_query(class, "querySelector", QueryMethod::QuerySelector);
+    add_query(class, "querySelectorAll", QueryMethod::QuerySelectorAll);
+    add_query(class, "getElementsByClassName", QueryMethod::GetElementsByClassName);
+    add_query(class, "getElementsByTagName", QueryMethod::GetElementsByTagName);
+}
+
 fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     for (name, prop) in [
         ("nodeType", Prop::NodeType),
@@ -312,6 +355,12 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     }
     add_accessor(class, "id", Prop::Id, SetProp::Id);
     add_accessor(class, "className", Prop::ClassName, SetProp::ClassName);
+    add_accessor(class, "innerHTML", Prop::InnerHtml, SetProp::InnerHtml);
+    add_getter(class, "outerHTML", Prop::OuterHtml);
+    add_getter(class, "dataset", Prop::Dataset);
+    init_parent_node(class);
+    add_query(class, "matches", QueryMethod::Matches);
+    add_query(class, "closest", QueryMethod::Closest);
     add_method(class, "getAttribute", 1, Method::GetAttribute);
     add_method(class, "hasAttribute", 1, Method::HasAttribute);
     add_method(class, "hasAttributes", 0, Method::HasAttributes);
@@ -341,6 +390,8 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_mutator(class, "createElement", 1, MutMethod::CreateElement);
     add_mutator(class, "createTextNode", 1, MutMethod::CreateTextNode);
     add_mutator(class, "createComment", 1, MutMethod::CreateComment);
+    init_parent_node(class);
+    add_query(class, "getElementById", QueryMethod::GetElementById);
     // Item 3.1's properties, which read the tab's `DocumentInfo`.
     for (name, part) in [
         ("URL", DOC_URL),
@@ -479,6 +530,7 @@ enum Out {
     Node(Option<NodeId>),
     Nodes(Vec<NodeId>),
     TokenList(NodeId),
+    Dataset(NodeId),
 }
 
 fn finish(out: Out, context: &mut Context) -> JsResult<JsValue> {
@@ -490,6 +542,7 @@ fn finish(out: Out, context: &mut Context) -> JsResult<JsValue> {
             let proto = prototype_of::<TokenListClass>(context)?;
             Ok(JsObject::from_proto_and_data(proto, TokenList { id }).into())
         }
+        Out::Dataset(id) => dataset_proxy(id, context),
     }
 }
 
@@ -527,6 +580,9 @@ enum Prop {
     DocumentElement,
     Head,
     Body,
+    InnerHtml,
+    OuterHtml,
+    Dataset,
 }
 
 fn get(this: &JsValue, _: &[JsValue], prop: &Prop, context: &mut Context) -> JsResult<JsValue> {
@@ -561,8 +617,11 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
             (ChildNodes | Children, _) => Out::Nodes(Vec::new()),
             (IsConnected, _) => Out::Value(false.into()),
             (ChildElementCount | Length | NodeType, _) => Out::Value(0.into()),
-            (NodeName | TagName | LocalName | Id | ClassName | Data | TextContent, _) => Out::Value(js_str("")),
+            (NodeName | TagName | LocalName | Id | ClassName | Data | TextContent | InnerHtml | OuterHtml, _) => {
+                Out::Value(js_str(""))
+            }
             (ClassList, Some(id)) => Out::TokenList(id),
+            (Dataset, Some(id)) => Out::Dataset(id),
             _ => Out::Value(JsValue::null()),
         };
     };
@@ -656,6 +715,15 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
         DocumentElement => Out::Node(doc.document_element()),
         Head => Out::Node(doc.head()),
         Body => Out::Node(doc.body()),
+        InnerHtml => Out::Value(js_str(&doc.serialize_html(id, false))),
+        OuterHtml => Out::Value(js_str(&doc.serialize_html(id, true))),
+        Dataset => {
+            if element.is_some() {
+                Out::Dataset(id)
+            } else {
+                Out::Value(JsValue::null())
+            }
+        }
     }
 }
 
@@ -783,6 +851,26 @@ enum SetProp {
     Data,
     Id,
     ClassName,
+    InnerHtml,
+}
+
+/// Replace every child of element `id` with the nodes `html` parses to
+/// in its context (`innerHTML = `). A `<template>` gets them in its
+/// contents.
+fn replace_children_with_html(dom: &mut Dom, id: NodeId, html: &str) {
+    let target = dom
+        .doc
+        .get(id)
+        .as_element()
+        .and_then(|e| e.template_contents)
+        .unwrap_or(id);
+    let children: Vec<NodeId> = dom.doc.children(target).collect();
+    for c in children {
+        dom.discard(c);
+    }
+    for n in dom.doc.parse_fragment(id, html) {
+        dom.doc.append_child(target, n);
+    }
 }
 
 fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) -> JsResult<JsValue> {
@@ -803,6 +891,8 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
     let is_element = dom.doc.get(id).is_element();
     match prop {
         SetProp::TextContent if is_element => replace_children_with_text(&mut dom, id, &text),
+        SetProp::InnerHtml if is_element => replace_children_with_html(&mut dom, id, &text),
+        SetProp::InnerHtml => return Ok(JsValue::undefined()),
         SetProp::TextContent | SetProp::NodeValue | SetProp::Data => set_data(&mut dom.doc, id, text),
         SetProp::Id | SetProp::ClassName => {
             let name = if matches!(prop, SetProp::Id) { "id" } else { "class" };
@@ -1023,6 +1113,321 @@ fn mutate(
         dom.mutated = true;
     }
     Ok(out)
+}
+
+// ----- lookups: selectors, ids, classes, tags -----
+
+#[derive(Clone, Trace, Finalize)]
+enum QueryMethod {
+    QuerySelector,
+    QuerySelectorAll,
+    Matches,
+    Closest,
+    GetElementById,
+    GetElementsByClassName,
+    GetElementsByTagName,
+}
+
+fn query_call(this: &JsValue, args: &[JsValue], method: &QueryMethod, context: &mut Context) -> JsResult<JsValue> {
+    let node = this_node(this)?;
+    let arg = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let shared = dom(context)?;
+    let result = {
+        let mut dom = shared.borrow_mut();
+        query(&mut dom, &node, method, &arg)
+    };
+    match result {
+        Ok(out) => finish(out, context),
+        Err(fail) => Err(fail.into_error(context)),
+    }
+}
+
+fn query(dom: &mut Dom, node: &DomNode, method: &QueryMethod, arg: &str) -> Result<Out, Fail> {
+    use QueryMethod::*;
+    let Some(id) = node.resolve(&dom.doc) else {
+        return Ok(match method {
+            Matches => Out::Value(false.into()),
+            QuerySelectorAll | GetElementsByClassName | GetElementsByTagName => Out::Nodes(Vec::new()),
+            _ => Out::Value(JsValue::null()),
+        });
+    };
+    match method {
+        QuerySelector | QuerySelectorAll | Matches | Closest => {
+            let dom = &mut *dom;
+            let (doc, states, cache) = (&dom.doc, &dom.states, &mut dom.selectors);
+            let Some(list) = cached_selector(cache, arg) else {
+                return Err(Fail::Dom("SyntaxError", format!("'{arg}' is not a valid selector")));
+            };
+            Ok(match method {
+                QuerySelector => Out::Node(query_selector(list, doc, id, states, true).into_iter().next()),
+                QuerySelectorAll => Out::Nodes(query_selector(list, doc, id, states, false)),
+                Matches => Out::Value((doc.get(id).is_element() && element_matches(list, doc, id, states)).into()),
+                _ => Out::Node(
+                    std::iter::once(id)
+                        .chain(doc.ancestors(id))
+                        .find(|&a| doc.get(a).is_element() && element_matches(list, doc, a, states)),
+                ),
+            })
+        }
+        GetElementById => Ok(Out::Node(
+            dom.doc
+                .descendants(id)
+                .find(|&n| dom.doc.element(n).is_some_and(|e| e.id() == Some(arg))),
+        )),
+        GetElementsByClassName => {
+            let wanted: Vec<&str> = arg.split_ascii_whitespace().collect();
+            if wanted.is_empty() {
+                return Ok(Out::Nodes(Vec::new()));
+            }
+            let doc = &dom.doc;
+            Ok(Out::Nodes(
+                doc.descendants(id)
+                    .filter(|&n| {
+                        doc.element(n).is_some_and(|e| {
+                            let classes: Vec<&str> = e.classes().collect();
+                            wanted.iter().all(|w| classes.contains(w))
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+        GetElementsByTagName => {
+            let doc = &dom.doc;
+            let lower = arg.to_ascii_lowercase();
+            Ok(Out::Nodes(
+                doc.descendants(id)
+                    .filter(|&n| {
+                        doc.element(n).is_some_and(|e| {
+                            arg == "*"
+                                || if e.is_html() { *e.name.local == *lower } else { element_name(e) == arg }
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+    }
+}
+
+// ----- dataset (DOMStringMap) -----
+
+/// The target behind a `dataset` proxy: which element it reads.
+#[derive(Debug, Clone, Trace, Finalize, JsData)]
+struct DatasetTarget {
+    #[unsafe_ignore_trace]
+    id: NodeId,
+}
+
+/// `dataset.fooBar` is the `data-foo-bar` attribute: a `Proxy` whose
+/// traps read and write the element's attributes, so it is always live.
+fn dataset_proxy(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
+    let target = JsObject::from_proto_and_data(
+        context.intrinsics().constructors().object().prototype(),
+        DatasetTarget { id },
+    );
+    let proxy = JsProxy::builder(target)
+        .get(dataset_get)
+        .set(dataset_set)
+        .has(dataset_has)
+        .delete_property(dataset_delete)
+        .own_keys(dataset_keys)
+        .get_own_property_descriptor(dataset_descriptor)
+        .build(context)?;
+    Ok(proxy.into())
+}
+
+/// The element a trap's target argument stands for.
+fn dataset_target(args: &[JsValue]) -> JsResult<(JsObject, NodeId)> {
+    let target = args
+        .first()
+        .and_then(JsValue::as_object)
+        .ok_or_else(illegal_invocation)?;
+    let id = target
+        .downcast_ref::<DatasetTarget>()
+        .map(|t| t.id)
+        .ok_or_else(illegal_invocation)?;
+    Ok((target.clone(), id))
+}
+
+/// The trap's key as a string; `None` for a symbol.
+fn dataset_key(args: &[JsValue], context: &mut Context) -> JsResult<Option<String>> {
+    let key = args.get_or_undefined(1);
+    if key.is_symbol() {
+        return Ok(None);
+    }
+    Ok(Some(key.to_string(context)?.to_std_string_escaped()))
+}
+
+/// `fooBar` → `data-foo-bar`. `None` when the name cannot be an
+/// attribute (a `-` followed by a lower-case letter, per the DOM).
+fn dataset_attr_name(prop: &str) -> Option<String> {
+    let bytes = prop.as_bytes();
+    if bytes.windows(2).any(|w| w[0] == b'-' && w[1].is_ascii_lowercase()) {
+        return None;
+    }
+    let mut name = String::with_capacity(prop.len() + 5);
+    name.push_str("data-");
+    for c in prop.chars() {
+        if c.is_ascii_uppercase() {
+            name.push('-');
+            name.push(c.to_ascii_lowercase());
+        } else {
+            name.push(c);
+        }
+    }
+    Some(name)
+}
+
+/// `data-foo-bar` → `fooBar`. `None` for an attribute the map skips
+/// (not `data-`, or with an upper-case ASCII letter).
+fn dataset_prop_name(attr: &str) -> Option<String> {
+    let rest = attr.strip_prefix("data-")?;
+    if rest.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut out = String::with_capacity(rest.len());
+    let mut upper_next = false;
+    for c in rest.chars() {
+        if c == '-' && !upper_next {
+            upper_next = true;
+        } else if upper_next {
+            upper_next = false;
+            if c.is_ascii_lowercase() {
+                out.push(c.to_ascii_uppercase());
+            } else {
+                out.push('-');
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    if upper_next {
+        out.push('-');
+    }
+    Some(out)
+}
+
+fn dataset_read(id: NodeId, attr: &str, context: &mut Context) -> JsResult<Option<String>> {
+    let shared = dom(context)?;
+    let dom = shared.borrow();
+    Ok(dom
+        .doc
+        .contains(id)
+        .then(|| dom.doc.get(id).as_element().and_then(|e| e.attr(attr).map(str::to_owned)))
+        .flatten())
+}
+
+fn dataset_get(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (target, id) = dataset_target(args)?;
+    if let Some(key) = dataset_key(args, context)?
+        && let Some(attr) = dataset_attr_name(&key)
+        && let Some(value) = dataset_read(id, &attr, context)?
+    {
+        return Ok(js_str(&value));
+    }
+    // Anything else (`toString`, symbols) comes from the plain target.
+    let key = args.get_or_undefined(1).to_property_key(context)?;
+    target.get(key, context)
+}
+
+fn dataset_set(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (_, id) = dataset_target(args)?;
+    let Some(key) = dataset_key(args, context)? else {
+        return Ok(false.into());
+    };
+    let value = args.get_or_undefined(2).to_string(context)?.to_std_string_escaped();
+    let Some(attr) = dataset_attr_name(&key) else {
+        return Err(dom_exception("SyntaxError", &format!("'{key}' is not a valid dataset property name"), context));
+    };
+    if !valid_attribute_name(&attr) {
+        return Err(dom_exception("InvalidCharacterError", &format!("'{attr}' is not a valid attribute name"), context));
+    }
+    let shared = dom(context)?;
+    let mut dom = shared.borrow_mut();
+    if dom.doc.contains(id) {
+        let connected = dom.doc.is_connected(id);
+        if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
+            e.set_attr(&attr, &value);
+            if connected {
+                dom.mutated = true;
+            }
+        }
+    }
+    Ok(true.into())
+}
+
+fn dataset_has(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (_, id) = dataset_target(args)?;
+    let Some(key) = dataset_key(args, context)? else {
+        return Ok(false.into());
+    };
+    let Some(attr) = dataset_attr_name(&key) else {
+        return Ok(false.into());
+    };
+    Ok(dataset_read(id, &attr, context)?.is_some().into())
+}
+
+fn dataset_delete(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (_, id) = dataset_target(args)?;
+    let Some(key) = dataset_key(args, context)? else {
+        return Ok(true.into());
+    };
+    let Some(attr) = dataset_attr_name(&key) else {
+        return Ok(true.into());
+    };
+    let shared = dom(context)?;
+    let mut dom = shared.borrow_mut();
+    if dom.doc.contains(id) {
+        let connected = dom.doc.is_connected(id);
+        if let Some(e) = dom.doc.get_mut(id).as_element_mut()
+            && e.attr(&attr).is_some()
+        {
+            e.remove_attr(&attr);
+            if connected {
+                dom.mutated = true;
+            }
+        }
+    }
+    Ok(true.into())
+}
+
+fn dataset_keys(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (_, id) = dataset_target(args)?;
+    let names: Vec<JsValue> = {
+        let shared = dom(context)?;
+        let dom = shared.borrow();
+        dom.doc
+            .contains(id)
+            .then(|| dom.doc.get(id).as_element())
+            .flatten()
+            .map(|e| {
+                e.attrs
+                    .iter()
+                    .filter_map(|a| dataset_prop_name(&a.name.local))
+                    .map(|n| js_str(&n))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(JsArray::from_iter(names, context).into())
+}
+
+fn dataset_descriptor(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (_, id) = dataset_target(args)?;
+    let value = match dataset_key(args, context)?.and_then(|k| dataset_attr_name(&k)) {
+        Some(attr) => dataset_read(id, &attr, context)?,
+        None => None,
+    };
+    let Some(value) = value else {
+        return Ok(JsValue::undefined());
+    };
+    Ok(ObjectInitializer::new(context)
+        .property(js_string!("value"), js_str(&value), Attribute::all())
+        .property(js_string!("writable"), true, Attribute::all())
+        .property(js_string!("enumerable"), true, Attribute::all())
+        .property(js_string!("configurable"), true, Attribute::all())
+        .build()
+        .into())
 }
 
 // ----- DOMTokenList (classList) -----

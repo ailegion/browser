@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 browser-dom.workspace = true
+browser-style.workspace = true
 boa_engine.workspace = true
 boa_gc.workspace = true
 boa_runtime.workspace = true

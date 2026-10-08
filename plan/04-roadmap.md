@@ -683,14 +683,60 @@ Work:
       script empties `body` mid-parse without breaking the parser, a
       timer builds a styled element and removes the focused link:
       restyle and layout run, the ring and focus are dropped, the
-      title reaches the shell). Not done: a `<style>` or `<link>`
-      inserted by script is not collected as a stylesheet (and a
-      changed `<style>` text is not re-parsed) until later;
-      `cloneNode`, `DocumentFragment`, `append`/`prepend`/`before`/
-      `after`/`replaceWith`, `insertAdjacentElement`, `normalize`,
-      `createElementNS`; detached subtrees a script dropped are not
-      freed before navigation (O18). Block 3 (selectors, `innerHTML`,
-      `dataset`) follows.
+      title reaches the shell). Detached subtrees a script dropped are
+      freed in Phase 5 (O18).
+      **Block 3 done 2026-10-09: lookups, `innerHTML`, `dataset`.**
+      `querySelector`, `querySelectorAll`, `matches`, `closest` on
+      `Element` and `Document` (the first two) through the style
+      crate's matcher (`browser_style::selector_impl::{parse_selector_list,
+      element_matches, query_selector}`): one `MatchingContext` per
+      query, parsed selector lists cached per host by their text (512
+      entries), the tab's `ElementStates` lent with the document so
+      `:hover`, `:focus` and friends match as in the cascade, quirks
+      mode from the document; an invalid selector is a `SyntaxError`.
+      `getElementById`, `getElementsByClassName` (every token must be
+      present), `getElementsByTagName` (`*`, case-insensitive for HTML
+      elements). `innerHTML` getter and `outerHTML` through html5ever's
+      serializer over the arena (`Document::serialize_html`, depth
+      bounded per O14; raw text inside `<script>`/`<style>`, escaping
+      elsewhere); `innerHTML` setter through html5ever's fragment
+      parser in the element's context (`Document::parse_fragment`: the
+      document is parsed into in place, the algorithm's temporary root
+      element is removed afterwards; `<tr>` in a `<table>` gets its
+      `<tbody>`, text in a `<script>` stays raw, a `<template>` takes
+      the nodes into its contents); scripts in a fragment are built,
+      not run. `dataset` is a `Proxy` over the element's `data-*`
+      attributes (camelCase both ways per the DOM, `SyntaxError` for a
+      name a `-` and a lower-case letter would collide with, live reads,
+      writes, deletes, `Object.keys`, `JSON.stringify`). All of these
+      report changes to the tab like block 2. Tests: one dom test
+      (fragments in `div`, `table` and `script` context, serialization
+      back, no root left behind), one script test (selectors with a
+      hovered link, errors, `getElementsBy*`, `innerHTML` both ways and
+      in context, `dataset`), one tab harness test (a timer finds the
+      hovered link with `a:hover`, rewrites a container through
+      `innerHTML`, and the new markup is styled and laid out; `dataset`
+      reads it).
+      **Remaining block of item 3.2; the item is not complete until it
+      is done:**
+      **Block 4 (next):** stylesheet reaction to script mutation (a `<style>`
+      or `<link rel=stylesheet>` inserted or removed by script is
+      collected or dropped, a changed `<style>` text is re-parsed, a
+      `<link>` is fetched), `cloneNode(deep)`, `DocumentFragment` with
+      `createDocumentFragment` and insertion of a fragment's children,
+      `append`, `prepend`, `before`, `after`, `replaceWith`,
+      `replaceChildren`, `insertAdjacentElement`, `insertAdjacentHTML`,
+      `insertAdjacentText`, `normalize`, `createElementNS`,
+      `getElementsByTagNameNS`, `setAttributeNS`/`getAttributeNS`; live
+      `NodeList` and `HTMLCollection` objects for `childNodes`,
+      `children`, `getElementsBy*` (block 1 and 3 return plain
+      arrays), one cached `classList` and `dataset` object per element
+      (blocks 1 and 3 make a new one per access), `Element` methods on
+      a non-element receiver throwing `TypeError` (block 1 answers as
+      if empty).
+      Rule for every block: a gap found while building is added to
+      that block or to a named later item in this file, never left
+      without a home.
    3. `EventTarget`, `Event`, `MouseEvent`, `KeyboardEvent`, `InputEvent`,
       capture and bubble, `preventDefault`, `addEventListener` options.
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,

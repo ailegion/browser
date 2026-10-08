@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod encoding;
+mod fragment;
 mod sink;
 
 use std::fmt::Write as _;
@@ -349,9 +350,17 @@ impl Document {
         self.create_node(NodeKind::Text(text.into()))
     }
 
-    /// An element in the HTML namespace with no attributes, detached.
+    /// An element in the HTML namespace with no attributes, detached. A
+    /// `<template>` gets its contents fragment, as the parser gives it.
     pub fn create_html_element(&mut self, local: &str) -> NodeId {
-        self.create_element(QualName::new(None, ns!(html), LocalName::from(local)), Vec::new())
+        let id = self.create_element(QualName::new(None, ns!(html), LocalName::from(local)), Vec::new());
+        if local == "template" {
+            let contents = self.create_node(NodeKind::Document);
+            if let Some(e) = self.get_mut(id).as_element_mut() {
+                e.template_contents = Some(contents);
+            }
+        }
+        id
     }
 
     /// Whether `id` is in the tree under the document node.

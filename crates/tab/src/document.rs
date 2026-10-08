@@ -2005,12 +2005,13 @@ impl TabState {
     fn with_script(&mut self, f: impl FnOnce(&mut ScriptHost)) {
         let Some(host) = &mut self.script else { return };
         let parsing = self.parser.is_some();
+        let states = self.states.clone();
         let doc = match (&mut self.parser, &mut self.doc) {
             (Some(parser), _) => std::mem::take(&mut *parser.document_mut()),
             (None, Some(doc)) => std::mem::take(doc),
             (None, None) => Document::new(),
         };
-        host.lend_document(doc, parsing);
+        host.lend_document(doc, parsing, states);
         f(host);
         let doc = host.reclaim_document();
         match (&mut self.parser, &mut self.doc) {
@@ -3952,6 +3953,33 @@ mod tests {
             assert_eq!(doc.children(body).count(), 2, "the removed elements are out of the tree");
             assert!(doc.descendants(doc.root()).all(|n| doc.element(n).is_none_or(|e| e.id() != Some("link"))));
         }
+    }
+
+    #[test]
+    fn dom_lookups_and_inner_html_from_script_reach_the_page() {
+        // A script finds the hovered link through `:hover`, rewrites a
+        // container through innerHTML and the new markup is styled and
+        // laid out; dataset reads what the markup carried.
+        let html = "<!DOCTYPE html><title>Q</title><style>.big { height: 100px } p { height: 10px }</style>\
+            <body><a id=link href='#x'>link</a><div id=root><p>old</p></div>\
+            <script>setTimeout(() => { \
+                var hovered = document.querySelector('a:hover'); \
+                var root = document.getElementById('root'); \
+                root.innerHTML = '<p class=big data-size=\"L\">new</p><p>more</p>'; \
+                console.log(hovered ? hovered.id : 'none', root.children.length, root.querySelector('.big').dataset.size, document.getElementsByTagName('p').length); }, 30)</script>";
+        let mut h = Harness::load(html);
+        let (x, y) = h.center("a");
+        h.send(ShellToTab::MouseMove { x, y });
+        assert_eq!(h.state.hover, Some(h.by_id("link")));
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        h.pump();
+        assert_eq!(console_texts(&h).last().map(String::as_str), Some("link 2 L 2"));
+        let root = h.by_id("root");
+        let first = {
+            let doc = h.state.doc.as_ref().expect("document");
+            doc.children(root).next().expect("p")
+        };
+        assert_eq!(h.rect_of(first).height, 100.0, "the markup from innerHTML was styled and laid out");
     }
 
     #[test]
