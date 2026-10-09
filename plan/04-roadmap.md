@@ -977,20 +977,27 @@ Work:
       nothing copied, a textarea's line moves; composition start,
       update, clear-then-commit, clear-then-cancel, a refused start, a
       blur commit, a dead-key commit, the caret reported to the shell),
-      one paint pixel test (the underline). Raised with the owner
-      2026-10-09 for placement, not built here: `ClipboardEvent` with
-      `clipboardData` for `cut`/`copy`/`paste` listeners (Phase 5 lists
-      a clipboard API); `window.getSelection()` and `selectionchange`
-      (no owner yet); `selectionStart`/`selectionEnd`/
-      `setSelectionRange` on input elements (no owner yet; item 3.3.7
-      forms is the natural one).
+      one paint pixel test (the underline). Placed by the owner
+      2026-10-09: `ClipboardEvent` with `clipboardData` in Phase 5's
+      clipboard API; `window.getSelection()` and `selectionchange` in
+      item 3.3.9; `selectionStart`/`selectionEnd`/`setSelectionRange`
+      in item 3.3.7.
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,
       `getBoundingClientRect`, scroll properties.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.
-   7. Forms: values, `submit`, validation basics.
+   7. Forms: values, `submit`, validation basics. Placed here by the
+      owner 2026-10-09: `selectionStart`/`selectionEnd`/
+      `selectionDirection`/`setSelectionRange`/`select()` on input and
+      textarea elements, next to `value`; `<label>` clicks focusing or
+      activating their control; `:placeholder-shown` and `[value]`
+      restyling as the user edits; a select's drop-down list on click;
+      input types with their own UI (range, color, date, number).
    8. `MutationObserver`, `IntersectionObserver`, `ResizeObserver`.
+   9. Selection API: `window.getSelection()`, `Selection` and `Range`,
+      `selectionchange` on the document, over the page selection and the
+      control selection the tab already keeps.
 4. Same-origin policy, CORS with preflight, CSP `script-src` and
    `connect-src`, mixed-content blocking.
 5. Headless mode that loads a URL and prints results, used to run a chosen
@@ -1053,7 +1060,12 @@ what breaks the most pages.
 - Web APIs: `WebSocket`, Canvas 2D on vello, `postMessage`, `iframe`
   (each frame is its own document on the same tab thread), `Web Workers`
   (a separate Boa context on its own thread, message passing only),
-  `Notification` (in-app only), clipboard API with permission.
+  `Notification` (in-app only), clipboard API with permission, which also
+  owns `ClipboardEvent` with `clipboardData` for `cut`/`copy`/`paste`
+  listeners (a cancelled `paste` pastes nothing, a cancelled `copy`
+  copies nothing).
+- Rendering polish in text controls: caret blink, and scrolling a long
+  value to keep the caret in view.
 - Audio via `symphonia` (pure Rust). Video decoding: no production pure-Rust
   decoder exists; out of scope until one does.
 - Accessibility via `accesskit`.
