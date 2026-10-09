@@ -504,6 +504,17 @@ impl App {
     fn send_viewport(&self) {
         if let (Some(tab), Some(vp)) = (self.current_handle(), self.viewport()) {
             tab.send(ShellToTab::Resize(vp));
+            // The page's `outerWidth`/`outerHeight` and `screen`.
+            if let Some(active) = &self.active {
+                let scale = active.window.scale_factor();
+                let outer = active.window.outer_size();
+                let window = ((outer.width as f64 / scale) as f32, (outer.height as f64 / scale) as f32);
+                let screen = active.window.current_monitor().map_or(window, |m| {
+                    let s = m.size();
+                    ((s.width as f64 / scale) as f32, (s.height as f64 / scale) as f32)
+                });
+                tab.send(ShellToTab::Screen { window, screen });
+            }
         }
     }
 

@@ -653,7 +653,9 @@ dependencies = [
  "boa_gc",
  "boa_runtime",
  "browser-dom",
+ "browser-layout",
  "browser-style",
+ "html5ever",
  "url",
 ]
 

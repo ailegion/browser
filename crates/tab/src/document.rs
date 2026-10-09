@@ -11,7 +11,9 @@ use browser_layout::{LayoutEngine, LayoutTree, Rect, SelectionRanges};
 use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
-use browser_script::{ConsoleLevel, ConsoleLine, EventTargetRef, HostRequest, ModuleProgress, ModuleScript, ScriptHost};
+use browser_script::{
+    ConsoleLevel, ConsoleLine, EventTargetRef, HostRequest, ImageSizeMap, ModuleProgress, ModuleScript, ScriptHost, View,
+};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
@@ -251,10 +253,23 @@ pub(crate) struct TabState {
     /// reloaded document revalidates them, as browsers do.
     doc_cache: CacheMode,
 
-    engine: LayoutEngine,
+    /// Lent to the script host around every script run (`View`), so a
+    /// script can force a layout; always back here between runs.
+    engine: Option<LayoutEngine>,
     styles: StyleMap,
     layout: Option<LayoutTree>,
     scene: Scene,
+    /// The view lent to scripts: the viewport and what it needs to lay
+    /// out; its caches live on between runs.
+    view: View,
+    /// The window's outer size and the screen's, from the shell.
+    window_size: (f32, f32),
+    screen_size: (f32, f32),
+    /// Intrinsic image sizes for a layout a script forces.
+    image_sizes: ImageSizeMap,
+    /// A script forced a layout that is still current: `dom_changed`
+    /// need not schedule another.
+    host_layout_fresh: bool,
 
     /// Interaction state behind `:hover`, `:active` and `:focus`, and how
     /// far a change in it reaches under the current sheets.
@@ -399,10 +414,15 @@ impl TabState {
             loaded_sheets: Default::default(),
             images: ImageStore::new(),
             doc_cache: CacheMode::Default,
-            engine: LayoutEngine::new(),
+            engine: Some(LayoutEngine::new()),
             styles: StyleMap::new(),
             layout: None,
             scene: Scene::new(),
+            view: View::default(),
+            window_size: (viewport.width, viewport.height),
+            screen_size: (viewport.width, viewport.height),
+            image_sizes: ImageSizeMap::default(),
+            host_layout_fresh: false,
             states: ElementStates::default(),
             deps: InteractionDeps::default(),
             hover: None,
@@ -521,6 +541,10 @@ impl TabState {
                     // Media queries may change with the viewport.
                     self.needs_style = true;
                 }
+            }
+            ShellToTab::Screen { window, screen } => {
+                self.window_size = window;
+                self.screen_size = screen;
             }
             // Pointer moves and scrolls arrive in bursts; hover is
             // re-evaluated once per batch, in `flush`, at the final position.
@@ -2111,6 +2135,7 @@ impl TabState {
                 if let Some(img) = decode_image(&p.body) {
                     self.images.insert(url, img);
                     self.needs_layout = true;
+                    self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
                 }
             }
             PendingKind::Script { id } => {
@@ -2263,6 +2288,27 @@ impl TabState {
             (None, None) => Document::new(),
         };
         host.lend_document(doc, parsing, states);
+        // The view: what a geometry read needs. The styles and layout
+        // are current unless a restyle or layout is pending (or the
+        // document on screen is not the one lent, while parsing).
+        let mut view = std::mem::take(&mut self.view);
+        view.viewport = (self.viewport.width, self.viewport.height);
+        view.scale = self.viewport.scale_factor;
+        view.scroll = (self.scroll_x, self.scroll_y);
+        view.window = self.window_size;
+        view.screen = self.screen_size;
+        view.engine = self.engine.take();
+        view.styles = std::mem::take(&mut self.styles);
+        view.layout = self.layout.take();
+        view.deps = std::mem::take(&mut self.deps);
+        view.loaded_sheets = std::mem::take(&mut self.loaded_sheets);
+        view.images = self.image_sizes.clone();
+        let fresh = !parsing && !self.needs_style && !self.needs_layout && view.layout.is_some();
+        view.clean_generation = if fresh { Some(host.generation()) } else { None };
+        view.recomputed = false;
+        view.scroll_changed = false;
+        self.host_layout_fresh = false;
+        host.lend_view(view);
         f(host);
         let doc = host.reclaim_document();
         match (&mut self.parser, &mut self.doc) {
@@ -2270,6 +2316,31 @@ impl TabState {
             (None, Some(slot)) => *slot = doc,
             (None, None) => {}
         }
+        let Some(mut view) = host.reclaim_view() else { return };
+        self.engine = view.engine.take();
+        self.styles = std::mem::take(&mut view.styles);
+        self.layout = view.layout.take();
+        self.deps = std::mem::take(&mut view.deps);
+        self.loaded_sheets = std::mem::take(&mut view.loaded_sheets);
+        // A layout the script forced that nothing changed after is the
+        // layout the tab would compute next: keep it.
+        let generation = host.generation();
+        if view.recomputed && view.clean_generation == Some(generation) && !parsing {
+            self.needs_style = false;
+            self.needs_layout = false;
+            self.needs_paint = true;
+            self.host_layout_fresh = true;
+            self.fetch_background_images();
+            self.after_layout();
+        }
+        if view.scroll_changed {
+            self.scroll_x = view.scroll.0;
+            self.scroll_y = view.scroll.1;
+            self.clamp_scroll();
+            self.needs_paint = true;
+            self.hover_dirty = true;
+        }
+        self.view = view;
     }
 
     /// Tell the bindings where the document stands before a script runs:
@@ -2614,8 +2685,11 @@ impl TabState {
     /// change may have made stale: a freed node, or one no longer in the
     /// document. Hover is found again after layout.
     fn dom_changed(&mut self) {
-        self.needs_style = true;
-        self.needs_layout = true;
+        // A layout the script forced after its last change is current.
+        if !std::mem::take(&mut self.host_layout_fresh) {
+            self.needs_style = true;
+            self.needs_layout = true;
+        }
         self.state_dirty = true;
         // A `<style>` or `<link>` the script added, changed or removed.
         self.sync_stylesheets();
@@ -2980,10 +3054,9 @@ impl TabState {
 
     fn relayout(&mut self) {
         let Some(doc) = &self.doc else { return };
+        let Some(engine) = &mut self.engine else { return };
         let started = std::time::Instant::now();
-        let tree = self
-            .engine
-            .layout(doc, &self.styles, self.viewport.width, self.viewport.height, &self.images);
+        let tree = engine.layout(doc, &self.styles, self.viewport.width, self.viewport.height, &self.images);
         tracing::debug!(
             tab = self.id.0,
             layout_ms = started.elapsed().as_millis(),
@@ -2991,6 +3064,13 @@ impl TabState {
             "relayout"
         );
         self.layout = Some(tree);
+        self.after_layout();
+    }
+
+    /// What follows a new layout, the tab's own or one a script forced:
+    /// the scroll offset clamped, find matches and the focus ring and
+    /// caret placed again.
+    fn after_layout(&mut self) {
         self.clamp_scroll();
         if self.find.is_some() {
             let prefer = self.current_match_start();
@@ -4339,11 +4419,13 @@ mod tests {
         // restyles; removing it drops its rules; an appended <link> is
         // fetched and applied; the imported sheet of a parsed <style>
         // survives an unrelated DOM change.
+        // The timers start when the test says so (`go`), so a slow load
+        // under a parallel test run cannot overtake the first reading.
         let page = "<!DOCTYPE html><title>CSS</title><style>@import url(/imp.css);</style><body><p id=p>x</p><div id=q>y</div>\
-            <script>var s; \
+            <script>var s; function go() { \
               setTimeout(() => { s = document.createElement('style'); s.textContent = '#p { height: 100px }'; document.head.appendChild(s); }, 10); \
               setTimeout(() => { s.textContent = '#p { height: 50px }'; }, 60); \
-              setTimeout(() => { s.remove(); var l = document.createElement('link'); l.setAttribute('rel', 'stylesheet'); l.setAttribute('href', '/ext.css'); document.head.appendChild(l); }, 110); \
+              setTimeout(() => { s.remove(); var l = document.createElement('link'); l.setAttribute('rel', 'stylesheet'); l.setAttribute('href', '/ext.css'); document.head.appendChild(l); }, 110); } \
             </script>";
         let server = Server::start(
             &[
@@ -4360,6 +4442,7 @@ mod tests {
         let plain = h.rect_of(p).height;
         assert!(plain != 100.0 && plain != 50.0 && plain != 70.0);
         assert_eq!(h.rect_of(q).height, 30.0, "the imported sheet applies");
+        run_js(&mut h, "go()");
         std::thread::sleep(std::time::Duration::from_millis(25));
         h.pump();
         assert_eq!(h.rect_of(p).height, 100.0, "the appended style applies");
@@ -4447,6 +4530,107 @@ mod tests {
     /// is not lent).
     fn js(h: &mut Harness, src: &str) -> String {
         h.state.script.as_mut().expect("host").eval_to_string(src).expect("eval")
+    }
+
+    /// Evaluate `src` as the tab runs a script: the document and the
+    /// view lent, the aftermath applied, the batch flushed.
+    fn run_js(h: &mut Harness, src: &str) -> String {
+        h.state.sync_document_info();
+        let mut out = None;
+        h.state.with_script(|host| out = Some(host.eval_to_string(src)));
+        h.state.after_script();
+        h.pump();
+        out.expect("a script host").expect("eval")
+    }
+
+    #[test]
+    fn geometry_scrolling_and_the_viewport_from_script() {
+        let html = "<!DOCTYPE html><title>Geo</title>\
+             <style>body { margin: 0 } #a { width: 100px; height: 50px; margin: 10px; padding: 5px; border: 2px solid black } \
+                    #rel { position: relative; margin-top: 20px; padding: 3px } #in { width: 30px; height: 30px } #tall { height: 3000px }</style>\
+             <div id=a></div><div id=rel><div id=in></div><span id=s>words</span></div><div id=tall></div>\
+             <script>\
+               var log = []; \
+               document.addEventListener('scroll', () => log.push('scroll:' + window.scrollY)); \
+               window.addEventListener('resize', () => log.push('resize:' + innerWidth)); \
+               visualViewport.addEventListener('resize', () => log.push('vv:' + visualViewport.width)); \
+               var mql = matchMedia('(max-width: 700px)'); \
+               mql.addEventListener('change', ev => log.push('mql:' + ev.matches + ':' + ev.media + ':' + (ev instanceof MediaQueryListEvent))); \
+               var a = document.getElementById('a'), rel = document.getElementById('rel'), inn = document.getElementById('in'), tall = document.getElementById('tall'); \
+               var r = el => { var b = el.getBoundingClientRect(); return [b.x, b.y, b.width, b.height, b.top, b.right, b.bottom, b.left].join(); }; \
+             </script>";
+        let mut h = Harness::load(html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+
+        // Boxes: the border box, the padding box, offsets from the
+        // offset parent.
+        assert_eq!(run_js(&mut h, "r(a)"), "\"10,10,114,64,10,124,74,10\"");
+        // `offsetTop` is 0: the top margin collapses through `body`, so
+        // body's padding edge is at 10 too (the known gotcha).
+        assert_eq!(
+            run_js(&mut h, "[a.offsetWidth, a.offsetHeight, a.offsetLeft, a.offsetTop, a.clientWidth, a.clientHeight, a.clientLeft, a.clientTop, a.offsetParent === document.body, a.scrollWidth, a.scrollHeight, a.scrollTop].join()"),
+            "\"114,64,10,0,110,60,2,2,true,110,60,0\""
+        );
+        assert_eq!(run_js(&mut h, "[inn.offsetParent === rel, inn.offsetLeft, inn.offsetTop, rel.offsetParent === document.body, document.body.offsetParent].join()"), "\"true,3,3,true,\"");
+        assert_eq!(
+            run_js(&mut h, "var cr = document.getElementById('s').getClientRects(); [cr.length, cr[0].width > 0, cr.item(0) === cr[0], cr.item(5), document.getElementById('s').offsetWidth > 0].join()"),
+            "\"1,true,true,,true\""
+        );
+        // The window and the scrolling element.
+        assert_eq!(
+            run_js(&mut h, "[document.scrollingElement === document.documentElement, innerWidth, innerHeight, devicePixelRatio, scrollX, scrollY, document.documentElement.clientWidth, document.documentElement.scrollHeight > 3000].join()"),
+            "\"true,800,600,1,0,0,800,true\""
+        );
+        assert_eq!(
+            run_js(&mut h, "window.scrollTo(0, 100); [scrollY, pageYOffset, document.documentElement.scrollTop, a.getBoundingClientRect().y].join()"),
+            "\"100,100,100,-90\""
+        );
+        assert_eq!(h.state.scroll_y, 100.0, "the tab applied the scroll");
+        assert_eq!(drain(&mut h), "\"scroll:100\"");
+        assert_eq!(run_js(&mut h, "scrollBy({ top: 50 }); var y1 = scrollY; document.documentElement.scrollTop = 20; [y1, scrollY].join()"), "\"150,20\"");
+        assert_eq!(h.state.scroll_y, 20.0);
+        drain(&mut h);
+        // A change then a read: layout is forced on the spot, a `<style>`
+        // the script added included; the tab keeps the result.
+        assert_eq!(
+            run_js(&mut h, "a.setAttribute('style', 'width: 200px'); var w = a.getBoundingClientRect().width; \
+                            var st = document.createElement('style'); st.textContent = '#a { height: 80px }'; document.head.appendChild(st); [w, a.offsetHeight].join()"),
+            "\"214,94\""
+        );
+        assert_eq!(h.rect_of(h.by_id("a")).height, 94.0);
+        // scrollIntoView: to the top, to the end (clamped), centred.
+        let tall_y = h.rect_of(h.by_id("tall")).y;
+        assert_eq!(run_js(&mut h, "tall.scrollIntoView(); scrollY"), format!("{tall_y}"));
+        assert_eq!(
+            run_js(&mut h, "tall.scrollIntoView({ block: 'end' }); scrollY === document.documentElement.scrollHeight - innerHeight"),
+            "true"
+        );
+        assert_eq!(run_js(&mut h, "a.scrollIntoView({ block: 'center' }); scrollY"), "0");
+        drain(&mut h);
+        // The screen and the window, as the shell reports them; a
+        // resize fires `resize` on window and visualViewport and
+        // `change` on the media query list.
+        h.send(ShellToTab::Screen {
+            window: (900.0, 700.0),
+            screen: (1920.0, 1080.0),
+        });
+        assert_eq!(
+            run_js(&mut h, "[outerWidth, outerHeight, screen.width, screen.availHeight, screen.colorDepth, screen.orientation.type, mql.matches, mql.media].join()"),
+            "\"900,700,1920,1080,24,landscape-primary,false,(max-width: 700px)\""
+        );
+        h.send(ShellToTab::Resize(Viewport {
+            width: 600.0,
+            height: 500.0,
+            scale_factor: 1.0,
+        }));
+        assert_eq!(drain(&mut h), "\"resize:600 vv:600 mql:true:(max-width: 700px):true\"");
+        assert_eq!(run_js(&mut h, "[mql.matches, innerWidth, visualViewport.height, visualViewport.pageTop].join()"), "\"true,600,500,0\"");
+        // The rectangle classes.
+        assert_eq!(
+            run_js(&mut h, "var d = new DOMRect(1, 2, 3, 4); d.width = 5; var ro = DOMRectReadOnly.fromRect({ x: 1, width: -2 }); \
+                            [d.right, d.bottom, ro.left, ro.right, ro instanceof DOMRectReadOnly, d instanceof DOMRectReadOnly, JSON.stringify(ro.toJSON()).includes('top'), ro.width].join()"),
+            "\"6,6,-1,1,true,true,true,-2\""
+        );
     }
 
     #[test]

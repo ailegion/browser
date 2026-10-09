@@ -34,8 +34,10 @@
 
 mod dom;
 mod events;
+mod view;
 
 pub use events::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
+pub use view::{ImageSizeMap, View};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -482,7 +484,7 @@ struct HostState {
 
 type SharedHost = Rc<RefCell<HostState>>;
 
-fn host_state(context: &mut Context) -> JsResult<SharedHost> {
+pub(crate) fn host_state(context: &mut Context) -> JsResult<SharedHost> {
     context
         .get_data::<SharedHost>()
         .cloned()
@@ -831,6 +833,39 @@ impl ScriptHost {
     /// Take the lent document back; the bindings keep an empty one.
     pub fn reclaim_document(&mut self) -> Document {
         self.dom.borrow_mut().reclaim()
+    }
+
+    /// Lend the layout machinery and the viewport with the document
+    /// (`View`): geometry reads use them, recomputing style and layout
+    /// when the script changed the tree. Take it back with
+    /// `reclaim_view` after the script.
+    pub fn lend_view(&mut self, view: View) {
+        self.dom.borrow_mut().view = Some(view);
+    }
+
+    pub fn reclaim_view(&mut self) -> Option<View> {
+        self.dom.borrow_mut().view.take()
+    }
+
+    /// The arena generation: bumped by every change a script makes to
+    /// the document, so the tab can tell whether a layout the script
+    /// forced is still current.
+    pub fn generation(&self) -> u64 {
+        self.dom.borrow().generation
+    }
+
+    /// The viewport changed: fire `change` on every `MediaQueryList`
+    /// whose answer flipped. The document and view must be lent.
+    pub fn report_media_changes(&mut self) {
+        if let Err(err) = view::report_media_changes(&mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.microtask_checkpoint();
+    }
+
+    /// `visualViewport` as an event target, for `resize` and `scroll`.
+    pub fn visual_viewport(&self) -> Option<EventTargetRef> {
+        self.dom.borrow().visual_viewport.map(EventTargetRef::Plain)
     }
 
     /// Whether a script changed the connected tree (structure, text or
@@ -1702,6 +1737,15 @@ mod tests {
                         pe.getCoalescedEvents().length, pe.getPredictedEvents().length, new PointerEvent('x').pointerId, new PointerEvent('x').pointerType === '', Math.round(pe.altitudeAngle * 100), \
                         typeof document.body.setPointerCapture, typeof document.setPointerCapture].join('|')").as_deref(),
             Ok("\"true|true|7|pen|0.3|true|1|1|0|0|2|4|1|0|0|0|true|157|function|undefined\"")
+        );
+        // Without a lent view: the rectangle and media classes exist,
+        // geometry reads as nothing rendered.
+        assert_eq!(
+            s(&mut h, "var me = new MediaQueryListEvent('change', { media: 'print', matches: true }); var m = matchMedia(' (min-width: 1px) '); \
+                       [me.media, me.matches, me instanceof Event, m instanceof MediaQueryList, m instanceof EventTarget, m.media, m.matches, typeof m.addListener, \
+                        typeof visualViewport.addEventListener, visualViewport.scale, document.body.offsetWidth, document.body.getBoundingClientRect().width, document.body.getClientRects().length, \
+                        String(document.body.offsetParent), innerWidth, typeof screen.width].join('|')").as_deref(),
+            Ok("\"print|true|true|true|true|(min-width: 1px)|false|function|function|1|0|0|0|null|0|number\"")
         );
         assert_eq!(
             s(&mut h, "var ce = new CompositionEvent('compositionstart', { data: 'x' }); \

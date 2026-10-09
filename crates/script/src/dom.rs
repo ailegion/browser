@@ -58,13 +58,14 @@ pub(crate) struct Dom {
     parsing: bool,
     /// The tab's interaction state, so `:hover`, `:focus` and friends
     /// match in `querySelector` as they do in the cascade.
-    states: ElementStates,
+    pub(crate) states: ElementStates,
     /// Selector lists already parsed, by their text: pages query the
     /// same selectors over and over.
     selectors: HashMap<String, Selectors>,
     /// Bumped on every change to the arena, connected or not: live
-    /// collections recompute their members when it moved.
-    generation: u64,
+    /// collections recompute their members when it moved, and a layout
+    /// a script forced is current only for the generation it ran at.
+    pub(crate) generation: u64,
     /// One `classList` and one `dataset` object per element, as the
     /// specification requires (`el.classList === el.classList`).
     token_lists: HashMap<NodeId, JsObject>,
@@ -77,6 +78,16 @@ pub(crate) struct Dom {
     /// The element a script asked to capture the mouse, until the tab
     /// processes it (`events.rs`, pointer capture).
     pub(crate) pointer_capture: Option<NodeId>,
+    /// The layout machinery and the viewport, lent with the document
+    /// (`view.rs`).
+    pub(crate) view: Option<crate::view::View>,
+    /// Event targets that are neither nodes nor `window`, by the id
+    /// their `PlainTarget` carries: `MediaQueryList`s and
+    /// `visualViewport`, held so the tab can fire at them.
+    pub(crate) plain_objects: HashMap<u64, JsObject>,
+    pub(crate) media_lists: Vec<crate::view::MediaList>,
+    /// The id of `visualViewport`'s target.
+    pub(crate) visual_viewport: Option<u64>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -214,7 +225,10 @@ macro_rules! dom_class {
 
 dom_class!(NodeClass, "Node", init_node);
 dom_class!(ElementClass, "Element", init_element);
-dom_class!(HtmlElementClass, "HTMLElement", |_| Ok(()));
+dom_class!(HtmlElementClass, "HTMLElement", |class| {
+    crate::view::add_html_element_geometry(class);
+    Ok(())
+});
 dom_class!(CharacterDataClass, "CharacterData", init_character_data);
 dom_class!(TextClass, "Text", |_| Ok(()));
 dom_class!(CommentClass, "Comment", |_| Ok(()));
@@ -273,6 +287,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     let document = JsObject::from_proto_and_data(proto, DomNode { id: None });
     dom(context)?.borrow_mut().document = Some(document.clone());
     context.register_global_property(js_string!("document"), document, Attribute::ENUMERABLE)?;
+    crate::view::register(context)?;
     Ok(())
 }
 
@@ -521,6 +536,7 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_mutator(class, "toggleAttribute", 1, MutMethod::ToggleAttribute);
     crate::events::add_handler_attributes(class);
     crate::events::add_pointer_capture_methods(class);
+    crate::view::add_element_geometry(class);
     Ok(())
 }
 
@@ -547,6 +563,12 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     init_parent_node(class);
     crate::events::add_handler_attributes(class);
     add_query(class, "getElementById", QueryMethod::GetElementById);
+    let get = getter(
+        class.context(),
+        "scrollingElement",
+        NativeFunction::from_fn_ptr(crate::view::document_scrolling_element),
+    );
+    class.accessor(js_string!("scrollingElement"), Some(get), None, ATTR);
     // Item 3.1's properties, which read the tab's `DocumentInfo`.
     for (name, part) in [
         ("URL", DOC_URL),

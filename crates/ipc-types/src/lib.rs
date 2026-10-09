@@ -78,6 +78,12 @@ pub enum ShellToTab {
     GoBack,
     GoForward,
     Resize(Viewport),
+    /// The window's outer size and the screen's size, in logical pixels,
+    /// for `outerWidth`/`outerHeight` and `screen`.
+    Screen {
+        window: (f32, f32),
+        screen: (f32, f32),
+    },
     Scroll { dx: f32, dy: f32 },
     MouseMove { x: f32, y: f32 },
     MouseDown { x: f32, y: f32, button: MouseButton },

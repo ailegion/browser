@@ -52,6 +52,8 @@ pub enum UiClass {
     Pointer,
     /// `CompositionEvent`: `data` is the composition text.
     Composition,
+    /// `MediaQueryListEvent`: `media` and `matches`.
+    MediaQueryList,
 }
 
 /// What the tab knows about a user event: the fields of the `UIEvent`
@@ -103,6 +105,9 @@ pub struct UiEventInit {
     pub delta_y: f64,
     /// `WheelEvent.deltaMode`: 0 pixels, 1 lines, 2 pages.
     pub delta_mode: u32,
+    /// `MediaQueryListEvent`: the query and whether it matches now.
+    pub media: String,
+    pub media_matches: bool,
 }
 
 #[derive(Clone)]
@@ -157,6 +162,14 @@ impl Events {
     /// they are not counted here; the tab checks those on the path.
     pub(crate) fn has_listeners(&self, kind: &str) -> bool {
         self.listeners.values().any(|list| list.iter().any(|l| l.kind == kind))
+    }
+
+    /// A fresh id for a plain target (`new EventTarget()`, a
+    /// `MediaQueryList`, `visualViewport`).
+    pub(crate) fn next_plain_id(&mut self) -> u64 {
+        let id = self.next_plain;
+        self.next_plain += 1;
+        id
     }
 }
 
@@ -255,11 +268,12 @@ fn now_ms(context: &mut Context) -> JsResult<f64> {
     Ok(started.elapsed().as_secs_f64() * 1000.0)
 }
 
-/// A `new EventTarget()` object.
+/// A `new EventTarget()` object, or another target that is neither a
+/// node nor `window` (`MediaQueryList`, `visualViewport`).
 #[derive(Debug, Trace, Finalize, JsData)]
-struct PlainTarget {
+pub(crate) struct PlainTarget {
     #[unsafe_ignore_trace]
-    id: u64,
+    pub(crate) id: u64,
 }
 
 // ----- classes -----
@@ -415,9 +429,38 @@ ui_class!(InputEventClass, "InputEvent", UiClass::Input, init_input_event);
 ui_class!(FocusEventClass, "FocusEvent", UiClass::Focus, init_focus_event);
 ui_class!(PointerEventClass, "PointerEvent", UiClass::Pointer, init_pointer_event);
 ui_class!(CompositionEventClass, "CompositionEvent", UiClass::Composition, init_composition_event);
+ui_class!(MediaQueryListEventClass, "MediaQueryListEvent", UiClass::MediaQueryList, init_media_event);
 
 fn init_composition_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_ui_getters(class, &[("data", UiProp::Data)]);
+    Ok(())
+}
+
+fn init_media_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(class, &[("media", UiProp::Media), ("matches", UiProp::MediaMatches)]);
+    Ok(())
+}
+
+/// Put `on<type>` accessors on one object (`visualViewport`, a
+/// `MediaQueryList`); the names must be among `HANDLER_NAMES`.
+pub(crate) fn add_handler_properties(object: &JsObject, names: &[&str], context: &mut Context) -> JsResult<()> {
+    for name in names {
+        let Some(index) = HANDLER_NAMES.iter().position(|n| n == name) else {
+            continue;
+        };
+        let get = getter(context, name, NativeFunction::from_copy_closure_with_captures(handler_get, index as u8));
+        let set = setter(context, name, NativeFunction::from_copy_closure_with_captures(handler_set, index as u8));
+        object.define_property_or_throw(
+            JsString::from(*name),
+            PropertyDescriptor::builder()
+                .get(get)
+                .set(set)
+                .enumerable(true)
+                .configurable(true)
+                .build(),
+            context,
+        )?;
+    }
     Ok(())
 }
 
@@ -660,6 +703,7 @@ fn ui_prototype(class: UiClass, context: &mut Context) -> JsResult<JsObject> {
         UiClass::Focus => context.get_global_class::<FocusEventClass>().map(|c| c.prototype()),
         UiClass::Pointer => context.get_global_class::<PointerEventClass>().map(|c| c.prototype()),
         UiClass::Composition => context.get_global_class::<CompositionEventClass>().map(|c| c.prototype()),
+        UiClass::MediaQueryList => context.get_global_class::<MediaQueryListEventClass>().map(|c| c.prototype()),
     };
     proto.ok_or_else(|| JsNativeError::typ().with_message("event class is not registered").into())
 }
@@ -757,6 +801,10 @@ fn construct_ui(
             UiClass::Composition => {
                 ui.data = init_string(init, "data", context)?;
             }
+            UiClass::MediaQueryList => {
+                ui.media = init_string(init, "media", context)?.unwrap_or_default();
+                ui.media_matches = init_bool(init, "matches", context)?;
+            }
             UiClass::Ui | UiClass::Plain => {}
         }
     }
@@ -813,6 +861,8 @@ enum UiProp {
     IsPrimary,
     /// Tilt, twist, tangential pressure, azimuth: a mouse has none.
     Zero,
+    Media,
+    MediaMatches,
 }
 
 /// The legacy `keyCode` of a key value.
@@ -917,6 +967,8 @@ fn ui_get(this: &JsValue, _: &[JsValue], prop: &UiProp, context: &mut Context) -
         UiProp::PointerType => js_str(&ui.pointer_type),
         UiProp::IsPrimary => ui.is_primary.into(),
         UiProp::Zero => 0.into(),
+        UiProp::Media => js_str(&ui.media),
+        UiProp::MediaMatches => ui.media_matches.into(),
     })
 }
 
@@ -939,7 +991,7 @@ fn get_modifier_state(this: &JsValue, args: &[JsValue], context: &mut Context) -
 /// methods being on the global object). `new EventTarget()` makes a
 /// plain target.
 #[derive(Debug, Trace, Finalize, JsData)]
-struct EventTargetClass;
+pub(crate) struct EventTargetClass;
 
 impl Class for EventTargetClass {
     const NAME: &'static str = "EventTarget";
@@ -960,12 +1012,7 @@ impl Class for EventTargetClass {
                 .into());
         }
         let shared = dom(context)?;
-        let id = {
-            let mut dom = shared.borrow_mut();
-            let id = dom.events.next_plain;
-            dom.events.next_plain += 1;
-            id
-        };
+        let id = shared.borrow_mut().events.next_plain_id();
         let proto = context
             .get_global_class::<Self>()
             .ok_or_else(|| JsNativeError::typ().with_message("EventTarget is not registered"))?
@@ -1005,7 +1052,9 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     context.register_global_class::<FocusEventClass>()?;
     context.register_global_class::<PointerEventClass>()?;
     context.register_global_class::<CompositionEventClass>()?;
+    context.register_global_class::<MediaQueryListEventClass>()?;
     inherit::<CompositionEventClass, UiEventClass>(context);
+    inherit::<MediaQueryListEventClass, EventData>(context);
     inherit::<UiEventClass, EventData>(context);
     inherit::<MouseEventClass, UiEventClass>(context);
     inherit::<WheelEventClass, MouseEventClass>(context);
@@ -1228,8 +1277,12 @@ fn target_value(target: EventTargetRef, this: Option<&JsObject>, context: &mut C
         EventTargetRef::Node(id) => wrap(id, context)?
             .as_object()
             .ok_or_else(|| JsNativeError::typ().with_message("the node is gone").into()),
-        // A plain target has no wrapper cache: it is the object itself.
-        EventTargetRef::Plain(_) => this.cloned().ok_or_else(illegal_invocation),
+        // A registered plain target (`MediaQueryList`, `visualViewport`)
+        // is found by id; a `new EventTarget()` is the object itself.
+        EventTargetRef::Plain(id) => {
+            let registered = dom(context)?.borrow().plain_objects.get(&id).cloned();
+            registered.or_else(|| this.cloned()).ok_or_else(illegal_invocation)
+        }
     }
 }
 
@@ -1340,7 +1393,7 @@ pub(crate) fn new_event(kind: &str, init: UiEventInit, context: &mut Context) ->
         Some(t) => Some(target_value(t, None, context)?),
         None => None,
     };
-    data.has_view = init.class != UiClass::Plain;
+    data.has_view = !matches!(init.class, UiClass::Plain | UiClass::MediaQueryList);
     let proto = ui_prototype(init.class, context)?;
     data.ui = init;
     Ok(JsObject::from_proto_and_data(proto, data))

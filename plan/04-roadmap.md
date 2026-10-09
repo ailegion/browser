@@ -983,7 +983,71 @@ Work:
       item 3.3.9; `selectionStart`/`selectionEnd`/`setSelectionRange`
       in item 3.3.7.
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,
-      `getBoundingClientRect`, scroll properties.
+      `getBoundingClientRect`, scroll properties. Two blocks; the item
+      is complete when both are done. Owner's scope decisions
+      2026-10-09: `matchMedia` and `visualViewport` belong here;
+      element scroll containers belong to Phase 5 (layout).
+      **Block 1 done 2026-10-09: geometry, scrolling, the viewport.**
+      The tab lends the layout machinery with the document
+      (`browser_script::View`: engine, computed styles, layout tree,
+      loaded external sheets, image sizes, viewport, scroll, window and
+      screen sizes), moved in and out like the document, so a geometry
+      read after the script changed the tree recomputes style and
+      layout on the spot (`View::ensure_layout`, keyed by the arena
+      generation): the cascade is rebuilt from the document's sheets as
+      they are now (a `<style>` the script just added is parsed and
+      cached by text; a `<link>` not fetched yet waits for the tab), then
+      layout; the tab adopts the result when nothing changed after it,
+      so it is not computed twice. `crates/script/src/view.rs`:
+      `DOMRectReadOnly`/`DOMRect` (constructors, `fromRect`, `toJSON`,
+      negative sizes), `DOMRectList`; on `Element`:
+      `getBoundingClientRect` and `getClientRects` (an inline element's
+      boxes are those of what it contains, one per line), `clientWidth`/
+      `Height`/`Left`/`Top` (the viewport for the scrolling element),
+      `scrollWidth`/`Height` (the content extent inside the padding box;
+      the page's content size for the scrolling element), `scrollTop`/
+      `scrollLeft` (live for the scrolling element, 0 and a no-op
+      elsewhere until Phase 5's scroll containers), `scrollIntoView`
+      (boolean or `{block, inline}` with `start`/`center`/`end`/
+      `nearest`), `scrollTo`/`scroll`/`scrollBy`; on `HTMLElement`:
+      `offsetWidth`/`Height`/`Left`/`Top`/`offsetParent` per CSSOM View
+      (positioned ancestor, table part, or `body`; offsets from its
+      padding edge, so a margin collapsed through `body` gives 0, as in
+      browsers); `document.scrollingElement` (`body` in quirks mode);
+      on `window`: `innerWidth`/`innerHeight`, `outerWidth`/
+      `outerHeight`, `scrollX`/`scrollY`/`pageXOffset`/`pageYOffset`,
+      `devicePixelRatio`, `screenX`/`Y`/`Left`/`Top`, `scrollTo`/
+      `scroll`/`scrollBy` (numbers or `{left, top}`), `screen` (`width`,
+      `height`, `availWidth`/`Height`, `availLeft`/`Top`, `colorDepth`,
+      `pixelDepth`, `orientation`), `visualViewport` (an event target
+      with `width`, `height`, `pageLeft`/`Top`, `offsetLeft`/`Top`,
+      `scale`, `onresize`/`onscroll`; the tab fires `resize` and
+      `scroll` on it with `window`'s), `matchMedia` (`MediaQueryList`
+      with `matches`, `media`, `change` events, `onchange`,
+      `addListener`/`removeListener`; the tab reports changed lists
+      after a resize, after `resize`, per HTML's update-the-rendering
+      order) and `MediaQueryListEvent`. A scroll a script asks for is
+      applied by the tab after the script (clamped), firing `scroll` as
+      a user's would. The shell sends the window's outer size and the
+      monitor's size (`ShellToTab::Screen`) with every resize. Tests:
+      one script test (the classes without a view), one tab harness test
+      (every box and offset property against a styled page, the
+      scrolling element, scrolling by every method with `scroll` fired
+      and the tab's offset moved, a change then a read with a `<style>`
+      added by script measured synchronously and kept by the tab,
+      `scrollIntoView` three ways, the screen message, a resize firing
+      `resize`, `visualViewport`'s `resize` and the media query
+      `change`, the rectangle classes). Checked against CSSOM View
+      2026-10-09: `offsetTop` under a collapsed margin (first built with
+      the wrong expectation in the test, corrected the same day).
+      **Block 2 (next):** `element.style` as a `CSSStyleDeclaration`
+      over the `style` attribute (camelCase and dashed names,
+      `setProperty`/`getPropertyValue`/`removeProperty`/
+      `getPropertyPriority`, `cssText`, `length`/`item`, `cssFloat`,
+      shorthands, invalid values dropped as the cascade drops them,
+      every write restyling), and `getComputedStyle` with resolved
+      values serialized for every longhand and the shorthands the
+      property table expands.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.
@@ -1052,7 +1116,12 @@ Goal: fewer broken sites. This phase does not end; items are prioritized by
 what breaks the most pages.
 
 - Layout: tables, floats, `position: sticky`, multi-column, writing modes,
-  `aspect-ratio`, `object-fit`.
+  `aspect-ratio`, `object-fit`. Scroll containers (owner's placement
+  2026-10-09): boxes with `overflow: auto`/`scroll` that scroll with the
+  wheel, keys and a drag, scrollbars drawn inside the page, hit testing
+  and selection through the scrolled offset, and the element
+  `scrollTop`/`scrollLeft`/`scrollTo`/`scrollIntoView` of item 3.3.4
+  applying to them (today they move only the page).
 - Style: transitions and animations wired to rAF, `@font-face` web fonts,
   `filter`, `backdrop-filter`, `mask`, `clip-path`, gradients, shadows,
   selector-based invalidation for performance.

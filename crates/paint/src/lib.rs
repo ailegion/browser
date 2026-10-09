@@ -37,6 +37,14 @@ impl ImageStore {
         self.images.insert(url, image);
     }
 
+    /// Every image's intrinsic size, for a layout run elsewhere.
+    pub fn sizes(&self) -> HashMap<Url, (f32, f32)> {
+        self.images
+            .iter()
+            .map(|(u, i)| (u.clone(), (i.width as f32, i.height as f32)))
+            .collect()
+    }
+
     pub fn get(&self, url: &Url) -> Option<&ImageData> {
         self.images.get(url)
     }

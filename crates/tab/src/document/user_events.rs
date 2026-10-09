@@ -17,7 +17,7 @@
 
 use browser_dom::{Document, NodeId};
 use browser_ipc_types::{Key, MouseButton};
-use browser_script::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
+use browser_script::{EventTargetRef, MOUSE_POINTER_ID, ScriptHost, UiClass, UiEventInit, forwarded_to_window};
 
 use super::{TabState, is_text_control};
 
@@ -575,8 +575,12 @@ impl TabState {
     pub(super) fn fire_view_events(&mut self) -> bool {
         let mut fired = false;
         let vp = (self.viewport.width, self.viewport.height);
+        let visual = self.script.as_ref().and_then(ScriptHost::visual_viewport);
         if vp != self.viewport_reported {
             self.viewport_reported = vp;
+            // `resize` on `window` and on `visualViewport`, then the
+            // media query lists whose answer changed (HTML's "update
+            // the rendering" order).
             if self.wants_event(EventTargetRef::Window, "resize") {
                 self.fire_user_event(
                     EventTargetRef::Window,
@@ -586,6 +590,18 @@ impl TabState {
                         ..UiEventInit::default()
                     },
                 );
+                fired = true;
+            }
+            if let Some(target) = visual
+                && self.wants_event(target, "resize")
+            {
+                self.fire_user_event(target, "resize", UiEventInit::default());
+                fired = true;
+            }
+            if self.event_doc().is_some() {
+                self.sync_document_info();
+                self.with_script(ScriptHost::report_media_changes);
+                self.after_script();
                 fired = true;
             }
         }
@@ -601,6 +617,12 @@ impl TabState {
                         ..UiEventInit::default()
                     },
                 );
+                fired = true;
+            }
+            if let Some(target) = visual
+                && self.wants_event(target, "scroll")
+            {
+                self.fire_user_event(target, "scroll", UiEventInit::default());
                 fired = true;
             }
         }
