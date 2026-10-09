@@ -62,6 +62,13 @@ pub(crate) struct Dom {
     /// Selector lists already parsed, by their text: pages query the
     /// same selectors over and over.
     selectors: HashMap<String, Selectors>,
+    /// Bumped on every change to the arena, connected or not: live
+    /// collections recompute their members when it moved.
+    generation: u64,
+    /// One `classList` and one `dataset` object per element, as the
+    /// specification requires (`el.classList === el.classList`).
+    token_lists: HashMap<NodeId, JsObject>,
+    datasets: HashMap<NodeId, JsObject>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -195,7 +202,10 @@ dom_class!(CharacterDataClass, "CharacterData", init_character_data);
 dom_class!(TextClass, "Text", |_| Ok(()));
 dom_class!(CommentClass, "Comment", |_| Ok(()));
 dom_class!(DocumentClass, "Document", init_document);
+dom_class!(DocumentFragmentClass, "DocumentFragment", init_document_fragment);
 dom_class!(TokenListClass, "DOMTokenList", init_token_list);
+dom_class!(NodeListClass, "NodeList", init_node_list);
+dom_class!(HtmlCollectionClass, "HTMLCollection", init_html_collection);
 
 fn prototype_of<C: Class>(context: &mut Context) -> JsResult<JsObject> {
     context
@@ -226,13 +236,17 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     context.register_global_class::<TextClass>()?;
     context.register_global_class::<CommentClass>()?;
     context.register_global_class::<DocumentClass>()?;
+    context.register_global_class::<DocumentFragmentClass>()?;
     context.register_global_class::<TokenListClass>()?;
+    context.register_global_class::<NodeListClass>()?;
+    context.register_global_class::<HtmlCollectionClass>()?;
     inherit::<ElementClass, NodeClass>(context)?;
     inherit::<HtmlElementClass, ElementClass>(context)?;
     inherit::<CharacterDataClass, NodeClass>(context)?;
     inherit::<TextClass, CharacterDataClass>(context)?;
     inherit::<CommentClass, CharacterDataClass>(context)?;
     inherit::<DocumentClass, NodeClass>(context)?;
+    inherit::<DocumentFragmentClass, NodeClass>(context)?;
 
     let proto = prototype_of::<DocumentClass>(context)?;
     let document = JsObject::from_proto_and_data(proto, DomNode { id: None });
@@ -288,12 +302,121 @@ fn add_query(class: &mut ClassBuilder<'_>, name: &str, method: QueryMethod) {
     );
 }
 
-/// The `ParentNode` mixin's lookups, on `Element` and `Document`.
+/// The `ParentNode` mixin, on `Element`, `Document` and
+/// `DocumentFragment`.
 fn init_parent_node(class: &mut ClassBuilder<'_>) {
+    for (name, prop) in [
+        ("children", Prop::Children),
+        ("firstElementChild", Prop::FirstElementChild),
+        ("lastElementChild", Prop::LastElementChild),
+        ("childElementCount", Prop::ChildElementCount),
+    ] {
+        add_getter(class, name, prop);
+    }
     add_query(class, "querySelector", QueryMethod::QuerySelector);
     add_query(class, "querySelectorAll", QueryMethod::QuerySelectorAll);
     add_query(class, "getElementsByClassName", QueryMethod::GetElementsByClassName);
     add_query(class, "getElementsByTagName", QueryMethod::GetElementsByTagName);
+    class.method(
+        js_string!("getElementsByTagNameNS"),
+        2,
+        NativeFunction::from_fn_ptr(get_elements_by_tag_name_ns),
+    );
+    add_mutator(class, "append", 0, MutMethod::Append);
+    add_mutator(class, "prepend", 0, MutMethod::Prepend);
+    add_mutator(class, "replaceChildren", 0, MutMethod::ReplaceChildren);
+}
+
+/// The `ChildNode` mixin, on `Element` and `CharacterData`.
+fn init_child_node(class: &mut ClassBuilder<'_>) {
+    add_getter(class, "previousElementSibling", Prop::PreviousElementSibling);
+    add_getter(class, "nextElementSibling", Prop::NextElementSibling);
+    add_mutator(class, "remove", 0, MutMethod::Remove);
+    add_mutator(class, "before", 0, MutMethod::Before);
+    add_mutator(class, "after", 0, MutMethod::After);
+    add_mutator(class, "replaceWith", 0, MutMethod::ReplaceWith);
+}
+
+fn init_document_fragment(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    init_parent_node(class);
+    Ok(())
+}
+
+/// `NodeList` and `HTMLCollection` are proxies (`collection_proxy`)
+/// whose prototype carries the generic methods: `item` reads `this[i]`,
+/// iteration and `forEach` are the array ones, which work on anything
+/// with a `length`.
+fn init_collection(class: &mut ClassBuilder<'_>, html: bool) -> JsResult<()> {
+    class.method(js_string!("item"), 1, NativeFunction::from_fn_ptr(collection_item));
+    if html {
+        class.method(js_string!("namedItem"), 1, NativeFunction::from_fn_ptr(collection_named_item));
+    }
+    let context = class.context();
+    let array = context.intrinsics().constructors().array().prototype();
+    let values = array.get(js_string!("values"), context)?;
+    let names: &[&str] = if html { &[] } else { &["forEach", "entries", "keys"] };
+    let mut methods = Vec::new();
+    for name in names {
+        methods.push((*name, array.get(JsString::from(*name), context)?));
+    }
+    class.property(boa_engine::JsSymbol::iterator(), values.clone(), Attribute::WRITABLE | Attribute::CONFIGURABLE);
+    if !html {
+        class.property(js_string!("values"), values, Attribute::WRITABLE | Attribute::CONFIGURABLE);
+    }
+    for (name, f) in methods {
+        class.property(JsString::from(name), f, Attribute::WRITABLE | Attribute::CONFIGURABLE);
+    }
+    Ok(())
+}
+
+fn init_node_list(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    init_collection(class, false)
+}
+
+fn init_html_collection(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    init_collection(class, true)
+}
+
+/// `list.item(i)`: `this[i]`, or null.
+fn collection_item(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let Some(list) = this.as_object() else {
+        return Err(illegal_invocation());
+    };
+    let index = args.get_or_undefined(0).to_number(context)?;
+    if index < 0.0 || index.is_nan() || index.fract() != 0.0 {
+        return Ok(JsValue::null());
+    }
+    let value = list.get(index as u32, context)?;
+    Ok(if value.is_undefined() { JsValue::null() } else { value })
+}
+
+/// `collection.namedItem(name)`: the first element whose `id` or `name`
+/// attribute is `name`.
+fn collection_named_item(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let Some(list) = this.as_object() else {
+        return Err(illegal_invocation());
+    };
+    let name = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    if name.is_empty() {
+        return Ok(JsValue::null());
+    }
+    let length = list.get(js_string!("length"), context)?.to_u32(context)?;
+    for i in 0..length {
+        let item = list.get(i, context)?;
+        let Some(node) = item.as_object().and_then(|o| o.downcast_ref::<DomNode>().map(|d| d.clone())) else {
+            continue;
+        };
+        let shared = dom(context)?;
+        let dom = shared.borrow();
+        if let Some(id) = node.resolve(&dom.doc)
+            && let Some(e) = dom.doc.element(id)
+            && (e.id() == Some(&name) || e.attr("name") == Some(&name))
+        {
+            drop(dom);
+            return Ok(item);
+        }
+    }
+    Ok(JsValue::null())
 }
 
 fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
@@ -321,6 +444,8 @@ fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_mutator(class, "insertBefore", 2, MutMethod::InsertBefore);
     add_mutator(class, "removeChild", 1, MutMethod::RemoveChild);
     add_mutator(class, "replaceChild", 2, MutMethod::ReplaceChild);
+    add_mutator(class, "cloneNode", 0, MutMethod::CloneNode);
+    add_mutator(class, "normalize", 0, MutMethod::Normalize);
     for (name, value) in [
         ("ELEMENT_NODE", 1),
         ("ATTRIBUTE_NODE", 2),
@@ -343,16 +468,21 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         ("tagName", Prop::TagName),
         ("localName", Prop::LocalName),
         ("namespaceURI", Prop::NamespaceUri),
+        ("prefix", Prop::Prefix),
         ("classList", Prop::ClassList),
-        ("children", Prop::Children),
-        ("firstElementChild", Prop::FirstElementChild),
-        ("lastElementChild", Prop::LastElementChild),
-        ("previousElementSibling", Prop::PreviousElementSibling),
-        ("nextElementSibling", Prop::NextElementSibling),
-        ("childElementCount", Prop::ChildElementCount),
+        // `HTMLTemplateElement.content`; null on any other element.
+        ("content", Prop::TemplateContent),
     ] {
         add_getter(class, name, prop);
     }
+    init_child_node(class);
+    add_mutator(class, "insertAdjacentElement", 2, MutMethod::InsertAdjacentElement);
+    add_mutator(class, "insertAdjacentText", 2, MutMethod::InsertAdjacentText);
+    add_mutator(class, "insertAdjacentHTML", 2, MutMethod::InsertAdjacentHtml);
+    add_mutator(class, "setAttributeNS", 3, MutMethod::SetAttributeNs);
+    add_mutator(class, "removeAttributeNS", 2, MutMethod::RemoveAttributeNs);
+    add_method(class, "getAttributeNS", 2, Method::GetAttributeNs);
+    add_method(class, "hasAttributeNS", 2, Method::HasAttributeNs);
     add_accessor(class, "id", Prop::Id, SetProp::Id);
     add_accessor(class, "className", Prop::ClassName, SetProp::ClassName);
     add_accessor(class, "innerHTML", Prop::InnerHtml, SetProp::InnerHtml);
@@ -368,14 +498,13 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_mutator(class, "setAttribute", 2, MutMethod::SetAttribute);
     add_mutator(class, "removeAttribute", 1, MutMethod::RemoveAttribute);
     add_mutator(class, "toggleAttribute", 1, MutMethod::ToggleAttribute);
-    add_mutator(class, "remove", 0, MutMethod::Remove);
     Ok(())
 }
 
 fn init_character_data(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_accessor(class, "data", Prop::Data, SetProp::Data);
     add_getter(class, "length", Prop::Length);
-    add_mutator(class, "remove", 0, MutMethod::Remove);
+    init_child_node(class);
     Ok(())
 }
 
@@ -388,8 +517,10 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         add_getter(class, name, prop);
     }
     add_mutator(class, "createElement", 1, MutMethod::CreateElement);
+    add_mutator(class, "createElementNS", 2, MutMethod::CreateElementNs);
     add_mutator(class, "createTextNode", 1, MutMethod::CreateTextNode);
     add_mutator(class, "createComment", 1, MutMethod::CreateComment);
+    add_mutator(class, "createDocumentFragment", 0, MutMethod::CreateDocumentFragment);
     init_parent_node(class);
     add_query(class, "getElementById", QueryMethod::GetElementById);
     // Item 3.1's properties, which read the tab's `DocumentInfo`.
@@ -473,6 +604,7 @@ enum Proto {
     HtmlElement,
     Text,
     Comment,
+    DocumentFragment,
 }
 
 /// The wrapper for `id` in the lent document, made on first access.
@@ -494,6 +626,7 @@ fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
             NodeKind::Element(_) => Proto::Element,
             NodeKind::Text(_) => Proto::Text,
             NodeKind::Comment(_) => Proto::Comment,
+            NodeKind::DocumentFragment => Proto::DocumentFragment,
             _ => Proto::Node,
         }
     };
@@ -503,6 +636,7 @@ fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
         Proto::HtmlElement => prototype_of::<HtmlElementClass>(context)?,
         Proto::Text => prototype_of::<TextClass>(context)?,
         Proto::Comment => prototype_of::<CommentClass>(context)?,
+        Proto::DocumentFragment => prototype_of::<DocumentFragmentClass>(context)?,
     };
     let obj = JsObject::from_proto_and_data(proto, DomNode { id: Some(id) });
     shared.borrow_mut().wrappers.insert(id, obj.clone());
@@ -516,19 +650,15 @@ fn wrap_opt(id: Option<NodeId>, context: &mut Context) -> JsResult<JsValue> {
     }
 }
 
-fn wrap_all(ids: Vec<NodeId>, context: &mut Context) -> JsResult<JsValue> {
-    let mut items = Vec::with_capacity(ids.len());
-    for id in ids {
-        items.push(wrap(id, context)?);
-    }
-    Ok(JsArray::from_iter(items, context).into())
-}
-
 /// What a read produced, before wrapping (which needs the borrow released).
 enum Out {
     Value(JsValue),
     Node(Option<NodeId>),
+    /// A static `NodeList` (`querySelectorAll`).
     Nodes(Vec<NodeId>),
+    /// A live collection: a `NodeList` for `childNodes`, an
+    /// `HTMLCollection` for the rest.
+    Live(CollectionKind),
     TokenList(NodeId),
     Dataset(NodeId),
 }
@@ -537,13 +667,64 @@ fn finish(out: Out, context: &mut Context) -> JsResult<JsValue> {
     match out {
         Out::Value(v) => Ok(v),
         Out::Node(id) => wrap_opt(id, context),
-        Out::Nodes(ids) => wrap_all(ids, context),
+        Out::Nodes(ids) => collection_proxy(CollectionKind::Static(ids), context),
+        Out::Live(kind) => collection_proxy(kind, context),
         Out::TokenList(id) => {
+            let shared = dom(context)?;
+            if let Some(o) = shared.borrow().token_lists.get(&id) {
+                return Ok(o.clone().into());
+            }
             let proto = prototype_of::<TokenListClass>(context)?;
-            Ok(JsObject::from_proto_and_data(proto, TokenList { id }).into())
+            let list = JsObject::from_proto_and_data(proto, TokenList { id });
+            shared.borrow_mut().token_lists.insert(id, list.clone());
+            Ok(list.into())
         }
-        Out::Dataset(id) => dataset_proxy(id, context),
+        Out::Dataset(id) => {
+            let shared = dom(context)?;
+            if let Some(o) = shared.borrow().datasets.get(&id) {
+                return Ok(o.clone().into());
+            }
+            let proxy = dataset_proxy(id, context)?;
+            if let Some(o) = proxy.as_object() {
+                shared.borrow_mut().datasets.insert(id, o.clone());
+            }
+            Ok(proxy)
+        }
     }
+}
+
+/// Which node kinds a property or method is defined on; anything else
+/// is an "Illegal invocation" `TypeError`, as in browsers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Receiver {
+    Any,
+    Element,
+    CharacterData,
+    /// `Element`, `Document` or `DocumentFragment`.
+    ParentNode,
+    /// `Element` or `CharacterData`.
+    ChildNode,
+    Document,
+}
+
+fn check_receiver(doc: &Document, id: NodeId, receiver: Receiver) -> Result<(), Fail> {
+    let kind = &doc.get(id).kind;
+    let ok = match receiver {
+        Receiver::Any => true,
+        Receiver::Element => matches!(kind, NodeKind::Element(_)),
+        Receiver::CharacterData => {
+            matches!(kind, NodeKind::Text(_) | NodeKind::Comment(_) | NodeKind::ProcessingInstruction { .. })
+        }
+        Receiver::ParentNode => {
+            matches!(kind, NodeKind::Element(_) | NodeKind::Document | NodeKind::DocumentFragment)
+        }
+        Receiver::ChildNode => matches!(
+            kind,
+            NodeKind::Element(_) | NodeKind::Text(_) | NodeKind::Comment(_) | NodeKind::ProcessingInstruction { .. }
+        ),
+        Receiver::Document => matches!(kind, NodeKind::Document),
+    };
+    if ok { Ok(()) } else { Err(Fail::Type("Illegal invocation".to_owned())) }
 }
 
 // ----- properties -----
@@ -566,6 +747,7 @@ enum Prop {
     TagName,
     LocalName,
     NamespaceUri,
+    Prefix,
     Id,
     ClassName,
     ClassList,
@@ -583,6 +765,7 @@ enum Prop {
     InnerHtml,
     OuterHtml,
     Dataset,
+    TemplateContent,
 }
 
 fn get(this: &JsValue, _: &[JsValue], prop: &Prop, context: &mut Context) -> JsResult<JsValue> {
@@ -590,9 +773,28 @@ fn get(this: &JsValue, _: &[JsValue], prop: &Prop, context: &mut Context) -> JsR
     let out = {
         let shared = dom(context)?;
         let dom = shared.borrow();
+        if let Some(id) = node.resolve(&dom.doc)
+            && let Err(fail) = check_receiver(&dom.doc, id, prop_receiver(prop))
+        {
+            drop(dom);
+            return Err(fail.into_error(context));
+        }
         read(&dom.doc, &node, prop.clone())
     };
     finish(out, context)
+}
+
+fn prop_receiver(prop: &Prop) -> Receiver {
+    use Prop::*;
+    match prop {
+        TagName | LocalName | NamespaceUri | Prefix | Id | ClassName | ClassList | InnerHtml | OuterHtml | Dataset
+        | TemplateContent => Receiver::Element,
+        Children | FirstElementChild | LastElementChild | ChildElementCount => Receiver::ParentNode,
+        PreviousElementSibling | NextElementSibling => Receiver::ChildNode,
+        Data | Length => Receiver::CharacterData,
+        DocumentElement | Head | Body => Receiver::Document,
+        _ => Receiver::Any,
+    }
 }
 
 /// `nodeName` and `tagName`: upper-case for HTML elements, the qualified
@@ -614,7 +816,8 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
     let Some(id) = node.resolve(doc) else {
         // The node was freed: it reads as detached and empty.
         return match (prop, node.id) {
-            (ChildNodes | Children, _) => Out::Nodes(Vec::new()),
+            (ChildNodes, _) => Out::Live(CollectionKind::ChildNodes(node.clone())),
+            (Children, _) => Out::Live(CollectionKind::Children(node.clone())),
             (IsConnected, _) => Out::Value(false.into()),
             (ChildElementCount | Length | NodeType, _) => Out::Value(0.into()),
             (NodeName | TagName | LocalName | Id | ClassName | Data | TextContent | InnerHtml | OuterHtml, _) => {
@@ -637,6 +840,7 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
                 NodeKind::Comment(_) => 8,
                 NodeKind::Document => 9,
                 NodeKind::Doctype { .. } => 10,
+                NodeKind::DocumentFragment => 11,
             }
             .into(),
         ),
@@ -646,6 +850,7 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
             NodeKind::ProcessingInstruction { target, .. } => target.clone(),
             NodeKind::Comment(_) => "#comment".to_owned(),
             NodeKind::Document => "#document".to_owned(),
+            NodeKind::DocumentFragment => "#document-fragment".to_owned(),
             NodeKind::Doctype { name, .. } => name.clone(),
         })),
         NodeValue | Data => match &node.kind {
@@ -662,14 +867,14 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
         }),
         TextContent => match &node.kind {
             NodeKind::Document | NodeKind::Doctype { .. } => Out::Value(JsValue::null()),
-            NodeKind::Element(_) => Out::Value(js_str(&doc.text_content(id))),
+            NodeKind::Element(_) | NodeKind::DocumentFragment => Out::Value(js_str(&doc.text_content(id))),
             NodeKind::Text(t) | NodeKind::Comment(t) | NodeKind::ProcessingInstruction { data: t, .. } => {
                 Out::Value(js_str(t))
             }
         },
         ParentNode => Out::Node(node.parent),
         ParentElement => Out::Node(node.parent.filter(|&p| is_element(p))),
-        ChildNodes => Out::Nodes(doc.children(id).collect()),
+        ChildNodes => Out::Live(CollectionKind::ChildNodes(DomNode { id: Some(id) })),
         FirstChild => Out::Node(node.first_child),
         LastChild => Out::Node(node.last_child),
         PreviousSibling => Out::Node(node.prev_sibling),
@@ -679,6 +884,11 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
         TagName => Out::Value(element.map_or(JsValue::null(), |e| js_str(&element_name(e)))),
         LocalName => Out::Value(element.map_or(JsValue::null(), |e| js_str(&e.name.local))),
         NamespaceUri => Out::Value(element.map_or(JsValue::null(), |e| js_str(&e.name.ns))),
+        Prefix => Out::Value(
+            element
+                .and_then(|e| e.name.prefix.as_ref())
+                .map_or(JsValue::null(), |p| js_str(p)),
+        ),
         Id => Out::Value(js_str(element.and_then(|e| e.id()).unwrap_or(""))),
         ClassName => Out::Value(js_str(element.and_then(|e| e.attr("class")).unwrap_or(""))),
         ClassList => {
@@ -688,7 +898,7 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
                 Out::Value(JsValue::null())
             }
         }
-        Children => Out::Nodes(doc.children(id).filter(|&c| is_element(c)).collect()),
+        Children => Out::Live(CollectionKind::Children(DomNode { id: Some(id) })),
         FirstElementChild => Out::Node(doc.children(id).find(|&c| is_element(c))),
         LastElementChild => Out::Node(doc.children(id).filter(|&c| is_element(c)).last()),
         PreviousElementSibling => {
@@ -717,6 +927,7 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
         Body => Out::Node(doc.body()),
         InnerHtml => Out::Value(js_str(&doc.serialize_html(id, false))),
         OuterHtml => Out::Value(js_str(&doc.serialize_html(id, true))),
+        TemplateContent => Out::Node(element.and_then(|e| e.template_contents)),
         Dataset => {
             if element.is_some() {
                 Out::Dataset(id)
@@ -738,6 +949,17 @@ enum Method {
     HasAttribute,
     HasAttributes,
     GetAttributeNames,
+    GetAttributeNs,
+    HasAttributeNs,
+}
+
+/// A namespace argument: null and undefined mean no namespace.
+fn namespace_arg(args: &[JsValue], index: usize, context: &mut Context) -> JsResult<String> {
+    let v = args.get_or_undefined(index);
+    if v.is_null_or_undefined() {
+        return Ok(String::new());
+    }
+    Ok(v.to_string(context)?.to_std_string_escaped())
 }
 
 fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context) -> JsResult<JsValue> {
@@ -747,6 +969,13 @@ fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context
         Method::GetAttribute | Method::HasAttribute => {
             Some(args.get_or_undefined(0).to_string(context)?.to_std_string_escaped())
         }
+        Method::GetAttributeNs | Method::HasAttributeNs => {
+            Some(args.get_or_undefined(1).to_string(context)?.to_std_string_escaped())
+        }
+        _ => None,
+    };
+    let ns = match method {
+        Method::GetAttributeNs | Method::HasAttributeNs => Some(namespace_arg(args, 0, context)?),
         _ => None,
     };
     let shared = dom(context)?;
@@ -754,11 +983,19 @@ fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context
     let doc = &dom.doc;
     let Some(id) = node.resolve(doc) else {
         return Ok(match method {
-            Method::GetAttribute => JsValue::null(),
+            Method::GetAttribute | Method::GetAttributeNs => JsValue::null(),
             Method::GetAttributeNames => JsArray::from_iter(Vec::<JsValue>::new(), context).into(),
             _ => false.into(),
         });
     };
+    let receiver = match method {
+        Method::HasChildNodes | Method::Contains | Method::IsSameNode => Receiver::Any,
+        _ => Receiver::Element,
+    };
+    if let Err(fail) = check_receiver(doc, id, receiver) {
+        drop(dom);
+        return Err(fail.into_error(context));
+    }
     let element = doc.get(id).as_element();
     // HTML elements match attribute names case-insensitively.
     let attr_name = |e: &browser_dom::Element| {
@@ -777,6 +1014,12 @@ fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context
             .map_or(JsValue::null(), js_str),
         Method::HasAttribute => element.is_some_and(|e| e.attr(&attr_name(e)).is_some()).into(),
         Method::HasAttributes => element.is_some_and(|e| !e.attrs.is_empty()).into(),
+        Method::GetAttributeNs => element
+            .and_then(|e| e.attr_ns(ns.as_deref().unwrap_or(""), name.as_deref().unwrap_or("")))
+            .map_or(JsValue::null(), js_str),
+        Method::HasAttributeNs => element
+            .is_some_and(|e| e.attr_ns(ns.as_deref().unwrap_or(""), name.as_deref().unwrap_or("")).is_some())
+            .into(),
         Method::GetAttributeNames => {
             let names: Vec<JsValue> = element
                 .map(|e| e.attrs.iter().map(|a| js_str(&a.name.local)).collect())
@@ -887,6 +1130,16 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
     let Some(id) = node.resolve(&dom.doc) else {
         return Ok(JsValue::undefined());
     };
+    let receiver = match prop {
+        SetProp::Id | SetProp::ClassName | SetProp::InnerHtml => Receiver::Element,
+        SetProp::Data => Receiver::CharacterData,
+        _ => Receiver::Any,
+    };
+    if let Err(fail) = check_receiver(&dom.doc, id, receiver) {
+        drop(dom);
+        return Err(fail.into_error(context));
+    }
+    dom.generation += 1;
     let connected = dom.doc.is_connected(id);
     let is_element = dom.doc.get(id).is_element();
     match prop {
@@ -917,9 +1170,61 @@ enum MutMethod {
     SetAttribute,
     RemoveAttribute,
     ToggleAttribute,
+    SetAttributeNs,
+    RemoveAttributeNs,
     CreateElement,
+    CreateElementNs,
     CreateTextNode,
     CreateComment,
+    CreateDocumentFragment,
+    CloneNode,
+    Normalize,
+    Append,
+    Prepend,
+    ReplaceChildren,
+    Before,
+    After,
+    ReplaceWith,
+    InsertAdjacentElement,
+    InsertAdjacentText,
+    InsertAdjacentHtml,
+}
+
+/// A node-or-string argument of `append` and friends, converted before
+/// the borrow (a string conversion can run script).
+enum NodeOrText {
+    Node(DomNode),
+    Text(String),
+}
+
+fn node_or_text_args(args: &[JsValue], context: &mut Context) -> JsResult<Vec<NodeOrText>> {
+    let mut out = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        match arg_node(args, i) {
+            Some(n) => out.push(NodeOrText::Node(n)),
+            None => out.push(NodeOrText::Text(a.to_string(context)?.to_std_string_escaped())),
+        }
+    }
+    Ok(out)
+}
+
+/// `insertAdjacent*` positions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Adjacent {
+    BeforeBegin,
+    AfterBegin,
+    BeforeEnd,
+    AfterEnd,
+}
+
+fn adjacent_position(text: &str) -> Option<Adjacent> {
+    match text.to_ascii_lowercase().as_str() {
+        "beforebegin" => Some(Adjacent::BeforeBegin),
+        "afterbegin" => Some(Adjacent::AfterBegin),
+        "beforeend" => Some(Adjacent::BeforeEnd),
+        "afterend" => Some(Adjacent::AfterEnd),
+        _ => None,
+    }
 }
 
 /// The node argument at `index`, which must be a node wrapper whose node
@@ -939,7 +1244,7 @@ fn check_insert(
     child: NodeId,
     reference: Option<NodeId>,
 ) -> Result<Option<NodeId>, Fail> {
-    if !matches!(doc.get(parent).kind, NodeKind::Document | NodeKind::Element(_)) {
+    if !matches!(doc.get(parent).kind, NodeKind::Document | NodeKind::Element(_) | NodeKind::DocumentFragment) {
         return Err(Fail::hierarchy("the parent cannot have children"));
     }
     if child == parent || doc.ancestors(parent).any(|a| a == child) {
@@ -965,13 +1270,76 @@ fn check_insert(
     Ok(if reference == Some(child) { doc.next_sibling(child) } else { reference })
 }
 
-/// Put `child` under `parent` before `reference`, moving it if attached.
-fn insert(doc: &mut Document, parent: NodeId, child: NodeId, reference: Option<NodeId>) {
-    doc.detach(child);
-    match reference {
-        Some(r) => doc.insert_before(r, child),
-        None => doc.append_child(parent, child),
+/// The nodes an insertion puts in place of `child`: a fragment's
+/// children (which leave it), else the node itself.
+fn nodes_to_insert(doc: &Document, child: NodeId) -> Vec<NodeId> {
+    if matches!(doc.get(child).kind, NodeKind::DocumentFragment) {
+        doc.children(child).collect()
+    } else {
+        vec![child]
     }
+}
+
+/// Check and perform `insertBefore(child, reference)` on `parent`, where
+/// `child` may be a fragment. Returns whether anything connected changed.
+fn insert_node(doc: &mut Document, parent: NodeId, child: NodeId, reference: Option<NodeId>) -> Result<bool, Fail> {
+    let nodes = nodes_to_insert(doc, child);
+    let mut reference = check_insert(doc, parent, child, reference)?;
+    let mut connected = false;
+    for n in &nodes {
+        check_insert(doc, parent, *n, reference)?;
+    }
+    for n in nodes {
+        connected |= doc.is_connected(n);
+        if reference == Some(n) {
+            reference = doc.next_sibling(n);
+        }
+        doc.detach(n);
+        match reference {
+            Some(r) => doc.insert_before(r, n),
+            None => doc.append_child(parent, n),
+        }
+    }
+    Ok(connected)
+}
+
+/// Turn node-or-string arguments into nodes (strings become text nodes).
+fn materialize(doc: &mut Document, items: &[NodeOrText]) -> Result<Vec<NodeId>, Fail> {
+    let mut nodes = Vec::with_capacity(items.len());
+    for item in items {
+        nodes.push(match item {
+            NodeOrText::Node(n) => n
+                .resolve(doc)
+                .ok_or_else(|| Fail::Type("parameter is not of type 'Node'".to_owned()))?,
+            NodeOrText::Text(t) => doc.create_text(t.clone()),
+        });
+    }
+    Ok(nodes)
+}
+
+/// Insert several nodes before `reference` under `parent`, as `append`,
+/// `prepend`, `before` and `after` do. Returns whether anything
+/// connected changed.
+fn insert_all(doc: &mut Document, parent: NodeId, nodes: &[NodeId], reference: Option<NodeId>) -> Result<bool, Fail> {
+    let mut connected = false;
+    for &n in nodes {
+        connected |= insert_node(doc, parent, n, reference)?;
+    }
+    Ok(connected)
+}
+
+/// The first sibling after `id` (or before, when `backwards`) that is
+/// not among `nodes`: where `after`/`before` insert so a node listed
+/// among its own arguments does not anchor the insertion.
+fn viable_sibling(doc: &Document, id: NodeId, nodes: &[NodeId], backwards: bool) -> Option<NodeId> {
+    let mut cur = if backwards { doc.prev_sibling(id) } else { doc.next_sibling(id) };
+    while let Some(s) = cur {
+        if !nodes.contains(&s) {
+            return Some(s);
+        }
+        cur = if backwards { doc.prev_sibling(s) } else { doc.next_sibling(s) };
+    }
+    None
 }
 
 fn mutate_call(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &mut Context) -> JsResult<JsValue> {
@@ -983,19 +1351,38 @@ fn mutate_call(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &m
             args.get_or_undefined(0).to_string(context)?.to_std_string_escaped(),
             args.get_or_undefined(1).to_string(context)?.to_std_string_escaped(),
         ],
+        SetAttributeNs => vec![
+            namespace_arg(args, 0, context)?,
+            args.get_or_undefined(1).to_string(context)?.to_std_string_escaped(),
+            args.get_or_undefined(2).to_string(context)?.to_std_string_escaped(),
+        ],
+        RemoveAttributeNs | CreateElementNs => vec![
+            namespace_arg(args, 0, context)?,
+            args.get_or_undefined(1).to_string(context)?.to_std_string_escaped(),
+        ],
         RemoveAttribute | ToggleAttribute | CreateElement | CreateTextNode | CreateComment => {
             vec![args.get_or_undefined(0).to_string(context)?.to_std_string_escaped()]
         }
+        InsertAdjacentElement => vec![args.get_or_undefined(0).to_string(context)?.to_std_string_escaped()],
+        InsertAdjacentText | InsertAdjacentHtml => vec![
+            args.get_or_undefined(0).to_string(context)?.to_std_string_escaped(),
+            args.get_or_undefined(1).to_string(context)?.to_std_string_escaped(),
+        ],
+        _ => Vec::new(),
+    };
+    let items = match method {
+        Append | Prepend | ReplaceChildren | Before | After | ReplaceWith => node_or_text_args(args, context)?,
         _ => Vec::new(),
     };
     let force = match method {
         ToggleAttribute => args.get(1).filter(|v| !v.is_undefined()).map(JsValue::to_boolean),
+        CloneNode => Some(args.get_or_undefined(0).to_boolean()),
         _ => None,
     };
     let shared = dom(context)?;
     let result = {
         let mut dom = shared.borrow_mut();
-        mutate(&mut dom, node, args, method, &strings, force)
+        mutate(&mut dom, node, args, method, &strings, &items, force)
     };
     match result {
         Ok(out) => finish(out, context),
@@ -1009,9 +1396,11 @@ fn mutate(
     args: &[JsValue],
     method: &MutMethod,
     strings: &[String],
+    items: &[NodeOrText],
     force: Option<bool>,
 ) -> Result<Out, Fail> {
     use MutMethod::*;
+    dom.generation += 1;
     // Creating a detached node changes nothing the tab can see.
     match method {
         CreateElement => {
@@ -1021,13 +1410,33 @@ fn mutate(
             }
             return Ok(Out::Node(Some(dom.doc.create_html_element(&name))));
         }
+        CreateElementNs => {
+            let qualified = &strings[1];
+            let local = qualified.rsplit(':').next().unwrap_or(qualified);
+            if !valid_element_name(local) || qualified.starts_with(':') || qualified.ends_with(':') {
+                return Err(Fail::Dom("InvalidCharacterError", format!("'{qualified}' is not a valid element name")));
+            }
+            if qualified.contains(':') && strings[0].is_empty() {
+                return Err(Fail::Dom("NamespaceError", "a prefix needs a namespace".to_owned()));
+            }
+            return Ok(Out::Node(Some(dom.doc.create_element_ns(&strings[0], qualified))));
+        }
         CreateTextNode => return Ok(Out::Node(Some(dom.doc.create_text(strings[0].clone())))),
         CreateComment => return Ok(Out::Node(Some(dom.doc.create_node(NodeKind::Comment(strings[0].clone()))))),
+        CreateDocumentFragment => return Ok(Out::Node(Some(dom.doc.create_node(NodeKind::DocumentFragment)))),
         _ => {}
     }
     let Some(id) = node.resolve(&dom.doc) else {
         return Err(Fail::hierarchy("the node is gone"));
     };
+    let receiver = match method {
+        SetAttribute | RemoveAttribute | ToggleAttribute | SetAttributeNs | RemoveAttributeNs | InsertAdjacentElement
+        | InsertAdjacentText | InsertAdjacentHtml => Receiver::Element,
+        Remove | Before | After | ReplaceWith => Receiver::ChildNode,
+        Append | Prepend | ReplaceChildren => Receiver::ParentNode,
+        _ => Receiver::Any,
+    };
+    check_receiver(&dom.doc, id, receiver)?;
     let mut connected = dom.doc.is_connected(id);
     let out = match method {
         AppendChild | InsertBefore => {
@@ -1036,9 +1445,7 @@ fn mutate(
                 InsertBefore if !args.get_or_undefined(1).is_null_or_undefined() => Some(node_arg(args, 1, &dom.doc)?),
                 _ => None,
             };
-            let reference = check_insert(&dom.doc, id, child, reference)?;
-            connected |= dom.doc.is_connected(child);
-            insert(&mut dom.doc, id, child, reference);
+            connected |= insert_node(&mut dom.doc, id, child, reference)?;
             Out::Node(Some(child))
         }
         ReplaceChild => {
@@ -1047,13 +1454,12 @@ fn mutate(
             if dom.doc.parent(old) != Some(id) {
                 return Err(Fail::Dom("NotFoundError", "the node to be replaced is not a child of this node".to_owned()));
             }
-            let reference = check_insert(&dom.doc, id, new, Some(old))?;
-            connected |= dom.doc.is_connected(new);
-            // The reference is `old` itself unless `new` is `old`; the
-            // node after `old` is where `new` goes once `old` is out.
-            let reference = if reference == Some(old) { dom.doc.next_sibling(old) } else { reference };
+            check_insert(&dom.doc, id, new, Some(old))?;
+            // `new` goes where `old` was: before the node after `old`
+            // (which may be `new` itself, moving up).
+            let reference = viable_sibling(&dom.doc, old, &[new], false);
             dom.doc.detach(old);
-            insert(&mut dom.doc, id, new, reference);
+            connected |= insert_node(&mut dom.doc, id, new, reference)?;
             Out::Node(Some(old))
         }
         RemoveChild => {
@@ -1067,6 +1473,106 @@ fn mutate(
         }
         Remove => {
             dom.doc.detach(id);
+            Out::Value(JsValue::undefined())
+        }
+        CloneNode => {
+            // The copy is detached: nothing visible changed.
+            connected = false;
+            Out::Node(Some(dom.doc.clone_subtree(id, force.unwrap_or(false))))
+        }
+        Normalize => {
+            dom.doc.normalize(id);
+            Out::Value(JsValue::undefined())
+        }
+        Append | Prepend => {
+            let nodes = materialize(&mut dom.doc, items)?;
+            let reference = if matches!(method, Prepend) { dom.doc.first_child(id) } else { None };
+            connected |= insert_all(&mut dom.doc, id, &nodes, reference)?;
+            Out::Value(JsValue::undefined())
+        }
+        ReplaceChildren => {
+            let nodes = materialize(&mut dom.doc, items)?;
+            for n in &nodes {
+                check_insert(&dom.doc, id, *n, None)?;
+            }
+            let children: Vec<NodeId> = dom.doc.children(id).collect();
+            for c in children {
+                if !nodes.contains(&c) {
+                    dom.discard(c);
+                } else {
+                    dom.doc.detach(c);
+                }
+            }
+            connected |= insert_all(&mut dom.doc, id, &nodes, None)?;
+            Out::Value(JsValue::undefined())
+        }
+        Before | After | ReplaceWith => {
+            let Some(parent) = dom.doc.parent(id) else {
+                return Ok(Out::Value(JsValue::undefined()));
+            };
+            let nodes = materialize(&mut dom.doc, items)?;
+            let reference = match method {
+                Before => viable_sibling(&dom.doc, id, &nodes, true)
+                    .map_or(dom.doc.first_child(parent), |s| dom.doc.next_sibling(s)),
+                _ => viable_sibling(&dom.doc, id, &nodes, false),
+            };
+            if matches!(method, ReplaceWith) {
+                dom.doc.detach(id);
+            }
+            connected |= insert_all(&mut dom.doc, parent, &nodes, reference)?;
+            Out::Value(JsValue::undefined())
+        }
+        InsertAdjacentElement | InsertAdjacentText | InsertAdjacentHtml => {
+            let Some(position) = adjacent_position(&strings[0]) else {
+                return Err(Fail::Dom("SyntaxError", format!("'{}' is not one of the insert positions", strings[0])));
+            };
+            let outside = matches!(position, Adjacent::BeforeBegin | Adjacent::AfterEnd);
+            let parent = if outside { dom.doc.parent(id) } else { Some(id) };
+            let Some(parent) = parent else {
+                return match method {
+                    InsertAdjacentElement => Ok(Out::Value(JsValue::null())),
+                    InsertAdjacentText => Ok(Out::Value(JsValue::undefined())),
+                    _ => Err(Fail::Dom("NoModificationAllowedError", "the element has no parent".to_owned())),
+                };
+            };
+            let reference = match position {
+                Adjacent::BeforeBegin => Some(id),
+                Adjacent::AfterBegin => dom.doc.first_child(id),
+                Adjacent::BeforeEnd => None,
+                Adjacent::AfterEnd => dom.doc.next_sibling(id),
+            };
+            let nodes: Vec<NodeId> = match method {
+                InsertAdjacentElement => vec![node_arg(args, 1, &dom.doc)?],
+                InsertAdjacentText => vec![dom.doc.create_text(strings[1].clone())],
+                _ => dom.doc.parse_fragment(parent, &strings[1]),
+            };
+            connected |= insert_all(&mut dom.doc, parent, &nodes, reference)?;
+            match method {
+                InsertAdjacentElement => Out::Node(nodes.first().copied()),
+                _ => Out::Value(JsValue::undefined()),
+            }
+        }
+        SetAttributeNs | RemoveAttributeNs => {
+            let Some(e) = dom.doc.get_mut(id).as_element_mut() else {
+                return Ok(Out::Value(JsValue::undefined()));
+            };
+            let (ns, qualified) = (&strings[0], &strings[1]);
+            match method {
+                SetAttributeNs => {
+                    let local = qualified.rsplit(':').next().unwrap_or(qualified);
+                    if !valid_attribute_name(local) || qualified.starts_with(':') || qualified.ends_with(':') {
+                        return Err(Fail::Dom("InvalidCharacterError", format!("'{qualified}' is not a valid attribute name")));
+                    }
+                    if qualified.contains(':') && ns.is_empty() {
+                        return Err(Fail::Dom("NamespaceError", "a prefix needs a namespace".to_owned()));
+                    }
+                    e.set_attr_ns(ns, qualified, &strings[2]);
+                }
+                _ => {
+                    connected &= e.attr_ns(ns, qualified).is_some();
+                    e.remove_attr_ns(ns, qualified);
+                }
+            }
             Out::Value(JsValue::undefined())
         }
         SetAttribute | RemoveAttribute | ToggleAttribute => {
@@ -1107,7 +1613,9 @@ fn mutate(
                 }
             }
         }
-        CreateElement | CreateTextNode | CreateComment => unreachable!("handled above"),
+        CreateElement | CreateElementNs | CreateTextNode | CreateComment | CreateDocumentFragment => {
+            unreachable!("handled above")
+        }
     };
     if connected {
         dom.mutated = true;
@@ -1147,10 +1655,18 @@ fn query(dom: &mut Dom, node: &DomNode, method: &QueryMethod, arg: &str) -> Resu
     let Some(id) = node.resolve(&dom.doc) else {
         return Ok(match method {
             Matches => Out::Value(false.into()),
-            QuerySelectorAll | GetElementsByClassName | GetElementsByTagName => Out::Nodes(Vec::new()),
+            QuerySelectorAll => Out::Nodes(Vec::new()),
+            GetElementsByClassName => Out::Live(CollectionKind::ByClass(node.clone(), arg.to_owned())),
+            GetElementsByTagName => Out::Live(CollectionKind::ByTag(node.clone(), arg.to_owned())),
             _ => Out::Value(JsValue::null()),
         });
     };
+    let receiver = match method {
+        Matches | Closest => Receiver::Element,
+        GetElementById => Receiver::Document,
+        _ => Receiver::ParentNode,
+    };
+    check_receiver(&dom.doc, id, receiver)?;
     match method {
         QuerySelector | QuerySelectorAll | Matches | Closest => {
             let dom = &mut *dom;
@@ -1174,38 +1690,218 @@ fn query(dom: &mut Dom, node: &DomNode, method: &QueryMethod, arg: &str) -> Resu
                 .descendants(id)
                 .find(|&n| dom.doc.element(n).is_some_and(|e| e.id() == Some(arg))),
         )),
-        GetElementsByClassName => {
-            let wanted: Vec<&str> = arg.split_ascii_whitespace().collect();
-            if wanted.is_empty() {
-                return Ok(Out::Nodes(Vec::new()));
-            }
-            let doc = &dom.doc;
-            Ok(Out::Nodes(
-                doc.descendants(id)
-                    .filter(|&n| {
-                        doc.element(n).is_some_and(|e| {
-                            let classes: Vec<&str> = e.classes().collect();
-                            wanted.iter().all(|w| classes.contains(w))
-                        })
-                    })
-                    .collect(),
-            ))
-        }
-        GetElementsByTagName => {
-            let doc = &dom.doc;
-            let lower = arg.to_ascii_lowercase();
-            Ok(Out::Nodes(
-                doc.descendants(id)
-                    .filter(|&n| {
-                        doc.element(n).is_some_and(|e| {
-                            arg == "*"
-                                || if e.is_html() { *e.name.local == *lower } else { element_name(e) == arg }
-                        })
-                    })
-                    .collect(),
-            ))
-        }
+        GetElementsByClassName => Ok(Out::Live(CollectionKind::ByClass(node.clone(), arg.to_owned()))),
+        GetElementsByTagName => Ok(Out::Live(CollectionKind::ByTag(node.clone(), arg.to_owned()))),
     }
+}
+
+/// `getElementsByTagNameNS(namespace, localName)`, `*` for either.
+fn get_elements_by_tag_name_ns(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let node = this_node(this)?;
+    let ns = namespace_arg(args, 0, context)?;
+    let local = args.get_or_undefined(1).to_string(context)?.to_std_string_escaped();
+    collection_proxy(CollectionKind::ByTagNs(node, ns, local), context)
+}
+
+// ----- live collections (NodeList, HTMLCollection) -----
+
+/// What a collection holds. The live kinds are recomputed whenever the
+/// arena changed since they were last read.
+#[derive(Debug, Clone)]
+enum CollectionKind {
+    ChildNodes(DomNode),
+    Children(DomNode),
+    ByClass(DomNode, String),
+    ByTag(DomNode, String),
+    ByTagNs(DomNode, String, String),
+    Static(Vec<NodeId>),
+}
+
+/// The target behind a collection proxy.
+#[derive(Debug, Trace, Finalize, JsData)]
+struct CollectionTarget {
+    #[unsafe_ignore_trace]
+    kind: CollectionKind,
+    /// Members as of `Dom::generation`.
+    #[unsafe_ignore_trace]
+    cache: RefCell<Option<(u64, Vec<NodeId>)>>,
+}
+
+/// The members of a collection, in document order.
+fn collection_members(dom: &Dom, kind: &CollectionKind) -> Vec<NodeId> {
+    let doc = &dom.doc;
+    let root = |n: &DomNode| n.resolve(doc);
+    match kind {
+        CollectionKind::Static(ids) => ids.iter().copied().filter(|&i| doc.contains(i)).collect(),
+        CollectionKind::ChildNodes(n) => root(n).map(|id| doc.children(id).collect()).unwrap_or_default(),
+        CollectionKind::Children(n) => root(n)
+            .map(|id| doc.children(id).filter(|&c| doc.get(c).is_element()).collect())
+            .unwrap_or_default(),
+        CollectionKind::ByClass(n, names) => {
+            let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
+            if wanted.is_empty() {
+                return Vec::new();
+            }
+            root(n)
+                .map(|id| {
+                    doc.descendants(id)
+                        .filter(|&d| {
+                            doc.element(d).is_some_and(|e| {
+                                let classes: Vec<&str> = e.classes().collect();
+                                wanted.iter().all(|w| classes.contains(w))
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        CollectionKind::ByTag(n, name) => {
+            let lower = name.to_ascii_lowercase();
+            root(n)
+                .map(|id| {
+                    doc.descendants(id)
+                        .filter(|&d| {
+                            doc.element(d).is_some_and(|e| {
+                                name == "*" || if e.is_html() { *e.name.local == *lower } else { element_name(e) == *name }
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        CollectionKind::ByTagNs(n, ns, local) => root(n)
+            .map(|id| {
+                doc.descendants(id)
+                    .filter(|&d| {
+                        doc.element(d).is_some_and(|e| {
+                            (ns == "*" || *e.name.ns == **ns) && (local == "*" || *e.name.local == **local)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// A `NodeList` or `HTMLCollection`: a `Proxy` whose indexed reads and
+/// `length` come from the document at the time of the read.
+fn collection_proxy(kind: CollectionKind, context: &mut Context) -> JsResult<JsValue> {
+    let proto = match kind {
+        CollectionKind::ChildNodes(_) | CollectionKind::Static(_) => prototype_of::<NodeListClass>(context)?,
+        _ => prototype_of::<HtmlCollectionClass>(context)?,
+    };
+    let target = JsObject::from_proto_and_data(
+        proto,
+        CollectionTarget {
+            kind,
+            cache: RefCell::new(None),
+        },
+    );
+    let proxy = JsProxy::builder(target)
+        .get(collection_get)
+        .has(collection_has)
+        .own_keys(collection_keys)
+        .get_own_property_descriptor(collection_descriptor)
+        .build(context)?;
+    Ok(proxy.into())
+}
+
+/// The members of the collection behind a trap's target, from the cache
+/// when the arena has not changed.
+fn collection_of(args: &[JsValue], context: &mut Context) -> JsResult<(JsObject, Vec<NodeId>)> {
+    let target = args
+        .first()
+        .and_then(JsValue::as_object)
+        .ok_or_else(illegal_invocation)?;
+    let members = {
+        let data = target.downcast_ref::<CollectionTarget>().ok_or_else(illegal_invocation)?;
+        let shared = dom(context)?;
+        let dom = shared.borrow();
+        let mut cache = data.cache.borrow_mut();
+        match &*cache {
+            Some((generation, members)) if *generation == dom.generation => members.clone(),
+            _ => {
+                let members = collection_members(&dom, &data.kind);
+                *cache = Some((dom.generation, members.clone()));
+                members
+            }
+        }
+    };
+    Ok((target.clone(), members))
+}
+
+/// The trap's key as an index, if it is a canonical array index.
+fn collection_index(args: &[JsValue], context: &mut Context) -> JsResult<Option<usize>> {
+    let key = args.get_or_undefined(1);
+    if key.is_symbol() {
+        return Ok(None);
+    }
+    let text = key.to_string(context)?.to_std_string_escaped();
+    if text == "0" || (!text.starts_with('0') && text.bytes().all(|b| b.is_ascii_digit()) && !text.is_empty()) {
+        Ok(text.parse().ok())
+    } else {
+        Ok(None)
+    }
+}
+
+fn collection_get(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (target, members) = collection_of(args, context)?;
+    if let Some(i) = collection_index(args, context)? {
+        return match members.get(i) {
+            Some(&id) => wrap(id, context),
+            None => Ok(JsValue::undefined()),
+        };
+    }
+    let key = args.get_or_undefined(1);
+    if !key.is_symbol() && key.to_string(context)?.to_std_string_escaped() == "length" {
+        return Ok((members.len() as i32).into());
+    }
+    let key = key.to_property_key(context)?;
+    target.get(key, context)
+}
+
+fn collection_has(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (target, members) = collection_of(args, context)?;
+    if let Some(i) = collection_index(args, context)? {
+        return Ok((i < members.len()).into());
+    }
+    let key = args.get_or_undefined(1);
+    if !key.is_symbol() && key.to_string(context)?.to_std_string_escaped() == "length" {
+        return Ok(true.into());
+    }
+    let key = key.to_property_key(context)?;
+    Ok(target.has_property(key, context)?.into())
+}
+
+fn collection_keys(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (_, members) = collection_of(args, context)?;
+    let mut keys: Vec<JsValue> = (0..members.len()).map(|i| js_str(&i.to_string())).collect();
+    keys.push(js_str("length"));
+    Ok(JsArray::from_iter(keys, context).into())
+}
+
+fn collection_descriptor(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let (_, members) = collection_of(args, context)?;
+    let (value, enumerable) = if let Some(i) = collection_index(args, context)? {
+        match members.get(i) {
+            Some(&id) => (wrap(id, context)?, true),
+            None => return Ok(JsValue::undefined()),
+        }
+    } else {
+        let key = args.get_or_undefined(1);
+        if !key.is_symbol() && key.to_string(context)?.to_std_string_escaped() == "length" {
+            ((members.len() as i32).into(), false)
+        } else {
+            return Ok(JsValue::undefined());
+        }
+    };
+    Ok(ObjectInitializer::new(context)
+        .property(js_string!("value"), value, Attribute::all())
+        .property(js_string!("writable"), false, Attribute::all())
+        .property(js_string!("enumerable"), enumerable, Attribute::all())
+        .property(js_string!("configurable"), true, Attribute::all())
+        .build()
+        .into())
 }
 
 // ----- dataset (DOMStringMap) -----
@@ -1344,6 +2040,7 @@ fn dataset_set(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
     }
     let shared = dom(context)?;
     let mut dom = shared.borrow_mut();
+    dom.generation += 1;
     if dom.doc.contains(id) {
         let connected = dom.doc.is_connected(id);
         if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
@@ -1377,6 +2074,7 @@ fn dataset_delete(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
     };
     let shared = dom(context)?;
     let mut dom = shared.borrow_mut();
+    dom.generation += 1;
     if dom.doc.contains(id) {
         let connected = dom.doc.is_connected(id);
         if let Some(e) = dom.doc.get_mut(id).as_element_mut()
@@ -1543,6 +2241,9 @@ fn token_mutate(
     force: Option<bool>,
 ) -> Result<JsValue, Fail> {
     use TokenMethod::*;
+    if matches!(method, Add | Remove | Toggle | Replace) {
+        dom.generation += 1;
+    }
     let mut tokens = tokens(&dom.doc, id);
     let class_attr = |dom: &Dom| {
         dom.doc

@@ -90,7 +90,7 @@ impl TreeSink for Sink {
         let mut doc = self.doc.borrow_mut();
         let id = doc.create_element(name, attrs);
         if flags.template {
-            let contents = doc.create_node(NodeKind::Document);
+            let contents = doc.create_node(NodeKind::DocumentFragment);
             if let Some(e) = doc.get_mut(id).as_element_mut() {
                 e.template_contents = Some(contents);
             }

@@ -30,8 +30,9 @@ const MAX_IMPORT_DEPTH: u8 = 6;
 enum PendingKind {
     Main,
     Stylesheet {
-        /// Index into `sheets`.
-        slot: usize,
+        /// Every slot in `sheets` with this URL and no sheet yet takes the
+        /// response.
+        url: Url,
         depth: u8,
     },
     Image {
@@ -184,9 +185,21 @@ struct Find {
 
 /// One author stylesheet in cascade order, possibly still loading.
 struct SheetSlot {
+    /// The `<style>` or `<link>` element the sheet comes from; an
+    /// `@import`'s slot carries its importer's, so they go together.
+    source: NodeId,
     url: Option<Url>,
     media: MediaQueryList,
+    /// Hash of a `<style>`'s text, so an edit by script is noticed.
+    text_hash: u64,
     sheet: Option<Arc<Stylesheet>>,
+}
+
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
 }
 
 pub(crate) struct TabState {
@@ -210,6 +223,9 @@ pub(crate) struct TabState {
     pending: HashMap<RequestId, Pending>,
     sheets: Vec<SheetSlot>,
     fetched_urls: std::collections::HashSet<Url>,
+    /// External sheets already parsed, by URL, so a script that adds a
+    /// `<link>` or `<style>` again does not fetch again.
+    loaded_sheets: std::collections::HashMap<Url, Arc<Stylesheet>>,
     images: ImageStore,
     /// How the current document's sub-resources use the HTTP cache: a
     /// reloaded document revalidates them, as browsers do.
@@ -316,6 +332,7 @@ impl TabState {
             pending: HashMap::new(),
             sheets: Vec::new(),
             fetched_urls: Default::default(),
+            loaded_sheets: Default::default(),
             images: ImageStore::new(),
             doc_cache: CacheMode::Default,
             engine: LayoutEngine::new(),
@@ -1840,22 +1857,23 @@ impl TabState {
                 };
                 self.set_document(doc);
             }
-            PendingKind::Stylesheet { slot, depth } => {
+            PendingKind::Stylesheet { url, depth } => {
                 if p.status == 0 || (200..300).contains(&p.status) {
                     let (_, charset) = Self::content_type_of(&p.headers);
                     let css = browser_dom::encoding::decode_stylesheet(&p.body, charset.as_deref());
-                    tracing::debug!(
-                        tab = self.id.0,
-                        bytes = css.len(),
-                        url = ?self.sheets.get(slot).and_then(|s| s.url.as_ref()).map(|u| u.as_str()),
-                        "external stylesheet loaded"
-                    );
-                    let base = self.sheets.get(slot).and_then(|s| s.url.clone());
-                    let sheet = Stylesheet::parse_with_base(&css, Origin::Author, base.as_ref());
-                    // Imports are inserted before this sheet, moving its slot.
-                    let slot = slot + self.queue_imports(slot, &sheet, depth);
-                    if let Some(s) = self.sheets.get_mut(slot) {
-                        s.sheet = Some(Arc::new(sheet));
+                    tracing::debug!(tab = self.id.0, bytes = css.len(), url = url.as_str(), "external stylesheet loaded");
+                    let sheet = Arc::new(Stylesheet::parse_with_base(&css, Origin::Author, Some(&url)));
+                    self.loaded_sheets.insert(url.clone(), sheet.clone());
+                    // Every slot waiting for this URL (a script may have
+                    // added the same link twice). Imports are inserted
+                    // before a slot, moving it, so each is found afresh.
+                    while let Some(slot) = self
+                        .sheets
+                        .iter()
+                        .position(|s| s.url.as_ref() == Some(&url) && s.sheet.is_none())
+                    {
+                        let slot = slot + self.queue_imports(slot, &sheet, depth);
+                        self.sheets[slot].sheet = Some(sheet.clone());
                     }
                     self.needs_style = true;
                 }
@@ -1940,6 +1958,7 @@ impl TabState {
     fn set_document(&mut self, doc: Document) {
         self.sheets.clear();
         self.fetched_urls.clear();
+        self.loaded_sheets.clear();
         self.images = ImageStore::new();
         self.doc = Some(doc);
         self.doc_url = self.url.clone();
@@ -1963,7 +1982,7 @@ impl TabState {
             f.ranges = SelectionRanges::default();
             f.current_ranges = SelectionRanges::default();
         }
-        self.collect_stylesheets();
+        self.sync_stylesheets();
         self.collect_images();
         self.pending_fragment = self.url.as_ref().is_some_and(|u| u.fragment().is_some());
         self.schedule_refresh();
@@ -2367,6 +2386,8 @@ impl TabState {
         self.needs_style = true;
         self.needs_layout = true;
         self.state_dirty = true;
+        // A `<style>` or `<link>` the script added, changed or removed.
+        self.sync_stylesheets();
         let live = |doc: &Document, id: NodeId| doc.contains(id) && doc.is_connected(id);
         let (focus_lost, hover_lost, press_control_lost, press_lost) = match (&self.parser, &self.doc) {
             (Some(parser), _) => {
@@ -2412,10 +2433,21 @@ impl TabState {
         }
     }
 
-    fn collect_stylesheets(&mut self) {
+    /// Make `sheets` match the document's `<style>` and `<link
+    /// rel=stylesheet>` elements, in document order. Called when the
+    /// document is set and after every script change to it: a slot whose
+    /// element is unchanged is kept (with its imports and a fetch in
+    /// flight), a new or changed element gets a new slot (an inline sheet
+    /// is parsed, an external one fetched unless already loaded), and the
+    /// slots of a removed element go.
+    fn sync_stylesheets(&mut self) {
+        enum Source {
+            Inline(String),
+            Link(Url),
+        }
         let Some(doc) = &self.doc else { return };
         let base = doc.base_url.clone();
-        let mut found: Vec<(Option<Url>, MediaQueryList, Option<String>)> = Vec::new();
+        let mut found: Vec<(NodeId, MediaQueryList, Source)> = Vec::new();
         for id in doc.descendants(doc.root()) {
             let Some(e) = doc.element(id) else { continue };
             if e.name.ns != ns!(html) {
@@ -2423,9 +2455,7 @@ impl TabState {
             }
             let media = parse_media_attr(e.attr("media"));
             if e.name.local == local_name!("style") {
-                let css = doc.text_content(id);
-                tracing::debug!(tab = self.id.0, "inline stylesheet:\n{css}");
-                found.push((None, media, Some(css)));
+                found.push((id, media, Source::Inline(doc.text_content(id))));
             } else if e.name.local == local_name!("link") {
                 let rel = e.attr("rel").unwrap_or("");
                 let is_sheet = rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet"));
@@ -2434,75 +2464,109 @@ impl TabState {
                     && let Some(href) = e.attr("href")
                     && let Some(url) = doc.resolve_url(href)
                 {
-                    found.push((Some(url), media, None));
+                    found.push((id, media, Source::Link(url)));
                 }
             }
         }
-        for (url, media, inline) in found {
-            let slot = self.sheets.len();
-            match (url, inline) {
-                (None, Some(css)) => {
+        let mut by_source: std::collections::HashMap<NodeId, Vec<SheetSlot>> = std::collections::HashMap::new();
+        for slot in std::mem::take(&mut self.sheets) {
+            by_source.entry(slot.source).or_default().push(slot);
+        }
+        let mut changed = false;
+        for (node, media, source) in found {
+            // The element's own slot is the last of its group; its
+            // imports come before it.
+            let mut same = by_source.remove(&node).unwrap_or_default();
+            let unchanged = same.last().is_some_and(|main| {
+                main.media == media
+                    && match &source {
+                        Source::Inline(css) => main.url == base && main.text_hash == text_hash(css),
+                        Source::Link(url) => main.url.as_ref() == Some(url),
+                    }
+            });
+            if unchanged {
+                self.sheets.append(&mut same);
+                continue;
+            }
+            changed = true;
+            match source {
+                Source::Inline(css) => {
+                    tracing::debug!(tab = self.id.0, "inline stylesheet:\n{css}");
                     let sheet = Stylesheet::parse_with_base(&css, Origin::Author, base.as_ref());
+                    let slot = self.sheets.len();
                     self.sheets.push(SheetSlot {
+                        source: node,
                         url: base.clone(),
                         media,
+                        text_hash: text_hash(&css),
                         sheet: None,
                     });
                     let slot = slot + self.queue_imports(slot, &sheet, 0);
                     self.sheets[slot].sheet = Some(Arc::new(sheet));
                 }
-                (Some(url), _) => {
+                Source::Link(url) => {
+                    let slot = self.sheets.len();
                     self.sheets.push(SheetSlot {
+                        source: node,
                         url: Some(url.clone()),
                         media,
+                        text_hash: 0,
                         sheet: None,
                     });
-                    let request = self.subresource(url);
-                    self.fetch(request, PendingKind::Stylesheet { slot, depth: 0 });
+                    self.load_external_sheet(slot, url, 0);
                 }
-                _ => {}
             }
+        }
+        // Whatever is left belonged to elements that are gone (or were
+        // replaced above); a fetch still in flight for them finds no
+        // empty slot with its URL and is dropped.
+        if !by_source.is_empty() {
+            changed = true;
+        }
+        if changed {
+            self.needs_style = true;
         }
     }
 
-    /// Insert slots for a sheet's `@import`s before it and fetch them.
-    /// Returns how many slots were inserted before `slot`.
+    /// Fill `slot` with the sheet at `url`: from the loaded sheets if it
+    /// came before, else by fetching it (once; a second slot with the
+    /// same URL is filled when the response comes).
+    fn load_external_sheet(&mut self, slot: usize, url: Url, depth: u8) {
+        if let Some(sheet) = self.loaded_sheets.get(&url).cloned() {
+            let slot = slot + self.queue_imports(slot, &sheet, depth);
+            self.sheets[slot].sheet = Some(sheet);
+            return;
+        }
+        if self.fetched_urls.insert(url.clone()) {
+            let request = self.subresource(url.clone());
+            self.fetch(request, PendingKind::Stylesheet { url, depth });
+        }
+    }
+
+    /// Insert slots for a sheet's `@import`s before it and fill or fetch
+    /// them. Returns how many slots were inserted before `slot`.
     fn queue_imports(&mut self, slot: usize, sheet: &Stylesheet, depth: u8) -> usize {
         if depth >= MAX_IMPORT_DEPTH || sheet.imports.is_empty() {
             return 0;
         }
+        let source = self.sheets[slot].source;
         let mut insert_at = slot;
         for (href, media) in &sheet.imports {
             let Ok(url) = Url::parse(href) else { continue };
-            if self.fetched_urls.contains(&url) {
-                continue;
-            }
-            self.fetched_urls.insert(url.clone());
             self.sheets.insert(
                 insert_at,
                 SheetSlot {
+                    source,
                     url: Some(url.clone()),
                     media: media.clone(),
+                    text_hash: 0,
                     sheet: None,
                 },
             );
-            // Slots after the insertion point moved by one; fix pending kinds.
-            for p in self.pending.values_mut() {
-                if let PendingKind::Stylesheet { slot: s, .. } = &mut p.kind
-                    && *s >= insert_at
-                {
-                    *s += 1;
-                }
-            }
-            let request = self.subresource(url);
-            self.fetch(
-                request,
-                PendingKind::Stylesheet {
-                    slot: insert_at,
-                    depth: depth + 1,
-                },
-            );
-            insert_at += 1;
+            let before = self.sheets.len();
+            self.load_external_sheet(insert_at, url, depth + 1);
+            // A loaded import may have inserted its own imports before it.
+            insert_at += 1 + (self.sheets.len() - before);
         }
         insert_at - slot
     }
@@ -3980,6 +4044,47 @@ mod tests {
             doc.children(root).next().expect("p")
         };
         assert_eq!(h.rect_of(first).height, 100.0, "the markup from innerHTML was styled and laid out");
+    }
+
+    #[test]
+    fn stylesheets_added_changed_and_removed_by_script_take_effect() {
+        // A <style> appended by script styles the page; editing its text
+        // restyles; removing it drops its rules; an appended <link> is
+        // fetched and applied; the imported sheet of a parsed <style>
+        // survives an unrelated DOM change.
+        let page = "<!DOCTYPE html><title>CSS</title><style>@import url(/imp.css);</style><body><p id=p>x</p><div id=q>y</div>\
+            <script>var s; \
+              setTimeout(() => { s = document.createElement('style'); s.textContent = '#p { height: 100px }'; document.head.appendChild(s); }, 10); \
+              setTimeout(() => { s.textContent = '#p { height: 50px }'; }, 60); \
+              setTimeout(() => { s.remove(); var l = document.createElement('link'); l.setAttribute('rel', 'stylesheet'); l.setAttribute('href', '/ext.css'); document.head.appendChild(l); }, 110); \
+            </script>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/imp.css", "text/css", "#q { height: 30px }"),
+                ("/ext.css", "text/css", "#p { height: 70px }"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.doc.is_some() && !h.state.is_loading());
+        let p = h.by_id("p");
+        let q = h.by_id("q");
+        let plain = h.rect_of(p).height;
+        assert!(plain != 100.0 && plain != 50.0 && plain != 70.0);
+        assert_eq!(h.rect_of(q).height, 30.0, "the imported sheet applies");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        h.pump();
+        assert_eq!(h.rect_of(p).height, 100.0, "the appended style applies");
+        assert_eq!(h.rect_of(q).height, 30.0, "the import is kept across the change");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h.pump();
+        assert_eq!(h.rect_of(p).height, 50.0, "the edited style text applies");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h.pump();
+        h.pump_until(|h| h.rect_of(p).height == 70.0);
+        assert_eq!(h.rect_of(q).height, 30.0);
+        assert_eq!(h.state.sheets.len(), 3, "import, its style, the link");
     }
 
     #[test]

@@ -717,23 +717,56 @@ Work:
       hovered link with `a:hover`, rewrites a container through
       `innerHTML`, and the new markup is styled and laid out; `dataset`
       reads it).
-      **Remaining block of item 3.2; the item is not complete until it
-      is done:**
-      **Block 4 (next):** stylesheet reaction to script mutation (a `<style>`
-      or `<link rel=stylesheet>` inserted or removed by script is
-      collected or dropped, a changed `<style>` text is re-parsed, a
-      `<link>` is fetched), `cloneNode(deep)`, `DocumentFragment` with
-      `createDocumentFragment` and insertion of a fragment's children,
-      `append`, `prepend`, `before`, `after`, `replaceWith`,
-      `replaceChildren`, `insertAdjacentElement`, `insertAdjacentHTML`,
-      `insertAdjacentText`, `normalize`, `createElementNS`,
-      `getElementsByTagNameNS`, `setAttributeNS`/`getAttributeNS`; live
-      `NodeList` and `HTMLCollection` objects for `childNodes`,
-      `children`, `getElementsBy*` (block 1 and 3 return plain
-      arrays), one cached `classList` and `dataset` object per element
-      (blocks 1 and 3 make a new one per access), `Element` methods on
-      a non-element receiver throwing `TypeError` (block 1 answers as
-      if empty).
+      **Block 4 done 2026-10-09: stylesheet reaction, fragments, the
+      rest of the Node and Element surface, live collections. Item 3.2
+      complete.** Stylesheets (`crates/tab`): `sync_stylesheets` runs
+      when the document is set and after every script change to it;
+      sheet slots are keyed by their `<style>`/`<link>` element (an
+      `@import`'s slot carries its importer's), so an unchanged element
+      keeps its slot, imports and any fetch in flight, a new or edited
+      element (text hash, `href`, `media`) gets a fresh slot, parsed or
+      fetched, and a removed element's slots go; fetches are keyed by
+      URL and fill every empty slot with that URL, and parsed external
+      sheets are cached by URL (`loaded_sheets`) so re-adding does not
+      refetch. DOM (`crates/dom`): `NodeKind::DocumentFragment` (also
+      a `<template>`'s contents now), `clone_subtree`, `normalize`,
+      `create_element_ns`, `Element::{attr_ns, set_attr_ns,
+      remove_attr_ns}`. Bindings (`crates/script/src/dom.rs`):
+      `DocumentFragment` with `createDocumentFragment`, inserting a
+      fragment moves its children, `template.content`; `cloneNode`,
+      `normalize`; `ParentNode` on `Element`, `Document` and
+      `DocumentFragment` (`children`, `firstElementChild`,
+      `lastElementChild`, `childElementCount`, `querySelector*`,
+      `getElementsBy*`, `getElementsByTagNameNS`, `append`, `prepend`,
+      `replaceChildren`) and `ChildNode` on `Element` and
+      `CharacterData` (`before`, `after`, `replaceWith`, `remove`,
+      `previousElementSibling`, `nextElementSibling`), strings
+      becoming text nodes and a node listed among the arguments not
+      anchoring its own insertion; `insertAdjacentElement`/`Text`/
+      `HTML` with the four positions, `SyntaxError` for another and
+      `NoModificationAllowedError` for markup outside a parentless
+      element; `createElementNS`, `prefix`, `setAttributeNS`,
+      `getAttributeNS`, `hasAttributeNS`, `removeAttributeNS`
+      (`NamespaceError` for a prefix without a namespace). `NodeList`
+      and `HTMLCollection` are proxies: `childNodes` (`NodeList`),
+      `children` and `getElementsBy*` (`HTMLCollection`) are live,
+      recomputed when the arena's generation moved and cached
+      otherwise, `querySelectorAll` is a static `NodeList`; indexed
+      access, `length`, `item`, `namedItem`, iteration, `forEach`,
+      `Array.from`, spread and `in` work. One `classList` and one
+      `dataset` object per element. Every `Element`, `CharacterData`,
+      `ParentNode`, `ChildNode` and `Document` member throws
+      `TypeError: Illegal invocation` on a receiver of another kind.
+      Found and fixed on the way: `cloneNode` on a connected node
+      reported a tree change (clones are detached). Tests: one dom test
+      (clone deep and shallow with a template, normalize, namespaced
+      elements and attributes), one script test (live collections
+      against a snapshot, cached lists, fragments, template contents,
+      clone, normalize, every insertion method and its errors,
+      `insertAdjacent*`, namespaces, wrong receivers), one tab harness
+      test against the loopback server (a `<style>` appended, edited
+      and removed by script, an `@import` kept across those changes,
+      a `<link>` appended by script fetched and applied).
       Rule for every block: a gap found while building is added to
       that block or to a named later item in this file, never left
       without a home.

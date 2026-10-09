@@ -12,7 +12,7 @@ mod sink;
 
 use std::fmt::Write as _;
 
-use html5ever::{Attribute, LocalName, Namespace, QualName, local_name, ns};
+use html5ever::{Attribute, LocalName, Namespace, Prefix, QualName, local_name, ns};
 use slotmap::SlotMap;
 use url::Url;
 
@@ -28,6 +28,9 @@ slotmap::new_key_type! {
 #[derive(Debug, Clone)]
 pub enum NodeKind {
     Document,
+    /// A `DocumentFragment`: a `<template>`'s contents, or one a script
+    /// made to build a subtree before inserting it.
+    DocumentFragment,
     Doctype {
         name: String,
         public_id: String,
@@ -62,6 +65,38 @@ impl Element {
 
     pub fn is_html(&self) -> bool {
         self.name.ns == ns!(html)
+    }
+
+    /// Attribute value by namespace and local name (`getAttributeNS`);
+    /// an empty `ns` means no namespace.
+    pub fn attr_ns(&self, ns: &str, local: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|a| &*a.name.ns == ns && &*a.name.local == local)
+            .map(|a| &*a.value)
+    }
+
+    /// Set an attribute by namespace and qualified name
+    /// (`setAttributeNS`): an existing attribute with that namespace
+    /// and local name is replaced, prefix included.
+    pub fn set_attr_ns(&mut self, ns: &str, qualified: &str, value: &str) {
+        let (prefix, local) = split_qualified(qualified);
+        let name = QualName::new(
+            prefix.map(Prefix::from),
+            Namespace::from(ns),
+            LocalName::from(local),
+        );
+        if let Some(a) = self.attrs.iter_mut().find(|a| &*a.name.ns == ns && &*a.name.local == local) {
+            a.name = name;
+            a.value = value.into();
+        } else {
+            self.attrs.push(Attribute { name, value: value.into() });
+        }
+    }
+
+    /// Drop the attribute with that namespace and local name.
+    pub fn remove_attr_ns(&mut self, ns: &str, local: &str) {
+        self.attrs.retain(|a| !(&*a.name.ns == ns && &*a.name.local == local));
     }
 
     /// Attribute value by local name, ignoring namespace.
@@ -103,6 +138,14 @@ impl Element {
                 value: value.into(),
             });
         }
+    }
+}
+
+/// `prefix:local` → (`Some(prefix)`, `local`); no colon → (`None`, all).
+fn split_qualified(qualified: &str) -> (Option<&str>, &str) {
+    match qualified.split_once(':') {
+        Some((p, l)) if !p.is_empty() && !l.is_empty() => (Some(p), l),
+        _ => (None, qualified),
     }
 }
 
@@ -355,12 +398,86 @@ impl Document {
     pub fn create_html_element(&mut self, local: &str) -> NodeId {
         let id = self.create_element(QualName::new(None, ns!(html), LocalName::from(local)), Vec::new());
         if local == "template" {
-            let contents = self.create_node(NodeKind::Document);
+            let contents = self.create_node(NodeKind::DocumentFragment);
             if let Some(e) = self.get_mut(id).as_element_mut() {
                 e.template_contents = Some(contents);
             }
         }
         id
+    }
+
+    /// An element in namespace `ns` with the qualified name given
+    /// (`createElementNS`), detached. An HTML `template` gets its
+    /// contents fragment.
+    pub fn create_element_ns(&mut self, ns: &str, qualified: &str) -> NodeId {
+        if ns == &*ns!(html) && !qualified.contains(':') {
+            return self.create_html_element(qualified);
+        }
+        let (prefix, local) = split_qualified(qualified);
+        let name = QualName::new(prefix.map(Prefix::from), Namespace::from(ns), LocalName::from(local));
+        self.create_element(name, Vec::new())
+    }
+
+    /// A copy of `id` (`cloneNode`): the node alone, or with its whole
+    /// subtree (and a template's contents) when `deep`. Detached.
+    pub fn clone_subtree(&mut self, id: NodeId, deep: bool) -> NodeId {
+        let mut kind = self.nodes[id].kind.clone();
+        if let NodeKind::Element(e) = &mut kind
+            && let Some(contents) = e.template_contents
+        {
+            e.template_contents = Some(if deep {
+                self.clone_subtree(contents, true)
+            } else {
+                self.create_node(NodeKind::DocumentFragment)
+            });
+        }
+        let copy = self.create_node(kind);
+        if deep {
+            let mut child = self.nodes[id].first_child;
+            while let Some(c) = child {
+                child = self.nodes[c].next_sibling;
+                let c2 = self.clone_subtree(c, true);
+                self.append_child(copy, c2);
+            }
+        }
+        copy
+    }
+
+    /// Merge adjacent text nodes under `id` (recursively) and drop empty
+    /// ones (`normalize`).
+    pub fn normalize(&mut self, id: NodeId) {
+        let mut child = self.nodes[id].first_child;
+        while let Some(c) = child {
+            let next = self.nodes[c].next_sibling;
+            if let NodeKind::Text(t) = &self.nodes[c].kind {
+                if t.is_empty() {
+                    self.remove_subtree(c);
+                } else {
+                    // Pull every following text sibling into this one.
+                    let mut after = next;
+                    while let Some(a) = after
+                        && let NodeKind::Text(more) = &self.nodes[a].kind
+                    {
+                        let more = more.clone();
+                        after = self.nodes[a].next_sibling;
+                        if let NodeKind::Text(t) = &mut self.nodes[c].kind {
+                            t.push_str(&more);
+                        }
+                        self.remove_subtree(a);
+                    }
+                    child = after;
+                    continue;
+                }
+            } else {
+                self.normalize(c);
+                if let Some(e) = self.nodes[c].as_element()
+                    && let Some(contents) = e.template_contents
+                {
+                    self.normalize(contents);
+                }
+            }
+            child = next;
+        }
     }
 
     /// Whether `id` is in the tree under the document node.
@@ -502,6 +619,9 @@ impl Document {
             NodeKind::Document => {
                 let _ = writeln!(out, "{indent}#document");
             }
+            NodeKind::DocumentFragment => {
+                let _ = writeln!(out, "{indent}#document-fragment");
+            }
             NodeKind::Doctype { name, .. } => {
                 let _ = writeln!(out, "{indent}<!DOCTYPE {name}>");
             }
@@ -594,6 +714,57 @@ mod tests {
         assert_eq!(e.id(), Some("a"));
         assert_eq!(e.classes().collect::<Vec<_>>(), vec!["x", "y"]);
         assert_eq!(doc.text_content(p), "Hello world");
+    }
+
+    #[test]
+    fn clone_normalize_and_namespaces() {
+        let mut doc = parse_html(b"<div id=d><p class=x>a<b>b</b></p><template><i>t</i></template></div>");
+        let body = doc.body().expect("body");
+        let d = doc.children(body).next().expect("div");
+        let copy = doc.clone_subtree(d, true);
+        assert!(doc.parent(copy).is_none());
+        assert_eq!(
+            doc.serialize_html(copy, true),
+            "<div id=\"d\"><p class=\"x\">a<b>b</b></p><template><i>t</i></template></div>"
+        );
+        let template = doc.children(copy).nth(1).expect("template");
+        let original_template = doc.children(d).nth(1).expect("template");
+        assert_ne!(
+            doc.element(template).and_then(|e| e.template_contents),
+            doc.element(original_template).and_then(|e| e.template_contents),
+            "a deep clone gets its own contents"
+        );
+        let shallow = doc.clone_subtree(d, false);
+        assert_eq!(doc.serialize_html(shallow, true), "<div id=\"d\"></div>");
+
+        let p = doc.children(copy).next().expect("p");
+        for t in ["", "x", "y"] {
+            let n = doc.create_text(t);
+            doc.append_child(p, n);
+        }
+        assert_eq!(doc.children(p).count(), 5);
+        doc.normalize(copy);
+        let kids: Vec<_> = doc.children(p).collect();
+        assert_eq!(kids.len(), 3);
+        assert_eq!(doc.get(kids[2]).as_text(), Some("xy"));
+
+        let svg = doc.create_element_ns("http://www.w3.org/2000/svg", "svg");
+        assert!(doc.element(svg).is_some_and(|e| !e.is_html() && &*e.name.local == "svg"));
+        let t = doc.create_element_ns("http://www.w3.org/1999/xhtml", "template");
+        assert!(doc.element(t).is_some_and(|e| e.is_html() && e.template_contents.is_some()));
+        let e = doc.get_mut(svg).as_element_mut().expect("element");
+        e.set_attr_ns("http://www.w3.org/1999/xlink", "xlink:href", "#a");
+        e.set_attr_ns("", "plain", "1");
+        assert_eq!(e.attr_ns("http://www.w3.org/1999/xlink", "href"), Some("#a"));
+        assert_eq!(e.attr("href"), Some("#a"));
+        assert_eq!(e.attr_ns("", "href"), None);
+        assert_eq!(e.attr_ns("", "plain"), Some("1"));
+        e.set_attr_ns("http://www.w3.org/1999/xlink", "xlink:href", "#b");
+        assert_eq!(e.attrs.len(), 2);
+        assert_eq!(doc.serialize_html(svg, true), "<svg xlink:href=\"#b\" plain=\"1\"></svg>");
+        let e = doc.get_mut(svg).as_element_mut().expect("element");
+        e.remove_attr_ns("http://www.w3.org/1999/xlink", "href");
+        assert_eq!(e.attr("href"), None);
     }
 
     #[test]

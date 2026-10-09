@@ -1385,6 +1385,98 @@ mod tests {
     }
 
     #[test]
+    fn dom_fragments_live_collections_clone_adjacent_and_namespaces() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><html><head></head><body><ul id=ul><li id=a>1</li><li id=b name=bee>2</li></ul>\
+              <div id=d>t<b>x</b></div><template id=tp><i>in</i></template></body></html>",
+        );
+        h.lend_document(doc, false, Default::default());
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+
+        // Live collections follow the tree; querySelectorAll is a snapshot.
+        assert_eq!(
+            s(&mut h, "var ul = document.getElementById('ul'); var kids = ul.childNodes, ch = ul.children, lis = document.getElementsByTagName('li'), all = document.querySelectorAll('li'); \
+                       var before = [kids.length, ch.length, lis.length, all.length].join(','); \
+                       var li = document.createElement('li'); li.id = 'c'; ul.appendChild(li); \
+                       [before, kids.length, ch.length, lis.length, all.length, kids[2] === li, ch[2] === li, lis.item(2) === li, lis.namedItem('bee').id, String(lis.namedItem('zz')), \
+                        kids instanceof NodeList, ch instanceof HTMLCollection, lis instanceof HTMLCollection, all instanceof NodeList, Array.from(ch).length, [...kids].length, Object.keys(kids).join(','), \
+                        2 in kids, 3 in kids, String(kids[5]), String(kids.item(-1)), typeof kids.forEach, typeof ch.forEach, kids.length in kids].join('|')").as_deref(),
+            Ok("\"2,2,2,2|3|3|3|2|true|true|true|b|null|true|true|true|true|3|3|0,1,2|true|false|undefined|null|function|undefined|false\"")
+        );
+        assert_eq!(
+            s(&mut h, "var seen = []; kids.forEach((n, i) => seen.push(i + n.id)); for (const n of ch) seen.push(n.tagName); seen.join()").as_deref(),
+            Ok("\"0a,1b,2c,LI,LI,LI\"")
+        );
+        assert!(h.take_dom_mutated());
+        // One classList and one dataset per element.
+        assert_eq!(s(&mut h, "ul.classList === ul.classList && li.dataset === li.dataset && ul.classList !== li.classList").as_deref(), Ok("true"));
+        // Fragments: built detached, emptied into the parent on insertion.
+        assert_eq!(
+            s(&mut h, "var f = document.createDocumentFragment(); f.append(document.createElement('li'), 'txt'); \
+                       var r = [f.nodeType, f.nodeName, f.childNodes.length, f.textContent, f instanceof DocumentFragment, f instanceof Node, f.querySelector('li') !== null, f.children.length, String(f.parentNode), f.isConnected]; \
+                       var ret = ul.appendChild(f); r.push(ret === f, f.childNodes.length, ul.childNodes.length, ul.lastChild.data, kids.length); r.join('|')").as_deref(),
+            Ok("\"11|#document-fragment|2|txt|true|true|true|1|null|false|true|0|5|txt|5\"")
+        );
+        assert!(h.take_dom_mutated());
+        assert_eq!(
+            s(&mut h, "var tp = document.getElementById('tp'); [tp.content instanceof DocumentFragment, tp.content.childNodes.length, tp.content.firstChild.tagName, tp.childNodes.length, String(ul.content)].join('|')").as_deref(),
+            Ok("\"true|1|I|0|null\"")
+        );
+        // cloneNode and normalize.
+        assert_eq!(
+            s(&mut h, "var d = document.getElementById('d'); var c1 = d.cloneNode(), c2 = d.cloneNode(true), tc = tp.cloneNode(true); \
+                       [c1.childNodes.length, c2.childNodes.length, c2.id, c1 !== d, c2.isConnected, c2.innerHTML, c2.firstChild !== d.firstChild, tc.content.childNodes.length, tc.content !== tp.content].join('|')").as_deref(),
+            Ok("\"0|2|d|true|false|t<b>x</b>|true|1|true\"")
+        );
+        assert!(!h.take_dom_mutated(), "clones are detached");
+        assert_eq!(
+            s(&mut h, "d.append('', 'y', 'z'); var n1 = d.childNodes.length; d.normalize(); [n1, d.childNodes.length, d.lastChild.data].join('|')").as_deref(),
+            Ok("\"5|3|yz\"")
+        );
+        // ParentNode and ChildNode insertion with strings.
+        assert_eq!(
+            s(&mut h, "var box = document.createElement('div'); box.append('a', document.createElement('i')); box.prepend('z'); var i = box.querySelector('i'); i.before('p'); i.after('q', document.createElement('u')); \
+                       var s1 = box.innerHTML; i.replaceWith('R'); var s2 = box.innerHTML; box.replaceChildren('only', i); var s3 = box.innerHTML; \
+                       var errs = []; try { box.append(box) } catch (e) { errs.push(e.name) } try { i.after(box) } catch (e) { errs.push(e.name) } \
+                       [s1, s2, s3, errs.join(','), box.childNodes.length, String(i.parentNode === box)].join('|')").as_deref(),
+            Ok("\"zap<i></i>q<u></u>|zapRq<u></u>|only<i></i>|HierarchyRequestError,HierarchyRequestError|2|true\"")
+        );
+        // insertAdjacent*.
+        assert_eq!(
+            s(&mut h, "var host = document.createElement('div'); host.innerHTML = '<span id=s>mid</span>'; var sp = host.firstChild; \
+                       sp.insertAdjacentHTML('beforebegin', '<b>1</b>'); sp.insertAdjacentHTML('afterbegin', '2'); sp.insertAdjacentText('beforeend', '3'); var e4 = sp.insertAdjacentElement('afterend', document.createElement('em')); \
+                       var errs2 = []; try { sp.insertAdjacentHTML('nowhere', 'x') } catch (e) { errs2.push(e.name) } try { host.insertAdjacentHTML('beforebegin', 'x') } catch (e) { errs2.push(e.name) } \
+                       [host.innerHTML, e4.tagName, String(host.insertAdjacentElement('afterend', e4)), errs2.join(',')].join('|')").as_deref(),
+            Ok("\"<b>1</b><span id=\\\"s\\\">2mid3</span><em></em>|EM|null|SyntaxError,NoModificationAllowedError\"")
+        );
+        // Namespaces.
+        assert_eq!(
+            s(&mut h, "var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); var c = document.createElementNS('http://www.w3.org/2000/svg', 'circle'); svg.appendChild(c); var xl = document.createElementNS('http://www.w3.org/2000/svg', 'svg:rect'); \
+                       c.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#a'); c.setAttribute('r', '5'); \
+                       var errs3 = []; try { document.createElementNS(null, 'a:b') } catch (e) { errs3.push(e.name) } try { c.setAttributeNS('', 'x:y', '1') } catch (e) { errs3.push(e.name) } \
+                       [svg instanceof Element, !(svg instanceof HTMLElement), svg.namespaceURI, String(svg.prefix), xl.prefix, xl.localName, xl.tagName, c.getAttributeNS('http://www.w3.org/1999/xlink', 'href'), String(c.getAttributeNS(null, 'href')), \
+                        c.hasAttributeNS('http://www.w3.org/1999/xlink', 'href'), c.getAttributeNS(null, 'r'), svg.getElementsByTagNameNS('http://www.w3.org/2000/svg', 'circle').length, svg.getElementsByTagNameNS('*', '*').length, \
+                        document.getElementsByTagNameNS('http://www.w3.org/1999/xhtml', 'li').length, (c.removeAttributeNS('http://www.w3.org/1999/xlink', 'href'), c.hasAttribute('href')), errs3.join(','), \
+                        document.createElementNS('http://www.w3.org/1999/xhtml', 'template').content instanceof DocumentFragment].join('|')").as_deref(),
+            Ok("\"true|true|http://www.w3.org/2000/svg|null|svg|rect|svg:rect|#a|null|true|5|1|1|4|false|NamespaceError,NamespaceError|true\"")
+        );
+        // Element and CharacterData members refuse other receivers.
+        assert_eq!(
+            s(&mut h, "var t = document.createTextNode('t'); var e = []; \
+                       try { Object.getOwnPropertyDescriptor(Element.prototype, 'tagName').get.call(t) } catch (x) { e.push(x.name) } \
+                       try { Element.prototype.getAttribute.call(document, 'x') } catch (x) { e.push(x.name) } \
+                       try { Object.getOwnPropertyDescriptor(CharacterData.prototype, 'data').get.call(document.body) } catch (x) { e.push(x.name) } \
+                       try { Element.prototype.setAttribute.call(t, 'a', 'b') } catch (x) { e.push(x.name) } \
+                       try { Element.prototype.querySelector.call(t, 'x') } catch (x) { e.push(x.name) } \
+                       try { Element.prototype.matches.call(document, 'x') } catch (x) { e.push(x.name) } \
+                       try { Object.getOwnPropertyDescriptor(Element.prototype, 'children').get.call(document); e.push('ok') } catch (x) { e.push(x.name) } \
+                       try { Element.prototype.remove.call(document) } catch (x) { e.push(x.name) } e.join(',')").as_deref(),
+            Ok("\"TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,ok,TypeError\"")
+        );
+    }
+
+    #[test]
     fn a_script_is_a_task_and_its_microtasks_run_after_it_in_order() {
         let mut h = host();
         h.run_script(

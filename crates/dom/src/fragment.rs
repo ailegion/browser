@@ -107,7 +107,7 @@ fn serialize_node<S: Serializer>(
                 s.end_elem(e.name.clone())?;
             }
         }
-        NodeKind::Document => {
+        NodeKind::Document | NodeKind::DocumentFragment => {
             if depth < MAX_DEPTH {
                 for c in doc.children(id) {
                     serialize_node(doc, c, s, true, depth + 1)?;
