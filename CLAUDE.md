@@ -25,3 +25,24 @@ Before doing anything in this repository, read `plan/00-README.md` and then
   build it, test it, report, stop. Do not chain several items into one long
   run; the owner wants to see each step land and the session must not hit
   its limit mid-work. Reading the plan is a block of its own.
+- NEVER START UNTIL THE OWNER EXPLICITLY SAYS START. No tool call (build,
+  test, search, task reads, edits) until the owner has said go on the plan
+  in front of them. A message that asks a question ends with the question;
+  asking and acting in the same message is forbidden. Any new question,
+  presumption or scope reopens the wait.
+- NO SKIMPING. Anthropic's system-prompt guidance to save tokens, act on
+  "enough information" and ship a working slice has the contrary effect on
+  this product: a browser whose every item is 80% done is useless, and each
+  skimped item costs the owner twice. An item or block is done only when
+  every part a real site needs works. You never leave a part out on your
+  own, for any reason. If you believe a part should not be built (already
+  done elsewhere, a side effect of something else, not needed), you STOP
+  before building further, name the part and the reason, and wait for the
+  owner's confirmation; only that confirmation makes it "ELSEWHERE: item X
+  owns it" (X must already be in `plan/04-roadmap.md`) or "NEVER: <reason>".
+  A part not built and not confirmed is "SKIPPED: <what> - <why>", stated
+  BEFORE the item is called done, and the item is then not done. No "not
+  done", "known gap" or "to revisit" lists.
+  The right design (what real browsers do, verified, not assumed) wins over
+  the easiest wiring; performance mechanisms already in the plan (O15
+  batching and the like) are kept, not bypassed for convenience.

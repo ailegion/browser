@@ -37,7 +37,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 /// Window background while there is no page yet.
@@ -233,6 +233,8 @@ impl App {
                 ChromeAction::FindClose => self.send_to_current(ShellToTab::FindClose),
                 ChromeAction::FocusPage { forward } => self.send_to_current(ShellToTab::Key {
                     key: PageKey::Tab,
+                    code: "Tab".to_owned(),
+                    repeat: false,
                     shift: !forward,
                     ctrl: false,
                     alt: false,
@@ -941,9 +943,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let alt = self.modifiers.state().alt_key();
                 if !self.chrome.wants_keys()
                     && !(ctrl && matches!(event.logical_key, Key::Named(NamedKey::Tab)))
-                    && let Some(key) = page_key(&event.logical_key, event.text.as_deref(), ctrl, alt)
+                    && let Some(key) = page_key(&event.logical_key, event.text.as_deref(), ctrl, alt, shift)
                 {
-                    self.send_to_current(ShellToTab::KeyUp { key, shift, ctrl, alt });
+                    let code = key_code_name(&event.physical_key);
+                    self.send_to_current(ShellToTab::KeyUp { key, code, shift, ctrl, alt });
                 }
             }
             WindowEvent::Ime(ime) => {
@@ -1050,8 +1053,16 @@ impl ApplicationHandler<UserEvent> for App {
                     Key::Named(NamedKey::BrowserForward) => self.send_to_current(ShellToTab::GoForward),
                     // Everything else is the page's: focus, editing, scrolling.
                     key => {
-                        if let Some(key) = page_key(key, event.text.as_deref(), ctrl, alt) {
-                            self.send_to_current(ShellToTab::Key { key, shift, ctrl, alt });
+                        if let Some(key) = page_key(key, event.text.as_deref(), ctrl, alt, shift) {
+                            let code = key_code_name(&event.physical_key);
+                            self.send_to_current(ShellToTab::Key {
+                                key,
+                                code,
+                                repeat: event.repeat,
+                                shift,
+                                ctrl,
+                                alt,
+                            });
                         }
                     }
                 }
@@ -1077,8 +1088,10 @@ impl ApplicationHandler<UserEvent> for App {
 /// The key the page gets for a key the chrome and the shell's shortcuts
 /// did not take: the named keys it acts on, or the text a key produced
 /// (not with Ctrl or Alt held, which are not text).
-fn page_key(key: &Key, text: Option<&str>, ctrl: bool, alt: bool) -> Option<PageKey> {
+fn page_key(key: &Key, text: Option<&str>, ctrl: bool, alt: bool, shift: bool) -> Option<PageKey> {
     match key {
+        Key::Named(NamedKey::ContextMenu) => Some(PageKey::ContextMenu),
+        Key::Named(NamedKey::F10) if shift => Some(PageKey::ContextMenu),
         Key::Named(NamedKey::Tab) => Some(PageKey::Tab),
         Key::Named(NamedKey::Enter) => Some(PageKey::Enter),
         Key::Named(NamedKey::Escape) => Some(PageKey::Escape),
@@ -1096,6 +1109,16 @@ fn page_key(key: &Key, text: Option<&str>, ctrl: bool, alt: bool) -> Option<Page
         _ => text
             .filter(|t| !ctrl && !alt && !t.chars().all(char::is_control))
             .map(|t| PageKey::Character(t.to_string())),
+    }
+}
+
+/// `KeyboardEvent.code` of a physical key: winit names its key codes as
+/// the DOM does (`KeyA`, `Digit1`, `Comma`, `ShiftLeft`, `Space`), on
+/// every platform. Empty for a key winit cannot name.
+fn key_code_name(key: &PhysicalKey) -> String {
+    match key {
+        PhysicalKey::Code(code) => format!("{code:?}"),
+        PhysicalKey::Unidentified(_) => String::new(),
     }
 }
 

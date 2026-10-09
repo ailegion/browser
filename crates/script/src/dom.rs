@@ -71,6 +71,12 @@ pub(crate) struct Dom {
     datasets: HashMap<NodeId, JsObject>,
     /// Event listeners and handlers (`events.rs`).
     pub(crate) events: crate::events::Events,
+    /// The mouse buttons held, as the tab last reported them, so
+    /// `setPointerCapture` knows the pointer is active.
+    pub(crate) pointer_buttons: u16,
+    /// The element a script asked to capture the mouse, until the tab
+    /// processes it (`events.rs`, pointer capture).
+    pub(crate) pointer_capture: Option<NodeId>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -514,6 +520,7 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_mutator(class, "removeAttribute", 1, MutMethod::RemoveAttribute);
     add_mutator(class, "toggleAttribute", 1, MutMethod::ToggleAttribute);
     crate::events::add_handler_attributes(class);
+    crate::events::add_pointer_capture_methods(class);
     Ok(())
 }
 

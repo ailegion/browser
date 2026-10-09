@@ -288,6 +288,19 @@ pub(crate) struct TabState {
     press_target: Option<NodeId>,
     /// The click count of the last primary press, for `detail`.
     press_clicks: u32,
+    /// The element capturing the mouse (`setPointerCapture`): pointer
+    /// and mouse events go to it until the button goes up.
+    pointer_capture: Option<NodeId>,
+    /// A `pointerdown` was cancelled: `mousedown`, `mousemove` and
+    /// `mouseup` are held back until the pointer goes up.
+    compat_suppressed: bool,
+    /// The pointer moved in this batch: `flush` fires one `pointermove`
+    /// and one `mousemove` at its final position.
+    pointer_moved: bool,
+    /// Where the last move event was fired, for `movementX/Y`.
+    last_move: Option<(f32, f32)>,
+    /// A button or checkbox Space went down on: it clicks on release.
+    space_armed: Option<NodeId>,
     /// A focused text control's value when it got focus; `change` fires
     /// on blur if it differs.
     focus_value: Option<String>,
@@ -391,6 +404,11 @@ impl TabState {
             buttons: 0,
             press_target: None,
             press_clicks: 1,
+            pointer_capture: None,
+            compat_suppressed: false,
+            pointer_moved: false,
+            last_move: None,
+            space_armed: None,
             focus_value: None,
             viewport_reported: (viewport.width, viewport.height),
             scroll_reported: (0.0, 0.0),
@@ -503,7 +521,7 @@ impl TabState {
                     }
                 } else {
                     self.hover_dirty = true;
-                    self.mouse_moved(x, y);
+                    self.pointer_moved = true;
                 }
                 if self.select_anchor.is_some() {
                     self.extend_selection_to(x, y);
@@ -519,6 +537,7 @@ impl TabState {
             }
             ShellToTab::MouseLeave => {
                 self.mouse = None;
+                self.last_move = None;
                 self.hover_dirty = true;
                 self.autoscroll = None;
             }
@@ -539,30 +558,45 @@ impl TabState {
                     return;
                 }
                 self.update_hover();
+                self.process_pointer_capture();
                 let hit = self.hover;
                 self.buttons |= button_bit(button);
+                if let Some(host) = &mut self.script {
+                    host.set_pointer_buttons(self.buttons);
+                }
                 let clicks = if button == MouseButton::Left { self.count_click(x, y) } else { 1 };
                 self.press_clicks = clicks;
                 self.press_target = hit;
-                // `mousedown` cancelled: no focus change, no caret, no
-                // selection; `:active`, the press and `click` still happen.
-                let proceed = self.fire_mouse("mousedown", hit, x, y, Some(button), clicks);
+                // `pointerdown` first; cancelled, it holds back the mouse
+                // events until the pointer goes up and starts no
+                // selection, but focus still moves. `mousedown` cancelled:
+                // no focus change, no caret, no selection. `:active`, the
+                // press and `click` happen either way.
+                let pointer_ok = self.fire_pointer("pointerdown", hit, x, y, button);
+                if !pointer_ok {
+                    self.compat_suppressed = true;
+                }
+                let mouse_ok = if self.compat_suppressed {
+                    true
+                } else {
+                    self.fire_mouse("mousedown", self.hover, x, y, button, clicks)
+                };
                 let hit = self.hover;
                 if button == MouseButton::Left {
                     self.set_active(hit);
-                    if proceed {
+                    if mouse_ok {
                         let focus = hit.and_then(|h| self.focusable_ancestor(h));
                         self.set_focus(focus, false);
                     }
                     self.press_control = hit.and_then(|h| self.ancestor_or_self(h, is_toggle));
-                    if proceed {
+                    if mouse_ok && pointer_ok {
                         self.place_caret_at(x, y);
                     }
                 }
                 if matches!(button, MouseButton::Left | MouseButton::Middle) {
                     self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
                 }
-                if button == MouseButton::Left && proceed {
+                if button == MouseButton::Left && mouse_ok && pointer_ok {
                     let on_link = self.press.is_some();
                     self.begin_selection(x, y, clicks, on_link);
                 }
@@ -580,8 +614,19 @@ impl TabState {
                     return;
                 }
                 self.update_hover();
+                self.process_pointer_capture();
                 let clicks = self.press_clicks;
-                self.fire_mouse("mouseup", self.hover, x, y, Some(button), clicks);
+                self.fire_pointer("pointerup", self.hover, x, y, button);
+                if !self.compat_suppressed {
+                    self.fire_mouse("mouseup", self.hover, x, y, button, clicks);
+                }
+                if let Some(host) = &mut self.script {
+                    host.set_pointer_buttons(self.buttons);
+                }
+                // The pointer is up: a capture is released, and the mouse
+                // events a cancelled `pointerdown` held back come again.
+                self.release_pointer_capture();
+                self.compat_suppressed = false;
                 // `click` (`auxclick` for the other buttons) goes to the
                 // nearest element the press and the release share;
                 // cancelled, nothing is toggled or followed. `dblclick`
@@ -589,14 +634,14 @@ impl TabState {
                 let pressed_on = self.press_target.take();
                 let click_target = self.common_ancestor(pressed_on, self.hover);
                 let proceed = match button {
-                    MouseButton::Left => self.fire_mouse("click", click_target, x, y, Some(button), clicks),
-                    _ => self.fire_mouse("auxclick", click_target, x, y, Some(button), clicks),
+                    MouseButton::Left => self.fire_click("click", click_target, x, y, button, clicks),
+                    _ => self.fire_click("auxclick", click_target, x, y, button, clicks),
                 };
                 if button == MouseButton::Right {
-                    self.fire_mouse("contextmenu", self.hover, x, y, Some(button), 0);
+                    self.fire_click("contextmenu", self.hover, x, y, button, 0);
                 }
                 if button == MouseButton::Left && clicks == 2 {
-                    self.fire_mouse("dblclick", click_target, x, y, Some(button), 2);
+                    self.fire_mouse("dblclick", click_target, x, y, button, 2);
                 }
                 if button == MouseButton::Left {
                     self.set_active(None);
@@ -639,9 +684,33 @@ impl TabState {
                     self.needs_paint = true;
                 }
             }
-            ShellToTab::Key { key, shift, ctrl, alt } => self.key(key, shift, ctrl, alt),
-            ShellToTab::KeyUp { key, shift, ctrl, alt } => {
-                self.fire_key("keyup", &key, shift, ctrl, alt);
+            ShellToTab::Key {
+                key,
+                code,
+                repeat,
+                shift,
+                ctrl,
+                alt,
+            } => self.key(key, &code, repeat, shift, ctrl, alt),
+            ShellToTab::KeyUp {
+                key,
+                code,
+                shift,
+                ctrl,
+                alt,
+            } => {
+                let proceed = self.fire_key("keyup", &key, &code, false, shift, ctrl, alt);
+                // Space clicks a button or checkbox on release, as
+                // browsers do, if focus is still where it went down.
+                if key == Key::Space
+                    && let Some(f) = self.space_armed.take()
+                    && self.focus == Some(f)
+                    && proceed
+                    && self.fire_synthetic_click(f)
+                    && self.doc.as_ref().and_then(|d| d.element(f)).is_some_and(is_toggle)
+                {
+                    self.toggle_control(f);
+                }
             }
             ShellToTab::Modifiers { shift, ctrl, alt, meta } => {
                 self.modifiers = Modifiers { shift, ctrl, alt, meta };
@@ -653,24 +722,27 @@ impl TabState {
     // ----- keys and form controls -----
 
     /// A key for the page: Tab moves focus; a focused text control takes
-    /// the rest as editing; otherwise Enter follows a link, Space toggles
-    /// a checkbox or radio, arrows step a select, and the remaining keys
-    /// scroll.
-    fn key(&mut self, key: Key, shift: bool, ctrl: bool, alt: bool) {
+    /// the rest as editing; otherwise Enter clicks a link or button,
+    /// Space arms a click on a button, checkbox or radio (made on
+    /// release), arrows step a select, and the remaining keys scroll.
+    fn key(&mut self, key: Key, code: &str, repeat: bool, shift: bool, ctrl: bool, alt: bool) {
         // `keydown` first; cancelled, the key does nothing. A key that
-        // produces a character also fires the legacy `keypress`.
-        if !self.fire_key("keydown", &key, shift, ctrl, alt) {
+        // produces a character also fires the legacy `keypress`, whose
+        // cancellation stops only the text it would insert: browsers
+        // scroll and activate on `keydown`.
+        if !self.fire_key("keydown", &key, code, repeat, shift, ctrl, alt) {
             return;
         }
-        if matches!(key, Key::Character(_) | Key::Enter | Key::Space)
-            && !ctrl
-            && !alt
-            && !self.fire_key("keypress", &key, shift, ctrl, alt)
-        {
-            return;
-        }
+        let keypress_ok = !matches!(key, Key::Character(_) | Key::Enter | Key::Space)
+            || ctrl
+            || alt
+            || self.fire_key("keypress", &key, code, repeat, shift, ctrl, alt);
         if key == Key::Tab && !ctrl && !alt {
             self.focus_step(!shift);
+            return;
+        }
+        if key == Key::ContextMenu {
+            self.fire_keyboard_contextmenu();
             return;
         }
         let focus = self.focus;
@@ -679,23 +751,36 @@ impl TabState {
                 .and_then(|f| self.doc.as_ref()?.element(f))
                 .is_some_and(pred)
         };
-        let (text, link, toggle, select) = (
+        let (text, textarea, link, toggle, select, button) = (
             focused_is(is_text_control),
+            focused_is(is_textarea),
             focused_is(is_link),
             focused_is(is_toggle),
             focused_is(is_select),
+            focused_is(is_button),
         );
         // Only read where one of the flags above is set, so a missing
         // focus never reaches a control.
         let f = focus.unwrap_or_default();
         if text {
-            self.edit_key(f, key, ctrl, alt);
+            // Enter in an input commits the value: `change` if edited.
+            if key == Key::Enter && !textarea && !ctrl && !alt {
+                self.fire_change_if_edited(f);
+                return;
+            }
+            if keypress_ok {
+                self.edit_key(f, key, ctrl, alt);
+            }
             return;
         }
         let h = self.viewport.height;
         match key {
-            Key::Enter if link && !ctrl && !alt => self.follow_link(f),
-            Key::Space if toggle => self.toggle_control(f),
+            Key::Enter if (link || button) && !ctrl && !alt => {
+                if self.fire_synthetic_click(f) && link {
+                    self.follow_link(f);
+                }
+            }
+            Key::Space if toggle || button => self.space_armed = Some(f),
             Key::ArrowUp | Key::ArrowDown if select => self.step_select(f, key == Key::ArrowDown),
             Key::ArrowDown => self.scroll_by(0.0, LINE_SCROLL),
             Key::ArrowUp => self.scroll_by(0.0, -LINE_SCROLL),
@@ -1666,7 +1751,11 @@ impl TabState {
         } else {
             self.mouse.and_then(|(x, y)| self.hit_node(x, y))
         };
-        let hit = raw.and_then(|n| self.element_of(n));
+        // A capturing element is what the pointer is "over" until release.
+        let hit = match self.pointer_capture {
+            Some(c) if self.live(c) => Some(c),
+            _ => raw.and_then(|n| self.element_of(n)),
+        };
         if hit == self.hover {
             return;
         }
@@ -1713,6 +1802,7 @@ impl TabState {
         let old = self.focus;
         let mut target = target;
         if target != old {
+            self.space_armed = None;
             if let Some(o) = old {
                 self.fire_blur(o, target);
             }
@@ -2606,6 +2696,15 @@ impl TabState {
             self.press = None;
             self.states.set_single(None, ElementStates::ACTIVE);
         }
+        if self.pointer_capture.is_some_and(|c| !self.live(c)) {
+            self.pointer_capture = None;
+            if let Some(host) = &mut self.script {
+                host.clear_pointer_capture();
+            }
+        }
+        if self.space_armed.is_some_and(|s| !self.live(s)) {
+            self.space_armed = None;
+        }
     }
 
     /// Make `sheets` match the document's `<style>` and `<link
@@ -2827,10 +2926,15 @@ impl TabState {
 
     /// Called after each batch of events: do the work that is due.
     pub fn flush(&mut self) {
+        // A capture a listener asked for takes effect before the batch's
+        // hover change is found, so the boundary events follow it.
+        self.process_pointer_capture();
         self.settle();
-        // `resize` and `scroll` listeners run after layout and may change
-        // the tree.
-        if self.fire_view_events() {
+        // The batch's move events, then `resize` and `scroll`: all run
+        // after layout and may change the tree.
+        let mut again = self.fire_pointer_move();
+        again |= self.fire_view_events();
+        if again {
             self.settle();
         }
         if self.needs_paint && self.layout.is_some() {
@@ -3062,6 +3166,13 @@ fn is_text_control(e: &browser_dom::Element) -> bool {
 /// A checkbox or radio button.
 fn is_toggle(e: &browser_dom::Element) -> bool {
     input_type(e).is_some_and(|t| t == "checkbox" || t == "radio")
+}
+
+/// A `<button>` or a button-like input: Enter and Space click it.
+fn is_button(e: &browser_dom::Element) -> bool {
+    e.name.ns == ns!(html)
+        && (e.name.local == local_name!("button")
+            || input_type(e).is_some_and(|t| matches!(t.as_str(), "button" | "submit" | "reset" | "image")))
 }
 
 /// Parse a `Refresh` value (`5`, `5; url=/next`, `0;URL='x'`) into the
@@ -3843,6 +3954,18 @@ mod tests {
         fn key(&mut self, key: Key, shift: bool) {
             self.send(ShellToTab::Key {
                 key,
+                code: String::new(),
+                repeat: false,
+                shift,
+                ctrl: false,
+                alt: false,
+            });
+        }
+
+        fn key_up(&mut self, key: Key, shift: bool) {
+            self.send(ShellToTab::KeyUp {
+                key,
+                code: String::new(),
                 shift,
                 ctrl: false,
                 alt: false,
@@ -4012,8 +4135,11 @@ mod tests {
         h.click_id("c");
         assert!(!h.has_attr("c", "checked"));
         assert_eq!(h.color_of("cs"), [0, 0, 0, 255]);
-        // Space on the focused checkbox toggles too; a disabled one never.
+        // Space on the focused checkbox toggles too, on release as in
+        // browsers; a disabled one never.
         h.key(Key::Space, false);
+        assert!(!h.has_attr("c", "checked"), "not before the key goes up");
+        h.key_up(Key::Space, false);
         assert!(h.has_attr("c", "checked"));
         h.click_id("d");
         assert!(!h.has_attr("d", "checked"));
@@ -4492,14 +4618,7 @@ mod tests {
              </script>";
         let mut h = Harness::load(html);
         let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
-        let key = |h: &mut Harness, key: Key, shift: bool| {
-            h.send(ShellToTab::Key {
-                key,
-                shift,
-                ctrl: false,
-                alt: false,
-            });
-        };
+        let key = |h: &mut Harness, key: Key, shift: bool| h.key(key, shift);
 
         // Nothing focused: the key goes to `body`; the page scrolls.
         key(&mut h, Key::ArrowDown, false);
@@ -4516,12 +4635,7 @@ mod tests {
         // Typing: `keydown`, `keypress`, `beforeinput`, `input`; `keyup`
         // from the shell. A cancelled `beforeinput` leaves the value.
         key(&mut h, Key::Character("x".into()), false);
-        h.send(ShellToTab::KeyUp {
-            key: Key::Character("x".into()),
-            shift: false,
-            ctrl: false,
-            alt: false,
-        });
+        h.key_up(Key::Character("x".into()), false);
         assert_eq!(
             drain(&mut h),
             "\"kd:x:KeyX:88:false:input#i:true kp:x:120:120 bi:insertText:x:true:true in:i:insertText:x:abx ku:x\""
@@ -4569,12 +4683,189 @@ mod tests {
         key(&mut h, Key::Tab, false);
         drain(&mut h);
         key(&mut h, Key::Space, false);
-        assert_eq!(drain(&mut h), "\"kd: :Space:32:false:input#c:true kp: :32:32 in:c::null:null ch:c:false\"");
+        h.key_up(Key::Space, false);
+        assert_eq!(drain(&mut h), "\"kd: :Space:32:false:input#c:true kp: :32:32 ku:  in:c::null:null ch:c:false\"");
         key(&mut h, Key::Tab, true);
         assert_eq!(
             drain(&mut h),
             "\"kd:Tab:Tab:9:true:input#c:true blur:c:s:false:true focusout:c:s:true:true focus:s:c:false:true focusin:s:c:true:true\""
         );
+    }
+
+    #[test]
+    fn pointer_events_come_first_capture_the_mouse_and_hold_back_mouse_events() {
+        let html = "<!DOCTYPE html><title>Pointer</title><style>body { margin: 0 } div { height: 40px; margin: 0 }</style>\
+             <div id=a></div><div id=b></div><div id=c></div>\
+             <script>\
+               var log = []; var cancel = {}; var capture = false; \
+               var a = document.getElementById('a'), b = document.getElementById('b'); \
+               var name = ev => ev.target.id || ev.target.tagName.toLowerCase(); \
+               var note = ev => log.push(ev.type + ':' + name(ev) + ':' + (ev.pointerId === undefined ? 'm' : ev.pointerId) + ':' + ev.button + ':' + ev.buttons); \
+               ['pointerdown', 'pointerup', 'pointermove', 'pointerover', 'pointerout', 'pointerenter', 'pointerleave', 'gotpointercapture', 'lostpointercapture', \
+                'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout', 'mouseenter', 'mouseleave', 'click'].forEach(t => document.addEventListener(t, note, true)); \
+               a.addEventListener('pointerdown', ev => { if (cancel.pointerdown) ev.preventDefault(); if (capture) a.setPointerCapture(ev.pointerId); }); \
+               b.addEventListener('pointermove', ev => log.push('mv:' + ev.movementX + ':' + ev.movementY + ':' + ev.getCoalescedEvents().length + ':' + (ev instanceof PointerEvent) + ':' + (ev instanceof MouseEvent) + ':' + ev.pressure + ':' + ev.pointerType)); \
+               a.addEventListener('lostpointercapture', () => log.push('hascap:' + a.hasPointerCapture(1))); \
+             </script>";
+        let mut h = Harness::load(html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+
+        // Into `a`: pointer boundary events, then the mouse ones, then
+        // the batch's `pointermove` and `mousemove`.
+        h.send(ShellToTab::MouseMove { x: 10.0, y: 20.0 });
+        assert_eq!(
+            drain(&mut h),
+            "\"pointerover:a:1:-1:0 pointerenter:html:1:-1:0 pointerenter:body:1:-1:0 pointerenter:a:1:-1:0 \
+              mouseover:a:m:0:0 mouseenter:html:m:0:0 mouseenter:body:m:0:0 mouseenter:a:m:0:0 pointermove:a:1:-1:0 mousemove:a:m:0:0\""
+        );
+        // Over to `b`, then a second move: `movementX/Y` from the last
+        // move, one coalesced event (the move itself).
+        h.send(ShellToTab::MouseMove { x: 10.0, y: 60.0 });
+        assert_eq!(
+            drain(&mut h),
+            "\"pointerout:a:1:-1:0 pointerleave:a:1:-1:0 mouseout:a:m:0:0 mouseleave:a:m:0:0 \
+              pointerover:b:1:-1:0 pointerenter:b:1:-1:0 mouseover:b:m:0:0 mouseenter:b:m:0:0 \
+              pointermove:b:1:-1:0 mv:0:40:1:true:true:0:mouse mousemove:b:m:0:0\""
+        );
+        h.send(ShellToTab::MouseMove { x: 15.0, y: 60.0 });
+        assert_eq!(drain(&mut h), "\"pointermove:b:1:-1:0 mv:5:0:1:true:true:0:mouse mousemove:b:m:0:0\"");
+
+        // A cancelled `pointerdown` holds back `mousedown`, `mousemove`
+        // and `mouseup` until the pointer goes up; `click` still fires.
+        h.send(ShellToTab::MouseMove { x: 10.0, y: 20.0 });
+        drain(&mut h);
+        js(&mut h, "cancel.pointerdown = true");
+        h.send(ShellToTab::MouseDown { x: 10.0, y: 20.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseMove { x: 12.0, y: 20.0 });
+        h.send(ShellToTab::MouseUp { x: 12.0, y: 20.0, button: MouseButton::Left });
+        assert_eq!(drain(&mut h), "\"pointerdown:a:1:0:1 pointermove:a:1:-1:1 pointerup:a:1:0:0 click:a:1:0:0\"");
+        js(&mut h, "cancel.pointerdown = false");
+        h.send(ShellToTab::MouseMove { x: 13.0, y: 20.0 });
+        assert_eq!(drain(&mut h), "\"pointermove:a:1:-1:0 mousemove:a:m:0:0\"");
+
+        // Capture: `gotpointercapture`, moves go to `a` wherever the
+        // pointer is, release on `pointerup` with `lostpointercapture`,
+        // then the boundary events catch up and `click` goes to the
+        // element the press and the release share.
+        js(&mut h, "capture = true");
+        h.send(ShellToTab::MouseDown { x: 13.0, y: 20.0, button: MouseButton::Left });
+        assert_eq!(drain(&mut h), "\"pointerdown:a:1:0:1 mousedown:a:m:0:1 gotpointercapture:a:1:-1:1\"");
+        h.send(ShellToTab::MouseMove { x: 10.0, y: 60.0 });
+        assert_eq!(drain(&mut h), "\"pointermove:a:1:-1:1 mousemove:a:m:0:1\"");
+        assert_eq!(h.state.hover, Some(h.by_id("a")), "hover follows the capture");
+        h.send(ShellToTab::MouseUp { x: 10.0, y: 60.0, button: MouseButton::Left });
+        assert_eq!(
+            drain(&mut h),
+            "\"pointerup:a:1:0:0 mouseup:a:m:0:0 lostpointercapture:a:1:-1:0 hascap:false \
+              pointerout:a:1:-1:0 pointerleave:a:1:-1:0 mouseout:a:m:0:0 mouseleave:a:m:0:0 \
+              pointerover:b:1:-1:0 pointerenter:b:1:-1:0 mouseover:b:m:0:0 mouseenter:b:m:0:0 click:body:1:0:0\""
+        );
+        assert_eq!(h.state.hover, Some(h.by_id("b")));
+        // The capture methods refuse an unknown pointer.
+        assert_eq!(
+            js(&mut h, "var e = []; try { a.setPointerCapture(2) } catch (x) { e.push(x.name) } try { a.releasePointerCapture(2) } catch (x) { e.push(x.name) } e.push(a.hasPointerCapture(1), a.hasPointerCapture(2)); e.join()"),
+            "\"NotFoundError,NotFoundError,false,false\""
+        );
+    }
+
+    #[test]
+    fn the_keyboard_clicks_links_and_buttons_and_commits_inputs() {
+        let html = "<!DOCTYPE html><title>KeyClick</title><a id=l href='#x'>link</a><button id=b>go</button><input type=checkbox id=c><input id=i value=v>\
+             <script>\
+               var log = []; var cancel = {}; \
+               document.addEventListener('click', ev => { log.push('click:' + ev.target.id + ':' + ev.pointerId + ':' + ev.pointerType + ':' + ev.detail + ':' + ev.clientX + ':' + (ev instanceof PointerEvent)); if (cancel[ev.target.id]) ev.preventDefault(); }); \
+               document.addEventListener('keydown', ev => log.push('kd:' + ev.code + ':' + ev.repeat)); \
+               document.addEventListener('keyup', ev => log.push('ku:' + ev.key + ':' + ev.code + ':' + ev.target.id)); \
+               document.addEventListener('change', ev => log.push('change:' + ev.target.id + ':' + ev.target.getAttribute('value'))); \
+               document.addEventListener('contextmenu', ev => log.push('ctx:' + ev.target.id + ':' + ev.pointerId + ':' + ev.pointerType + ':' + Math.round(ev.clientX) + ':' + Math.round(ev.clientY))); \
+             </script>";
+        let mut h = Harness::load(html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+
+        // Enter on a link: a synthetic `click` (pointerId -1, no
+        // coordinates); cancelled, the link is not followed.
+        h.key(Key::Tab, false);
+        drain(&mut h);
+        js(&mut h, "cancel.l = true");
+        h.key(Key::Enter, false);
+        assert_eq!(drain(&mut h), "\"kd:Enter:false click:l:-1::0:0:true\"");
+        assert_eq!(h.state.url.as_ref().and_then(|u| u.fragment()), None);
+        js(&mut h, "cancel.l = false");
+        h.key(Key::Enter, false);
+        assert_eq!(drain(&mut h), "\"kd:Enter:false click:l:-1::0:0:true\"");
+        assert_eq!(h.state.url.as_ref().and_then(|u| u.fragment()), Some("x"));
+
+        // Space on a button clicks on release; the shell's `code` and
+        // `repeat` ride along.
+        h.key(Key::Tab, false);
+        drain(&mut h);
+        h.send(ShellToTab::Key {
+            key: Key::Space,
+            code: "Space".into(),
+            repeat: true,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(drain(&mut h), "\"kd:Space:true\"");
+        h.send(ShellToTab::KeyUp {
+            key: Key::Space,
+            code: "Space".into(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(drain(&mut h), "\"ku: :Space:b click:b:-1::0:0:true\"");
+
+        // A checkbox: the click toggles; cancelled, it does not.
+        h.key(Key::Tab, false);
+        drain(&mut h);
+        h.key(Key::Space, false);
+        h.key_up(Key::Space, false);
+        assert_eq!(drain(&mut h), "\"kd:Space:false ku: :Space:c click:c:-1::0:0:true change:c:null\"");
+        assert!(h.has_attr("c", "checked"));
+        js(&mut h, "cancel.c = true");
+        h.key(Key::Space, false);
+        h.key_up(Key::Space, false);
+        assert!(h.has_attr("c", "checked"), "a cancelled click toggles nothing");
+        drain(&mut h);
+
+        // Enter in an input commits an edited value with `change`, once.
+        h.key(Key::Tab, false);
+        h.typed("w");
+        drain(&mut h);
+        h.key(Key::Enter, false);
+        assert_eq!(drain(&mut h), "\"kd:Enter:false change:i:vw\"");
+        h.key(Key::Enter, false);
+        assert_eq!(drain(&mut h), "\"kd:Enter:false\"");
+
+        // The context-menu key: `contextmenu` at the focused element, at
+        // its box.
+        let r = h.rect_of(h.by_id("i"));
+        h.key(Key::ContextMenu, false);
+        assert_eq!(
+            drain(&mut h),
+            format!("\"kd:ContextMenu:false ctx:i:-1::{}:{}\"", r.x.round() as i32, r.y.round() as i32)
+        );
+    }
+
+    #[test]
+    fn body_handler_attributes_forward_to_window() {
+        let html = "<!DOCTYPE html><title>Body</title>\
+             <body onload=\"log.push('bodyload:' + (this === window) + ':' + (event.target === window))\" onresize=\"log.push('bodyresize')\" onscroll=\"log.push('bodyscroll:' + (event.target === document))\">\
+             <div style='height: 3000px'></div>\
+             <script>var log = []; setTimeout(() => log.push('same:' + (document.body.onresize === window.onresize) + ':' + typeof window.onload + ':' + (document.body.onload === window.onload)), 0)</script>";
+        let mut h = Harness::load(html);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.pump();
+        assert_eq!(js(&mut h, "log.splice(0).join(' ')"), "\"bodyload:true:true same:true:function:true\"");
+        h.send(ShellToTab::Resize(Viewport {
+            width: 700.0,
+            height: 500.0,
+            scale_factor: 1.0,
+        }));
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 50.0 });
+        assert_eq!(js(&mut h, "log.splice(0).join(' ')"), "\"bodyresize bodyscroll:true\"");
     }
 
     /// Console text so far, in order.

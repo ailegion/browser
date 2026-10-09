@@ -23,7 +23,7 @@ use boa_engine::{
 use boa_gc::{Finalize, Trace};
 use browser_dom::NodeId;
 
-use crate::dom::{DomNode, dom, dom_exception, document_object, illegal_invocation, wrap};
+use crate::dom::{Dom, DomNode, dom, dom_exception, document_object, illegal_invocation, wrap};
 use crate::{getter, js_str, setter};
 
 /// What an event is dispatched to.
@@ -49,6 +49,7 @@ pub enum UiClass {
     Keyboard,
     Input,
     Focus,
+    Pointer,
 }
 
 /// What the tab knows about a user event: the fields of the `UIEvent`
@@ -71,8 +72,19 @@ pub struct UiEventInit {
     pub page_y: f64,
     pub offset_x: f64,
     pub offset_y: f64,
+    /// `movementX/Y`: how far the pointer moved since the last move event.
+    pub movement_x: f64,
+    pub movement_y: f64,
     pub button: i16,
     pub buttons: u16,
+    /// `PointerEvent`: `pointerId` (1 for the mouse, -1 for a click made
+    /// by the keyboard), `pointerType` (`mouse`, or empty for the
+    /// keyboard), `pressure` (0.5 with a button down, else 0),
+    /// `isPrimary`.
+    pub pointer_id: i32,
+    pub pointer_type: String,
+    pub pressure: f64,
+    pub is_primary: bool,
     /// `relatedTarget`: where the pointer or the focus came from or went.
     pub related_target: Option<EventTargetRef>,
     pub alt: bool,
@@ -399,6 +411,7 @@ ui_class!(WheelEventClass, "WheelEvent", UiClass::Wheel, init_wheel_event);
 ui_class!(KeyboardEventClass, "KeyboardEvent", UiClass::Keyboard, init_keyboard_event);
 ui_class!(InputEventClass, "InputEvent", UiClass::Input, init_input_event);
 ui_class!(FocusEventClass, "FocusEvent", UiClass::Focus, init_focus_event);
+ui_class!(PointerEventClass, "PointerEvent", UiClass::Pointer, init_pointer_event);
 
 fn add_ui_getters(class: &mut ClassBuilder<'_>, props: &[(&str, UiProp)]) {
     for (name, prop) in props {
@@ -438,6 +451,8 @@ fn init_mouse_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
             ("pageY", UiProp::PageY),
             ("offsetX", UiProp::OffsetX),
             ("offsetY", UiProp::OffsetY),
+            ("movementX", UiProp::MovementX),
+            ("movementY", UiProp::MovementY),
             ("button", UiProp::Button),
             ("buttons", UiProp::Buttons),
             ("relatedTarget", UiProp::RelatedTarget),
@@ -515,6 +530,116 @@ fn init_focus_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     Ok(())
 }
 
+fn init_pointer_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(
+        class,
+        &[
+            ("pointerId", UiProp::PointerId),
+            ("width", UiProp::Width),
+            ("height", UiProp::Height),
+            ("pressure", UiProp::Pressure),
+            ("tangentialPressure", UiProp::Zero),
+            ("tiltX", UiProp::Zero),
+            ("tiltY", UiProp::Zero),
+            ("twist", UiProp::Zero),
+            ("altitudeAngle", UiProp::AltitudeAngle),
+            ("azimuthAngle", UiProp::Zero),
+            ("pointerType", UiProp::PointerType),
+            ("isPrimary", UiProp::IsPrimary),
+        ],
+    );
+    class.method(
+        js_string!("getCoalescedEvents"),
+        0,
+        NativeFunction::from_copy_closure_with_captures(pointer_events_list, true),
+    );
+    class.method(
+        js_string!("getPredictedEvents"),
+        0,
+        NativeFunction::from_copy_closure_with_captures(pointer_events_list, false),
+    );
+    Ok(())
+}
+
+/// `getCoalescedEvents` (the event itself for a trusted `pointermove`,
+/// since moves are coalesced per batch) and `getPredictedEvents` (none).
+fn pointer_events_list(this: &JsValue, _: &[JsValue], coalesced: &bool, context: &mut Context) -> JsResult<JsValue> {
+    let event = this_event(this)?;
+    let include = *coalesced
+        && event
+            .downcast_ref::<EventData>()
+            .is_some_and(|d| d.flags.is_trusted && d.kind == "pointermove");
+    let items: Vec<JsValue> = if include { vec![event.clone().into()] } else { Vec::new() };
+    Ok(JsArray::from_iter(items, context).into())
+}
+
+/// Pointer capture on `Element`: `setPointerCapture`,
+/// `releasePointerCapture`, `hasPointerCapture`. The pointer is the mouse
+/// (id 1). A set is pending until the tab processes it before the next
+/// pointer event, as the specification's "pending pointer capture".
+pub(crate) fn add_pointer_capture_methods(class: &mut ClassBuilder<'_>) {
+    for (name, method) in [
+        ("setPointerCapture", CaptureMethod::Set),
+        ("releasePointerCapture", CaptureMethod::Release),
+        ("hasPointerCapture", CaptureMethod::Has),
+    ] {
+        class.method(
+            JsString::from(name),
+            1,
+            NativeFunction::from_copy_closure_with_captures(capture_call, method),
+        );
+    }
+}
+
+#[derive(Clone, Trace, Finalize)]
+enum CaptureMethod {
+    Set,
+    Release,
+    Has,
+}
+
+/// The mouse's `pointerId`; a click made by the keyboard reports -1.
+pub const MOUSE_POINTER_ID: i32 = 1;
+
+fn capture_call(this: &JsValue, args: &[JsValue], method: &CaptureMethod, context: &mut Context) -> JsResult<JsValue> {
+    let node = this
+        .as_object()
+        .and_then(|o| o.downcast_ref::<DomNode>().map(|d| d.clone()))
+        .ok_or_else(illegal_invocation)?;
+    // The document is a Node but not an Element.
+    let Some(id) = node.id else { return Err(illegal_invocation()) };
+    let pointer_id = args.get_or_undefined(0).to_number(context)?;
+    let shared = dom(context)?;
+    let (connected, buttons, capture) = {
+        let d = shared.borrow();
+        (d.doc.contains(id) && d.doc.is_connected(id), d.pointer_buttons, d.pointer_capture)
+    };
+    if pointer_id != f64::from(MOUSE_POINTER_ID) {
+        return match method {
+            CaptureMethod::Has => Ok(false.into()),
+            _ => Err(dom_exception("NotFoundError", "no pointer with that id", context)),
+        };
+    }
+    match method {
+        CaptureMethod::Set => {
+            if !connected {
+                return Err(dom_exception("InvalidStateError", "the element is not connected", context));
+            }
+            // Capture needs a pressed button; otherwise the call does nothing.
+            if buttons != 0 {
+                shared.borrow_mut().pointer_capture = Some(id);
+            }
+        }
+        CaptureMethod::Release => {
+            if capture == Some(id) {
+                shared.borrow_mut().pointer_capture = None;
+            }
+        }
+        CaptureMethod::Has => return Ok((capture == Some(id)).into()),
+    }
+    Ok(JsValue::undefined())
+}
+
 /// The prototype of a `UiClass`.
 fn ui_prototype(class: UiClass, context: &mut Context) -> JsResult<JsObject> {
     let proto = match class {
@@ -525,6 +650,7 @@ fn ui_prototype(class: UiClass, context: &mut Context) -> JsResult<JsObject> {
         UiClass::Keyboard => context.get_global_class::<KeyboardEventClass>().map(|c| c.prototype()),
         UiClass::Input => context.get_global_class::<InputEventClass>().map(|c| c.prototype()),
         UiClass::Focus => context.get_global_class::<FocusEventClass>().map(|c| c.prototype()),
+        UiClass::Pointer => context.get_global_class::<PointerEventClass>().map(|c| c.prototype()),
     };
     proto.ok_or_else(|| JsNativeError::typ().with_message("event class is not registered").into())
 }
@@ -579,7 +705,7 @@ fn construct_ui(
         ui.detail = init_number(init, "detail", context)? as i32;
         data.has_view = init.get(js_string!("view"), context)?.is_object();
         match class {
-            UiClass::Mouse | UiClass::Wheel => {
+            UiClass::Mouse | UiClass::Wheel | UiClass::Pointer => {
                 ui.screen_x = init_number(init, "screenX", context)?;
                 ui.screen_y = init_number(init, "screenY", context)?;
                 ui.client_x = init_number(init, "clientX", context)?;
@@ -588,6 +714,8 @@ fn construct_ui(
                 ui.page_y = ui.client_y;
                 ui.offset_x = ui.client_x;
                 ui.offset_y = ui.client_y;
+                ui.movement_x = init_number(init, "movementX", context)?;
+                ui.movement_y = init_number(init, "movementY", context)?;
                 ui.button = init_number(init, "button", context)? as i16;
                 ui.buttons = init_number(init, "buttons", context)? as u16;
                 init_modifiers(init, &mut ui, context)?;
@@ -596,6 +724,12 @@ fn construct_ui(
                     ui.delta_x = init_number(init, "deltaX", context)?;
                     ui.delta_y = init_number(init, "deltaY", context)?;
                     ui.delta_mode = init_number(init, "deltaMode", context)? as u32;
+                }
+                if class == UiClass::Pointer {
+                    ui.pointer_id = init_number(init, "pointerId", context)? as i32;
+                    ui.pointer_type = init_string(init, "pointerType", context)?.unwrap_or_default();
+                    ui.pressure = init_number(init, "pressure", context)?;
+                    ui.is_primary = init_bool(init, "isPrimary", context)?;
                 }
             }
             UiClass::Keyboard => {
@@ -652,6 +786,17 @@ enum UiProp {
     DeltaY,
     DeltaZ,
     DeltaMode,
+    MovementX,
+    MovementY,
+    PointerId,
+    Width,
+    Height,
+    Pressure,
+    AltitudeAngle,
+    PointerType,
+    IsPrimary,
+    /// Tilt, twist, tangential pressure, azimuth: a mouse has none.
+    Zero,
 }
 
 /// The legacy `keyCode` of a key value.
@@ -746,6 +891,16 @@ fn ui_get(this: &JsValue, _: &[JsValue], prop: &UiProp, context: &mut Context) -
         UiProp::DeltaY => ui.delta_y.into(),
         UiProp::DeltaZ => 0.0.into(),
         UiProp::DeltaMode => ui.delta_mode.into(),
+        UiProp::MovementX => ui.movement_x.into(),
+        UiProp::MovementY => ui.movement_y.into(),
+        UiProp::PointerId => ui.pointer_id.into(),
+        // A mouse contact is one pixel.
+        UiProp::Width | UiProp::Height => 1.into(),
+        UiProp::Pressure => ui.pressure.into(),
+        UiProp::AltitudeAngle => std::f64::consts::FRAC_PI_2.into(),
+        UiProp::PointerType => js_str(&ui.pointer_type),
+        UiProp::IsPrimary => ui.is_primary.into(),
+        UiProp::Zero => 0.into(),
     })
 }
 
@@ -832,9 +987,11 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     context.register_global_class::<KeyboardEventClass>()?;
     context.register_global_class::<InputEventClass>()?;
     context.register_global_class::<FocusEventClass>()?;
+    context.register_global_class::<PointerEventClass>()?;
     inherit::<UiEventClass, EventData>(context);
     inherit::<MouseEventClass, UiEventClass>(context);
     inherit::<WheelEventClass, MouseEventClass>(context);
+    inherit::<PointerEventClass, MouseEventClass>(context);
     inherit::<KeyboardEventClass, UiEventClass>(context);
     inherit::<InputEventClass, UiEventClass>(context);
     inherit::<FocusEventClass, UiEventClass>(context);
@@ -926,7 +1083,77 @@ const HANDLER_NAMES: &[&str] = &[
     "onpageshow",
     "onselectionchange",
     "onvisibilitychange",
+    "onpointerdown",
+    "onpointerup",
+    "onpointermove",
+    "onpointerover",
+    "onpointerout",
+    "onpointerenter",
+    "onpointerleave",
+    "onpointercancel",
+    "ongotpointercapture",
+    "onlostpointercapture",
 ];
+
+/// The handlers a `body` element forwards to `window`: `<body
+/// onload="...">` and `document.body.onresize = f` set `window`'s
+/// handler, as HTML's "window event handlers on body" say.
+const WINDOW_FORWARDED: &[&str] = &[
+    "blur",
+    "error",
+    "focus",
+    "load",
+    "resize",
+    "scroll",
+    "hashchange",
+    "popstate",
+    "unload",
+    "beforeunload",
+    "pagehide",
+    "pageshow",
+];
+
+/// Whether `body`'s `on<kind>` attribute is `window`'s handler for
+/// `kind`, so a dispatch reaching `window` can meet it.
+pub fn forwarded_to_window(kind: &str) -> bool {
+    WINDOW_FORWARDED.contains(&kind)
+}
+
+fn forwarded(kind: &str) -> bool {
+    forwarded_to_window(kind)
+}
+
+/// `body`'s handler slot for a forwarded kind is `window`'s.
+fn forward_body(target: EventTargetRef, kind: &str, context: &mut Context) -> JsResult<EventTargetRef> {
+    if let EventTargetRef::Node(id) = target
+        && forwarded(kind)
+    {
+        let shared = dom(context)?;
+        let dom = shared.borrow();
+        if dom.doc.contains(id) && dom.doc.body() == Some(id) {
+            return Ok(EventTargetRef::Window);
+        }
+    }
+    Ok(target)
+}
+
+/// The element whose `on<kind>` content attribute feeds `target`'s
+/// handler slot: the element itself, or `body` for a kind it forwards to
+/// `window`. None when no attribute can (the `body`'s own slot for a
+/// forwarded kind is `window`'s, handled there).
+fn attr_source(dom: &Dom, target: EventTargetRef, kind: &str) -> Option<NodeId> {
+    match target {
+        EventTargetRef::Node(id) => {
+            if forwarded(kind) && dom.doc.contains(id) && dom.doc.body() == Some(id) {
+                None
+            } else {
+                Some(id)
+            }
+        }
+        EventTargetRef::Window if forwarded(kind) => dom.doc.body(),
+        _ => None,
+    }
+}
 
 /// Put the `on<type>` accessors on a class (`Element`, `Document`).
 pub(crate) fn add_handler_attributes(class: &mut ClassBuilder<'_>) {
@@ -1259,11 +1486,13 @@ fn handler_kind(index: u8) -> &'static str {
 /// and make it the target's handler listener, unless the property was
 /// set from script.
 fn ensure_attribute_handler(target: EventTargetRef, kind: &str, context: &mut Context) -> JsResult<()> {
-    let EventTargetRef::Node(id) = target else { return Ok(()) };
-    let key = (id, kind.to_owned());
-    let (attr, action) = {
+    let (attr, action, key) = {
         let shared = dom(context)?;
         let dom = shared.borrow();
+        let Some(id) = attr_source(&dom, target, kind) else {
+            return Ok(());
+        };
+        let key = (id, kind.to_owned());
         let attr = dom
             .doc
             .contains(id)
@@ -1282,7 +1511,7 @@ fn ensure_attribute_handler(target: EventTargetRef, kind: &str, context: &mut Co
                 None => Action::Keep,
             },
         };
-        (attr, action)
+        (attr, action, key)
     };
     match action {
         Action::Keep => {}
@@ -1350,8 +1579,8 @@ fn set_handler(target: EventTargetRef, kind: &str, callback: Option<JsObject>, c
 }
 
 fn handler_get(this: &JsValue, _: &[JsValue], index: &u8, context: &mut Context) -> JsResult<JsValue> {
-    let target = this_target(this, context)?;
     let kind = handler_kind(*index);
+    let target = forward_body(this_target(this, context)?, kind, context)?;
     ensure_attribute_handler(target, kind, context)?;
     let shared = dom(context)?;
     let dom = shared.borrow();
@@ -1364,12 +1593,13 @@ fn handler_get(this: &JsValue, _: &[JsValue], index: &u8, context: &mut Context)
 }
 
 fn handler_set(this: &JsValue, args: &[JsValue], index: &u8, context: &mut Context) -> JsResult<JsValue> {
-    let target = this_target(this, context)?;
     let kind = handler_kind(*index);
+    let target = forward_body(this_target(this, context)?, kind, context)?;
     let callback = args.get_or_undefined(0).as_object().filter(JsObject::is_callable);
     // A property set wins over the attribute until the attribute changes.
-    if let EventTargetRef::Node(id) = target {
-        let shared = dom(context)?;
+    let shared = dom(context)?;
+    let source_id = attr_source(&shared.borrow(), target, kind);
+    if let Some(id) = source_id {
         let mut dom = shared.borrow_mut();
         let source = dom
             .doc

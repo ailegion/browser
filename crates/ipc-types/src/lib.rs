@@ -64,6 +64,8 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// The context-menu key, or Shift+F10.
+    ContextMenu,
 }
 
 /// Shell to tab. Mouse positions are logical pixels within the page's
@@ -98,16 +100,23 @@ pub enum ShellToTab {
     /// A key went down while the page has the keyboard. Tab and
     /// Shift+Tab move focus through the page's tab order; Enter activates
     /// the focused element. With nothing focused, Tab starts from the
-    /// first focusable element and Shift+Tab from the last.
+    /// first focusable element and Shift+Tab from the last. `code` is the
+    /// physical key's name as the DOM's `KeyboardEvent.code` gives it
+    /// (`KeyA`, `Digit1`, `Comma`, `ShiftLeft`); empty when unknown.
+    /// `repeat` says the key is auto-repeating while held.
     Key {
         key: Key,
+        code: String,
+        repeat: bool,
         shift: bool,
         ctrl: bool,
         alt: bool,
     },
-    /// A key the page was given went back up; only `keyup` fires.
+    /// A key the page was given went back up: `keyup`, and the click a
+    /// held Space makes on a button or checkbox.
     KeyUp {
         key: Key,
+        code: String,
         shift: bool,
         ctrl: bool,
         alt: bool,

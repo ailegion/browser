@@ -820,77 +820,121 @@ Work:
       fixed on the way: a property handler was overridden again by the
       attribute on the next dispatch.
       **Block 2 done 2026-10-09: the user's events, with cancellable
-      defaults. Item 3.3.3 complete.** Classes (`crates/script/src/
-      events.rs`): `UIEvent` (`detail`, `view`, `which`), `MouseEvent`
-      (`screenX/Y`, `clientX/Y`, `x`/`y`, `pageX/Y`, `offsetX/Y`,
+      defaults.** Classes (`crates/script/src/events.rs`): `UIEvent`
+      (`detail`, `view`, `which`), `MouseEvent` (`screenX/Y`,
+      `clientX/Y`, `x`/`y`, `pageX/Y`, `offsetX/Y`, `movementX/Y`,
       `button`, `buttons`, `relatedTarget`, the four modifier flags,
-      `getModifierState`), `WheelEvent` (`deltaX/Y/Z`, `deltaMode` and
+      `getModifierState`), `PointerEvent` (`pointerId`, `pointerType`,
+      `pressure`, `width`/`height`, tilt/twist/tangential pressure,
+      `altitudeAngle`/`azimuthAngle`, `isPrimary`, `getCoalescedEvents`,
+      `getPredictedEvents`), `WheelEvent` (`deltaX/Y/Z`, `deltaMode` and
       its constants), `KeyboardEvent` (`key`, `code`, `repeat`,
       `location`, `isComposing`, the legacy `keyCode`/`charCode`/`which`,
       modifiers, `getModifierState`), `InputEvent` (`data`,
       `inputType`), `FocusEvent` (`relatedTarget`); all constructible
       from script with their init dictionaries, chained under `Event`,
-      and sharing one event data type so `dispatchEvent` takes any of
-      them. The tab fires them through `ScriptHost::fire_ui_event` with
-      a `UiEventInit`; `ScriptHost::has_listeners` lets the tab skip a
-      dispatch nothing listens to (a mouse move on a page without mouse
-      listeners costs a hit test and no script entry). Tab
+      sharing one event data type so `dispatchEvent` takes any of them.
+      `Element.setPointerCapture`/`releasePointerCapture`/
+      `hasPointerCapture` (`NotFoundError` for a pointer other than the
+      mouse, `InvalidStateError` when not connected; a set is pending
+      until the tab makes it active). `<body onload>`, `onresize`,
+      `onscroll`, `onerror`, `onfocus`, `onblur`, `onhashchange`,
+      `onpopstate`, `onunload`, `onbeforeunload`, `onpagehide`,
+      `onpageshow`, as attribute or property, are `window`'s handlers
+      (HTML's window event handlers on `body`). The tab fires events
+      through `ScriptHost::fire_ui_event` with a `UiEventInit`;
+      `ScriptHost::has_listeners` plus a look at the `on*` attributes on
+      the path lets it skip a dispatch nothing listens to. Tab
       (`crates/tab/src/document/user_events.rs`), each a task with its
-      default held back when a listener calls `preventDefault`:
-      `mousedown` (cancelled: no focus, caret or selection; `:active`,
-      the press and `click` still happen), `mouseup`, `click` at the
-      nearest element the press and release share (cancelled: no link
-      followed, no checkbox toggled), `dblclick` on the second click,
-      `auxclick` for the other buttons (cancelled: no new tab for a
-      middle click), `contextmenu` after a right click (no default yet),
-      `mousemove` per pointer message, `mouseover`/`mouseout` (bubbling)
-      and `mouseenter`/`mouseleave` (per element crossed, enter outermost
-      first) when the hovered element changes, which with a listener for
-      any of them is found per move rather than per batch so they come
-      before `mousemove`; `wheel` before a wheel scroll (cancelled: no
-      scroll); `scroll` on the document and `resize` on `window` after
-      layout, once per flush in which the offset or viewport moved;
-      `keydown` (cancelled: the key does nothing, Tab included) then the
-      legacy `keypress` for character keys, Enter and Space, and `keyup`
-      from a new `ShellToTab::KeyUp` the shell sends on release;
-      `beforeinput` (cancelled: no edit) and `input` around an edit of a
-      text control with `inputType` (`insertText`, `insertLineBreak`,
+      default held back when a listener calls `preventDefault`. Pointer
+      moves are coalesced per event batch, as browsers coalesce them per
+      frame: `flush` finds the hover change once at the batch's final
+      position (O15 kept) and fires one `pointermove` and one `mousemove`
+      there, with `movementX/Y` from the last move; the boundary events
+      go `pointerout`, `pointerleave` (per element left), `mouseout`,
+      `mouseleave`, `pointerover`, `pointerenter` (per element entered,
+      outermost first), `mouseover`, `mouseenter`. A press: `pointerdown`
+      then `mousedown` (`pointerdown` cancelled: `mousedown`, `mousemove`
+      and `mouseup` are held back until the pointer goes up and no
+      selection starts, focus still moves; `mousedown` cancelled: no
+      focus, caret or selection; `:active`, the press and `click` happen
+      either way). A release: `pointerup`, `mouseup`, the implicit
+      capture release, then `click` (`auxclick` for the other buttons;
+      `click`, `auxclick` and `contextmenu` are `PointerEvent`s per UI
+      Events) at the nearest element the press and release share
+      (cancelled: no link followed, no checkbox toggled, no new tab for
+      a middle click), `contextmenu` after a right click, `dblclick` on
+      the second click. Pointer capture: a capture asked for by a
+      listener is made active at the next flush (`gotpointercapture`,
+      `lostpointercapture`), pointer and mouse events then go to the
+      capturing element and the boundary events follow it there and
+      back on release. `wheel` at the hovered element before a wheel
+      scroll (cancelled: no scroll); `scroll` on the document and
+      `resize` on `window` after layout, once per flush in which the
+      offset or viewport moved. Keyboard: `keydown` (cancelled: the key
+      does nothing, Tab included), then the legacy `keypress` for
+      character keys, Enter and Space, whose cancellation stops only the
+      text it would insert (browsers scroll and activate on `keydown`);
+      `keyup` from `ShellToTab::KeyUp`; Enter on a link or button fires
+      a synthetic `click` (a `PointerEvent` with `pointerId` -1, no
+      `pointerType`, no coordinates, per HTML) and follows the link if
+      not cancelled; Space on a button, checkbox or radio clicks on
+      release, as browsers do, and toggles if not cancelled; the
+      context-menu key and Shift+F10 fire `contextmenu` at the focused
+      element's box; `code` and `repeat` come from the shell (winit's
+      physical key, named as the DOM names it, on every platform) on
+      `ShellToTab::Key`/`KeyUp`. Editing: `beforeinput` (cancelled: no
+      edit) and `input` around an edit of a text control with
+      `inputType` (`insertText`, `insertLineBreak`,
       `deleteContentBackward`, `deleteContentForward`) and `data`;
       `input` then `change` when a checkbox, radio or select changes;
-      `change` on blur of a text control whose value changed since
-      focus, then `blur`/`focusout` on the old element and `focus`/
-      `focusin` on the new, with `relatedTarget`; nothing for an element
-      removed from the document. Mouse events carry the modifiers from a
-      new `ShellToTab::Modifiers` the shell sends on every change, and
-      `buttons` from the tab's own count; `code` is made from letters and
-      digits (`KeyA`, `Digit1`) since the shell reports no physical key;
-      `screenX/Y` equal `clientX/Y` (the window position is not known to
-      the tab). Nothing fires while a new document is still parsing: the
-      page on screen is the old one and its context is gone. Tests: one
-      script test (every class's constructor and fields, the chain,
-      dispatch of a script-made `MouseEvent`, trusted events from the
-      host with a cancelled default), two tab harness tests (the mouse:
-      the full over/enter/move order with coordinates, modifiers and
-      `buttons`, a cancelled `mousedown`, `dblclick`, right and middle
-      buttons with a cancelled `auxclick`, out/leave on the way to a
-      checkbox, a cancelled `click` leaving it alone, `wheel` and
-      `scroll` and a cancelled `wheel`, `resize`, then a click that
-      follows the link; the keyboard: keys at `body`, Tab with focus
+      `change` on Enter in an input and on blur of a text control whose
+      value changed since focus or the last `change`; then
+      `blur`/`focusout` on the old element and `focus`/`focusin` on the
+      new, with `relatedTarget`; nothing for an element removed from the
+      document. Mouse events carry the modifiers from
+      `ShellToTab::Modifiers`, which the shell sends on every change,
+      and `buttons` from the tab's own count; `screenX/Y` equal
+      `clientX/Y` (the window position is not known to the tab). Nothing
+      fires while a new document is still parsing: the page on screen is
+      the old one and its context is gone. Tests: one script test (every
+      class's constructor and fields, the chain, dispatch of a
+      script-made `MouseEvent`, trusted events from the host with a
+      cancelled default, `PointerEvent`, the capture methods, `body`'s
+      window handlers both ways), five tab harness tests (the mouse: the
+      over/enter/move order with coordinates, modifiers and `buttons`, a
+      cancelled `mousedown`, `dblclick`, right and middle buttons with a
+      cancelled `auxclick`, out/leave on the way to a checkbox, a
+      cancelled `click`, `wheel`, `scroll` and a cancelled `wheel`,
+      `resize`, a click that follows the link; the pointer: the full
+      pointer-before-mouse order, `movementX/Y`, coalesced events, a
+      cancelled `pointerdown` holding the mouse events back, capture
+      with moves away from the element, release, boundary events
+      catching up and `click` at the shared ancestor, the capture
+      methods' errors; the keyboard: keys at `body`, Tab with focus
       events and `relatedTarget`, typing with `keypress`, `beforeinput`,
       `input` and `keyup`, a cancelled `beforeinput`, `change` only for
-      an edited value, a cancelled Tab, a select and a checkbox by key).
-      Not done: `click` from Enter or Space on links and buttons (the
-      default still runs without a `click` event), `change` on Enter in
-      an input, `keypress` is fired before the default for Space even
-      though browsers scroll on `keydown`, `mouseenter`/`mouseleave`
-      without a listener for any crossing event stay per batch (same
-      order as browsers, one hover change per batch), `pointer*` and
-      `touch*` events, `MouseEvent.movementX/Y`, `KeyboardEvent.code`
-      for keys other than letters, digits and the named ones, the
-      `body` element's `onresize`/`onscroll` forwarding to `window`,
-      `dblclick` timing from the OS (ours: half a second and four
-      pixels), `contextmenu` from the keyboard, `select` events, IME
-      composition events.
+      an edited value, a cancelled Tab, a select and a checkbox by key;
+      synthetic clicks: Enter on a link cancelled and not, Space on a
+      button on release with `code` and `repeat` from the shell, Space
+      on a checkbox cancelled and not, `change` on Enter once, the
+      context-menu key; `<body onload/onresize/onscroll>` reaching
+      `window`). Two details rest on the implementer's reading rather
+      than a checked source: focus still moving after a cancelled
+      `pointerdown`, and `setPointerCapture` doing nothing (not
+      throwing) while no button is down; owner informed 2026-10-09.
+      **Block 3 (next): page IME and selection inside controls.**
+      Phase 2 item 7 left IME on the page and text selection and the
+      clipboard inside a text control unbuilt, and nothing later owned
+      them. This block builds them: the shell routes IME preedit and
+      commit to the page when a text control has focus (the chrome's
+      input already does this for the address bar), the control shows
+      the preedit, `compositionstart`/`compositionupdate`/
+      `compositionend` fire around it with `beforeinput`/`input` of
+      `insertCompositionText`, Shift+arrows, Shift+click, drag and
+      double click select inside a control, Ctrl+C/X/V work there, and
+      the `select` event fires on a selection change in a control. The
+      item is complete when blocks 1 to 3 are done.
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,
       `getBoundingClientRect`, scroll properties.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,

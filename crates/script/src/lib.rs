@@ -35,7 +35,7 @@
 mod dom;
 mod events;
 
-pub use events::{EventTargetRef, UiClass, UiEventInit};
+pub use events::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -56,7 +56,7 @@ use boa_engine::{
 use boa_gc::{Finalize, Trace};
 use boa_runtime::extensions::{ConsoleExtension, MicrotaskExtension, TimeoutExtension};
 use boa_runtime::{ConsoleState, Logger};
-use browser_dom::Document;
+use browser_dom::{Document, NodeId};
 use url::Url;
 
 use crate::dom::{Dom, SharedDom};
@@ -880,6 +880,23 @@ impl ScriptHost {
         self.dom.borrow().events.has_listeners(kind)
     }
 
+    /// The mouse buttons held, for `setPointerCapture` (which needs an
+    /// active pointer).
+    pub fn set_pointer_buttons(&mut self, buttons: u16) {
+        self.dom.borrow_mut().pointer_buttons = buttons;
+    }
+
+    /// The element a script asked to capture the mouse (pending until
+    /// the tab makes it active before the next pointer event).
+    pub fn pointer_capture(&self) -> Option<NodeId> {
+        self.dom.borrow().pointer_capture
+    }
+
+    /// Drop a pointer capture: the implicit release on `pointerup`.
+    pub fn clear_pointer_capture(&mut self) {
+        self.dom.borrow_mut().pointer_capture = None;
+    }
+
     /// Keep what `location` and `document` report current. `charset` is
     /// the encoding's standard name; `quirks` whether the parser put the
     /// document in quirks mode.
@@ -1677,6 +1694,24 @@ mod tests {
         assert_eq!(
             s(&mut h, "t.join('|')").as_deref(),
             Ok("\"mousemove|true|105|2|1|true|true|true|Enter|Enter|13|true|false|true|true\"")
+        );
+        // PointerEvent, and the capture methods on Element.
+        assert_eq!(
+            s(&mut h, "var pe = new PointerEvent('pointerdown', { pointerId: 7, pointerType: 'pen', pressure: 0.3, isPrimary: true, clientX: 2, movementX: 4, button: 1 }); \
+                       [pe instanceof PointerEvent, pe instanceof MouseEvent, pe.pointerId, pe.pointerType, pe.pressure, pe.isPrimary, pe.width, pe.height, pe.tiltX, pe.twist, pe.clientX, pe.movementX, pe.button, \
+                        pe.getCoalescedEvents().length, pe.getPredictedEvents().length, new PointerEvent('x').pointerId, new PointerEvent('x').pointerType === '', Math.round(pe.altitudeAngle * 100), \
+                        typeof document.body.setPointerCapture, typeof document.setPointerCapture].join('|')").as_deref(),
+            Ok("\"true|true|7|pen|0.3|true|1|1|0|0|2|4|1|0|0|0|true|157|function|undefined\"")
+        );
+        // `body`'s window handlers are `window`'s: the property both
+        // ways, and the content attribute compiled on first dispatch.
+        assert_eq!(
+            s(&mut h, "var f = () => t.push('load'); document.body.onload = f; var u = []; \
+                       u.push(window.onload === f, document.body.onload === f, String(document.body.onclick)); \
+                       document.body.setAttribute('onresize', \"t.push('resize:' + (this === window))\"); t = []; window.dispatchEvent(new Event('resize')); \
+                       u.push(typeof window.onresize, document.body.onresize === window.onresize); \
+                       window.onresize = null; window.dispatchEvent(new Event('resize')); u.push(t.join()); u.join('|')").as_deref(),
+            Ok("\"true|true|null|function|true|resize:true\"")
         );
     }
 
