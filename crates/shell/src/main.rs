@@ -923,7 +923,29 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m,
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m;
+                let state = m.state();
+                self.send_to_current(ShellToTab::Modifiers {
+                    shift: state.shift_key(),
+                    ctrl: state.control_key(),
+                    alt: state.alt_key(),
+                    meta: state.super_key(),
+                });
+            }
+            // A release only matters to the page, for `keyup`; the chrome
+            // and the shell's own shortcuts act on the press.
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                let ctrl = self.modifiers.state().control_key();
+                let shift = self.modifiers.state().shift_key();
+                let alt = self.modifiers.state().alt_key();
+                if !self.chrome.wants_keys()
+                    && !(ctrl && matches!(event.logical_key, Key::Named(NamedKey::Tab)))
+                    && let Some(key) = page_key(&event.logical_key, event.text.as_deref(), ctrl, alt)
+                {
+                    self.send_to_current(ShellToTab::KeyUp { key, shift, ctrl, alt });
+                }
+            }
             WindowEvent::Ime(ime) => {
                 match ime {
                     Ime::Preedit(text, cursor) => self.chrome.ime_preedit(&text, cursor),
@@ -1028,28 +1050,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Key::Named(NamedKey::BrowserForward) => self.send_to_current(ShellToTab::GoForward),
                     // Everything else is the page's: focus, editing, scrolling.
                     key => {
-                        let page_key = match key {
-                            Key::Named(NamedKey::Tab) => Some(PageKey::Tab),
-                            Key::Named(NamedKey::Enter) => Some(PageKey::Enter),
-                            Key::Named(NamedKey::Escape) => Some(PageKey::Escape),
-                            Key::Named(NamedKey::Space) => Some(PageKey::Space),
-                            Key::Named(NamedKey::Backspace) => Some(PageKey::Backspace),
-                            Key::Named(NamedKey::Delete) => Some(PageKey::Delete),
-                            Key::Named(NamedKey::ArrowLeft) => Some(PageKey::ArrowLeft),
-                            Key::Named(NamedKey::ArrowRight) => Some(PageKey::ArrowRight),
-                            Key::Named(NamedKey::ArrowUp) => Some(PageKey::ArrowUp),
-                            Key::Named(NamedKey::ArrowDown) => Some(PageKey::ArrowDown),
-                            Key::Named(NamedKey::Home) => Some(PageKey::Home),
-                            Key::Named(NamedKey::End) => Some(PageKey::End),
-                            Key::Named(NamedKey::PageUp) => Some(PageKey::PageUp),
-                            Key::Named(NamedKey::PageDown) => Some(PageKey::PageDown),
-                            _ => event
-                                .text
-                                .as_ref()
-                                .filter(|t| !ctrl && !alt && !t.chars().all(char::is_control))
-                                .map(|t| PageKey::Character(t.to_string())),
-                        };
-                        if let Some(key) = page_key {
+                        if let Some(key) = page_key(key, event.text.as_deref(), ctrl, alt) {
                             self.send_to_current(ShellToTab::Key { key, shift, ctrl, alt });
                         }
                     }
@@ -1070,6 +1071,31 @@ impl ApplicationHandler<UserEvent> for App {
             }
             _ => {}
         }
+    }
+}
+
+/// The key the page gets for a key the chrome and the shell's shortcuts
+/// did not take: the named keys it acts on, or the text a key produced
+/// (not with Ctrl or Alt held, which are not text).
+fn page_key(key: &Key, text: Option<&str>, ctrl: bool, alt: bool) -> Option<PageKey> {
+    match key {
+        Key::Named(NamedKey::Tab) => Some(PageKey::Tab),
+        Key::Named(NamedKey::Enter) => Some(PageKey::Enter),
+        Key::Named(NamedKey::Escape) => Some(PageKey::Escape),
+        Key::Named(NamedKey::Space) => Some(PageKey::Space),
+        Key::Named(NamedKey::Backspace) => Some(PageKey::Backspace),
+        Key::Named(NamedKey::Delete) => Some(PageKey::Delete),
+        Key::Named(NamedKey::ArrowLeft) => Some(PageKey::ArrowLeft),
+        Key::Named(NamedKey::ArrowRight) => Some(PageKey::ArrowRight),
+        Key::Named(NamedKey::ArrowUp) => Some(PageKey::ArrowUp),
+        Key::Named(NamedKey::ArrowDown) => Some(PageKey::ArrowDown),
+        Key::Named(NamedKey::Home) => Some(PageKey::Home),
+        Key::Named(NamedKey::End) => Some(PageKey::End),
+        Key::Named(NamedKey::PageUp) => Some(PageKey::PageUp),
+        Key::Named(NamedKey::PageDown) => Some(PageKey::PageDown),
+        _ => text
+            .filter(|t| !ctrl && !alt && !t.chars().all(char::is_control))
+            .map(|t| PageKey::Character(t.to_string())),
     }
 }
 

@@ -24,6 +24,10 @@ use vello::Scene;
 
 use crate::{OutputSink, TabOutput};
 
+mod user_events;
+
+use user_events::{Modifiers, button_bit};
+
 /// Nested `@import` depth allowed.
 const MAX_IMPORT_DEPTH: u8 = 6;
 
@@ -275,6 +279,22 @@ pub(crate) struct TabState {
     mouse: Option<(f32, f32)>,
     /// The pointer or the scroll moved since hover was last evaluated.
     hover_dirty: bool,
+    /// The modifier keys held, for the events' `ctrlKey` and friends.
+    modifiers: Modifiers,
+    /// The mouse buttons held, as `MouseEvent.buttons` bits.
+    buttons: u16,
+    /// The element a button went down on, for `click`: it goes to the
+    /// nearest element the press and the release share.
+    press_target: Option<NodeId>,
+    /// The click count of the last primary press, for `detail`.
+    press_clicks: u32,
+    /// A focused text control's value when it got focus; `change` fires
+    /// on blur if it differs.
+    focus_value: Option<String>,
+    /// The viewport size and scroll offset `resize` and `scroll` were
+    /// last fired for.
+    viewport_reported: (f32, f32),
+    scroll_reported: (f32, f32),
     /// The scrollbar thumb is being dragged: where in the thumb it was
     /// grabbed, in logical pixels from its top.
     scroll_drag: Option<f32>,
@@ -367,6 +387,13 @@ impl TabState {
             press: None,
             mouse: None,
             hover_dirty: false,
+            modifiers: Modifiers::default(),
+            buttons: 0,
+            press_target: None,
+            press_clicks: 1,
+            focus_value: None,
+            viewport_reported: (viewport.width, viewport.height),
+            scroll_reported: (0.0, 0.0),
             scroll_drag: None,
             cursor: Cursor::Default,
             selection: None,
@@ -456,6 +483,10 @@ impl TabState {
             // Pointer moves and scrolls arrive in bursts; hover is
             // re-evaluated once per batch, in `flush`, at the final position.
             ShellToTab::Scroll { dx, dy } => {
+                // `wheel` first: a listener may take the scroll.
+                if !self.fire_wheel(dx, dy) {
+                    return;
+                }
                 self.scroll_x += dx;
                 self.scroll_y += dy;
                 self.clamp_scroll();
@@ -472,6 +503,7 @@ impl TabState {
                     }
                 } else {
                     self.hover_dirty = true;
+                    self.mouse_moved(x, y);
                 }
                 if self.select_anchor.is_some() {
                     self.extend_selection_to(x, y);
@@ -508,18 +540,29 @@ impl TabState {
                 }
                 self.update_hover();
                 let hit = self.hover;
+                self.buttons |= button_bit(button);
+                let clicks = if button == MouseButton::Left { self.count_click(x, y) } else { 1 };
+                self.press_clicks = clicks;
+                self.press_target = hit;
+                // `mousedown` cancelled: no focus change, no caret, no
+                // selection; `:active`, the press and `click` still happen.
+                let proceed = self.fire_mouse("mousedown", hit, x, y, Some(button), clicks);
+                let hit = self.hover;
                 if button == MouseButton::Left {
                     self.set_active(hit);
-                    let focus = hit.and_then(|h| self.focusable_ancestor(h));
-                    self.set_focus(focus, false);
+                    if proceed {
+                        let focus = hit.and_then(|h| self.focusable_ancestor(h));
+                        self.set_focus(focus, false);
+                    }
                     self.press_control = hit.and_then(|h| self.ancestor_or_self(h, is_toggle));
-                    self.place_caret_at(x, y);
+                    if proceed {
+                        self.place_caret_at(x, y);
+                    }
                 }
                 if matches!(button, MouseButton::Left | MouseButton::Middle) {
                     self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
                 }
-                if button == MouseButton::Left {
-                    let clicks = self.count_click(x, y);
+                if button == MouseButton::Left && proceed {
                     let on_link = self.press.is_some();
                     self.begin_selection(x, y, clicks, on_link);
                 }
@@ -530,17 +573,37 @@ impl TabState {
                     self.select_anchor = None;
                     self.autoscroll = None;
                 }
+                self.buttons &= !button_bit(button);
                 if self.scroll_drag.take().is_some() {
                     self.needs_paint = true;
                     self.hover_dirty = true;
                     return;
                 }
                 self.update_hover();
+                let clicks = self.press_clicks;
+                self.fire_mouse("mouseup", self.hover, x, y, Some(button), clicks);
+                // `click` (`auxclick` for the other buttons) goes to the
+                // nearest element the press and the release share;
+                // cancelled, nothing is toggled or followed. `dblclick`
+                // and `contextmenu` have no default action here.
+                let pressed_on = self.press_target.take();
+                let click_target = self.common_ancestor(pressed_on, self.hover);
+                let proceed = match button {
+                    MouseButton::Left => self.fire_mouse("click", click_target, x, y, Some(button), clicks),
+                    _ => self.fire_mouse("auxclick", click_target, x, y, Some(button), clicks),
+                };
+                if button == MouseButton::Right {
+                    self.fire_mouse("contextmenu", self.hover, x, y, Some(button), 0);
+                }
+                if button == MouseButton::Left && clicks == 2 {
+                    self.fire_mouse("dblclick", click_target, x, y, Some(button), 2);
+                }
                 if button == MouseButton::Left {
                     self.set_active(None);
                     let released_control = self.hover.and_then(|h| self.ancestor_or_self(h, is_toggle));
                     if let Some(c) = self.press_control.take()
                         && released_control == Some(c)
+                        && proceed
                     {
                         self.toggle_control(c);
                     }
@@ -549,6 +612,7 @@ impl TabState {
                 if let (Some((pressed, pressed_button)), Some(released)) = (self.press.take(), released_on)
                     && pressed == released
                     && pressed_button == button
+                    && proceed
                 {
                     match button {
                         MouseButton::Left => self.follow_link(pressed),
@@ -576,6 +640,12 @@ impl TabState {
                 }
             }
             ShellToTab::Key { key, shift, ctrl, alt } => self.key(key, shift, ctrl, alt),
+            ShellToTab::KeyUp { key, shift, ctrl, alt } => {
+                self.fire_key("keyup", &key, shift, ctrl, alt);
+            }
+            ShellToTab::Modifiers { shift, ctrl, alt, meta } => {
+                self.modifiers = Modifiers { shift, ctrl, alt, meta };
+            }
             ShellToTab::Close => {}
         }
     }
@@ -587,6 +657,18 @@ impl TabState {
     /// a checkbox or radio, arrows step a select, and the remaining keys
     /// scroll.
     fn key(&mut self, key: Key, shift: bool, ctrl: bool, alt: bool) {
+        // `keydown` first; cancelled, the key does nothing. A key that
+        // produces a character also fires the legacy `keypress`.
+        if !self.fire_key("keydown", &key, shift, ctrl, alt) {
+            return;
+        }
+        if matches!(key, Key::Character(_) | Key::Enter | Key::Space)
+            && !ctrl
+            && !alt
+            && !self.fire_key("keypress", &key, shift, ctrl, alt)
+        {
+            return;
+        }
         if key == Key::Tab && !ctrl && !alt {
             self.focus_step(!shift);
             return;
@@ -669,39 +751,40 @@ impl TabState {
         }
         let prev_len = |v: &str, c: usize| v[..c].chars().next_back().map_or(0, char::len_utf8);
         let next_len = |v: &str, c: usize| v[c..].chars().next().map_or(0, char::len_utf8);
-        let mut changed = false;
+        // The edit made, as `InputEvent.inputType` and `data`.
+        let mut edit: Option<(&str, Option<String>)> = None;
         match key {
             Key::Character(s) if !ctrl && !alt => {
                 let s: String = s.chars().filter(|c| !c.is_control()).collect();
                 if !s.is_empty() {
                     value.insert_str(caret, &s);
                     caret += s.len();
-                    changed = true;
+                    edit = Some(("insertText", Some(s)));
                 }
             }
             Key::Space if !ctrl && !alt => {
                 value.insert(caret, ' ');
                 caret += 1;
-                changed = true;
+                edit = Some(("insertText", Some(" ".to_owned())));
             }
             Key::Enter if textarea && !ctrl && !alt => {
                 value.insert(caret, '\n');
                 caret += 1;
-                changed = true;
+                edit = Some(("insertLineBreak", None));
             }
             Key::Backspace => {
                 let n = prev_len(&value, caret);
                 if n > 0 {
                     value.replace_range(caret - n..caret, "");
                     caret -= n;
-                    changed = true;
+                    edit = Some(("deleteContentBackward", None));
                 }
             }
             Key::Delete => {
                 let n = next_len(&value, caret);
                 if n > 0 {
                     value.replace_range(caret..caret + n, "");
-                    changed = true;
+                    edit = Some(("deleteContentForward", None));
                 }
             }
             Key::ArrowLeft => caret -= prev_len(&value, caret),
@@ -710,14 +793,20 @@ impl TabState {
             Key::End => caret += value[caret..].find('\n').unwrap_or(value.len() - caret),
             _ => {}
         }
-        if changed {
+        if let Some((input_type, data)) = edit {
+            // `beforeinput` may cancel the edit; `input` follows it.
+            if !self.fire_input(f, "beforeinput", input_type, data.as_deref()) {
+                self.update_caret();
+                return;
+            }
             self.set_control_value(f, &value);
+            // With a layout pending the caret is placed after it.
+            self.caret = caret;
+            self.fire_input(f, "input", input_type, data.as_deref());
+            return;
         }
         self.caret = caret;
-        // With a layout pending the caret is placed after it.
-        if !changed {
-            self.update_caret();
-        }
+        self.update_caret();
     }
 
     /// A click in a text control puts the caret where it landed.
@@ -839,6 +928,7 @@ impl TabState {
         }
         // `:checked` can restyle anything; the cascade runs again.
         self.needs_style = true;
+        self.fire_control_changed(id);
     }
 
     /// Arrow keys on a focused select move the chosen option.
@@ -876,6 +966,7 @@ impl TabState {
             }
         }
         self.needs_style = true;
+        self.fire_control_changed(id);
     }
 
     // ----- keyboard focus -----
@@ -1390,6 +1481,7 @@ impl TabState {
         self.main_done = false;
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_reported = (0.0, 0.0);
         // The new document's scripts run while it parses, so its context
         // starts here; the old document's timers stop with its context.
         self.new_script_host();
@@ -1578,7 +1670,11 @@ impl TabState {
         if hit == self.hover {
             return;
         }
+        let old = self.hover;
         self.hover = hit;
+        self.fire_hover_change(old, hit);
+        // A listener may have changed the tree; `hover` is pruned then.
+        let hit = self.hover;
 
         let over_link = hit.and_then(|h| self.ancestor_or_self(h, is_link)).is_some();
         // Text nodes, and the made-up text of a text control (whose
@@ -1586,7 +1682,7 @@ impl TabState {
         let over_text = raw.is_some_and(|n| {
             self.doc
                 .as_ref()
-                .is_some_and(|d| !d.get(n).is_element() || d.element(n).is_some_and(is_text_control))
+                .is_some_and(|d| d.contains(n) && (!d.get(n).is_element() || d.element(n).is_some_and(is_text_control)))
         });
         let cursor = if over_link {
             Cursor::Pointer
@@ -1614,6 +1710,17 @@ impl TabState {
     /// Focus `target`. Focus from the keyboard also gets `:focus-visible`
     /// and the focus ring; a click gets neither.
     fn set_focus(&mut self, target: Option<NodeId>, keyboard: bool) {
+        let old = self.focus;
+        let mut target = target;
+        if target != old {
+            if let Some(o) = old {
+                self.fire_blur(o, target);
+            }
+            // A blur listener may have taken the new target out.
+            if target.is_some_and(|t| !self.live(t)) {
+                target = None;
+            }
+        }
         let visible = if keyboard { target } else { None };
         let same = target == self.focus && visible.is_some() == self.states.has_any(ElementStates::FOCUS_VISIBLE);
         self.focus = target;
@@ -1634,6 +1741,11 @@ impl TabState {
             self.needs_paint = true;
         }
         self.update_caret();
+        if target != old
+            && let Some(t) = target
+        {
+            self.fire_focus(t, old);
+        }
     }
 
     /// Restyle what a state change on `changed` can affect, per `reach`,
@@ -2475,6 +2587,7 @@ impl TabState {
         };
         if focus_lost {
             self.focus = None;
+            self.focus_value = None;
             self.focus_ring.clear();
             self.caret_rect = None;
             self.states.set_single(None, ElementStates::FOCUS);
@@ -2714,6 +2827,23 @@ impl TabState {
 
     /// Called after each batch of events: do the work that is due.
     pub fn flush(&mut self) {
+        self.settle();
+        // `resize` and `scroll` listeners run after layout and may change
+        // the tree.
+        if self.fire_view_events() {
+            self.settle();
+        }
+        if self.needs_paint && self.layout.is_some() {
+            self.repaint();
+            self.needs_paint = false;
+        }
+        if self.state_dirty {
+            self.send_state();
+        }
+    }
+
+    /// Style and lay out until nothing is pending.
+    fn settle(&mut self) {
         // Style, then layout, then paint. A new layout can put a different
         // element under the pointer, whose hover styles need one more
         // round; two rounds always settle it.
@@ -2742,13 +2872,6 @@ impl TabState {
             if !self.needs_style && !self.needs_layout {
                 break;
             }
-        }
-        if self.needs_paint && self.layout.is_some() {
-            self.repaint();
-            self.needs_paint = false;
-        }
-        if self.state_dirty {
-            self.send_state();
         }
     }
 
@@ -4216,6 +4339,242 @@ mod tests {
         assert_eq!(h.title().as_deref(), Some("Replaced"));
         assert_eq!(h.state.history, vec![target], "replace overwrote the only entry");
         assert_eq!(h.state.doc_cache, CacheMode::Default, "a replace is not a reload");
+    }
+
+    /// Evaluate `src` in the page's context (no DOM access: the document
+    /// is not lent).
+    fn js(h: &mut Harness, src: &str) -> String {
+        h.state.script.as_mut().expect("host").eval_to_string(src).expect("eval")
+    }
+
+    #[test]
+    fn mouse_events_fire_in_order_with_cancellable_defaults() {
+        let other = data_url("<title>Other</title>", None);
+        let html = format!(
+            "<!DOCTYPE html><title>Mouse</title><style>body {{ margin: 0 }} #box {{ height: 40px }} p {{ margin: 0; height: 20px }} #tall {{ height: 2000px }}</style>\
+             <div id=box><a id=l href='{other}'>link</a></div><p><input type=checkbox id=c></p><div id=tall></div>\
+             <script>\
+               var log = []; var cancel = {{}}; \
+               var l = document.getElementById('l'), box = document.getElementById('box'), c = document.getElementById('c'); \
+               var note = ev => log.push(ev.type + ':' + ev.target.id + ':' + ev.button + ':' + ev.detail + ':' + ev.isTrusted); \
+               ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu'].forEach(t => document.addEventListener(t, note)); \
+               ['mousedown', 'click', 'auxclick'].forEach(t => l.addEventListener(t, ev => {{ if (cancel[t]) ev.preventDefault(); }})); \
+               c.addEventListener('click', ev => {{ if (cancel.cclick) ev.preventDefault(); }}); \
+               box.onmouseover = ev => log.push('over:' + ev.target.id + ':' + String(ev.relatedTarget && ev.relatedTarget.id)); \
+               box.onmouseout = ev => log.push('out:' + ev.target.id + ':' + String(ev.relatedTarget && ev.relatedTarget.id)); \
+               l.onmouseenter = ev => log.push('enter:' + ev.target.id); box.onmouseenter = ev => log.push('enter:' + ev.target.id); \
+               l.onmouseleave = ev => log.push('leave:' + ev.target.id); box.onmouseleave = ev => log.push('leave:' + ev.target.id); \
+               l.addEventListener('mousemove', ev => log.push('move:' + Math.round(ev.clientX) + ':' + Math.round(ev.pageY) + ':' + Math.round(ev.offsetX) + ':' + ev.buttons + ':' + ev.ctrlKey + ':' + (ev instanceof MouseEvent))); \
+               l.onfocus = () => log.push('focus:l'); \
+               c.oninput = ev => log.push('input:' + ev.target.hasAttribute('checked')); c.onchange = ev => log.push('change:' + ev.target.hasAttribute('checked')); \
+               window.addEventListener('wheel', ev => {{ log.push('wheel:' + ev.deltaY + ':' + ev.target.id + ':' + (ev instanceof WheelEvent)); if (cancel.wheel) ev.preventDefault(); }}); \
+               document.addEventListener('scroll', ev => log.push('scroll:' + (ev.target === document) + ':' + ev.bubbles)); \
+               window.onresize = ev => log.push('resize:' + (ev.target === window) + ':' + (ev instanceof UIEvent)); \
+             </script>"
+        );
+        let mut h = Harness::load(&html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+        let r = h.rect_of(h.by_id("l"));
+        let (x, y) = (r.x + 3.0, r.y + 3.0);
+        let (rx, ry) = (x.round() as i32, y.round() as i32);
+
+        // Into the link: `mouseover`, `mouseenter` outermost first, then
+        // the move with its coordinates.
+        h.send(ShellToTab::MouseMove { x, y });
+        assert_eq!(drain(&mut h), format!("\"over:l:null enter:box enter:l move:{rx}:{ry}:3:0:false:true\""));
+
+        // A cancelled `mousedown` gives no focus; the modifiers and the
+        // held button ride along on the move; the cancelled `click` does
+        // not follow the link.
+        js(&mut h, "cancel.mousedown = true; cancel.click = true");
+        h.send(ShellToTab::Modifiers { shift: false, ctrl: true, alt: false, meta: false });
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseMove { x: x + 1.0, y });
+        h.send(ShellToTab::MouseUp { x: x + 1.0, y, button: MouseButton::Left });
+        assert_eq!(
+            drain(&mut h),
+            format!("\"mousedown:l:0:1:true move:{}:{ry}:4:1:true:true mouseup:l:0:1:true click:l:0:1:true\"", rx + 1)
+        );
+        assert!(h.state.focus.is_none(), "a cancelled mousedown does not focus");
+        assert_eq!(h.title().as_deref(), Some("Mouse"));
+        h.send(ShellToTab::Modifiers { shift: false, ctrl: false, alt: false, meta: false });
+
+        // The second press in a row: `detail` 2 and `dblclick`; focus now.
+        js(&mut h, "cancel.mousedown = false");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(
+            drain(&mut h),
+            "\"mousedown:l:0:2:true focus:l mouseup:l:0:2:true click:l:0:2:true dblclick:l:0:2:true\""
+        );
+        assert_eq!(h.title().as_deref(), Some("Mouse"));
+
+        // The other buttons: `auxclick`, and `contextmenu` for the right
+        // one; a cancelled `auxclick` does not open the link in a new tab.
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Right });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Right });
+        assert_eq!(
+            drain(&mut h),
+            "\"mousedown:l:2:1:true mouseup:l:2:1:true auxclick:l:2:1:true contextmenu:l:2:0:true\""
+        );
+        js(&mut h, "cancel.auxclick = true");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Middle });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Middle });
+        assert_eq!(drain(&mut h), "\"mousedown:l:1:1:true mouseup:l:1:1:true auxclick:l:1:1:true\"");
+        let opened = |h: &Harness| {
+            h.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|m| matches!(m, TabToShell::OpenInNewTab { .. }))
+                .count()
+        };
+        assert_eq!(opened(&h), 0);
+        js(&mut h, "cancel.auxclick = false");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Middle });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Middle });
+        assert_eq!(opened(&h), 1);
+        drain(&mut h);
+
+        // Over to the checkbox: out and leave on the way; a click toggles
+        // it and fires `input` and `change`; a cancelled click does not.
+        h.click_id("c");
+        assert_eq!(
+            drain(&mut h),
+            "\"out:l:c leave:l leave:box mousedown:c:0:1:true mouseup:c:0:1:true click:c:0:1:true input:true change:true\""
+        );
+        js(&mut h, "cancel.cclick = true");
+        h.click_id("c");
+        assert_eq!(
+            drain(&mut h),
+            "\"mousedown:c:0:2:true mouseup:c:0:2:true click:c:0:2:true dblclick:c:0:2:true\""
+        );
+        let c = h.by_id("c");
+        assert!(h.state.doc.as_ref().and_then(|d| d.element(c)).is_some_and(|e| e.attr("checked").is_some()));
+
+        // `wheel` before the scroll, `scroll` after it; a cancelled
+        // `wheel` scrolls nothing. `resize` on the window.
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 100.0 });
+        assert_eq!(drain(&mut h), "\"wheel:100:c:true scroll:true:true\"");
+        assert_eq!(h.state.scroll_y, 100.0);
+        js(&mut h, "cancel.wheel = true");
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 100.0 });
+        assert_eq!(drain(&mut h), "\"wheel:100:tall:true\"");
+        assert_eq!(h.state.scroll_y, 100.0);
+        h.send(ShellToTab::Resize(Viewport {
+            width: 700.0,
+            height: 500.0,
+            scale_factor: 1.0,
+        }));
+        assert_eq!(drain(&mut h), "\"resize:true:true\"");
+
+        // Nothing cancelled: the click follows the link.
+        js(&mut h, "cancel.wheel = false; cancel.click = false");
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: -100.0 });
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(h.title().as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn key_focus_and_input_events_fire_with_cancellable_defaults() {
+        let html = "<!DOCTYPE html><title>Keys</title><input id=i value=ab><input id=j><select id=s><option>a</option><option>b</option></select><input type=checkbox id=c><div style='height: 3000px'></div>\
+             <script>\
+               var log = []; var cancel = {}; \
+               var i = document.getElementById('i'); \
+               ['focus', 'blur', 'focusin', 'focusout'].forEach(t => document.addEventListener(t, ev => log.push(ev.type + ':' + ev.target.id + ':' + (ev.relatedTarget ? ev.relatedTarget.id : '-') + ':' + ev.bubbles + ':' + (ev instanceof FocusEvent)), true)); \
+               document.addEventListener('keydown', ev => { log.push('kd:' + ev.key + ':' + ev.code + ':' + ev.keyCode + ':' + ev.shiftKey + ':' + ev.target.tagName.toLowerCase() + (ev.target.id ? '#' + ev.target.id : '') + ':' + (ev instanceof KeyboardEvent)); if (cancel[ev.key]) ev.preventDefault(); }); \
+               document.addEventListener('keypress', ev => log.push('kp:' + ev.key + ':' + ev.charCode + ':' + ev.which)); \
+               document.addEventListener('keyup', ev => log.push('ku:' + ev.key)); \
+               i.addEventListener('beforeinput', ev => { log.push('bi:' + ev.inputType + ':' + ev.data + ':' + ev.cancelable + ':' + (ev instanceof InputEvent)); if (ev.data === 'z') ev.preventDefault(); }); \
+               document.addEventListener('input', ev => log.push('in:' + ev.target.id + ':' + ev.inputType + ':' + ev.data + ':' + ev.target.getAttribute('value'))); \
+               document.addEventListener('change', ev => log.push('ch:' + ev.target.id + ':' + ev.cancelable)); \
+             </script>";
+        let mut h = Harness::load(html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+        let key = |h: &mut Harness, key: Key, shift: bool| {
+            h.send(ShellToTab::Key {
+                key,
+                shift,
+                ctrl: false,
+                alt: false,
+            });
+        };
+
+        // Nothing focused: the key goes to `body`; the page scrolls.
+        key(&mut h, Key::ArrowDown, false);
+        assert_eq!(drain(&mut h), "\"kd:ArrowDown:ArrowDown:40:false:body:true\"");
+        assert!(h.state.scroll_y > 0.0);
+
+        // Tab into the first input: `focus` (no bubble), `focusin`.
+        key(&mut h, Key::Tab, false);
+        assert_eq!(
+            drain(&mut h),
+            "\"kd:Tab:Tab:9:false:body:true focus:i:-:false:true focusin:i:-:true:true\""
+        );
+
+        // Typing: `keydown`, `keypress`, `beforeinput`, `input`; `keyup`
+        // from the shell. A cancelled `beforeinput` leaves the value.
+        key(&mut h, Key::Character("x".into()), false);
+        h.send(ShellToTab::KeyUp {
+            key: Key::Character("x".into()),
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+        assert_eq!(
+            drain(&mut h),
+            "\"kd:x:KeyX:88:false:input#i:true kp:x:120:120 bi:insertText:x:true:true in:i:insertText:x:abx ku:x\""
+        );
+        key(&mut h, Key::Character("z".into()), false);
+        assert_eq!(drain(&mut h), "\"kd:z:KeyZ:90:false:input#i:true kp:z:122:122 bi:insertText:z:true:true\"");
+        let i = h.by_id("i");
+        assert_eq!(h.state.control_value(i), "abx");
+
+        // Tab on: `change` for the edited value, then `blur` and
+        // `focusout` with the new element related, `focus` and `focusin`
+        // with the old one.
+        key(&mut h, Key::Tab, false);
+        assert_eq!(
+            drain(&mut h),
+            "\"kd:Tab:Tab:9:false:input#i:true ch:i:false blur:i:j:false:true focusout:i:j:true:true focus:j:i:false:true focusin:j:i:true:true\""
+        );
+        // A cancelled Tab moves nothing.
+        js(&mut h, "cancel.Tab = true");
+        key(&mut h, Key::Tab, false);
+        assert_eq!(drain(&mut h), "\"kd:Tab:Tab:9:false:input#j:true\"");
+        assert_eq!(h.focus_id().as_deref(), Some("j"));
+        js(&mut h, "cancel.Tab = false");
+
+        // Deleting; an unchanged value on blur fires no `change`.
+        key(&mut h, Key::Character("y".into()), false);
+        key(&mut h, Key::Backspace, false);
+        assert_eq!(
+            drain(&mut h),
+            "\"kd:y:KeyY:89:false:input#j:true kp:y:121:121 in:j:insertText:y:y kd:Backspace:Backspace:8:false:input#j:true in:j:deleteContentBackward:null:\""
+        );
+        key(&mut h, Key::Tab, false);
+        assert_eq!(
+            drain(&mut h),
+            "\"kd:Tab:Tab:9:false:input#j:true blur:j:s:false:true focusout:j:s:true:true focus:s:j:false:true focusin:s:j:true:true\""
+        );
+
+        // A select stepped and a checkbox toggled by key: `input` and
+        // `change` at once.
+        key(&mut h, Key::ArrowDown, false);
+        assert_eq!(
+            drain(&mut h),
+            "\"kd:ArrowDown:ArrowDown:40:false:select#s:true in:s::null:null ch:s:false\""
+        );
+        key(&mut h, Key::Tab, false);
+        drain(&mut h);
+        key(&mut h, Key::Space, false);
+        assert_eq!(drain(&mut h), "\"kd: :Space:32:false:input#c:true kp: :32:32 in:c::null:null ch:c:false\"");
+        key(&mut h, Key::Tab, true);
+        assert_eq!(
+            drain(&mut h),
+            "\"kd:Tab:Tab:9:true:input#c:true blur:c:s:false:true focusout:c:s:true:true focus:s:c:false:true focusin:s:c:true:true\""
+        );
     }
 
     /// Console text so far, in order.

@@ -1,5 +1,7 @@
 //! Events (Phase 3 item 3.3): `EventTarget`, `Event`, `CustomEvent`, the
-//! dispatch algorithm with capture and bubble, and `on<type>` handlers.
+//! dispatch algorithm with capture and bubble, `on<type>` handlers, and
+//! the `UIEvent` family the tab fires for the user's input (`MouseEvent`,
+//! `WheelEvent`, `KeyboardEvent`, `InputEvent`, `FocusEvent`).
 //!
 //! Listeners live in `Dom::events`, keyed by target: `window`, the
 //! document, a node, or a plain `EventTarget` object. Callbacks are
@@ -32,6 +34,61 @@ pub enum EventTargetRef {
     Node(NodeId),
     /// A `new EventTarget()` object, by the number it was given.
     Plain(u64),
+}
+
+/// Which `Event` subclass a user event is: its prototype, and which of
+/// `UiEventInit`'s fields it shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UiClass {
+    /// A plain `Event`.
+    #[default]
+    Plain,
+    Ui,
+    Mouse,
+    Wheel,
+    Keyboard,
+    Input,
+    Focus,
+}
+
+/// What the tab knows about a user event: the fields of the `UIEvent`
+/// family. Coordinates are CSS pixels: `client_*` in the viewport,
+/// `page_*` with the scroll offset added, `offset_*` from the target's
+/// box. A script-made event has `page_*` and `offset_*` equal to
+/// `client_*`.
+#[derive(Debug, Clone, Default)]
+pub struct UiEventInit {
+    pub class: UiClass,
+    pub bubbles: bool,
+    pub cancelable: bool,
+    /// `UIEvent.detail`: the click count of a mouse event.
+    pub detail: i32,
+    pub screen_x: f64,
+    pub screen_y: f64,
+    pub client_x: f64,
+    pub client_y: f64,
+    pub page_x: f64,
+    pub page_y: f64,
+    pub offset_x: f64,
+    pub offset_y: f64,
+    pub button: i16,
+    pub buttons: u16,
+    /// `relatedTarget`: where the pointer or the focus came from or went.
+    pub related_target: Option<EventTargetRef>,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub meta: bool,
+    pub key: String,
+    pub code: String,
+    pub repeat: bool,
+    /// `InputEvent.data`: the text inserted; nothing for a deletion.
+    pub data: Option<String>,
+    pub input_type: String,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    /// `WheelEvent.deltaMode`: 0 pixels, 1 lines, 2 pages.
+    pub delta_mode: u32,
 }
 
 #[derive(Clone)]
@@ -80,6 +137,15 @@ impl Default for Events {
     }
 }
 
+impl Events {
+    /// Whether any target has a listener or handler for `kind`. Content
+    /// attributes (`onclick="..."`) are compiled on first dispatch, so
+    /// they are not counted here; the tab checks those on the path.
+    pub(crate) fn has_listeners(&self, kind: &str) -> bool {
+        self.listeners.values().any(|list| list.iter().any(|l| l.kind == kind))
+    }
+}
+
 const NONE: u8 = 0;
 const CAPTURING_PHASE: u8 = 1;
 const AT_TARGET: u8 = 2;
@@ -97,6 +163,16 @@ pub(crate) struct EventData {
     path: Vec<JsObject>,
     /// `CustomEvent.detail`.
     detail: JsValue,
+    /// The `UIEvent` family's fields; left at their defaults by a plain
+    /// event.
+    #[unsafe_ignore_trace]
+    ui: UiEventInit,
+    /// `MouseEvent.relatedTarget` and `FocusEvent.relatedTarget`.
+    related_target: Option<JsObject>,
+    /// `UIEvent.view` is `window`: always for a trusted event, for a
+    /// script-made one when its init said so.
+    #[unsafe_ignore_trace]
+    has_view: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -131,6 +207,9 @@ impl EventData {
             current_target: None,
             path: Vec::new(),
             detail: JsValue::null(),
+            ui: UiEventInit::default(),
+            related_target: None,
+            has_view: false,
         }
     }
 
@@ -285,6 +364,406 @@ impl Class for CustomEventClass {
     }
 }
 
+// ----- the UIEvent family -----
+
+/// A subclass of `Event` sharing `EventData`, constructible from script
+/// with its init dictionary.
+macro_rules! ui_class {
+    ($t:ident, $name:literal, $class:expr, $init:expr) => {
+        #[derive(Debug, Trace, Finalize, JsData)]
+        struct $t;
+
+        impl Class for $t {
+            const NAME: &'static str = $name;
+            const LENGTH: usize = 1;
+
+            fn init(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+                let init: fn(&mut ClassBuilder<'_>) -> JsResult<()> = $init;
+                init(class)
+            }
+
+            fn data_constructor(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<Self> {
+                Err(JsNativeError::typ().with_message("Illegal constructor").into())
+            }
+
+            fn construct(new_target: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsObject> {
+                construct_ui($class, $name, new_target, args, context)
+            }
+        }
+    };
+}
+
+ui_class!(UiEventClass, "UIEvent", UiClass::Ui, init_ui_event);
+ui_class!(MouseEventClass, "MouseEvent", UiClass::Mouse, init_mouse_event);
+ui_class!(WheelEventClass, "WheelEvent", UiClass::Wheel, init_wheel_event);
+ui_class!(KeyboardEventClass, "KeyboardEvent", UiClass::Keyboard, init_keyboard_event);
+ui_class!(InputEventClass, "InputEvent", UiClass::Input, init_input_event);
+ui_class!(FocusEventClass, "FocusEvent", UiClass::Focus, init_focus_event);
+
+fn add_ui_getters(class: &mut ClassBuilder<'_>, props: &[(&str, UiProp)]) {
+    for (name, prop) in props {
+        let get = getter(
+            class.context(),
+            name,
+            NativeFunction::from_copy_closure_with_captures(ui_get, prop.clone()),
+        );
+        class.accessor(JsString::from(*name), Some(get), None, ATTR);
+    }
+}
+
+fn add_modifier_state(class: &mut ClassBuilder<'_>) {
+    class.method(
+        js_string!("getModifierState"),
+        1,
+        NativeFunction::from_fn_ptr(get_modifier_state),
+    );
+}
+
+fn init_ui_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(class, &[("detail", UiProp::Detail), ("view", UiProp::View), ("which", UiProp::Which)]);
+    Ok(())
+}
+
+fn init_mouse_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(
+        class,
+        &[
+            ("screenX", UiProp::ScreenX),
+            ("screenY", UiProp::ScreenY),
+            ("clientX", UiProp::ClientX),
+            ("clientY", UiProp::ClientY),
+            ("x", UiProp::ClientX),
+            ("y", UiProp::ClientY),
+            ("pageX", UiProp::PageX),
+            ("pageY", UiProp::PageY),
+            ("offsetX", UiProp::OffsetX),
+            ("offsetY", UiProp::OffsetY),
+            ("button", UiProp::Button),
+            ("buttons", UiProp::Buttons),
+            ("relatedTarget", UiProp::RelatedTarget),
+            ("altKey", UiProp::AltKey),
+            ("ctrlKey", UiProp::CtrlKey),
+            ("shiftKey", UiProp::ShiftKey),
+            ("metaKey", UiProp::MetaKey),
+        ],
+    );
+    add_modifier_state(class);
+    Ok(())
+}
+
+fn init_wheel_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(
+        class,
+        &[
+            ("deltaX", UiProp::DeltaX),
+            ("deltaY", UiProp::DeltaY),
+            ("deltaZ", UiProp::DeltaZ),
+            ("deltaMode", UiProp::DeltaMode),
+        ],
+    );
+    for (name, value) in [("DOM_DELTA_PIXEL", 0), ("DOM_DELTA_LINE", 1), ("DOM_DELTA_PAGE", 2)] {
+        class.property(JsString::from(name), value, Attribute::ENUMERABLE);
+        class.static_property(JsString::from(name), value, Attribute::ENUMERABLE);
+    }
+    Ok(())
+}
+
+fn init_keyboard_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(
+        class,
+        &[
+            ("key", UiProp::Key),
+            ("code", UiProp::Code),
+            ("repeat", UiProp::Repeat),
+            ("location", UiProp::Location),
+            ("isComposing", UiProp::IsComposing),
+            ("keyCode", UiProp::KeyCode),
+            ("charCode", UiProp::CharCode),
+            ("altKey", UiProp::AltKey),
+            ("ctrlKey", UiProp::CtrlKey),
+            ("shiftKey", UiProp::ShiftKey),
+            ("metaKey", UiProp::MetaKey),
+        ],
+    );
+    add_modifier_state(class);
+    for (name, value) in [
+        ("DOM_KEY_LOCATION_STANDARD", 0),
+        ("DOM_KEY_LOCATION_LEFT", 1),
+        ("DOM_KEY_LOCATION_RIGHT", 2),
+        ("DOM_KEY_LOCATION_NUMPAD", 3),
+    ] {
+        class.property(JsString::from(name), value, Attribute::ENUMERABLE);
+        class.static_property(JsString::from(name), value, Attribute::ENUMERABLE);
+    }
+    Ok(())
+}
+
+fn init_input_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(
+        class,
+        &[
+            ("data", UiProp::Data),
+            ("inputType", UiProp::InputType),
+            ("isComposing", UiProp::IsComposing),
+        ],
+    );
+    Ok(())
+}
+
+fn init_focus_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(class, &[("relatedTarget", UiProp::RelatedTarget)]);
+    Ok(())
+}
+
+/// The prototype of a `UiClass`.
+fn ui_prototype(class: UiClass, context: &mut Context) -> JsResult<JsObject> {
+    let proto = match class {
+        UiClass::Plain => context.get_global_class::<EventData>().map(|c| c.prototype()),
+        UiClass::Ui => context.get_global_class::<UiEventClass>().map(|c| c.prototype()),
+        UiClass::Mouse => context.get_global_class::<MouseEventClass>().map(|c| c.prototype()),
+        UiClass::Wheel => context.get_global_class::<WheelEventClass>().map(|c| c.prototype()),
+        UiClass::Keyboard => context.get_global_class::<KeyboardEventClass>().map(|c| c.prototype()),
+        UiClass::Input => context.get_global_class::<InputEventClass>().map(|c| c.prototype()),
+        UiClass::Focus => context.get_global_class::<FocusEventClass>().map(|c| c.prototype()),
+    };
+    proto.ok_or_else(|| JsNativeError::typ().with_message("event class is not registered").into())
+}
+
+fn init_number(init: &JsObject, name: &str, context: &mut Context) -> JsResult<f64> {
+    let v = init.get(JsString::from(name), context)?;
+    if v.is_undefined() { Ok(0.0) } else { v.to_number(context) }
+}
+
+fn init_bool(init: &JsObject, name: &str, context: &mut Context) -> JsResult<bool> {
+    Ok(init.get(JsString::from(name), context)?.to_boolean())
+}
+
+/// A string member; `None` for `null` or absent.
+fn init_string(init: &JsObject, name: &str, context: &mut Context) -> JsResult<Option<String>> {
+    let v = init.get(JsString::from(name), context)?;
+    if v.is_null_or_undefined() {
+        Ok(None)
+    } else {
+        Ok(Some(v.to_string(context)?.to_std_string_escaped()))
+    }
+}
+
+fn init_modifiers(init: &JsObject, ui: &mut UiEventInit, context: &mut Context) -> JsResult<()> {
+    ui.alt = init_bool(init, "altKey", context)?;
+    ui.ctrl = init_bool(init, "ctrlKey", context)?;
+    ui.shift = init_bool(init, "shiftKey", context)?;
+    ui.meta = init_bool(init, "metaKey", context)?;
+    Ok(())
+}
+
+/// `new MouseEvent(type, init)` and the rest of the family.
+fn construct_ui(
+    class: UiClass,
+    name: &str,
+    new_target: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsObject> {
+    if new_target.is_undefined() || args.is_empty() {
+        return Err(JsNativeError::typ()
+            .with_message(format!("{name} constructor: 1 argument required, called with new"))
+            .into());
+    }
+    let mut data = EventData::from_args(args, context)?;
+    let mut ui = UiEventInit {
+        class,
+        ..UiEventInit::default()
+    };
+    if let Some(init) = args.get_or_undefined(1).as_object() {
+        let init = &init;
+        ui.detail = init_number(init, "detail", context)? as i32;
+        data.has_view = init.get(js_string!("view"), context)?.is_object();
+        match class {
+            UiClass::Mouse | UiClass::Wheel => {
+                ui.screen_x = init_number(init, "screenX", context)?;
+                ui.screen_y = init_number(init, "screenY", context)?;
+                ui.client_x = init_number(init, "clientX", context)?;
+                ui.client_y = init_number(init, "clientY", context)?;
+                ui.page_x = ui.client_x;
+                ui.page_y = ui.client_y;
+                ui.offset_x = ui.client_x;
+                ui.offset_y = ui.client_y;
+                ui.button = init_number(init, "button", context)? as i16;
+                ui.buttons = init_number(init, "buttons", context)? as u16;
+                init_modifiers(init, &mut ui, context)?;
+                data.related_target = init.get(js_string!("relatedTarget"), context)?.as_object();
+                if class == UiClass::Wheel {
+                    ui.delta_x = init_number(init, "deltaX", context)?;
+                    ui.delta_y = init_number(init, "deltaY", context)?;
+                    ui.delta_mode = init_number(init, "deltaMode", context)? as u32;
+                }
+            }
+            UiClass::Keyboard => {
+                ui.key = init_string(init, "key", context)?.unwrap_or_default();
+                ui.code = init_string(init, "code", context)?.unwrap_or_default();
+                ui.repeat = init_bool(init, "repeat", context)?;
+                init_modifiers(init, &mut ui, context)?;
+            }
+            UiClass::Input => {
+                ui.data = init_string(init, "data", context)?;
+                ui.input_type = init_string(init, "inputType", context)?.unwrap_or_default();
+            }
+            UiClass::Focus => {
+                data.related_target = init.get(js_string!("relatedTarget"), context)?.as_object();
+            }
+            UiClass::Ui | UiClass::Plain => {}
+        }
+    }
+    data.ui = ui;
+    let proto = ui_prototype(class, context)?;
+    Ok(JsObject::from_proto_and_data(proto, data))
+}
+
+#[derive(Clone, Trace, Finalize)]
+enum UiProp {
+    Detail,
+    View,
+    Which,
+    ScreenX,
+    ScreenY,
+    ClientX,
+    ClientY,
+    PageX,
+    PageY,
+    OffsetX,
+    OffsetY,
+    Button,
+    Buttons,
+    RelatedTarget,
+    AltKey,
+    CtrlKey,
+    ShiftKey,
+    MetaKey,
+    Key,
+    Code,
+    Repeat,
+    Location,
+    IsComposing,
+    KeyCode,
+    CharCode,
+    Data,
+    InputType,
+    DeltaX,
+    DeltaY,
+    DeltaZ,
+    DeltaMode,
+}
+
+/// The legacy `keyCode` of a key value.
+fn key_code(key: &str) -> u32 {
+    match key {
+        "Backspace" => 8,
+        "Tab" => 9,
+        "Enter" => 13,
+        "Shift" => 16,
+        "Control" => 17,
+        "Alt" => 18,
+        "Escape" => 27,
+        " " => 32,
+        "PageUp" => 33,
+        "PageDown" => 34,
+        "End" => 35,
+        "Home" => 36,
+        "ArrowLeft" => 37,
+        "ArrowUp" => 38,
+        "ArrowRight" => 39,
+        "ArrowDown" => 40,
+        "Delete" => 46,
+        "Meta" => 91,
+        k => {
+            let mut chars = k.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_alphanumeric() => c.to_ascii_uppercase() as u32,
+                _ => 0,
+            }
+        }
+    }
+}
+
+/// The legacy `charCode`: the character of a `keypress`.
+fn char_code(kind: &str, key: &str) -> u32 {
+    if kind != "keypress" {
+        return 0;
+    }
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => c as u32,
+        _ => 0,
+    }
+}
+
+fn ui_get(this: &JsValue, _: &[JsValue], prop: &UiProp, context: &mut Context) -> JsResult<JsValue> {
+    let event = this_event(this)?;
+    let data = event.downcast_ref::<EventData>().ok_or_else(illegal_invocation)?;
+    let ui = &data.ui;
+    Ok(match prop {
+        UiProp::Detail => ui.detail.into(),
+        UiProp::View => {
+            if data.has_view {
+                context.global_object().into()
+            } else {
+                JsValue::null()
+            }
+        }
+        UiProp::Which => match ui.class {
+            UiClass::Keyboard => {
+                let c = char_code(&data.kind, &ui.key);
+                (if c != 0 { c } else { key_code(&ui.key) }).into()
+            }
+            UiClass::Mouse | UiClass::Wheel => (i32::from(ui.button) + 1).into(),
+            _ => 0.into(),
+        },
+        UiProp::ScreenX => ui.screen_x.into(),
+        UiProp::ScreenY => ui.screen_y.into(),
+        UiProp::ClientX => ui.client_x.into(),
+        UiProp::ClientY => ui.client_y.into(),
+        UiProp::PageX => ui.page_x.into(),
+        UiProp::PageY => ui.page_y.into(),
+        UiProp::OffsetX => ui.offset_x.into(),
+        UiProp::OffsetY => ui.offset_y.into(),
+        UiProp::Button => i32::from(ui.button).into(),
+        UiProp::Buttons => i32::from(ui.buttons).into(),
+        UiProp::RelatedTarget => data.related_target.clone().map_or(JsValue::null(), JsValue::from),
+        UiProp::AltKey => ui.alt.into(),
+        UiProp::CtrlKey => ui.ctrl.into(),
+        UiProp::ShiftKey => ui.shift.into(),
+        UiProp::MetaKey => ui.meta.into(),
+        UiProp::Key => js_str(&ui.key),
+        UiProp::Code => js_str(&ui.code),
+        UiProp::Repeat => ui.repeat.into(),
+        UiProp::Location => 0.into(),
+        UiProp::IsComposing => false.into(),
+        UiProp::KeyCode => key_code(&ui.key).into(),
+        UiProp::CharCode => char_code(&data.kind, &ui.key).into(),
+        UiProp::Data => ui.data.as_deref().map_or(JsValue::null(), js_str),
+        UiProp::InputType => js_str(&ui.input_type),
+        UiProp::DeltaX => ui.delta_x.into(),
+        UiProp::DeltaY => ui.delta_y.into(),
+        UiProp::DeltaZ => 0.0.into(),
+        UiProp::DeltaMode => ui.delta_mode.into(),
+    })
+}
+
+/// `getModifierState("Control")` and friends.
+fn get_modifier_state(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let event = this_event(this)?;
+    let name = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let data = event.downcast_ref::<EventData>().ok_or_else(illegal_invocation)?;
+    Ok(match name.as_str() {
+        "Alt" => data.ui.alt,
+        "Control" => data.ui.ctrl,
+        "Shift" => data.ui.shift,
+        "Meta" => data.ui.meta,
+        _ => false,
+    }
+    .into())
+}
+
 /// `EventTarget`: the base of `Node` (and of `window`, by its
 /// methods being on the global object). `new EventTarget()` makes a
 /// plain target.
@@ -347,6 +826,18 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
         custom.prototype().set_prototype(Some(event.prototype()));
         custom.constructor().set_prototype(Some(event.constructor()));
     }
+    context.register_global_class::<UiEventClass>()?;
+    context.register_global_class::<MouseEventClass>()?;
+    context.register_global_class::<WheelEventClass>()?;
+    context.register_global_class::<KeyboardEventClass>()?;
+    context.register_global_class::<InputEventClass>()?;
+    context.register_global_class::<FocusEventClass>()?;
+    inherit::<UiEventClass, EventData>(context);
+    inherit::<MouseEventClass, UiEventClass>(context);
+    inherit::<WheelEventClass, MouseEventClass>(context);
+    inherit::<KeyboardEventClass, UiEventClass>(context);
+    inherit::<InputEventClass, UiEventClass>(context);
+    inherit::<FocusEventClass, UiEventClass>(context);
     for (name, length, f) in [
         ("addEventListener", 2, add_event_listener as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
         ("removeEventListener", 2, remove_event_listener),
@@ -372,6 +863,16 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     Ok(())
 }
 
+/// Make `Sub` inherit from `Base`: its prototype and its constructor.
+fn inherit<Sub: Class, Base: Class>(context: &mut Context) {
+    let sub = context.get_global_class::<Sub>();
+    let base = context.get_global_class::<Base>();
+    if let (Some(sub), Some(base)) = (sub, base) {
+        sub.prototype().set_prototype(Some(base.prototype()));
+        sub.constructor().set_prototype(Some(base.constructor()));
+    }
+}
+
 /// Make `Node` inherit from `EventTarget`; called by the DOM registration.
 pub(crate) fn make_node_an_event_target(node: &boa_engine::context::intrinsics::StandardConstructor, context: &mut Context) {
     if let Some(base) = context.get_global_class::<EventTargetClass>() {
@@ -384,6 +885,7 @@ pub(crate) fn make_node_an_event_target(node: &boa_engine::context::intrinsics::
 /// `window`. The index is what a getter or setter captures.
 const HANDLER_NAMES: &[&str] = &[
     "onabort",
+    "onauxclick",
     "onbeforeinput",
     "onblur",
     "onchange",
@@ -580,17 +1082,20 @@ fn dispatch_event(this: &JsValue, args: &[JsValue], context: &mut Context) -> Js
     Ok(not_cancelled.into())
 }
 
-/// Make a trusted event of `kind`, as the tab fires them.
-pub(crate) fn new_event(kind: &str, bubbles: bool, cancelable: bool, context: &mut Context) -> JsResult<JsObject> {
+/// Make a trusted event of `kind` with `init`'s class and fields, as the
+/// tab fires them. The document must be lent when `init` names a
+/// related target.
+pub(crate) fn new_event(kind: &str, init: UiEventInit, context: &mut Context) -> JsResult<JsObject> {
     let now = now_ms(context)?;
-    let proto = context
-        .get_global_class::<EventData>()
-        .ok_or_else(|| JsNativeError::typ().with_message("Event is not registered"))?
-        .prototype();
-    Ok(JsObject::from_proto_and_data(
-        proto,
-        EventData::new(kind.to_owned(), bubbles, cancelable, false, true, now),
-    ))
+    let mut data = EventData::new(kind.to_owned(), init.bubbles, init.cancelable, false, true, now);
+    data.related_target = match init.related_target {
+        Some(t) => Some(target_value(t, None, context)?),
+        None => None,
+    };
+    data.has_view = init.class != UiClass::Plain;
+    let proto = ui_prototype(init.class, context)?;
+    data.ui = init;
+    Ok(JsObject::from_proto_and_data(proto, data))
 }
 
 // ----- dispatch -----

@@ -35,7 +35,7 @@
 mod dom;
 mod events;
 
-pub use events::EventTargetRef;
+pub use events::{EventTargetRef, UiClass, UiEventInit};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -845,7 +845,21 @@ impl ScriptHost {
     /// may proceed: false when a listener called `preventDefault` on a
     /// cancelable event. The document must be lent.
     pub fn fire_event(&mut self, target: EventTargetRef, kind: &str, bubbles: bool, cancelable: bool) -> bool {
-        let result = events::new_event(kind, bubbles, cancelable, &mut self.context)
+        self.fire_ui_event(
+            target,
+            kind,
+            UiEventInit {
+                bubbles,
+                cancelable,
+                ..UiEventInit::default()
+            },
+        )
+    }
+
+    /// `fire_event` for the user's input: `init` chooses the event's
+    /// class (`MouseEvent`, `KeyboardEvent`, ...) and carries its fields.
+    pub fn fire_ui_event(&mut self, target: EventTargetRef, kind: &str, init: UiEventInit) -> bool {
+        let result = events::new_event(kind, init, &mut self.context)
             .and_then(|event| events::dispatch(&event, target, None, &mut self.context));
         let proceed = match result {
             Ok(proceed) => proceed,
@@ -856,6 +870,14 @@ impl ScriptHost {
         };
         self.microtask_checkpoint();
         proceed
+    }
+
+    /// Whether any target has a listener or `on<type>` handler property
+    /// for `kind`. Content attributes are not counted (they compile on
+    /// first dispatch); the tab checks the target's ancestors for those.
+    /// Lets the tab skip the dispatch of a mouse move nobody listens to.
+    pub fn has_listeners(&self, kind: &str) -> bool {
+        self.dom.borrow().events.has_listeners(kind)
     }
 
     /// Keep what `location` and `document` report current. `charset` is
@@ -1574,6 +1596,87 @@ mod tests {
                        document.onreadystatechange = () => log.push('rsc'); document.dispatchEvent(new Event('readystatechange')); \
                        [log.join(' '), typeof window.onload, String(window.onclick), t instanceof EventTarget].join('|')").as_deref(),
             Ok("\"plain:true:true onload resize:true rsc|function|null|true\"")
+        );
+    }
+
+    #[test]
+    fn ui_event_classes_construct_and_carry_what_the_tab_gives_them() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><html><head></head><body><div id=d><p id=p>x</p></div></body></html>",
+        );
+        let body = doc.body().expect("body");
+        let p = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| e.attr("id") == Some("p")))
+            .expect("p");
+        h.lend_document(doc, false, Default::default());
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+
+        // The chain and the constructors' init dictionaries.
+        assert_eq!(
+            s(&mut h, "var m = new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 10, clientY: 20, screenX: 110, button: 2, buttons: 2, ctrlKey: true, detail: 2, relatedTarget: document.body, view: window }); \
+                       [m instanceof MouseEvent, m instanceof UIEvent, m instanceof Event, Object.getPrototypeOf(WheelEvent) === MouseEvent, Object.getPrototypeOf(UIEvent) === Event, m.type, m.bubbles, \
+                        m.clientX, m.clientY, m.x, m.pageX, m.offsetY, m.screenX, m.screenY, m.button, m.buttons, m.ctrlKey, m.shiftKey, m.getModifierState('Control'), m.getModifierState('Shift'), \
+                        m.detail, m.relatedTarget === document.body, m.view === window, m.which, m.isTrusted].join('|')").as_deref(),
+            Ok("\"true|true|true|true|true|click|true|10|20|10|10|20|110|0|2|2|true|false|true|false|2|true|true|3|false\"")
+        );
+        assert_eq!(
+            s(&mut h, "var k = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', shiftKey: true, repeat: true }); var kp = new KeyboardEvent('keypress', { key: 'a' }); var ke = new KeyboardEvent('keydown', { key: 'Enter' }); \
+                       [k instanceof KeyboardEvent, k instanceof UIEvent, k.key, k.code, k.shiftKey, k.repeat, k.keyCode, k.which, k.charCode, kp.charCode, kp.which, ke.keyCode, k.location, k.isComposing, String(k.view), new KeyboardEvent('x').key === '', KeyboardEvent.DOM_KEY_LOCATION_NUMPAD].join('|')").as_deref(),
+            Ok("\"true|true|a|KeyA|true|true|65|65|0|97|97|13|0|false|null|true|3\"")
+        );
+        assert_eq!(
+            s(&mut h, "var w = new WheelEvent('wheel', { deltaY: -3, deltaMode: WheelEvent.DOM_DELTA_LINE, clientX: 1 }); var i = new InputEvent('input', { data: 'ab', inputType: 'insertText' }); var i2 = new InputEvent('beforeinput'); \
+                       var f = new FocusEvent('focus', { relatedTarget: document.getElementById('p') }); var u = new UIEvent('resize', { detail: 7, view: window }); \
+                       [w instanceof MouseEvent, w.deltaX, w.deltaY, w.deltaZ, w.deltaMode, w.DOM_DELTA_PAGE, w.clientX, i instanceof UIEvent, i.data, i.inputType, String(i2.data), i2.inputType, f instanceof FocusEvent, f.relatedTarget.id, u.detail, u.view === window, String(new UIEvent('x').view)].join('|')").as_deref(),
+            Ok("\"true|0|-3|0|1|2|1|true|ab|insertText|null||true|p|7|true|null\"")
+        );
+        // Constructor errors; a script-made event dispatched through the tree.
+        assert_eq!(
+            s(&mut h, "var errs = []; try { new MouseEvent() } catch (x) { errs.push(x.name) } try { KeyboardEvent('a') } catch (x) { errs.push(x.name) } \
+                       var seen = ''; document.getElementById('d').addEventListener('click', ev => { seen = ev.clientX + ':' + ev.target.id + ':' + (ev instanceof MouseEvent); ev.preventDefault(); }); \
+                       var r = document.getElementById('p').dispatchEvent(m); [errs.join(), seen, r, m.defaultPrevented].join('|')").as_deref(),
+            Ok("\"TypeError,TypeError|10:p:true|false|true\"")
+        );
+        // Trusted events from the host carry what the tab gives them.
+        s(&mut h, "var t = []; document.getElementById('p').onmousemove = ev => t.push(ev.type, ev.isTrusted, ev.pageX, ev.offsetX, ev.buttons, ev.relatedTarget === document.body, ev.view === window, ev instanceof MouseEvent); \
+                   document.onkeydown = ev => { t.push(ev.key, ev.code, ev.keyCode, ev.ctrlKey, ev.metaKey, ev instanceof KeyboardEvent, ev.target === document); ev.preventDefault(); }")
+            .expect("listeners");
+        assert!(h.has_listeners("mousemove") && h.has_listeners("keydown") && !h.has_listeners("mousedown"));
+        let proceed = h.fire_ui_event(
+            EventTargetRef::Node(p),
+            "mousemove",
+            UiEventInit {
+                class: UiClass::Mouse,
+                bubbles: true,
+                cancelable: true,
+                client_x: 5.0,
+                page_x: 105.0,
+                offset_x: 2.0,
+                buttons: 1,
+                related_target: Some(EventTargetRef::Node(body)),
+                ..UiEventInit::default()
+            },
+        );
+        assert!(proceed);
+        let proceed = h.fire_ui_event(
+            EventTargetRef::Document,
+            "keydown",
+            UiEventInit {
+                class: UiClass::Keyboard,
+                bubbles: true,
+                cancelable: true,
+                key: "Enter".into(),
+                code: "Enter".into(),
+                ctrl: true,
+                ..UiEventInit::default()
+            },
+        );
+        assert!(!proceed, "preventDefault in a listener holds the default back");
+        assert_eq!(
+            s(&mut h, "t.join('|')").as_deref(),
+            Ok("\"mousemove|true|105|2|1|true|true|true|Enter|Enter|13|true|false|true|true\"")
         );
     }
 

@@ -105,6 +105,22 @@ pub enum ShellToTab {
         ctrl: bool,
         alt: bool,
     },
+    /// A key the page was given went back up; only `keyup` fires.
+    KeyUp {
+        key: Key,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+    },
+    /// The modifier keys changed. Mouse events carry the modifiers held
+    /// at the time (`MouseEvent.ctrlKey` and friends), so the tab keeps
+    /// the current set.
+    Modifiers {
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    },
     Close,
 }
 
