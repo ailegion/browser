@@ -24,8 +24,10 @@ use vello::Scene;
 
 use crate::{OutputSink, TabOutput};
 
+mod editing;
 mod user_events;
 
+use editing::Composition;
 use user_events::{Modifiers, button_bit};
 
 /// Nested `@import` depth allowed.
@@ -266,6 +268,18 @@ pub(crate) struct TabState {
     focus_ring: Vec<Rect>,
     /// Byte offset of the caret in the focused text control's value.
     caret: usize,
+    /// The other end of the selection inside the focused text control,
+    /// when there is one (`editing.rs`).
+    sel_anchor: Option<usize>,
+    /// A primary drag inside the focused text control extends its
+    /// selection.
+    control_drag: bool,
+    /// An IME composition in the focused text control.
+    composition: Option<Composition>,
+    /// The control selection `select` was last fired for.
+    last_select: Option<(usize, usize)>,
+    /// The caret last reported to the shell (`TabToShell::Caret`).
+    caret_reported: Option<(f32, f32, f32, f32)>,
     /// Where the caret is drawn, kept up to date like `focus_ring`.
     caret_rect: Option<Rect>,
     /// The checkbox or radio a primary button went down on; released on
@@ -395,6 +409,11 @@ impl TabState {
             focus: None,
             focus_ring: Vec::new(),
             caret: 0,
+            sel_anchor: None,
+            control_drag: false,
+            composition: None,
+            last_select: None,
+            caret_reported: None,
             caret_rect: None,
             press_control: None,
             press: None,
@@ -469,6 +488,11 @@ impl TabState {
     // ----- shell messages -----
 
     pub fn handle_shell(&mut self, msg: ShellToTab) {
+        // A composition the IME cleared is a cancel unless a commit comes
+        // next.
+        if !matches!(msg, ShellToTab::ImeCommit { .. }) {
+            self.settle_composition();
+        }
         match msg {
             ShellToTab::Navigate { url } => self.go(url, NavKind::Push),
             ShellToTab::Reload => {
@@ -522,6 +546,9 @@ impl TabState {
                 } else {
                     self.hover_dirty = true;
                     self.pointer_moved = true;
+                }
+                if self.control_drag {
+                    self.control_drag_to(x, y);
                 }
                 if self.select_anchor.is_some() {
                     self.extend_selection_to(x, y);
@@ -584,21 +611,27 @@ impl TabState {
                 };
                 let proceed = pointer_ok && mouse_ok;
                 let hit = self.hover;
+                // A press inside the focused text control edits the
+                // selection within it, not the page's.
+                let mut in_control = false;
                 if button == MouseButton::Left {
                     self.set_active(hit);
                     if proceed {
                         let focus = hit.and_then(|h| self.focusable_ancestor(h));
                         self.set_focus(focus, false);
+                        if let Some(f) = self.text_focus()
+                            && hit.and_then(|h| self.ancestor_or_self(h, is_text_control)) == Some(f)
+                        {
+                            self.control_press(f, x, y, clicks);
+                            in_control = true;
+                        }
                     }
                     self.press_control = hit.and_then(|h| self.ancestor_or_self(h, is_toggle));
-                    if proceed {
-                        self.place_caret_at(x, y);
-                    }
                 }
                 if matches!(button, MouseButton::Left | MouseButton::Middle) {
                     self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
                 }
-                if button == MouseButton::Left && proceed {
+                if button == MouseButton::Left && proceed && !in_control {
                     let on_link = self.press.is_some();
                     self.begin_selection(x, y, clicks, on_link);
                 }
@@ -607,6 +640,7 @@ impl TabState {
                 self.mouse = Some((x, y));
                 if button == MouseButton::Left {
                     self.select_anchor = None;
+                    self.control_drag = false;
                     self.autoscroll = None;
                 }
                 self.buttons &= !button_bit(button);
@@ -669,16 +703,27 @@ impl TabState {
                 }
             }
             ShellToTab::SelectAll => {
-                let extent = self.layout.as_ref().and_then(selection::text_extent);
-                self.set_selection(extent);
+                if let Some(f) = self.text_focus() {
+                    self.select_all_in_control(f);
+                } else {
+                    let extent = self.layout.as_ref().and_then(selection::text_extent);
+                    self.set_selection(extent);
+                }
             }
             ShellToTab::Copy => {
+                if self.copy_from_control() {
+                    return;
+                }
                 if let Some(text) = self.selected_text()
                     && !text.is_empty()
                 {
                     self.send(TabToShell::CopyText { text });
                 }
             }
+            ShellToTab::Cut => self.cut_from_control(),
+            ShellToTab::Paste { text } => self.paste_into_control(&text),
+            ShellToTab::ImePreedit { text, cursor } => self.ime_preedit(&text, cursor),
+            ShellToTab::ImeCommit { text } => self.ime_commit(&text),
             ShellToTab::Find { query } => self.find(query),
             ShellToTab::FindNext { forward } => self.find_next(forward),
             ShellToTab::FindClose => {
@@ -771,7 +816,7 @@ impl TabState {
                 return;
             }
             if keypress_ok {
-                self.edit_key(f, key, ctrl, alt);
+                self.edit_key(f, key, shift, ctrl, alt);
             }
             return;
         }
@@ -826,90 +871,6 @@ impl TabState {
         }
         // The value is not a selector subject yet; layout is enough.
         self.needs_layout = true;
-    }
-
-    /// Editing keys in a focused text control.
-    fn edit_key(&mut self, f: NodeId, key: Key, ctrl: bool, alt: bool) {
-        let textarea = self.doc.as_ref().and_then(|d| d.element(f)).is_some_and(is_textarea);
-        let mut value = self.control_value(f);
-        let mut caret = self.caret.min(value.len());
-        while !value.is_char_boundary(caret) {
-            caret -= 1;
-        }
-        let prev_len = |v: &str, c: usize| v[..c].chars().next_back().map_or(0, char::len_utf8);
-        let next_len = |v: &str, c: usize| v[c..].chars().next().map_or(0, char::len_utf8);
-        // The edit made, as `InputEvent.inputType` and `data`.
-        let mut edit: Option<(&str, Option<String>)> = None;
-        match key {
-            Key::Character(s) if !ctrl && !alt => {
-                let s: String = s.chars().filter(|c| !c.is_control()).collect();
-                if !s.is_empty() {
-                    value.insert_str(caret, &s);
-                    caret += s.len();
-                    edit = Some(("insertText", Some(s)));
-                }
-            }
-            Key::Space if !ctrl && !alt => {
-                value.insert(caret, ' ');
-                caret += 1;
-                edit = Some(("insertText", Some(" ".to_owned())));
-            }
-            Key::Enter if textarea && !ctrl && !alt => {
-                value.insert(caret, '\n');
-                caret += 1;
-                edit = Some(("insertLineBreak", None));
-            }
-            Key::Backspace => {
-                let n = prev_len(&value, caret);
-                if n > 0 {
-                    value.replace_range(caret - n..caret, "");
-                    caret -= n;
-                    edit = Some(("deleteContentBackward", None));
-                }
-            }
-            Key::Delete => {
-                let n = next_len(&value, caret);
-                if n > 0 {
-                    value.replace_range(caret..caret + n, "");
-                    edit = Some(("deleteContentForward", None));
-                }
-            }
-            Key::ArrowLeft => caret -= prev_len(&value, caret),
-            Key::ArrowRight => caret += next_len(&value, caret),
-            Key::Home => caret = value[..caret].rfind('\n').map_or(0, |i| i + 1),
-            Key::End => caret += value[caret..].find('\n').unwrap_or(value.len() - caret),
-            _ => {}
-        }
-        if let Some((input_type, data)) = edit {
-            // `beforeinput` may cancel the edit; `input` follows it.
-            if !self.fire_input(f, "beforeinput", input_type, data.as_deref()) {
-                self.update_caret();
-                return;
-            }
-            self.set_control_value(f, &value);
-            // With a layout pending the caret is placed after it.
-            self.caret = caret;
-            self.fire_input(f, "input", input_type, data.as_deref());
-            return;
-        }
-        self.caret = caret;
-        self.update_caret();
-    }
-
-    /// A click in a text control puts the caret where it landed.
-    fn place_caret_at(&mut self, x: f32, y: f32) {
-        let Some(f) = self.focus else { return };
-        let Some(doc) = &self.doc else { return };
-        let Some(e) = doc.element(f) else { return };
-        if !is_text_control(e) || input_type(e).as_deref() == Some("password") {
-            return;
-        }
-        if let Some(p) = self.text_position_at(x, y)
-            && (p.node == f || doc.parent(p.node) == Some(f))
-        {
-            self.caret = p.offset;
-            self.update_caret();
-        }
     }
 
     /// Where the caret goes: after the value's character at `caret` in
@@ -1805,9 +1766,13 @@ impl TabState {
         let mut target = target;
         if target != old {
             self.space_armed = None;
+            self.control_drag = false;
             if let Some(o) = old {
+                self.end_composition(o);
                 self.fire_blur(o, target);
             }
+            self.sel_anchor = None;
+            self.last_select = None;
             // A blur listener may have taken the new target out.
             if target.is_some_and(|t| !self.live(t)) {
                 target = None;
@@ -2680,6 +2645,9 @@ impl TabState {
         if focus_lost {
             self.focus = None;
             self.focus_value = None;
+            self.sel_anchor = None;
+            self.composition = None;
+            self.control_drag = false;
             self.focus_ring.clear();
             self.caret_rect = None;
             self.states.set_single(None, ElementStates::FOCUS);
@@ -2939,6 +2907,7 @@ impl TabState {
         if again {
             self.settle();
         }
+        self.report_caret();
         if self.needs_paint && self.layout.is_some() {
             self.repaint();
             self.needs_paint = false;
@@ -3041,11 +3010,16 @@ impl TabState {
             viewport_width: self.viewport.width,
             viewport_height: self.viewport.height,
             scale: self.viewport.scale_factor,
-            selection: self.selection_ranges(),
+            selection: {
+                let mut ranges = self.selection_ranges();
+                ranges.extend(self.control_selection_ranges());
+                ranges
+            },
             matches: self.find.as_ref().map(|f| f.ranges.clone()).unwrap_or_default(),
             current_match: self.find.as_ref().map(|f| f.current_ranges.clone()).unwrap_or_default(),
             focus_ring: self.focus_ring.clone(),
             caret: self.caret_rect,
+            composition: self.composition_ranges(),
         };
         paint(tree, &self.images, &options, &mut self.scene);
         if let Some(sb) = self.scrollbar() {
@@ -4871,6 +4845,218 @@ mod tests {
         }));
         h.send(ShellToTab::Scroll { dx: 0.0, dy: 50.0 });
         assert_eq!(js(&mut h, "log.splice(0).join(' ')"), "\"bodyresize bodyscroll:true\"");
+    }
+
+    impl Harness {
+        fn key_mod(&mut self, key: Key, shift: bool, ctrl: bool) {
+            self.send(ShellToTab::Key {
+                key,
+                code: String::new(),
+                repeat: false,
+                shift,
+                ctrl,
+                alt: false,
+            });
+        }
+
+        fn copies(&self) -> Vec<String> {
+            self.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|m| match m {
+                    TabToShell::CopyText { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn last_caret(&self) -> Option<Option<(f32, f32, f32, f32)>> {
+            self.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    TabToShell::Caret { rect } => Some(*rect),
+                    _ => None,
+                })
+        }
+    }
+
+    #[test]
+    fn text_controls_select_edit_and_use_the_clipboard() {
+        let html = "<!DOCTYPE html><title>Edit</title><style>body { margin: 0 }</style>\
+             <p><input id=t value='hello world'> <input id=pw type=password value=abc></p><textarea id=ta>ab\ncd</textarea>\
+             <script>\
+               var log = []; \
+               document.addEventListener('select', ev => log.push('select:' + ev.target.id + ':' + ev.bubbles + ':' + ev.cancelable)); \
+               document.addEventListener('beforeinput', ev => log.push('bi:' + ev.inputType + ':' + ev.data)); \
+               document.addEventListener('input', ev => log.push('in:' + ev.inputType + ':' + ev.target.getAttribute('value'))); \
+             </script>";
+        let mut h = Harness::load(html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+
+        // Shift+arrows select; typing replaces the selection; Ctrl+Backspace
+        // takes a word.
+        h.click_end_of("t");
+        assert_eq!(h.state.caret, 11);
+        drain(&mut h);
+        for _ in 0..5 {
+            h.key_mod(Key::ArrowLeft, true, false);
+        }
+        assert_eq!(h.state.control_selection(), Some((6, 11)));
+        assert_eq!(drain(&mut h), "\"select:t:true:false select:t:true:false select:t:true:false select:t:true:false select:t:true:false\"");
+        h.typed("x");
+        assert_eq!(drain(&mut h), "\"bi:insertText:x in:insertText:hello x\"");
+        assert_eq!(h.state.caret, 7);
+        h.key_mod(Key::Backspace, false, true);
+        assert_eq!(drain(&mut h), "\"bi:deleteWordBackward:null in:deleteWordBackward:hello \"");
+
+        // Home, Shift+End; copy, cut, paste (an input takes one line).
+        h.key(Key::Home, false);
+        h.key(Key::End, true);
+        assert_eq!(h.state.control_selection(), Some((0, 6)));
+        assert_eq!(drain(&mut h), "\"select:t:true:false\"");
+        h.send(ShellToTab::Copy);
+        assert_eq!(h.copies(), ["hello "]);
+        h.send(ShellToTab::Cut);
+        assert_eq!(h.copies(), ["hello ", "hello "]);
+        assert_eq!(drain(&mut h), "\"bi:deleteByCut:null in:deleteByCut:\"");
+        h.send(ShellToTab::Paste { text: "a\nb".into() });
+        assert_eq!(drain(&mut h), "\"bi:insertFromPaste:ab in:insertFromPaste:ab\"");
+        assert_eq!(h.attr("t", "value").as_deref(), Some("ab"));
+
+        // A double click selects the word; Ctrl+A everything; Shift+click
+        // and a drag extend from the caret.
+        h.click_id("t");
+        h.click_id("t");
+        assert_eq!(h.state.control_selection(), Some((0, 2)));
+        assert_eq!(drain(&mut h), "\"select:t:true:false\"");
+        h.send(ShellToTab::SelectAll);
+        assert_eq!(h.state.control_selection(), Some((0, 2)));
+        assert_eq!(drain(&mut h), "\"\"", "the same selection again is no new select");
+        h.click_end_of("t");
+        assert_eq!(h.state.control_selection(), None);
+        let r = h.rect_of(h.by_id("t"));
+        h.send(ShellToTab::Modifiers { shift: true, ctrl: false, alt: false, meta: false });
+        h.send(ShellToTab::MouseDown { x: r.x + 1.0, y: r.y + r.height / 2.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x: r.x + 1.0, y: r.y + r.height / 2.0, button: MouseButton::Left });
+        h.send(ShellToTab::Modifiers { shift: false, ctrl: false, alt: false, meta: false });
+        assert_eq!((h.state.sel_anchor, h.state.caret), (Some(2), 0));
+        assert_eq!(drain(&mut h), "\"select:t:true:false\"");
+        h.send(ShellToTab::MouseDown { x: r.right() - 6.0, y: r.y + r.height / 2.0, button: MouseButton::Left });
+        assert_eq!(h.state.control_selection(), None);
+        h.send(ShellToTab::MouseMove { x: r.x + 1.0, y: r.y + r.height / 2.0 });
+        assert_eq!(h.state.control_selection(), Some((0, 2)));
+        h.send(ShellToTab::MouseUp { x: r.x + 1.0, y: r.y + r.height / 2.0, button: MouseButton::Left });
+        assert_eq!(h.state.selection, None, "no page selection was started");
+        assert_eq!(drain(&mut h), "\"select:t:true:false\"");
+
+        // A password: the caret and the selection work, the clipboard
+        // gets nothing.
+        h.click_end_of("pw");
+        assert_eq!(h.state.caret, 3);
+        h.key(Key::Home, true);
+        assert_eq!(h.state.control_selection(), Some((0, 3)));
+        h.send(ShellToTab::Copy);
+        h.send(ShellToTab::Cut);
+        assert_eq!(h.copies().len(), 2);
+        assert_eq!(h.attr("pw", "value").as_deref(), Some("abc"));
+        drain(&mut h);
+
+        // A textarea: lines up and down keep the column.
+        let r = h.rect_of(h.by_id("ta"));
+        h.send(ShellToTab::MouseDown { x: r.x + 2.0, y: r.y + 10.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x: r.x + 2.0, y: r.y + 10.0, button: MouseButton::Left });
+        assert_eq!((h.focus_id().as_deref(), h.state.caret), (Some("ta"), 0));
+        h.key(Key::End, false);
+        assert_eq!(h.state.caret, 2);
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.state.caret, 5);
+        h.key(Key::ArrowUp, false);
+        assert_eq!(h.state.caret, 2);
+        h.key_mod(Key::End, false, true);
+        assert_eq!(h.state.caret, 5);
+        h.key(Key::Home, false);
+        assert_eq!(h.state.caret, 3);
+        h.key(Key::ArrowUp, true);
+        assert_eq!(h.state.control_selection(), Some((0, 3)));
+        h.key(Key::Delete, false);
+        assert_eq!(h.state.doc.as_ref().expect("doc").text_content(h.by_id("ta")), "cd");
+    }
+
+    #[test]
+    fn ime_composition_in_a_text_control_fires_its_events() {
+        let html = "<!DOCTYPE html><title>IME</title><input id=t value=ab>\
+             <script>\
+               var log = []; var refuse = false; \
+               ['compositionstart', 'compositionupdate', 'compositionend'].forEach(t => document.addEventListener(t, ev => { \
+                 log.push(t.replace('composition', 'c') + ':' + ev.data + ':' + (ev instanceof CompositionEvent) + ':' + ev.cancelable); \
+                 if (refuse && t === 'compositionstart') ev.preventDefault(); })); \
+               document.addEventListener('beforeinput', ev => log.push('bi:' + ev.inputType + ':' + ev.data + ':' + ev.cancelable)); \
+               document.addEventListener('input', ev => log.push('in:' + ev.target.getAttribute('value'))); \
+             </script>";
+        let mut h = Harness::load(html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+        let preedit = |h: &mut Harness, text: &str, cursor: Option<(usize, usize)>| {
+            h.send(ShellToTab::ImePreedit {
+                text: text.into(),
+                cursor,
+            });
+        };
+
+        h.click_end_of("t");
+        assert!(matches!(h.last_caret(), Some(Some(_))), "the shell learns where the caret is");
+        drain(&mut h);
+        // Composing: start, then each text replaces the last.
+        preedit(&mut h, "n", Some((1, 1)));
+        assert_eq!(
+            drain(&mut h),
+            "\"cstart::true:true cupdate:n:true:false bi:insertCompositionText:n:false in:abn\""
+        );
+        assert_eq!(h.state.composition.map(|c| (c.start, c.len)), Some((2, 1)));
+        assert_eq!(h.state.caret, 3);
+        preedit(&mut h, "ni", None);
+        assert_eq!(drain(&mut h), "\"cupdate:ni:true:false bi:insertCompositionText:ni:false in:abni\"");
+        // A clear then a commit: the committed text replaces it.
+        preedit(&mut h, "", None);
+        h.send(ShellToTab::ImeCommit { text: "你".into() });
+        assert_eq!(drain(&mut h), "\"bi:insertCompositionText:你:false in:ab你 cend:你:true:false\"");
+        assert!(h.state.composition.is_none());
+        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你"));
+        // A clear with no commit: the IME cancelled.
+        preedit(&mut h, "k", None);
+        drain(&mut h);
+        preedit(&mut h, "", None);
+        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你k"), "nothing decided yet");
+        h.key(Key::ArrowLeft, false);
+        assert_eq!(
+            drain(&mut h),
+            "\"cupdate::true:false bi:insertCompositionText::false in:ab你 cend::true:false\""
+        );
+        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你"));
+        // A refused start: nothing is inserted, the end still comes.
+        js(&mut h, "refuse = true");
+        preedit(&mut h, "z", None);
+        assert_eq!(drain(&mut h), "\"cstart::true:true\"");
+        h.send(ShellToTab::ImeCommit { text: "z".into() });
+        assert_eq!(drain(&mut h), "\"cend:z:true:false\"");
+        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你"));
+        js(&mut h, "refuse = false");
+        // Focus leaving mid-composition commits what is there.
+        h.key(Key::End, false);
+        preedit(&mut h, "q", None);
+        drain(&mut h);
+        h.key(Key::Tab, false);
+        assert_eq!(drain(&mut h), "\"cend:q:true:false\"");
+        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你q"));
+        assert!(h.state.composition.is_none());
+        assert_eq!(h.last_caret(), Some(None), "no text control has focus");
+        // A commit with nothing composed (a dead key) is plain text.
+        h.key(Key::Tab, true);
+        h.send(ShellToTab::ImeCommit { text: "é".into() });
+        assert_eq!(drain(&mut h), "\"bi:insertText:é:true in:ab你qé\"");
     }
 
     /// Console text so far, in order.

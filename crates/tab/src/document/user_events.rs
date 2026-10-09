@@ -547,20 +547,6 @@ impl TabState {
         self.fire_user_event(target, kind, init)
     }
 
-    /// `beforeinput` (cancelable) before an edit of a text control and
-    /// `input` after it, with the edit's `inputType` and `data`.
-    pub(super) fn fire_input(&mut self, control: NodeId, kind: &str, input_type: &str, data: Option<&str>) -> bool {
-        let init = UiEventInit {
-            class: UiClass::Input,
-            bubbles: true,
-            cancelable: kind == "beforeinput",
-            data: data.map(str::to_owned),
-            input_type: input_type.to_owned(),
-            ..UiEventInit::default()
-        };
-        self.fire_user_event(EventTargetRef::Node(control), kind, init)
-    }
-
     /// A checkbox, radio or select the user changed: `input`, then
     /// `change`; both bubble, neither can be cancelled.
     pub(super) fn fire_control_changed(&mut self, control: NodeId) {

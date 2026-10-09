@@ -1703,6 +1703,11 @@ mod tests {
                         typeof document.body.setPointerCapture, typeof document.setPointerCapture].join('|')").as_deref(),
             Ok("\"true|true|7|pen|0.3|true|1|1|0|0|2|4|1|0|0|0|true|157|function|undefined\"")
         );
+        assert_eq!(
+            s(&mut h, "var ce = new CompositionEvent('compositionstart', { data: 'x' }); \
+                       [ce instanceof CompositionEvent, ce instanceof UIEvent, ce.data, new CompositionEvent('y').data === '', String(document.body.oncompositionstart)].join('|')").as_deref(),
+            Ok("\"true|true|x|true|null\"")
+        );
         // `body`'s window handlers are `window`'s: the property both
         // ways, and the content attribute compiled on first dispatch.
         assert_eq!(

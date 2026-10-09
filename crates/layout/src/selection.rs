@@ -37,7 +37,9 @@ impl SelectionRanges {
         self.by_node.get(&node).map_or(&[], Vec::as_slice)
     }
 
-    fn add(&mut self, node: NodeId, start: usize, end: usize) {
+    /// Highlight `start..end` of the node's text (a control's made-up
+    /// text, for the selection inside it).
+    pub fn add(&mut self, node: NodeId, start: usize, end: usize) {
         self.by_node.entry(node).or_default().push((start, end));
     }
 

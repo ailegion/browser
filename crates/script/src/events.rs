@@ -50,6 +50,8 @@ pub enum UiClass {
     Input,
     Focus,
     Pointer,
+    /// `CompositionEvent`: `data` is the composition text.
+    Composition,
 }
 
 /// What the tab knows about a user event: the fields of the `UIEvent`
@@ -412,6 +414,12 @@ ui_class!(KeyboardEventClass, "KeyboardEvent", UiClass::Keyboard, init_keyboard_
 ui_class!(InputEventClass, "InputEvent", UiClass::Input, init_input_event);
 ui_class!(FocusEventClass, "FocusEvent", UiClass::Focus, init_focus_event);
 ui_class!(PointerEventClass, "PointerEvent", UiClass::Pointer, init_pointer_event);
+ui_class!(CompositionEventClass, "CompositionEvent", UiClass::Composition, init_composition_event);
+
+fn init_composition_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+    add_ui_getters(class, &[("data", UiProp::Data)]);
+    Ok(())
+}
 
 fn add_ui_getters(class: &mut ClassBuilder<'_>, props: &[(&str, UiProp)]) {
     for (name, prop) in props {
@@ -651,6 +659,7 @@ fn ui_prototype(class: UiClass, context: &mut Context) -> JsResult<JsObject> {
         UiClass::Input => context.get_global_class::<InputEventClass>().map(|c| c.prototype()),
         UiClass::Focus => context.get_global_class::<FocusEventClass>().map(|c| c.prototype()),
         UiClass::Pointer => context.get_global_class::<PointerEventClass>().map(|c| c.prototype()),
+        UiClass::Composition => context.get_global_class::<CompositionEventClass>().map(|c| c.prototype()),
     };
     proto.ok_or_else(|| JsNativeError::typ().with_message("event class is not registered").into())
 }
@@ -745,8 +754,15 @@ fn construct_ui(
             UiClass::Focus => {
                 data.related_target = init.get(js_string!("relatedTarget"), context)?.as_object();
             }
+            UiClass::Composition => {
+                ui.data = init_string(init, "data", context)?;
+            }
             UiClass::Ui | UiClass::Plain => {}
         }
+    }
+    // A composition's `data` is a string, empty when not given.
+    if class == UiClass::Composition && ui.data.is_none() {
+        ui.data = Some(String::new());
     }
     data.ui = ui;
     let proto = ui_prototype(class, context)?;
@@ -988,6 +1004,8 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     context.register_global_class::<InputEventClass>()?;
     context.register_global_class::<FocusEventClass>()?;
     context.register_global_class::<PointerEventClass>()?;
+    context.register_global_class::<CompositionEventClass>()?;
+    inherit::<CompositionEventClass, UiEventClass>(context);
     inherit::<UiEventClass, EventData>(context);
     inherit::<MouseEventClass, UiEventClass>(context);
     inherit::<WheelEventClass, MouseEventClass>(context);
@@ -1093,6 +1111,9 @@ const HANDLER_NAMES: &[&str] = &[
     "onpointercancel",
     "ongotpointercapture",
     "onlostpointercapture",
+    "oncompositionstart",
+    "oncompositionupdate",
+    "oncompositionend",
 ];
 
 /// The handlers a `body` element forwards to `window`: `<body

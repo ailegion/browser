@@ -926,18 +926,64 @@ Work:
       same day), and `setPointerCapture` fails silently while no button
       is down, throws `InvalidStateError` for a disconnected element and
       `NotFoundError` for an unknown pointer.
-      **Block 3 (next): page IME and selection inside controls.**
-      Phase 2 item 7 left IME on the page and text selection and the
-      clipboard inside a text control unbuilt, and nothing later owned
-      them. This block builds them: the shell routes IME preedit and
-      commit to the page when a text control has focus (the chrome's
-      input already does this for the address bar), the control shows
-      the preedit, `compositionstart`/`compositionupdate`/
-      `compositionend` fire around it with `beforeinput`/`input` of
-      `insertCompositionText`, Shift+arrows, Shift+click, drag and
-      double click select inside a control, Ctrl+C/X/V work there, and
-      the `select` event fires on a selection change in a control. The
-      item is complete when blocks 1 to 3 are done.
+      **Block 3 done 2026-10-09: page IME and selection inside
+      controls. Item 3.3.3 complete.** Phase 2 item 7 had left IME on
+      the page and selection and the clipboard inside a text control
+      unbuilt with no later owner; this block builds them
+      (`crates/tab/src/document/editing.rs`). Selection: the caret and
+      an anchor are byte offsets into the control's value; Shift+arrows,
+      Shift+Home/End, Shift+Up/Down extend, plain arrows collapse to the
+      selection's edge, Ctrl+Left/Right move by word, Up/Down move a
+      line in a textarea keeping the column (start and end in an input),
+      Ctrl+Home/End go to the ends; a click places the caret (passwords
+      too now, bullets mapped to characters), Shift+click extends, a
+      drag extends, a double click selects the word, a triple the whole
+      value, Ctrl+A everything; a press inside the focused control never
+      starts a page selection. Editing: every change goes through one
+      `replace_range` with `beforeinput` and `input`; typing and Space
+      replace the selection, Backspace and Delete remove it, Ctrl+
+      Backspace/Delete remove a word (`deleteWordBackward`/`Forward`).
+      Clipboard: Ctrl+C copies the control's selection (nothing from a
+      password field), Ctrl+X cuts it (`deleteByCut`, cancelable; new
+      `ShellToTab::Cut`), Ctrl+V pastes the shell's clipboard text
+      (`insertFromPaste`, cancelable; new `ShellToTab::Paste`; line
+      breaks dropped in an input, normalised in a textarea). The
+      `select` event (bubbling) fires when the control's selection
+      becomes a different non-empty range. IME: the shell routes
+      `Ime::Preedit`/`Ime::Commit` to the page when the chrome has no
+      text box focused (`ShellToTab::ImePreedit`/`ImeCommit`), enables
+      the IME and places its candidate window at the caret the tab
+      reports (`TabToShell::Caret`, sent on change from `flush`). The
+      composition text is part of the value while composing, as in
+      browsers, underlined by the painter (`PaintOptions::composition`);
+      the first preedit fires `compositionstart` (cancelable: refused,
+      nothing is inserted and `compositionend` still comes), each
+      preedit fires `compositionupdate` then `beforeinput`/`input` of
+      `insertCompositionText` (not cancelable) replacing the previous
+      text, the caret follows the IME's cursor; a commit replaces the
+      composition text with `beforeinput`/`input` and fires
+      `compositionend` with it; a commit with nothing composed (dead
+      keys) is `insertText`; focus leaving mid-composition commits what
+      is there. winit clears the preedit both before a commit and on a
+      cancel, so an empty preedit is held until the next message: a
+      commit completes it, anything else makes it a cancel
+      (`compositionupdate` of "", `input`, `compositionend` of ""); a
+      commit arriving only in a later batch therefore lands as
+      `insertText` after a cancel, the text itself never lost. Classes:
+      `CompositionEvent` (`data`) with its three handler attributes.
+      Tests: one script test (`CompositionEvent`), two tab harness tests
+      (selection by keys, mouse and Ctrl+A with `select` events, word
+      deletion, copy, cut, paste, a password's caret and selection with
+      nothing copied, a textarea's line moves; composition start,
+      update, clear-then-commit, clear-then-cancel, a refused start, a
+      blur commit, a dead-key commit, the caret reported to the shell),
+      one paint pixel test (the underline). Raised with the owner
+      2026-10-09 for placement, not built here: `ClipboardEvent` with
+      `clipboardData` for `cut`/`copy`/`paste` listeners (Phase 5 lists
+      a clipboard API); `window.getSelection()` and `selectionchange`
+      (no owner yet); `selectionStart`/`selectionEnd`/
+      `setSelectionRange` on input elements (no owner yet; item 3.3.7
+      forms is the natural one).
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,
       `getBoundingClientRect`, scroll properties.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,

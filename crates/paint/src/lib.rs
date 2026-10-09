@@ -143,6 +143,8 @@ pub struct PaintOptions {
     pub focus_ring: Vec<Rect>,
     /// The text caret of the focused control, in page coordinates.
     pub caret: Option<Rect>,
+    /// The IME's composition text in the focused control, underlined.
+    pub composition: SelectionRanges,
 }
 
 /// The keyboard focus ring.
@@ -215,6 +217,7 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
             (&options.matches, MATCH),
             (&options.current_match, CURRENT_MATCH),
         ],
+        composition: &options.composition,
     };
     if let Some(html) = html {
         painter.fragment(html);
@@ -238,6 +241,8 @@ struct Painter<'a> {
     skip_background_of: Vec<NodeId>,
     /// Text highlights in paint order: later ones cover earlier ones.
     highlights: [(&'a SelectionRanges, Color); 3],
+    /// Composition text, underlined.
+    composition: &'a SelectionRanges,
 }
 
 fn color(c: Rgba) -> Color {
@@ -246,6 +251,23 @@ fn color(c: Rgba) -> Color {
 
 fn krect(r: &Rect) -> KRect {
     KRect::new(r.x as f64, r.y as f64, r.right() as f64, r.bottom() as f64)
+}
+
+/// The horizontal spans of the clusters of `t` within the text range
+/// `a..b`, adjacent clusters merged into one span each.
+fn cluster_runs(t: &TextFragment, a: usize, b: usize) -> Vec<(f32, f32)> {
+    let mut runs: Vec<(f32, f32)> = Vec::new();
+    for c in &t.clusters {
+        if c.start >= b || c.end <= a {
+            continue;
+        }
+        let (x0, x1) = (c.x, c.x + c.advance);
+        match runs.last_mut() {
+            Some(last) if (last.1 - x0).abs() < 0.01 => last.1 = x1,
+            _ => runs.push((x0, x1)),
+        }
+    }
+    runs
 }
 
 fn intersects(a: &Rect, b: &Rect) -> bool {
@@ -411,19 +433,7 @@ impl Painter<'_> {
         let Some(node) = node else { return };
         for (ranges, color) in self.highlights {
             for &(a, b) in ranges.get(node) {
-                // Merge runs of adjacent clusters into one rectangle each.
-                let mut runs: Vec<(f32, f32)> = Vec::new();
-                for c in &t.clusters {
-                    if c.start >= b || c.end <= a {
-                        continue;
-                    }
-                    let (x0, x1) = (c.x, c.x + c.advance);
-                    match runs.last_mut() {
-                        Some(last) if (last.1 - x0).abs() < 0.01 => last.1 = x1,
-                        _ => runs.push((x0, x1)),
-                    }
-                }
-                for (x0, x1) in runs {
+                for (x0, x1) in cluster_runs(t, a, b) {
                     let r = KRect::new(
                         (rect.x + x0) as f64,
                         rect.y as f64,
@@ -432,6 +442,18 @@ impl Painter<'_> {
                     );
                     self.scene.fill(Fill::NonZero, self.transform, color, None, &r);
                 }
+            }
+        }
+    }
+
+    /// A line under the composition text of a control, as IMEs show it.
+    fn composition_underline(&mut self, rect: &Rect, t: &TextFragment, node: Option<NodeId>) {
+        let Some(node) = node else { return };
+        for &(a, b) in self.composition.get(node) {
+            for (x0, x1) in cluster_runs(t, a, b) {
+                let y = (rect.y + t.baseline + 1.0) as f64;
+                let r = KRect::new((rect.x + x0) as f64, y, (rect.x + x1) as f64, y + 1.0);
+                self.scene.fill(Fill::NonZero, self.transform, color(t.color), None, &r);
             }
         }
     }
@@ -530,6 +552,7 @@ impl Painter<'_> {
             );
             self.scene.fill(Fill::NonZero, self.transform, brush, None, &line);
         }
+        self.composition_underline(rect, t, node);
     }
 
     fn image(&mut self, rect: &Rect, style: &ComputedStyle, url: &Url) {
@@ -718,6 +741,60 @@ mod tests {
         assert_eq!(px(off.x + 3.0, off.y + 3.0), [255, 255, 255], "unchecked: white inside");
         assert_eq!(px(off.x, off.y + 6.0), [0x76, 0x76, 0x76], "unchecked: gray border");
         assert_eq!(px(60.0, 68.0), [0x30, 0x30, 0x38], "the caret");
+    }
+
+    /// The IME's composition text gets a line just under the baseline,
+    /// in the text's colour, and nothing elsewhere under the text.
+    #[test]
+    fn composition_text_is_underlined() {
+        let html = b"<body style='margin:0;font-size:20px;line-height:24px;color:#000'><p style='margin:0'>Hello</p></body>";
+        let doc = browser_dom::parse_html(html);
+        let mut stylist = browser_style::Stylist::new();
+        stylist.add_sheet(browser_style::ua::ua_stylesheet());
+        let vp = browser_style::Viewport {
+            width: 200.0,
+            height: 100.0,
+            scale_factor: 1.0,
+            prefers_dark: false,
+        };
+        let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+        let mut engine = browser_layout::LayoutEngine::new();
+        let images = ImageStore::new();
+        let tree = engine.layout(&doc, &styles, 200.0, 100.0, &images);
+        // The middle of the first cluster ("H", no descender), a pixel
+        // row under the baseline.
+        let mut probe = None;
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), Some(n)) = (&f.content, f.node)
+                && probe.is_none()
+                && let Some(c) = t.clusters.first()
+            {
+                probe = Some((n, f.rect.x + c.x + c.advance / 2.0, f.rect.y + t.baseline + 1.5));
+            }
+        });
+        let (node, x, y) = probe.expect("text");
+        let mut options = PaintOptions {
+            viewport_width: 200.0,
+            viewport_height: 100.0,
+            scale: 1.0,
+            ..PaintOptions::default()
+        };
+        let mut scene = Scene::new();
+        paint(&tree, &images, &options, &mut scene);
+        let Some(pixels) = render_offscreen(&scene, 200, 100, Color::WHITE) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let at = |pixels: &[u8]| {
+            let i = (y as usize * 200 + x as usize) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        assert_eq!(at(&pixels), [255, 255, 255], "nothing under the baseline without a composition");
+        options.composition.add(node, 0, usize::MAX);
+        paint(&tree, &images, &options, &mut scene);
+        let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
+        let p = at(&pixels);
+        assert!(p.iter().all(|&c| c < 128), "the underline is dark: {p:?}");
     }
 
     #[test]

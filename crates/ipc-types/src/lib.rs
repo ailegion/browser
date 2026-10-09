@@ -130,6 +130,21 @@ pub enum ShellToTab {
         alt: bool,
         meta: bool,
     },
+    /// The IME's composition text so far, for the focused text control,
+    /// with the cursor (a byte range within `text`) if it reports one.
+    /// An empty text clears the composition: the IME cancelled it, or a
+    /// commit follows.
+    ImePreedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    /// The IME committed `text` into the focused text control.
+    ImeCommit { text: String },
+    /// Cut the focused text control's selection (answered with
+    /// `TabToShell::CopyText`).
+    Cut,
+    /// Clipboard text to paste into the focused text control.
+    Paste { text: String },
     Close,
 }
 
@@ -155,6 +170,11 @@ pub enum TabToShell {
     /// Tab moved past the page's last focusable element (or Shift+Tab
     /// before its first): focus goes to the chrome.
     FocusOut { forward: bool },
+    /// The caret of the focused text control, as `(x, y, width, height)`
+    /// in logical pixels within the page's viewport, or none when no
+    /// text control has focus. The shell enables the IME and places its
+    /// candidate window there.
+    Caret { rect: Option<(f32, f32, f32, f32)> },
     /// The tab thread panicked and was unwound; the shell shows a crashed page.
     Crashed { message: String },
     Closed,

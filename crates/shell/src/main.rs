@@ -121,6 +121,9 @@ struct Tab {
     can_go_back: bool,
     can_go_forward: bool,
     cursor: CursorIcon,
+    /// The caret of the page's focused text control, in logical pixels
+    /// within the page, for the IME.
+    caret: Option<(f32, f32, f32, f32)>,
 }
 
 struct App {
@@ -181,12 +184,21 @@ impl App {
         self.chrome.height()
     }
 
-    /// Keep the window's IME state in step with the address bar.
+    /// Keep the window's IME state in step with the text box that has
+    /// the keyboard: the address bar or the find box, else the page's
+    /// focused text control (whose caret the tab reports).
     fn sync_ime(&mut self) {
         let Some(active) = &self.active else { return };
         let focused = self.chrome.has_focus();
-        active.window.set_ime_allowed(focused);
-        if focused && let Some((x, y, w, h)) = self.chrome.ime_cursor_area() {
+        let page_top = self.page_top();
+        let page_caret = if focused { None } else { self.current_tab().and_then(|t| t.caret) };
+        active.window.set_ime_allowed(focused || page_caret.is_some());
+        let area = if focused {
+            self.chrome.ime_cursor_area()
+        } else {
+            page_caret.map(|(x, y, w, h)| (x, y + page_top, w, h))
+        };
+        if let Some((x, y, w, h)) = area {
             active
                 .window
                 .set_ime_cursor_area(LogicalPosition::new(x, y), LogicalSize::new(w.max(1.0), h.max(1.0)));
@@ -372,6 +384,7 @@ impl App {
             can_go_back: false,
             can_go_forward: false,
             cursor: CursorIcon::Default,
+            caret: None,
         });
         tracing::info!(tab = id.0, tabs = self.tabs.len(), "tab opened");
         if activate {
@@ -756,6 +769,12 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            TabOutput::Message(TabToShell::Caret { rect }) => {
+                self.tabs[index].caret = rect;
+                if is_current {
+                    self.sync_ime();
+                }
+            }
             TabOutput::Message(TabToShell::FocusOut { .. }) => {
                 // Past either end of the page's tab order: the address bar
                 // is the chrome's one stop, in both directions.
@@ -950,13 +969,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Ime(ime) => {
-                match ime {
-                    Ime::Preedit(text, cursor) => self.chrome.ime_preedit(&text, cursor),
-                    Ime::Commit(text) => {
-                        let actions = self.chrome.ime_commit(&text);
-                        self.handle_chrome_actions(actions, event_loop);
+                if self.chrome.has_focus() {
+                    match ime {
+                        Ime::Preedit(text, cursor) => self.chrome.ime_preedit(&text, cursor),
+                        Ime::Commit(text) => {
+                            let actions = self.chrome.ime_commit(&text);
+                            self.handle_chrome_actions(actions, event_loop);
+                        }
+                        Ime::Enabled | Ime::Disabled => {}
                     }
-                    Ime::Enabled | Ime::Disabled => {}
+                } else {
+                    // The page's focused text control composes.
+                    match ime {
+                        Ime::Preedit(text, cursor) => self.send_to_current(ShellToTab::ImePreedit { text, cursor }),
+                        Ime::Commit(text) => self.send_to_current(ShellToTab::ImeCommit { text }),
+                        Ime::Enabled | Ime::Disabled => {}
+                    }
                 }
                 self.sync_ime();
             }
@@ -1032,6 +1060,15 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("a") => {
                         self.send_to_current(ShellToTab::SelectAll);
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("x") => {
+                        self.send_to_current(ShellToTab::Cut);
+                    }
+                    Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
+                        let text = self.clipboard().and_then(|cb| cb.get_text().ok());
+                        if let Some(text) = text {
+                            self.send_to_current(ShellToTab::Paste { text });
+                        }
                     }
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("t") => self.new_tab(),
                     Key::Character(c) if ctrl && c.eq_ignore_ascii_case("w") => {
