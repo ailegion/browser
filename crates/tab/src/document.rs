@@ -567,11 +567,12 @@ impl TabState {
                 let clicks = if button == MouseButton::Left { self.count_click(x, y) } else { 1 };
                 self.press_clicks = clicks;
                 self.press_target = hit;
-                // `pointerdown` first; cancelled, it holds back the mouse
-                // events until the pointer goes up and starts no
-                // selection, but focus still moves. `mousedown` cancelled:
-                // no focus change, no caret, no selection. `:active`, the
-                // press and `click` happen either way.
+                // `pointerdown` first; its default action is `mousedown`'s
+                // (Pointer Events: focus and selection start), and
+                // cancelling it also holds the mouse events back until
+                // the pointer goes up. Either cancelled: no focus change,
+                // no caret, no selection. `:active`, the press and `click`
+                // happen either way.
                 let pointer_ok = self.fire_pointer("pointerdown", hit, x, y, button);
                 if !pointer_ok {
                     self.compat_suppressed = true;
@@ -581,22 +582,23 @@ impl TabState {
                 } else {
                     self.fire_mouse("mousedown", self.hover, x, y, button, clicks)
                 };
+                let proceed = pointer_ok && mouse_ok;
                 let hit = self.hover;
                 if button == MouseButton::Left {
                     self.set_active(hit);
-                    if mouse_ok {
+                    if proceed {
                         let focus = hit.and_then(|h| self.focusable_ancestor(h));
                         self.set_focus(focus, false);
                     }
                     self.press_control = hit.and_then(|h| self.ancestor_or_self(h, is_toggle));
-                    if mouse_ok && pointer_ok {
+                    if proceed {
                         self.place_caret_at(x, y);
                     }
                 }
                 if matches!(button, MouseButton::Left | MouseButton::Middle) {
                     self.press = hit.and_then(|h| self.ancestor_or_self(h, is_link)).map(|l| (l, button));
                 }
-                if button == MouseButton::Left && mouse_ok && pointer_ok {
+                if button == MouseButton::Left && proceed {
                     let on_link = self.press.is_some();
                     self.begin_selection(x, y, clicks, on_link);
                 }
@@ -4695,7 +4697,7 @@ mod tests {
     #[test]
     fn pointer_events_come_first_capture_the_mouse_and_hold_back_mouse_events() {
         let html = "<!DOCTYPE html><title>Pointer</title><style>body { margin: 0 } div { height: 40px; margin: 0 }</style>\
-             <div id=a></div><div id=b></div><div id=c></div>\
+             <div id=a tabindex=0></div><div id=b></div><div id=c></div>\
              <script>\
                var log = []; var cancel = {}; var capture = false; \
                var a = document.getElementById('a'), b = document.getElementById('b'); \
@@ -4731,11 +4733,13 @@ mod tests {
         assert_eq!(drain(&mut h), "\"pointermove:b:1:-1:0 mv:5:0:1:true:true:0:mouse mousemove:b:m:0:0\"");
 
         // A cancelled `pointerdown` holds back `mousedown`, `mousemove`
-        // and `mouseup` until the pointer goes up; `click` still fires.
+        // and `mouseup` until the pointer goes up, and takes
+        // `mousedown`'s default with it: no focus. `click` still fires.
         h.send(ShellToTab::MouseMove { x: 10.0, y: 20.0 });
         drain(&mut h);
         js(&mut h, "cancel.pointerdown = true");
         h.send(ShellToTab::MouseDown { x: 10.0, y: 20.0, button: MouseButton::Left });
+        assert!(h.state.focus.is_none(), "a cancelled pointerdown does not focus");
         h.send(ShellToTab::MouseMove { x: 12.0, y: 20.0 });
         h.send(ShellToTab::MouseUp { x: 12.0, y: 20.0, button: MouseButton::Left });
         assert_eq!(drain(&mut h), "\"pointerdown:a:1:0:1 pointermove:a:1:-1:1 pointerup:a:1:0:0 click:a:1:0:0\"");
@@ -4750,6 +4754,7 @@ mod tests {
         js(&mut h, "capture = true");
         h.send(ShellToTab::MouseDown { x: 13.0, y: 20.0, button: MouseButton::Left });
         assert_eq!(drain(&mut h), "\"pointerdown:a:1:0:1 mousedown:a:m:0:1 gotpointercapture:a:1:-1:1\"");
+        assert_eq!(h.state.focus, Some(h.by_id("a")), "an uncancelled press focuses");
         h.send(ShellToTab::MouseMove { x: 10.0, y: 60.0 });
         assert_eq!(drain(&mut h), "\"pointermove:a:1:-1:1 mousemove:a:m:0:1\"");
         assert_eq!(h.state.hover, Some(h.by_id("a")), "hover follows the capture");

@@ -854,11 +854,12 @@ Work:
       go `pointerout`, `pointerleave` (per element left), `mouseout`,
       `mouseleave`, `pointerover`, `pointerenter` (per element entered,
       outermost first), `mouseover`, `mouseenter`. A press: `pointerdown`
-      then `mousedown` (`pointerdown` cancelled: `mousedown`, `mousemove`
-      and `mouseup` are held back until the pointer goes up and no
-      selection starts, focus still moves; `mousedown` cancelled: no
-      focus, caret or selection; `:active`, the press and `click` happen
-      either way). A release: `pointerup`, `mouseup`, the implicit
+      then `mousedown`; `pointerdown`'s default action is `mousedown`'s
+      (Pointer Events: focus and selection start), and cancelling it
+      also holds `mousedown`, `mousemove` and `mouseup` back until the
+      pointer goes up (the boundary mouse events still fire); either
+      cancelled: no focus, caret or selection; `:active`, the press and
+      `click` happen either way. A release: `pointerup`, `mouseup`, the implicit
       capture release, then `click` (`auxclick` for the other buttons;
       `click`, `auxclick` and `contextmenu` are `PointerEvent`s per UI
       Events) at the nearest element the press and release share
@@ -919,10 +920,12 @@ Work:
       button on release with `code` and `repeat` from the shell, Space
       on a checkbox cancelled and not, `change` on Enter once, the
       context-menu key; `<body onload/onresize/onscroll>` reaching
-      `window`). Two details rest on the implementer's reading rather
-      than a checked source: focus still moving after a cancelled
-      `pointerdown`, and `setPointerCapture` doing nothing (not
-      throwing) while no button is down; owner informed 2026-10-09.
+      `window`). Checked against the Pointer Events specification
+      2026-10-09: a cancelled `pointerdown` prevents `mousedown`'s
+      default actions (first built as "focus still moves", corrected the
+      same day), and `setPointerCapture` fails silently while no button
+      is down, throws `InvalidStateError` for a disconnected element and
+      `NotFoundError` for an unknown pointer.
       **Block 3 (next): page IME and selection inside controls.**
       Phase 2 item 7 left IME on the page and text selection and the
       clipboard inside a text control unbuilt, and nothing later owned
