@@ -772,6 +772,56 @@ Work:
       without a home.
    3. `EventTarget`, `Event`, `MouseEvent`, `KeyboardEvent`, `InputEvent`,
       capture and bubble, `preventDefault`, `addEventListener` options.
+      Two blocks, the item is complete when both are done.
+      **Block 1 done 2026-10-09: `EventTarget`, `Event`, dispatch,
+      handlers, lifecycle events.** `crates/script/src/events.rs`.
+      `EventTarget` is the base of `Node`; its methods are also on the
+      global object, so `window.addEventListener` and a bare
+      `addEventListener` work; `new EventTarget()` makes a plain
+      target. `addEventListener` takes the options object (`capture`,
+      `once`, `passive`) or the boolean, keeps a listener added twice
+      once, and accepts `handleEvent` objects; `removeEventListener`;
+      `dispatchEvent` (`InvalidStateError` while the event is being
+      dispatched, `TypeError` for a non-event). `Event` (`new
+      Event(type, init)`; `type`, `target`, `currentTarget`,
+      `eventPhase` with the four constants, `bubbles`, `cancelable`,
+      `composed`, `defaultPrevented`, `isTrusted`, `timeStamp`,
+      `composedPath`, `stopPropagation`, `stopImmediatePropagation`,
+      `preventDefault` (ignored for a non-cancelable event and inside a
+      passive listener), the legacy `cancelBubble`, `returnValue`,
+      `srcElement`, `initEvent`) and `CustomEvent` with `detail`.
+      Dispatch: the path is the target, its ancestors, the document and
+      `window`; capture down, at-target, bubble up when `bubbles`; a
+      target's listeners are snapshotted before they run and one
+      removed meanwhile does not run; a listener that throws is reported
+      on the console as `Uncaught` and the rest run. `on<type>` handler
+      properties on `Element`, `Document` and `window` (41 names) sit in
+      the listener list where first set; `on<type>="code"` content
+      attributes compile to `new Function("event", code)` on first use
+      and recompile when the text changes; a property set wins until the
+      attribute changes; a handler's `return false` cancels. Listener
+      callbacks are held like wrappers (O18). Tab: a `Lifecycle` per
+      document drives `document.readyState` and fires, as tasks through
+      the lent document, `readystatechange` (`interactive`) once parsed
+      and before deferred scripts, `DOMContentLoaded` on the document
+      (bubbling to `window`) once they ran, then `readystatechange`
+      (`complete`) and `load` on `window` once nothing is left to fetch
+      (`complete` now waits for sub-resources, as the standard says;
+      `Stop` completes at once). Tests: one script test (classes,
+      constructor errors, the full capture/target/bubble order against
+      window, document and two elements, attribute and property
+      handlers and their replacement, no-bubble, stop and immediate
+      stop, once, passive, non-cancelable, duplicates, removal,
+      `handleEvent`, a throwing listener, removal during dispatch,
+      re-dispatch, `composedPath`, a plain target, `window` and
+      `document` handlers); one tab harness test against the loopback
+      server (the order of the lifecycle events with a deferred script
+      and a held image, `load` only after the image arrives). Found and
+      fixed on the way: a property handler was overridden again by the
+      attribute on the next dispatch.
+      **Block 2 (next):** the user's events from the tab (mouse, focus,
+      keyboard, input and change, scroll, resize, wheel) with their
+      default actions cancellable.
    4. `element.style` as `CSSStyleDeclaration`, `getComputedStyle`,
       `getBoundingClientRect`, scroll properties.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,

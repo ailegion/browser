@@ -47,7 +47,7 @@ use crate::{
 #[derive(Default)]
 pub(crate) struct Dom {
     /// The document while it is lent; an empty one otherwise.
-    doc: Document,
+    pub(crate) doc: Document,
     wrappers: HashMap<NodeId, JsObject>,
     /// The wrapper of the document node, which is the `document` global.
     document: Option<JsObject>,
@@ -69,6 +69,8 @@ pub(crate) struct Dom {
     /// specification requires (`el.classList === el.classList`).
     token_lists: HashMap<NodeId, JsObject>,
     datasets: HashMap<NodeId, JsObject>,
+    /// Event listeners and handlers (`events.rs`).
+    pub(crate) events: crate::events::Events,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -124,25 +126,34 @@ impl Dom {
 /// An error with a `DOMException` name (`NotFoundError`,
 /// `HierarchyRequestError`, ...). Boa has no `DOMException` class; this is
 /// an `Error` whose `name` is set, which is what code checks.
-fn dom_exception(name: &str, message: &str, context: &mut Context) -> boa_engine::JsError {
+pub(crate) fn dom_exception(name: &str, message: &str, context: &mut Context) -> boa_engine::JsError {
     let error = JsNativeError::error().with_message(message.to_owned()).into_opaque(context);
     let _ = error.set(js_string!("name"), js_str(name), false, context);
     boa_engine::JsError::from_opaque(error.into())
 }
 
-fn dom(context: &mut Context) -> JsResult<SharedDom> {
+pub(crate) fn dom(context: &mut Context) -> JsResult<SharedDom> {
     context
         .get_data::<SharedDom>()
         .cloned()
         .ok_or_else(|| JsNativeError::error().with_message("no document").into())
 }
 
+/// The `document` object.
+pub(crate) fn document_object(context: &mut Context) -> JsResult<JsObject> {
+    dom(context)?
+        .borrow()
+        .document
+        .clone()
+        .ok_or_else(|| JsNativeError::error().with_message("no document").into())
+}
+
 /// What a wrapper stands for: the document node (whatever the lent
 /// document's root is) or one node of it.
 #[derive(Debug, Clone, Trace, Finalize, JsData)]
-struct DomNode {
+pub(crate) struct DomNode {
     #[unsafe_ignore_trace]
-    id: Option<NodeId>,
+    pub(crate) id: Option<NodeId>,
 }
 
 impl DomNode {
@@ -157,7 +168,7 @@ impl DomNode {
 
 const ATTR: Attribute = Attribute::ENUMERABLE.union(Attribute::CONFIGURABLE);
 
-fn illegal_invocation() -> boa_engine::JsError {
+pub(crate) fn illegal_invocation() -> boa_engine::JsError {
     JsNativeError::typ().with_message("Illegal invocation").into()
 }
 
@@ -229,7 +240,11 @@ fn inherit<Sub: Class, Base: Class>(context: &mut Context) -> JsResult<()> {
 /// Register the classes and the `document` global. `location` and the
 /// host state must already be registered: `Document.prototype` reads them.
 pub(crate) fn register(context: &mut Context) -> JsResult<()> {
+    crate::events::register(context)?;
     context.register_global_class::<NodeClass>()?;
+    if let Some(node) = context.get_global_class::<NodeClass>() {
+        crate::events::make_node_an_event_target(&node, context);
+    }
     context.register_global_class::<ElementClass>()?;
     context.register_global_class::<HtmlElementClass>()?;
     context.register_global_class::<CharacterDataClass>()?;
@@ -498,6 +513,7 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_mutator(class, "setAttribute", 2, MutMethod::SetAttribute);
     add_mutator(class, "removeAttribute", 1, MutMethod::RemoveAttribute);
     add_mutator(class, "toggleAttribute", 1, MutMethod::ToggleAttribute);
+    crate::events::add_handler_attributes(class);
     Ok(())
 }
 
@@ -522,6 +538,7 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_mutator(class, "createComment", 1, MutMethod::CreateComment);
     add_mutator(class, "createDocumentFragment", 0, MutMethod::CreateDocumentFragment);
     init_parent_node(class);
+    crate::events::add_handler_attributes(class);
     add_query(class, "getElementById", QueryMethod::GetElementById);
     // Item 3.1's properties, which read the tab's `DocumentInfo`.
     for (name, part) in [
@@ -608,7 +625,7 @@ enum Proto {
 }
 
 /// The wrapper for `id` in the lent document, made on first access.
-fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
+pub(crate) fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
     let shared = dom(context)?;
     let proto = {
         let dom = shared.borrow();

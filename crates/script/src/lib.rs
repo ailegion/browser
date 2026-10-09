@@ -33,6 +33,9 @@
 #![forbid(unsafe_code)]
 
 mod dom;
+mod events;
+
+pub use events::EventTargetRef;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -837,6 +840,24 @@ impl ScriptHost {
         self.dom.borrow_mut().take_mutated()
     }
 
+    /// Dispatch a trusted event of `kind` at `target` as a task (a
+    /// microtask checkpoint follows). Returns whether the default action
+    /// may proceed: false when a listener called `preventDefault` on a
+    /// cancelable event. The document must be lent.
+    pub fn fire_event(&mut self, target: EventTargetRef, kind: &str, bubbles: bool, cancelable: bool) -> bool {
+        let result = events::new_event(kind, bubbles, cancelable, &mut self.context)
+            .and_then(|event| events::dispatch(&event, target, None, &mut self.context));
+        let proceed = match result {
+            Ok(proceed) => proceed,
+            Err(err) => {
+                self.report_uncaught(&err);
+                true
+            }
+        };
+        self.microtask_checkpoint();
+        proceed
+    }
+
     /// Keep what `location` and `document` report current. `charset` is
     /// the encoding's standard name; `quirks` whether the parser put the
     /// document in quirks mode.
@@ -1057,7 +1078,9 @@ impl ScriptHost {
     }
 
     fn collect_job_errors(&mut self) {
-        let errors = std::mem::take(&mut *self.executor.errors.borrow_mut());
+        let mut errors = std::mem::take(&mut *self.executor.errors.borrow_mut());
+        // Listeners that threw during a dispatch.
+        errors.append(&mut self.dom.borrow_mut().events.errors);
         let mut console = self.console.borrow_mut();
         console.extend(errors.into_iter().map(|text| ConsoleLine {
             level: ConsoleLevel::Error,
@@ -1473,6 +1496,84 @@ mod tests {
                        try { Object.getOwnPropertyDescriptor(Element.prototype, 'children').get.call(document); e.push('ok') } catch (x) { e.push(x.name) } \
                        try { Element.prototype.remove.call(document) } catch (x) { e.push(x.name) } e.join(',')").as_deref(),
             Ok("\"TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,ok,TypeError\"")
+        );
+    }
+
+    #[test]
+    fn events_dispatch_through_capture_target_and_bubble_with_handlers() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><html><head></head><body><div id=outer><p id=inner onclick=\"log.push('attr:' + event.type + ':' + this.id); return false\">x</p></div></body></html>",
+        );
+        h.lend_document(doc, false, Default::default());
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+
+        // Classes and the Event object.
+        assert_eq!(
+            s(&mut h, "var e = new Event('ping', { bubbles: true, cancelable: true }); var c = new CustomEvent('note', { detail: { n: 1 } }); \
+                       [e instanceof Event, c instanceof CustomEvent, c instanceof Event, e.type, e.bubbles, e.cancelable, e.composed, e.defaultPrevented, e.isTrusted, String(e.target), e.eventPhase, Event.AT_TARGET, e.BUBBLING_PHASE, \
+                        c.detail.n, c.bubbles, typeof e.timeStamp, document instanceof EventTarget, document.body instanceof EventTarget, typeof window.addEventListener, typeof addEventListener, Object.getPrototypeOf(Node) === EventTarget].join('|')").as_deref(),
+            Ok("\"true|true|true|ping|true|true|false|false|false|null|0|2|3|1|false|number|true|true|function|function|true\"")
+        );
+        assert_eq!(
+            s(&mut h, "var errs = []; try { new Event() } catch (x) { errs.push(x.name) } try { Event('a') } catch (x) { errs.push(x.name) } try { document.dispatchEvent({}) } catch (x) { errs.push(x.name) } errs.join()").as_deref(),
+            Ok("\"TypeError,TypeError,TypeError\"")
+        );
+        // Order: capture from window down, at the target, bubble up.
+        assert_eq!(
+            s(&mut h, "var log = []; var outer = document.getElementById('outer'), inner = document.getElementById('inner'); \
+                       var tag = (name, opts) => function (ev) { log.push(name + ':' + ev.eventPhase + ':' + (ev.currentTarget === this) + ':' + (ev.target === inner)); }; \
+                       window.addEventListener('ping', tag('w-c'), true); window.addEventListener('ping', tag('w')); \
+                       document.addEventListener('ping', tag('d-c'), { capture: true }); document.addEventListener('ping', tag('d')); \
+                       outer.addEventListener('ping', tag('o-c'), true); outer.addEventListener('ping', tag('o')); \
+                       inner.addEventListener('ping', tag('i')); inner.addEventListener('ping', tag('i-c'), true); \
+                       var r = inner.dispatchEvent(e); [r, e.eventPhase, String(e.currentTarget), e.target === inner, log.join(' ')].join('|')").as_deref(),
+            Ok("\"true|0|null|true|w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true o:3:true:true d:3:true:true w:3:true:true\"")
+        );
+        // The onclick attribute handler runs for a click, at the target;
+        // its `return false` cancels; the property replaces it.
+        assert_eq!(
+            s(&mut h, "log = []; var click = new Event('click', { cancelable: true }); var r2 = inner.dispatchEvent(click); \
+                       var fromAttr = typeof inner.onclick; inner.onclick = function (ev) { log.push('prop:' + (this === inner)); }; var r3 = inner.dispatchEvent(new Event('click', { cancelable: true })); \
+                       var before = typeof inner.onclick; inner.onclick = null; var r4 = inner.dispatchEvent(new Event('click', { cancelable: true })); \
+                       inner.setAttribute('onclick', 'log.push(\"again:\" + event.type)'); inner.dispatchEvent(new Event('click')); inner.removeAttribute('onclick'); inner.dispatchEvent(new Event('click')); \
+                       [r2, click.defaultPrevented, fromAttr, r3, before, String(inner.onclick), r4, log.join(' ')].join('|')").as_deref(),
+            Ok("\"false|true|function|true|function|null|true|attr:click:inner prop:true again:click\"")
+        );
+        // No bubbling, stopPropagation, stopImmediatePropagation, once,
+        // passive, duplicates, removal, handleEvent objects.
+        assert_eq!(
+            s(&mut h, "log = []; inner.dispatchEvent(new Event('ping')); var noBubble = log.join(' '); \
+                       log = []; var stopper = ev => { ev.stopPropagation(); log.push('stop'); }; outer.addEventListener('ping', stopper); inner.dispatchEvent(new Event('ping', { bubbles: true })); var stopped = log.join(' '); outer.removeEventListener('ping', stopper); \
+                       log = []; var first = ev => { ev.stopImmediatePropagation(); log.push('first'); }; var second = () => log.push('second'); inner.addEventListener('ping', first); inner.addEventListener('ping', second); inner.addEventListener('ping', second); \
+                       inner.dispatchEvent(new Event('ping')); var immediate = log.join(' '); inner.removeEventListener('ping', first); inner.removeEventListener('ping', second); \
+                       log = []; inner.addEventListener('ping', () => log.push('once'), { once: true }); inner.dispatchEvent(new Event('ping')); inner.dispatchEvent(new Event('ping')); var once = log.join(' '); \
+                       var p = new Event('ping', { cancelable: true }); inner.addEventListener('ping', ev => ev.preventDefault(), { passive: true, once: true }); inner.dispatchEvent(p); var passive = p.defaultPrevented; \
+                       var nc = new Event('ping'); inner.addEventListener('ping', ev => ev.preventDefault(), { once: true }); inner.dispatchEvent(nc); var notCancelable = nc.defaultPrevented; \
+                       log = []; var obj = { handleEvent(ev) { log.push('handle:' + (this === obj) + ':' + ev.type); } }; inner.addEventListener('ping', obj); inner.dispatchEvent(new Event('ping')); inner.removeEventListener('ping', obj); inner.dispatchEvent(new Event('ping')); var handled = log.join(' '); \
+                       [noBubble, stopped, immediate, once, passive, notCancelable, handled].join('|')").as_deref(),
+            Ok("\"w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true|w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true o:3:true:true stop|w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true first|w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true once w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true|false|false|w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true handle:true:ping w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true\"")
+        );
+        // A throwing listener is reported and the others still run; a
+        // listener removed by an earlier one does not run; dispatching a
+        // dispatching event is refused; composedPath.
+        assert_eq!(
+            s(&mut h, "log = []; var later = () => log.push('later'); var remover = () => { inner.removeEventListener('ping', later); throw new Error('boom'); }; \
+                       inner.addEventListener('ping', remover, { once: true }); inner.addEventListener('ping', later); inner.addEventListener('ping', () => log.push('after'), { once: true }); \
+                       var path = []; var again = ''; inner.addEventListener('ping', ev => { path = ev.composedPath().map(n => n === window ? 'window' : n === document ? 'document' : n.id); try { inner.dispatchEvent(ev) } catch (x) { again = x.name } }, { once: true }); \
+                       inner.dispatchEvent(new Event('ping')); inner.removeEventListener('ping', later); [log.join(' '), path.join('>'), again].join('|')").as_deref(),
+            Ok("\"w-c:1:true:true d-c:1:true:true o-c:1:true:true i:2:true:true i-c:2:true:true after|inner>outer>>>document>window|InvalidStateError\"")
+        );
+        let l = lines(&mut h);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].contains("boom"), "{}", l[0]);
+        // A plain EventTarget, and window as a target with on* handlers.
+        assert_eq!(
+            s(&mut h, "log = []; var t = new EventTarget(); t.addEventListener('x', ev => log.push('plain:' + (ev.target === t) + ':' + (ev.currentTarget === t))); t.dispatchEvent(new Event('x')); \
+                       window.onload = () => log.push('onload'); onresize = ev => log.push('resize:' + (this === window)); window.dispatchEvent(new Event('load')); dispatchEvent(new Event('resize')); \
+                       document.onreadystatechange = () => log.push('rsc'); document.dispatchEvent(new Event('readystatechange')); \
+                       [log.join(' '), typeof window.onload, String(window.onclick), t instanceof EventTarget].join('|')").as_deref(),
+            Ok("\"plain:true:true onload resize:true rsc|function|null|true\"")
         );
     }
 

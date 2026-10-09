@@ -11,7 +11,7 @@ use browser_layout::{LayoutEngine, LayoutTree, Rect, SelectionRanges};
 use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
-use browser_script::{ConsoleLevel, ConsoleLine, HostRequest, ModuleProgress, ModuleScript, ScriptHost};
+use browser_script::{ConsoleLevel, ConsoleLine, EventTargetRef, HostRequest, ModuleProgress, ModuleScript, ScriptHost};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
@@ -144,6 +144,20 @@ struct Pending {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+/// The stages of a document's load, as `document.readyState` and the
+/// lifecycle events see them: `loading` while parsing, `interactive`
+/// once parsed (deferred scripts run, then `DOMContentLoaded` fires),
+/// `complete` once nothing is still being fetched (`load` fires).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Lifecycle {
+    #[default]
+    Loading,
+    Interactive,
+    /// `DOMContentLoaded` has fired; still `interactive`.
+    ContentLoaded,
+    Complete,
 }
 
 /// What a navigation does to the history list when it commits.
@@ -289,6 +303,9 @@ pub(crate) struct TabState {
     /// The main response has ended; the document is finished as soon as
     /// the parser is no longer waiting for a script.
     main_done: bool,
+    /// How far the document's load has got, for `document.readyState`
+    /// and the events along the way (`update_readiness`).
+    lifecycle: Lifecycle,
     /// When the next animation frame is due, while callbacks wait for one.
     frame_due: Option<std::time::Instant>,
     /// The document's time origin, for animation frame timestamps.
@@ -360,6 +377,7 @@ impl TabState {
             script: None,
             scripts: Scripts::default(),
             main_done: false,
+            lifecycle: Lifecycle::Loading,
             frame_due: None,
             doc_started: std::time::Instant::now(),
             console: Vec::new(),
@@ -1346,6 +1364,8 @@ impl TabState {
             self.set_document(doc);
         }
         self.state_dirty = true;
+        // Nothing is being fetched any more: the document is complete.
+        self.update_readiness();
     }
 
     /// The first bytes of the main response: the navigation is now real.
@@ -1789,6 +1809,46 @@ impl TabState {
                 self.state_dirty = true;
             }
         }
+        // A finished fetch may have been the last one the load waited on.
+        self.update_readiness();
+    }
+
+    /// Move the document along its lifecycle and fire what each step
+    /// fires: `readystatechange` on the document when it becomes
+    /// `interactive` (parsed) and `complete` (nothing left to fetch),
+    /// `DOMContentLoaded` on the document (bubbling to `window`) once the
+    /// deferred scripts have run, `load` on `window` at `complete`.
+    fn update_readiness(&mut self) {
+        loop {
+            let parsed = self.parser.is_none() && self.doc.is_some() && self.script.is_some();
+            let deferred_done = self.scripts.deferred.is_empty() && !self.scripts.running_deferred;
+            let fetched = self.nav.is_none() && self.pending.is_empty();
+            match self.lifecycle {
+                Lifecycle::Loading if parsed => {
+                    self.lifecycle = Lifecycle::Interactive;
+                    self.fire_lifecycle_event(EventTargetRef::Document, "readystatechange", false);
+                }
+                Lifecycle::Interactive if parsed && deferred_done => {
+                    self.lifecycle = Lifecycle::ContentLoaded;
+                    self.fire_lifecycle_event(EventTargetRef::Document, "DOMContentLoaded", true);
+                }
+                Lifecycle::ContentLoaded if parsed && deferred_done && fetched => {
+                    self.lifecycle = Lifecycle::Complete;
+                    self.fire_lifecycle_event(EventTargetRef::Document, "readystatechange", false);
+                    self.fire_lifecycle_event(EventTargetRef::Window, "load", false);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Fire a trusted, non-cancelable event from the tab as a task.
+    fn fire_lifecycle_event(&mut self, target: EventTargetRef, kind: &str, bubbles: bool) {
+        self.sync_document_info();
+        self.with_script(|host| {
+            host.fire_event(target, kind, bubbles, false);
+        });
+        self.after_script();
     }
 
     fn content_type_of(headers: &[(String, String)]) -> (String, Option<String>) {
@@ -1991,6 +2051,8 @@ impl TabState {
         if self.script.is_none() {
             self.new_script_host();
         }
+        // Parsed: `interactive`, before any deferred script runs.
+        self.update_readiness();
         self.needs_style = true;
         self.state_dirty = true;
     }
@@ -2006,6 +2068,7 @@ impl TabState {
         self.frame_due = None;
         self.doc_started = std::time::Instant::now();
         self.scripts = Scripts::default();
+        self.lifecycle = Lifecycle::Loading;
         self.script = match ScriptHost::new(self.url.clone(), browser_net::USER_AGENT) {
             Ok(host) => Some(host),
             Err(e) => {
@@ -2050,12 +2113,10 @@ impl TabState {
             (None, Some(doc)) => doc.title(),
             (None, None) => None,
         };
-        let ready = if self.parser.is_some() {
-            "loading"
-        } else if !self.scripts.deferred.is_empty() || self.scripts.running_deferred {
-            "interactive"
-        } else {
-            "complete"
+        let ready = match self.lifecycle {
+            Lifecycle::Loading => "loading",
+            Lifecycle::Interactive | Lifecycle::ContentLoaded => "interactive",
+            Lifecycle::Complete => "complete",
         };
         // A document not decoded from bytes (`about:`) counts as UTF-8.
         let (encoding, quirks) = match (&self.parser, &self.doc) {
@@ -2102,6 +2163,7 @@ impl TabState {
     fn pump_scripts(&mut self) {
         self.drive_parser();
         self.run_ready_scripts();
+        self.update_readiness();
     }
 
     /// Run the parser until it runs dry or waits on a script fetch. Every
@@ -4085,6 +4147,45 @@ mod tests {
         h.pump_until(|h| h.rect_of(p).height == 70.0);
         assert_eq!(h.rect_of(q).height, 30.0);
         assert_eq!(h.state.sheets.len(), 3, "import, its style, the link");
+    }
+
+    #[test]
+    fn lifecycle_events_fire_in_order_and_load_waits_for_fetches() {
+        // readystatechange (interactive) before deferred scripts, then
+        // DOMContentLoaded (bubbling to window), then once the held image
+        // arrives: readystatechange (complete) and load on window.
+        let page = "<!DOCTYPE html><title>Life</title>\
+            <script>var log = []; var note = (n) => () => log.push(n + ':' + document.readyState); \
+              document.addEventListener('readystatechange', note('rsc')); document.addEventListener('DOMContentLoaded', note('dcl')); \
+              window.addEventListener('DOMContentLoaded', note('dcl@window')); window.addEventListener('load', ev => log.push('load:' + document.readyState + ':' + (ev.target === window) + ':' + ev.bubbles)); \
+              document.onreadystatechange = note('onrsc'); console.log('inline:' + document.readyState)</script>\
+            <script defer src='/d.js'></script><body><img src='/img.png'>\
+            <script>setTimeout(() => console.log(log.join(' ')), 20)</script>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/d.js", "text/javascript", "console.log('defer:' + document.readyState)"),
+                ("/img.png", "image/png", ""),
+            ],
+            &["/img.png"],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.doc.is_some() && h.state.scripts.deferred.is_empty());
+        assert_eq!(console_texts(&h), ["inline:loading", "defer:interactive"]);
+        assert_eq!(h.state.lifecycle, Lifecycle::ContentLoaded);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        h.pump();
+        assert_eq!(
+            console_texts(&h).last().map(String::as_str),
+            Some("rsc:interactive onrsc:interactive dcl:interactive dcl@window:interactive"),
+            "no load while the image is held"
+        );
+        server.release("/img.png");
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        assert_eq!(
+            h.state.script.as_mut().and_then(|s| s.eval_to_string("log.slice(4).join(' ')").ok()).as_deref(),
+            Some("\"rsc:complete onrsc:complete load:complete:true:false\"")
+        );
     }
 
     #[test]
