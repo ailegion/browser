@@ -109,6 +109,11 @@ pub struct TextFragment {
     pub skew: Option<f32>,
     pub underline: Option<Decoration>,
     pub strikethrough: Option<Decoration>,
+    /// Where the decoration lines go when they are on: (top relative to
+    /// the fragment's top, thickness), from the font's metrics. Kept so a
+    /// paint-only restyle can toggle them (`LayoutTree::refresh_styles`).
+    pub underline_metrics: (f32, f32),
+    pub strikethrough_metrics: (f32, f32),
     /// Baseline y relative to the fragment's top.
     pub baseline: f32,
 }
@@ -185,6 +190,47 @@ pub struct LayoutTree {
 }
 
 impl LayoutTree {
+    /// After a restyle that changed no layout-affecting value: every
+    /// fragment takes its element's current style (a text fragment its
+    /// parent element's), so the painter sees the new colours,
+    /// backgrounds and decorations without a layout. Text colour and the
+    /// decoration lines are refreshed in place, as they were baked in at
+    /// layout.
+    pub fn refresh_styles(&mut self, doc: &browser_dom::Document, styles: &browser_style::StyleMap) {
+        fn refresh(f: &mut Fragment, doc: &browser_dom::Document, styles: &browser_style::StyleMap) {
+            if let Some(n) = f.node
+                && doc.contains(n)
+            {
+                let style = if doc.get(n).is_element() {
+                    styles.get(n)
+                } else {
+                    doc.parent(n).and_then(|p| styles.get(p))
+                };
+                if let Some(s) = style
+                    && !Arc::ptr_eq(s, &f.style)
+                {
+                    f.style = s.clone();
+                    if let FragmentContent::Text(t) = &mut f.content {
+                        t.color = s.color;
+                        let line = |on: bool, (y, thickness): (f32, f32)| {
+                            on.then_some(Decoration {
+                                y,
+                                thickness,
+                                color: s.text_decoration_color,
+                            })
+                        };
+                        t.underline = line(s.text_decoration.underline, t.underline_metrics);
+                        t.strikethrough = line(s.text_decoration.line_through, t.strikethrough_metrics);
+                    }
+                }
+            }
+            for c in &mut f.children {
+                refresh(c, doc, styles);
+            }
+        }
+        refresh(&mut self.root, doc, styles);
+    }
+
     /// The rectangle of the first fragment (in tree order) whose node
     /// satisfies `matches`. Inline elements have no box of their own, so
     /// callers accept their text nodes too.

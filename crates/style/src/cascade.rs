@@ -176,8 +176,12 @@ pub fn compute_styles_with(
 /// What an incremental restyle did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Restyled {
-    /// Some computed style changed, so layout has to run again.
+    /// A layout-affecting value changed (`ComputedStyle::layout_differs`),
+    /// so layout has to run again.
     pub moved: bool,
+    /// Some computed value changed, so the page has to be painted again
+    /// (with `moved` false: from the current layout, with the new styles).
+    pub repaint: bool,
     /// Elements whose style was recomputed.
     pub styled: usize,
 }
@@ -265,7 +269,9 @@ pub fn restyle(
     let mut restyler = Restyler::new(doc, stylist, viewport, states, &must);
     let mut result = Restyled::default();
     for (root, keys) in &jobs {
-        result.moved |= restyler.restyle_subtree(*root, styles, keys.as_ref());
+        let (changed, moved) = restyler.restyle_subtree(*root, styles, keys.as_ref());
+        result.repaint |= changed;
+        result.moved |= moved;
     }
     result.styled = restyler.styled;
     result
@@ -355,14 +361,15 @@ impl<'a> Restyler<'a> {
     /// Style everything under `root`, in pre-order so parents are computed
     /// before children.
     fn restyle_all(&mut self, root: NodeId, styles: &mut StyleMap) -> bool {
-        self.walk(root, styles, true, None)
+        self.walk(root, styles, true, None).0
     }
 
     /// Style `root`; below it, recompute the elements whose key is in
     /// `keys` (none if `keys` is `None`), the elements whose own state
     /// changed, and every descendant of an element whose style changed
-    /// (it may inherit from it). Returns whether any style changed.
-    fn restyle_subtree(&mut self, root: NodeId, styles: &mut StyleMap, keys: Option<&SubjectKeys>) -> bool {
+    /// (it may inherit from it). Returns whether any style changed, and
+    /// whether a layout-affecting value did.
+    fn restyle_subtree(&mut self, root: NodeId, styles: &mut StyleMap, keys: Option<&SubjectKeys>) -> (bool, bool) {
         match keys {
             Some(keys) => {
                 let keep = |e: &browser_dom::Element| keys.matches(e);
@@ -378,10 +385,11 @@ impl<'a> Restyler<'a> {
         styles: &mut StyleMap,
         descendants: bool,
         filter: Option<&dyn Fn(&browser_dom::Element) -> bool>,
-    ) -> bool {
+    ) -> (bool, bool) {
         let doc = self.doc;
         let doc_root = doc.document_element();
         let mut changed = false;
+        let mut moved = false;
         // (element, parent's style changed)
         let mut stack = vec![(root, true)];
         while let Some((id, forced)) = stack.pop() {
@@ -404,7 +412,9 @@ impl<'a> Restyler<'a> {
                 };
                 let computed = self.style_element(id, element, &parent_style, root_font_size, is_root);
                 self.styled += 1;
-                if styles.get(id).is_none_or(|old| **old != computed) {
+                let old = styles.get(id);
+                if old.is_none_or(|old| **old != computed) {
+                    moved |= old.is_none_or(|old| old.layout_differs(&computed));
                     styles.insert(id, Arc::new(computed));
                     changed = true;
                     changed_here = true;
@@ -419,7 +429,7 @@ impl<'a> Restyler<'a> {
                 }
             }
         }
-        changed
+        (changed, moved)
     }
 
     /// Match, cascade and compute one element.
@@ -976,16 +986,19 @@ mod tests {
         let deps = stylist.interaction_deps();
         assert_eq!(deps.hover, Reach::Subtree);
         let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
-        assert!(r.moved);
+        assert!(r.moved, "bold moves text");
+        assert!(r.repaint);
         for (id, s) in full.iter() {
             assert_eq!(**s, *styles[id]);
         }
         let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
-        assert!(!r.moved, "nothing left to change");
+        assert!(!r.moved && !r.repaint, "nothing left to change");
 
-        // Leaving: the same roots, back to the plain styles.
+        // Leaving: the same roots, back to the plain styles; only colours
+        // change (the bold stays with the focus), so no layout.
         let changed = states.set_chain(&doc, None, ElementStates::HOVER);
-        assert!(restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps }).moved);
+        let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
+        assert!(r.repaint && !r.moved, "{r:?}");
         assert_eq!(styles[a].background_color.to_rgba8(), [0, 0, 0, 0]);
         assert_eq!(styles[a].font_weight, 700, "focus is separate from hover");
         assert_eq!(styles[span].color.to_rgba8(), [0, 0, 0, 255]);
@@ -1026,7 +1039,7 @@ mod tests {
         let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
         let full = compute_styles_with(&doc, &stylist, &vp, &states);
         let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
-        assert!(r.moved);
+        assert!(r.repaint && !r.moved, "colours only: {r:?}");
         for (id, s) in full.iter() {
             assert_eq!(**s, *styles[id]);
         }
@@ -1084,7 +1097,7 @@ mod tests {
             &mut styles,
             StateChange { changed: &changed, state: StateKind::Hover, deps: &deps },
         );
-        assert!(r.moved);
+        assert!(r.repaint && !r.moved);
         for (id, s) in full.iter() {
             assert_eq!(**s, *styles[id]);
         }
@@ -1140,7 +1153,7 @@ mod tests {
             &mut styles,
             StateChange { changed: &changed, state: StateKind::Hover, deps: &deps },
         );
-        assert!(r.moved);
+        assert!(r.repaint && !r.moved);
         for (id, s) in full.iter() {
             assert_eq!(**s, *styles[id]);
         }
@@ -1172,7 +1185,7 @@ mod tests {
         let mut states = ElementStates::default();
         let changed = states.set_chain(&doc, Some(div), ElementStates::HOVER);
         let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
-        assert!(r.moved);
+        assert!(r.repaint && !r.moved);
         for p in doc.children(div).filter(|&c| doc.get(c).is_element()) {
             assert_eq!(styles[p].color.to_rgba8(), [255, 0, 0, 255]);
         }
@@ -1193,8 +1206,40 @@ mod tests {
         let mut states = ElementStates::default();
         let changed = states.set_chain(&doc, Some(a), ElementStates::HOVER);
         let r = restyle(&doc, &stylist, &vp, &states, &mut styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps });
-        assert!(r.moved);
+        assert!(r.repaint && !r.moved);
         assert_eq!(styles[span].color.to_rgba8(), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn restyle_tells_paint_only_changes_from_layout_changes() {
+        // A hover that changes a background is paint-only; one that
+        // changes padding, a font or an underline moves or repaints as
+        // browsers classify them (an underline is painted, not laid out).
+        let doc = parse_html(b"<p><a href=x>one</a> <b>two</b> <i>three</i> <u>four</u></p>");
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            "a:hover { background: red; color: white; text-decoration: underline; opacity: 0.5 } b:hover { padding: 2px } i:hover { font-weight: bold } u:hover { visibility: hidden }",
+            Origin::Author,
+        )));
+        let vp = Viewport::default();
+        let deps = stylist.interaction_deps();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let hover = |tag: &str, states: &mut ElementStates, styles: &mut StyleMap| {
+            let changed = states.set_chain(&doc, Some(find(&doc, tag)), ElementStates::HOVER);
+            restyle(&doc, &stylist, &vp, states, styles, StateChange { changed: &changed, state: StateKind::Hover, deps: &deps })
+        };
+        let mut states = ElementStates::default();
+        // Paint-only in and out: `a` gains, then loses its hover to `u`.
+        let r = hover("a", &mut states, &mut styles);
+        assert!(r.repaint && !r.moved, "{r:?}");
+        let r = hover("u", &mut states, &mut styles);
+        assert!(r.repaint && !r.moved, "{r:?}");
+        // Padding, then bold (and `b` losing its padding): layout.
+        let r = hover("b", &mut states, &mut styles);
+        assert!(r.moved, "{r:?}");
+        let r = hover("i", &mut states, &mut styles);
+        assert!(r.moved, "{r:?}");
     }
 
     #[test]

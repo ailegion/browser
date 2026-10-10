@@ -284,6 +284,56 @@ impl ComputedStyle {
             || self.border_width.bottom > 0.0
             || self.border_width.left > 0.0
     }
+
+    /// Whether going from `self` to `other` changes anything layout
+    /// reads: box, size, font, text flow, flex and gap properties. A
+    /// change in colours, backgrounds, decorations, opacity, visibility
+    /// or custom properties alone is paint-only, as browsers classify it
+    /// (repaint without reflow).
+    pub fn layout_differs(&self, other: &ComputedStyle) -> bool {
+        self.display != other.display
+            || self.position != other.position
+            || self.float != other.float
+            || self.clear != other.clear
+            || self.box_sizing != other.box_sizing
+            || self.inset != other.inset
+            || self.margin != other.margin
+            || self.padding != other.padding
+            || self.border_width != other.border_width
+            || self.width != other.width
+            || self.height != other.height
+            || self.min_width != other.min_width
+            || self.min_height != other.min_height
+            || self.max_width != other.max_width
+            || self.max_height != other.max_height
+            || self.overflow_x != other.overflow_x
+            || self.overflow_y != other.overflow_y
+            || self.font_family != other.font_family
+            || self.font_size != other.font_size
+            || self.font_weight != other.font_weight
+            || self.font_style != other.font_style
+            || self.font_variant != other.font_variant
+            || self.font_stretch != other.font_stretch
+            || self.line_height != other.line_height
+            || self.text_align != other.text_align
+            || self.text_transform != other.text_transform
+            || self.white_space != other.white_space
+            || self.list_style_type != other.list_style_type
+            || self.list_style_position != other.list_style_position
+            || self.list_style_image != other.list_style_image
+            || self.vertical_align != other.vertical_align
+            || self.flex_direction != other.flex_direction
+            || self.flex_wrap != other.flex_wrap
+            || self.justify_content != other.justify_content
+            || self.align_items != other.align_items
+            || self.align_self != other.align_self
+            || self.align_content != other.align_content
+            || self.flex_grow != other.flex_grow
+            || self.flex_shrink != other.flex_shrink
+            || self.flex_basis != other.flex_basis
+            || self.row_gap != other.row_gap
+            || self.column_gap != other.column_gap
+    }
 }
 
 /// Declared values for one element, indexed by `PropertyId`, plus the

@@ -22,3 +22,7 @@ vello.workspace = true
 url.workspace = true
 html5ever.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The timing probe (`probe_page_timings`) shows the tab's debug logs.
+tracing-subscriber.workspace = true

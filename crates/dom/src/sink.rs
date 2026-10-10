@@ -401,3 +401,52 @@ pub fn parse_html(bytes: &[u8]) -> Document {
     p.feed(bytes);
     p.finish()
 }
+
+#[cfg(test)]
+mod probe {
+    use super::*;
+
+    /// Where parsing time goes on a real page:
+    /// `BROWSER_PROBE_HTML=<file> cargo test -p browser-dom --release probe_parse -- --ignored --nocapture`.
+    /// Times the whole parse into the arena, html5ever's tokenizer alone
+    /// (a counting sink), and html5ever's tree builder with a sink that
+    /// stores nothing.
+    #[test]
+    #[ignore]
+    fn probe_parse_timings() {
+        use html5ever::tokenizer::{BufferQueue, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts};
+        let Ok(path) = std::env::var("BROWSER_PROBE_HTML") else { return };
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+
+        let t = std::time::Instant::now();
+        let doc = parse_html(&bytes);
+        eprintln!("parse_html: {:?}, {} nodes", t.elapsed(), doc.node_count());
+
+        let t = std::time::Instant::now();
+        let mut p = HtmlParser::new(None);
+        for chunk in bytes.chunks(417_792) {
+            p.feed(chunk);
+        }
+        let doc = p.finish();
+        eprintln!("parse_html in 418K chunks: {:?}, {} nodes", t.elapsed(), doc.node_count());
+
+        struct Count(std::cell::Cell<usize>);
+        impl TokenSink for Count {
+            type Handle = ();
+            fn process_token(&self, token: Token, _line: u64) -> TokenSinkResult<()> {
+                if let Token::TagToken(_) = token {
+                    self.0.set(self.0.get() + 1);
+                }
+                TokenSinkResult::Continue
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let t = std::time::Instant::now();
+        let tok = Tokenizer::new(Count(std::cell::Cell::new(0)), TokenizerOpts::default());
+        let queue = BufferQueue::default();
+        queue.push_back(StrTendril::from_slice(&text));
+        let _ = tok.feed(&queue);
+        tok.end();
+        eprintln!("tokenizer only: {:?}, {} tags", t.elapsed(), tok.sink.0.get());
+    }
+}

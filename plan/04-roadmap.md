@@ -1152,6 +1152,34 @@ Work:
       release carries it). Tests: layout (5% padding on every side of a
       box in an 800px body is 40px in the box and in the reported
       padding), the tab CSSOM test measures `padding: 5%` again.
+      **Interaction fix 2026-10-11 (found on
+      `iana.org/domains/idn-tables`, 373k nodes, `tr:hover td` rules):**
+      a restyle for hover, focus, active or target reported `moved` for
+      any changed computed value, so a paint-only change (background,
+      colour, decoration) relaid out the whole page: 2 s per scroll
+      tick, per pointer move onto another row and per Tab press, inputs
+      queued behind each other and the page was dead. Now, as browsers
+      classify style changes: `ComputedStyle::layout_differs` names the
+      layout-affecting properties; `Restyled` carries `moved` (layout)
+      and `repaint` separately; on a paint-only change the tab calls
+      `LayoutTree::refresh_styles`, which gives every fragment its
+      element's current style and refreshes text colour and the
+      underline/strikethrough lines from metrics now kept on each text
+      fragment (`a:hover { text-decoration: underline }` is paint-only
+      too), then repaints. Measured on that page in release: scroll
+      2.05 s → 21 ms, pointer move 2.0 s → 21 ms, drag 2 s → 40 ms, Tab
+      2.1 s → 69 ms; a resize still relays out (3 s), which is item 4b.
+      Tests: style (paint-only vs layout changes, in and out of hover),
+      layout (refresh keeps boxes, updates colour, background and the
+      underline), tab harness (hover with a background rule: no layout;
+      with a padding rule: layout), plus two `#[ignore]` probes for
+      real pages (`probe_parse_timings` in `browser-dom`,
+      `probe_page_timings` in `browser-tab`, see their docs).
+   4b. **Big pages (next, before 5).** Render progressively while the
+      document streams in (first paint before parsing ends, as browsers
+      do; today nothing shows until the whole document is parsed), and
+      bring the layout of a 12,000-row table under a second (2 s today,
+      paid again on every resize).
    4a. **Engine properties (next, before 5).** Properties the engine
       does not know, so neither the cascade, layout, paint nor the CSSOM
       (which is table-driven and gets them for free once they are in the

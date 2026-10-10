@@ -977,6 +977,9 @@ fn emit_text_fragments(
                                 }
                             })
                         };
+                        // The same geometry for a line turned on later.
+                        let underline_metrics = (baseline - line_top - rm.underline_offset, rm.underline_size);
+                        let strikethrough_metrics = (baseline - line_top - rm.strikethrough_offset, rm.strikethrough_size);
                         let range = clusters.iter().map(|c| c.start).min().unwrap_or(0)
                             ..clusters.iter().map(|c| c.end).max().unwrap_or(0);
                         let text = TextFragment {
@@ -997,6 +1000,8 @@ fn emit_text_fragments(
                             skew: synthesis.skew(),
                             underline: deco(&style.underline, rm.underline_offset, rm.underline_size),
                             strikethrough: deco(&style.strikethrough, rm.strikethrough_offset, rm.strikethrough_size),
+                            underline_metrics,
+                            strikethrough_metrics,
                             baseline: baseline - line_top,
                         };
                         let (style, node) = span
@@ -1195,6 +1200,52 @@ mod tests {
         // Innermost with a node: the text fragment's node is the text node,
         // whose parent is p.
         assert!(hit == p || doc.parent(hit) == Some(p));
+    }
+
+    #[test]
+    fn refresh_styles_repaints_colours_and_decorations_without_layout() {
+        // The same document styled twice: the second sheet changes only
+        // paint (colour, background, underline). Refreshing the tree with
+        // the new styles keeps every box where it is and gives the text
+        // its new colour and underline from the metrics kept at layout.
+        let html = "<body style='margin:0'><p style='margin:0'><a href=x>link</a> and <b>bold</b></p></body>";
+        let (doc, mut tree) = layout(html, "a { color: red; text-decoration: none }");
+        let a = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "a"))
+            .expect("a");
+        let text_of = |tree: &LayoutTree| {
+            let mut found = None;
+            tree.root.walk(&mut |f| {
+                if let FragmentContent::Text(t) = &f.content
+                    && doc.parent(f.node.expect("node")) == Some(a)
+                    && found.is_none()
+                {
+                    found = Some((f.rect, t.color.to_rgba8(), t.underline, f.style.background_color.to_rgba8()));
+                }
+            });
+            found.expect("the link's text")
+        };
+        let (rect_before, color_before, underline_before, bg_before) = text_of(&tree);
+        assert_eq!(color_before, [255, 0, 0, 255]);
+        assert!(underline_before.is_none());
+        assert_eq!(bg_before, [0, 0, 0, 0]);
+
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            "a { color: white; background: blue; text-decoration: underline; text-decoration-color: lime }",
+            Origin::Author,
+        )));
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        tree.refresh_styles(&doc, &styles);
+        let (rect, color, underline, bg) = text_of(&tree);
+        assert_eq!(rect, rect_before, "no box moved");
+        assert_eq!(color, [255, 255, 255, 255]);
+        assert_eq!(bg, [0, 0, 255, 255], "the fragment carries the new style");
+        let underline = underline.expect("underline turned on");
+        assert!(underline.y > 0.0 && underline.thickness > 0.0, "{underline:?}");
+        assert_eq!(underline.color.to_rgba8(), [0, 255, 0, 255]);
     }
 
     #[test]

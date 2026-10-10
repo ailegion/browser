@@ -258,6 +258,9 @@ pub(crate) struct TabState {
     engine: Option<LayoutEngine>,
     styles: StyleMap,
     layout: Option<LayoutTree>,
+    /// How many layouts this tab has run: a paint-only restyle must not
+    /// add one (checked by tests; useful in logs).
+    layouts: u64,
     scene: Scene,
     /// The view lent to scripts: the viewport and what it needs to lay
     /// out; its caches live on between runs.
@@ -417,6 +420,7 @@ impl TabState {
             engine: Some(LayoutEngine::new()),
             styles: StyleMap::new(),
             layout: None,
+            layouts: 0,
             scene: Scene::new(),
             view: View::default(),
             window_size: (viewport.width, viewport.height),
@@ -1858,11 +1862,19 @@ impl TabState {
             ?reach,
             styled = result.styled,
             moved = result.moved,
+            repaint = result.repaint,
             ms = started.elapsed().as_millis(),
             "restyle for interaction"
         );
         if result.moved {
             self.needs_layout = true;
+        } else if result.repaint {
+            // Paint-only (colours, backgrounds, decorations): the boxes
+            // stay where they are and take the new styles.
+            if let Some(layout) = &mut self.layout {
+                layout.refresh_styles(doc, &self.styles);
+            }
+            self.needs_paint = true;
         }
     }
 
@@ -1976,8 +1988,20 @@ impl TabState {
                 let is_current_main = matches!(p.kind, PendingKind::Main)
                     && self.nav.as_ref().is_some_and(|n| n.request == id);
                 if is_current_main && let Some(parser) = &mut self.parser {
+                    let started = std::time::Instant::now();
                     parser.feed(&bytes);
+                    let feed = started.elapsed();
                     self.pump_scripts();
+                    let total = started.elapsed();
+                    if total.as_millis() > 20 {
+                        tracing::debug!(
+                            tab = self.id.0,
+                            bytes = bytes.len(),
+                            feed_ms = feed.as_millis(),
+                            total_ms = total.as_millis(),
+                            "slow chunk"
+                        );
+                    }
                 } else {
                     p.body.extend_from_slice(&bytes);
                 }
@@ -2436,8 +2460,11 @@ impl TabState {
             && self.parser.as_ref().is_some_and(HtmlParser::is_done)
             && let Some(parser) = self.parser.take()
         {
+            let started = std::time::Instant::now();
             let doc = parser.finish();
+            let finish_ms = started.elapsed().as_millis();
             self.set_document(doc);
+            tracing::debug!(tab = self.id.0, finish_ms, set_ms = started.elapsed().as_millis() - finish_ms, "document parsed");
         }
     }
 
@@ -3057,10 +3084,12 @@ impl TabState {
         let Some(engine) = &mut self.engine else { return };
         let started = std::time::Instant::now();
         let tree = engine.layout(doc, &self.styles, self.viewport.width, self.viewport.height, &self.images);
+        self.layouts += 1;
         tracing::debug!(
             tab = self.id.0,
             layout_ms = started.elapsed().as_millis(),
             content_height = tree.content_height,
+            layouts = self.layouts,
             "relayout"
         );
         self.layout = Some(tree);
@@ -3101,7 +3130,9 @@ impl TabState {
             caret: self.caret_rect,
             composition: self.composition_ranges(),
         };
+        let started = std::time::Instant::now();
         paint(tree, &self.images, &options, &mut self.scene);
+        tracing::debug!(tab = self.id.0, paint_ms = started.elapsed().as_millis(), "repaint");
         if let Some(sb) = self.scrollbar() {
             let active = self.scroll_drag.is_some() || self.over_scrollbar();
             sb.draw(&mut self.scene, self.viewport.scale_factor, active);
@@ -5564,6 +5595,174 @@ mod tests {
             run_js(&mut h, "a.style.color = 'revert'; [a.style.color, cs(a).color, cs(em).color].join('|')"),
             "\"revert|rgb(0, 0, 0)|rgb(0, 0, 0)\""
         );
+    }
+
+    #[test]
+    fn paint_only_hover_repaints_without_a_layout() {
+        // `a:hover` changes colours and the underline: the boxes stay,
+        // the text fragment takes the new colour and the line, no layout
+        // runs. `b:hover` changes padding: a layout runs.
+        let html = "<!DOCTYPE html><style>body { margin: 0 } a { text-decoration: none } a:hover { background: red; color: white; text-decoration: underline } b:hover { padding: 10px }</style>\
+             <p style='margin:0'><a href=x>link</a> and <b>bold</b> text</p>";
+        let mut h = Harness::load(html);
+        let layouts = h.state.layouts;
+        let doc = h.state.doc.as_ref().expect("doc");
+        let a = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "a"))
+            .expect("a");
+        let link_text = |h: &Harness| {
+            let doc = h.state.doc.as_ref().expect("doc");
+            let mut found = None;
+            h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+                if let browser_layout::FragmentContent::Text(t) = &f.content
+                    && doc.parent(f.node.expect("node")) == Some(a)
+                    && found.is_none()
+                {
+                    found = Some((f.rect, t.color.to_rgba8(), t.underline.is_some(), f.style.background_color.to_rgba8()));
+                }
+            });
+            found.expect("the link's text fragment")
+        };
+        let (rect, color, underline, bg) = link_text(&h);
+        assert_eq!((color, underline, bg), ([0, 0, 238, 255], false, [0, 0, 0, 0]));
+
+        let (x, y) = h.center("a");
+        h.send(ShellToTab::MouseMove { x, y });
+        assert_eq!(h.state.layouts, layouts, "a paint-only hover does not lay out");
+        let (rect2, color, underline, bg) = link_text(&h);
+        assert_eq!(rect2, rect);
+        assert_eq!((color, underline, bg), ([255, 255, 255, 255], true, [255, 0, 0, 255]), "painted from the new styles");
+        assert_eq!(h.style("a").color.to_rgba8(), [255, 255, 255, 255]);
+
+        let (x, y) = h.center("b");
+        h.send(ShellToTab::MouseMove { x, y });
+        assert_eq!(h.state.layouts, layouts + 1, "padding on hover lays out");
+        let (_, color, underline, _) = link_text(&h);
+        assert_eq!((color, underline), ([0, 0, 238, 255], false), "the link is plain again");
+        assert_eq!(h.style("b").padding.left, browser_style::ComputedLp::Px(10.0));
+    }
+
+    /// Where the time goes on a real page, served over loopback from a
+    /// file: `BROWSER_PROBE_HTML=<file> cargo test -p browser-tab --release
+    /// probe_page_timings -- --ignored --nocapture`. Prints the tab's debug
+    /// logs (parse, style, layout, paint) and the wall time of a load, two
+    /// pointer moves and a scroll.
+    #[test]
+    #[ignore]
+    fn probe_page_timings() {
+        let Ok(path) = std::env::var("BROWSER_PROBE_HTML") else { return };
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("probe html {path}: {e}"));
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        // No debug subscriber: html5ever logs every token at debug level
+        // through `log`, which would multiply the parse time; the shell
+        // filters at `info`. The stages are timed here directly instead.
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init();
+        let server = Server::start(&[("/page", "text/html; charset=utf-8", &html)], &[]);
+        // `BROWSER_PROBE_URL` loads a real URL through the real network
+        // instead, to see where a load that never finishes is stuck.
+        let url = match std::env::var("BROWSER_PROBE_URL") {
+            Ok(u) => Url::parse(&u).expect("probe url"),
+            Err(_) => server.url("/page"),
+        };
+        let started = std::time::Instant::now();
+        let mut h = Harness::start(url);
+        let deadline = started + std::time::Duration::from_secs(180);
+        let mut rounds = 0;
+        let mut last_report = started;
+        while h.state.lifecycle != Lifecycle::Complete && std::time::Instant::now() < deadline {
+            let t = std::time::Instant::now();
+            h.pump();
+            rounds += 1;
+            let ms = t.elapsed().as_millis();
+            if ms > 20 || last_report.elapsed().as_secs() >= 1 {
+                last_report = std::time::Instant::now();
+                let s = &h.state;
+                let pending: Vec<String> = s
+                    .pending
+                    .values()
+                    .map(|p| match &p.kind {
+                        PendingKind::Main => format!("main({} bytes buffered)", p.body.len()),
+                        PendingKind::Stylesheet { url, .. } => format!("css {url}"),
+                        PendingKind::Image { url } => format!("img {url}"),
+                        PendingKind::Script { .. } => "script".to_owned(),
+                        _ => "other".to_owned(),
+                    })
+                    .collect();
+                eprintln!(
+                    "{:5} ms round {rounds} ({ms} ms): parser={} blocked_script={:?} doc={} lifecycle={:?} nav={} blocking_script={:?} pending={:?}",
+                    started.elapsed().as_millis(),
+                    s.parser.is_some(),
+                    s.parser.as_ref().and_then(HtmlParser::blocked_script).is_some(),
+                    s.doc.is_some(),
+                    s.lifecycle,
+                    s.nav.is_some(),
+                    s.scripts.blocking.as_ref().map(|b| b.url.clone()),
+                    pending
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        eprintln!(
+            "load: {:?} in {rounds} rounds, lifecycle {:?}, nodes {}",
+            started.elapsed(),
+            h.state.lifecycle,
+            h.state.doc.as_ref().map_or(0, |d| d.node_count())
+        );
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            h.state.restyle_all();
+            let style = t.elapsed();
+            let t = std::time::Instant::now();
+            h.state.relayout();
+            let layout = t.elapsed();
+            let t = std::time::Instant::now();
+            h.state.repaint();
+            eprintln!("restyle {style:?}, relayout {layout:?}, repaint {:?}", t.elapsed());
+        }
+        // What a user does on the page, each input timed on its own.
+        let timed = |h: &mut Harness, what: &str, msg: ShellToTab| {
+            let t = std::time::Instant::now();
+            h.send(msg);
+            eprintln!("{what}: {:?}", t.elapsed());
+        };
+        for i in 0..5 {
+            let y = 100.0 + i as f32 * 60.0;
+            timed(&mut h, "mouse move", ShellToTab::MouseMove { x: 300.0, y });
+        }
+        for _ in 0..3 {
+            timed(&mut h, "wheel scroll", ShellToTab::Scroll { dx: 0.0, dy: 300.0 });
+        }
+        timed(&mut h, "mouse move after scroll", ShellToTab::MouseMove { x: 300.0, y: 250.0 });
+        timed(&mut h, "mouse down", ShellToTab::MouseDown { x: 300.0, y: 250.0, button: MouseButton::Left });
+        timed(&mut h, "drag 1", ShellToTab::MouseMove { x: 320.0, y: 300.0 });
+        timed(&mut h, "drag 2", ShellToTab::MouseMove { x: 340.0, y: 420.0 });
+        timed(&mut h, "drag 3 (past the bottom: autoscroll)", ShellToTab::MouseMove { x: 340.0, y: 620.0 });
+        timed(&mut h, "mouse up", ShellToTab::MouseUp { x: 340.0, y: 420.0, button: MouseButton::Left });
+        let t = std::time::Instant::now();
+        h.pump();
+        eprintln!("pump after the drag: {:?}", t.elapsed());
+        let tab = || ShellToTab::Key {
+            key: Key::Tab,
+            code: "Tab".to_owned(),
+            repeat: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        };
+        timed(&mut h, "tab key", tab());
+        timed(&mut h, "tab key again", tab());
+        timed(&mut h, "scroll far", ShellToTab::Scroll { dx: 0.0, dy: 400_000.0 });
+        timed(&mut h, "mouse move far down", ShellToTab::MouseMove { x: 300.0, y: 300.0 });
+        timed(&mut h, "resize", ShellToTab::Resize(Viewport { width: 900.0, height: 600.0, scale_factor: 1.0 }));
+        // A click on whatever link is at the pointer: a navigation starts.
+        let before = h.state.history.len();
+        timed(&mut h, "click (down)", ShellToTab::MouseDown { x: 300.0, y: 300.0, button: MouseButton::Left });
+        timed(&mut h, "click (up)", ShellToTab::MouseUp { x: 300.0, y: 300.0, button: MouseButton::Left });
+        eprintln!("navigations started by the click: {}", h.state.history.len() - before + usize::from(h.state.nav.is_some()));
     }
 }
 
