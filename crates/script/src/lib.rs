@@ -2023,6 +2023,14 @@ mod tests {
                        [st.gap, st.gridGap, st.cssText, st.backgroundImage, st.textDecoration].join('|')").as_deref(),
             Ok("\"1px|1px|gap: 1px; color: revert; background-image: url(\\\"a.png\\\"), none; text-decoration: underline wavy red;|url(\\\"a.png\\\"), none|underline wavy red\"")
         );
+        // `word-wrap` is `overflow-wrap`, both ways; the text properties
+        // of roadmap item 4a block 1 read back as written.
+        assert_eq!(
+            s(&mut h, "st.cssText = ''; st.wordWrap = 'break-word'; var a = [st.overflowWrap, st.wordWrap, st['word-wrap'], st.cssText]; \
+                       st.overflowWrap = 'anywhere'; st.letterSpacing = '.5em'; st.wordBreak = 'break-all'; st.textOverflow = 'ellipsis'; \
+                       a.push(st.wordWrap, st.cssText); st.letterSpacing = '10%'; a.push(st.letterSpacing); a.join('|')").as_deref(),
+            Ok("\"break-word|break-word|break-word|overflow-wrap: break-word;|anywhere|overflow-wrap: anywhere; letter-spacing: 0.5em; word-break: break-all; text-overflow: ellipsis;|0.5em\"")
+        );
         // Computed style without a view lent: empty, and read-only.
         assert_eq!(
             s(&mut h, "var cs = getComputedStyle(d); var errs = []; var tryit = f => { try { f() } catch (e) { errs.push(e.name) } }; \

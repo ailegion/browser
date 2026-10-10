@@ -5595,6 +5595,16 @@ mod tests {
             run_js(&mut h, "a.style.color = 'revert'; [a.style.color, cs(a).color, cs(em).color].join('|')"),
             "\"revert|rgb(0, 0, 0)|rgb(0, 0, 0)\""
         );
+        // Roadmap 4a block 1: the text properties resolve (`letter-spacing`
+        // in pixels, `word-wrap` as `overflow-wrap`, both inherited by
+        // `em`), and a `letter-spacing` write moves the text, so the
+        // element laid out wider at once.
+        assert_eq!(
+            run_js(&mut h, "var c = cs(a); var w0 = a.offsetWidth; a.style.width = 'auto'; a.style.display = 'inline-block'; a.style.whiteSpace = 'nowrap'; var w1 = a.offsetWidth; \
+                            a.style.letterSpacing = '0.5em'; a.style.wordWrap = 'break-word'; a.style.textOverflow = 'ellipsis'; a.style.wordBreak = 'keep-all'; var w2 = a.offsetWidth; \
+                            c = cs(a); [c.letterSpacing, c.wordWrap, c.overflowWrap, c.wordBreak, c.textOverflow, cs(em).letterSpacing, cs(em).overflowWrap, cs(em).textOverflow, w2 - w1 >= 20, c.getPropertyValue('word-wrap')].join('|')"),
+            "\"10px|break-word|break-word|keep-all|ellipsis|10px|break-word|clip|true|break-word\""
+        );
     }
 
     #[test]

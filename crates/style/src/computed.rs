@@ -27,6 +27,24 @@ impl LineHeight {
     }
 }
 
+/// Computed `letter-spacing`: `normal`, or an absolute length.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum LetterSpacing {
+    #[default]
+    Normal,
+    Px(f32),
+}
+
+impl LetterSpacing {
+    /// What layout adds between characters; `normal` adds nothing.
+    pub fn to_px(self) -> f32 {
+        match self {
+            LetterSpacing::Normal => 0.0,
+            LetterSpacing::Px(px) => px,
+        }
+    }
+}
+
 /// Computed `text-decoration-thickness`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum DecorationThickness {
@@ -123,6 +141,10 @@ pub struct ComputedStyle {
     pub text_decoration_thickness: DecorationThickness,
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
+    pub letter_spacing: LetterSpacing,
+    pub word_break: WordBreak,
+    pub overflow_wrap: OverflowWrap,
+    pub text_overflow: TextOverflow,
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
     pub list_style_image: Option<Arc<str>>,
@@ -217,6 +239,10 @@ impl ComputedStyle {
             text_decoration_thickness: DecorationThickness::Auto,
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
+            letter_spacing: LetterSpacing::Normal,
+            word_break: WordBreak::Normal,
+            overflow_wrap: OverflowWrap::Normal,
+            text_overflow: TextOverflow::Clip,
             list_style_type: ListStyleType::Disc,
             list_style_position: ListStylePosition::Outside,
             list_style_image: None,
@@ -258,6 +284,9 @@ impl ComputedStyle {
         self.text_align = p.text_align;
         self.text_transform = p.text_transform;
         self.white_space = p.white_space;
+        self.letter_spacing = p.letter_spacing;
+        self.word_break = p.word_break;
+        self.overflow_wrap = p.overflow_wrap;
         self.list_style_type = p.list_style_type;
         self.list_style_position = p.list_style_position;
         self.list_style_image = p.list_style_image.clone();
@@ -318,6 +347,10 @@ impl ComputedStyle {
             || self.text_align != other.text_align
             || self.text_transform != other.text_transform
             || self.white_space != other.white_space
+            || self.letter_spacing != other.letter_spacing
+            || self.word_break != other.word_break
+            || self.overflow_wrap != other.overflow_wrap
+            || self.text_overflow != other.text_overflow
             || self.list_style_type != other.list_style_type
             || self.list_style_position != other.list_style_position
             || self.list_style_image != other.list_style_image
@@ -692,6 +725,17 @@ pub fn compute(
     });
     pick!(text_transform, TextTransform, TextTransform, |v| *v);
     pick!(white_space, WhiteSpace, WhiteSpace, |v| *v);
+    pick!(letter_spacing, LetterSpacing, LetterSpacing, |v| match v {
+        LetterSpacingValue::Normal => LetterSpacing::Normal,
+        LetterSpacingValue::Length(l) => LetterSpacing::Px(l.to_px(&ctx)),
+        LetterSpacingValue::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(&ctx) {
+            ComputedLp::Px(px) => LetterSpacing::Px(px),
+            ComputedLp::Percent(_) => LetterSpacing::Normal,
+        },
+    });
+    pick!(word_break, WordBreak, WordBreak, |v| *v);
+    pick!(overflow_wrap, OverflowWrap, OverflowWrap, |v| *v);
+    pick!(text_overflow, TextOverflow, TextOverflow, |v| v.clone());
     pick!(list_style_type, ListStyleType, ListStyleType, |v| v.computed());
     pick!(list_style_position, ListStylePosition, ListStylePosition, |v| *v);
     pick!(list_style_image, ListStyleImage, ListStyleImage, |v| v.url());

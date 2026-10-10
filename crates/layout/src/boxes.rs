@@ -110,6 +110,17 @@ pub(crate) struct InlineContent {
     /// Floats this root's lines must avoid; filled by the engine after the
     /// first layout pass, empty on float-free pages.
     pub floats: Vec<FloatBand>,
+    /// The `text-overflow` marker (an ellipsis or the given string) laid
+    /// out in the container's font, when the container asks for one and
+    /// clips its overflow; set by the engine once the root's width is
+    /// final. A line that overflows the root ends with it.
+    pub ellipsis: Option<Ellipsis>,
+}
+
+/// The laid-out `text-overflow` marker of an inline root.
+pub(crate) struct Ellipsis {
+    pub text: Arc<str>,
+    pub layout: parley::Layout<crate::Brush>,
 }
 
 impl InlineContent {
@@ -121,7 +132,18 @@ impl InlineContent {
             container,
             cache: Vec::new(),
             floats: Vec::new(),
+            ellipsis: None,
         }
+    }
+
+    /// Whether lines of this root that overflow it end with the
+    /// container's `text-overflow` marker: only when the container clips
+    /// (CSS Overflow 3: `overflow` other than `visible`) and asks for one.
+    pub fn text_overflow_marker(&self) -> Option<&str> {
+        if matches!(self.container.overflow_x, browser_style::Overflow::Visible) {
+            return None;
+        }
+        self.container.text_overflow.marker()
     }
 
     fn is_empty(&self) -> bool {

@@ -4,13 +4,20 @@
 use std::sync::Arc;
 
 use browser_dom::Document;
-use browser_style::{ComputedStyle, Float, FontStyle, LineHeight, Overflow, Position, StyleMap, TextAlign};
+use browser_style::{
+    ComputedStyle, Float, FontStyle, LineHeight, Overflow, OverflowWrap, Position, StyleMap, TextAlign, WordBreak,
+};
 use parley::layout::YieldData;
 use parley::style::{FontFamily, FontStyle as PFontStyle, FontWeight, LineHeight as PLineHeight, StyleProperty};
-use parley::{Alignment, AlignmentOptions, FontContext, InlineBox, InlineBoxKind, LayoutContext, PositionedLayoutItem};
+use parley::{
+    Alignment, AlignmentOptions, FontContext, InlineBox, InlineBoxKind, LayoutContext, OverflowWrap as POverflowWrap,
+    PositionedLayoutItem, TextWrapMode, WordBreak as PWordBreak,
+};
 use taffy::prelude::*;
 
-use crate::boxes::{Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, FloatBand, InlineContent, InlineLayout, TaffyId};
+use crate::boxes::{
+    Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineContent, InlineLayout, TaffyId,
+};
 use crate::convert::to_taffy;
 use crate::{Brush, Cluster, Decoration, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
 
@@ -419,6 +426,19 @@ impl LayoutEngine {
             ensure_layout(content, &mut self.fonts, &mut self.lcx, Some(width));
             // Keep only the final layout.
             content.cache.retain(|l| l.max_width == Some(width));
+            // The `text-overflow` marker, in the container's font.
+            let marker = content.text_overflow_marker().map(str::to_owned);
+            content.ellipsis = marker.map(|marker| {
+                let mut builder = self.lcx.ranged_builder(&mut self.fonts, &marker, 1.0, true);
+                push_style(&mut builder, &content.container, None);
+                let mut layout = builder.build(&marker);
+                layout.break_all_lines(None);
+                layout.align(Alignment::Start, AlignmentOptions::default());
+                Ellipsis {
+                    text: Arc::from(marker.as_str()),
+                    layout,
+                }
+            });
         }
     }
 
@@ -445,7 +465,8 @@ impl LayoutEngine {
                 let mut children = Vec::new();
                 if let Some(il) = content.cache.first() {
                     let text: Arc<str> = Arc::from(content.text.as_str());
-                    emit_text_fragments(content, &text, &il.layout, x, y, &mut children);
+                    let overflow = content.ellipsis.as_ref().map(|e| (rect.width, e));
+                    emit_text_fragments(content, &text, &il.layout, x, y, overflow, &mut children);
                 }
                 Fragment {
                     rect,
@@ -722,13 +743,15 @@ fn build_parley_layout(
         });
     }
     let mut layout = builder.build(&content.text);
+    // Spans that may not wrap carry `TextWrapMode::NoWrap` (`push_style`),
+    // so the width goes to parley in every case.
     let wrap = container.white_space.allows_wrap();
     let height = match max_width {
         Some(width) if width > 0.0 && !content.floats.is_empty() => {
             break_around_floats(&mut layout, width, wrap, &content.floats)
         }
         _ => {
-            layout.break_all_lines(if wrap { max_width } else { None });
+            layout.break_all_lines(max_width);
             layout.height()
         }
     };
@@ -758,7 +781,7 @@ fn break_around_floats(layout: &mut parley::Layout<Brush>, width: f32, wrap: boo
     let max_attempts = 2 * bands.len() + 2;
     let mut height = 0.0;
     for attempt in 0..=max_attempts {
-        let (h, ends) = break_once(layout, width, wrap, bands, &pins);
+        let (h, ends) = break_once(layout, width, bands, &pins);
         height = h;
         if !wrap || attempt == max_attempts {
             break;
@@ -789,15 +812,12 @@ fn break_around_floats(layout: &mut parley::Layout<Brush>, width: f32, wrap: boo
 fn break_once(
     layout: &mut parley::Layout<Brush>,
     width: f32,
-    wrap: bool,
     bands: &[FloatBand],
     pins: &[(usize, f32)],
 ) -> (f32, Vec<(f32, f32)>) {
     let mut ends: Vec<(f32, f32)> = Vec::new();
     let mut breaker = layout.break_lines();
-    breaker
-        .state_mut()
-        .set_layout_max_advance(if wrap { width } else { f32::MAX });
+    breaker.state_mut().set_layout_max_advance(width);
     'lines: while !breaker.is_done() {
         let index = ends.len();
         let mut y = breaker.committed_y() as f32;
@@ -816,7 +836,7 @@ fn break_once(
             let state = breaker.state_mut();
             state.set_line_y(y as f64);
             state.set_line_x(left);
-            state.set_line_max_advance(if wrap { right - left } else { f32::MAX });
+            state.set_line_max_advance(right - left);
             let line = match breaker.break_next() {
                 Some(YieldData::LineBreak(line)) => line,
                 // Only yielded for max-height and out-of-flow boxes, which
@@ -892,7 +912,29 @@ fn push_style(
     // The decoration lines take `text-decoration-color` (the text color
     // unless set).
     let decoration = Brush(style.text_decoration_color.to_rgba8());
-    let props: [StyleProperty<'_, Brush>; 10] = [
+    // `word-break: break-word` lays out as `normal` with `overflow-wrap:
+    // anywhere`, whatever `overflow-wrap` says (CSS Text 3).
+    let (word_break, overflow_wrap) = match style.word_break {
+        WordBreak::Normal => (PWordBreak::Normal, style.overflow_wrap),
+        WordBreak::BreakAll => (PWordBreak::BreakAll, style.overflow_wrap),
+        WordBreak::KeepAll => (PWordBreak::KeepAll, style.overflow_wrap),
+        WordBreak::BreakWord => (PWordBreak::Normal, OverflowWrap::Anywhere),
+    };
+    let overflow_wrap = match overflow_wrap {
+        OverflowWrap::Normal => POverflowWrap::Normal,
+        OverflowWrap::BreakWord => POverflowWrap::BreakWord,
+        OverflowWrap::Anywhere => POverflowWrap::Anywhere,
+    };
+    // Where `white-space` forbids wrapping, parley keeps the span on its
+    // line; the layout still knows the box's width, so alignment and the
+    // start edge of an overflowing line are right (CSS Text 3: an
+    // overflowing line is start-aligned).
+    let wrap_mode = if style.white_space.allows_wrap() {
+        TextWrapMode::Wrap
+    } else {
+        TextWrapMode::NoWrap
+    };
+    let props: [StyleProperty<'_, Brush>; 14] = [
         StyleProperty::FontFamily(FontFamily::Source(std::borrow::Cow::Borrowed(&style.font_family))),
         StyleProperty::FontSize(style.font_size.max(0.0)),
         StyleProperty::FontWeight(FontWeight::new(style.font_weight as f32)),
@@ -911,6 +953,10 @@ fn push_style(
         StyleProperty::Strikethrough(style.text_decoration.line_through),
         StyleProperty::UnderlineBrush(Some(decoration)),
         StyleProperty::StrikethroughBrush(Some(decoration)),
+        StyleProperty::LetterSpacing(style.letter_spacing.to_px()),
+        StyleProperty::WordBreak(word_break),
+        StyleProperty::OverflowWrap(overflow_wrap),
+        StyleProperty::TextWrapMode(wrap_mode),
     ];
     for p in props {
         match &range {
@@ -920,21 +966,166 @@ fn push_style(
     }
 }
 
+/// How much of a line `text-overflow` keeps: the content that fits before
+/// the marker at the line's end edge (the right edge of a left-to-right
+/// line, the left edge of a right-to-left one).
+struct Truncation {
+    rtl: bool,
+    /// The inline root's width.
+    width: f32,
+    marker_width: f32,
+}
+
+/// Slack for the overflow and fit checks, in px.
+const OVERFLOW_EPS: f32 = 0.01;
+
+impl Truncation {
+    /// The truncation for a line that overflows the root; `None` for one
+    /// that fits. Hanging trailing whitespace does not count as overflow.
+    fn for_line(line: &parley::layout::Line<'_, Brush>, width: f32, marker: &Ellipsis, rtl: bool) -> Option<Self> {
+        let m = line.metrics();
+        let overflows = if rtl {
+            m.offset + m.trailing_whitespace < -OVERFLOW_EPS
+        } else {
+            m.offset + m.advance - m.trailing_whitespace > width + OVERFLOW_EPS
+        };
+        overflows.then(|| Truncation {
+            rtl,
+            width,
+            marker_width: marker.layout.width(),
+        })
+    }
+
+    /// Whether content spanning `x0..x1` (root coordinates) stays: it must
+    /// end before the marker's place.
+    fn keeps(&self, x0: f32, x1: f32) -> bool {
+        if self.rtl {
+            x0 >= self.marker_width - OVERFLOW_EPS
+        } else {
+            x1 <= self.width - self.marker_width + OVERFLOW_EPS
+        }
+    }
+
+    /// Where the marker goes once the kept content ends at `kept_edge`
+    /// (its right edge for left-to-right, left edge for right-to-left;
+    /// `None` when nothing was kept: the marker sits at the start edge).
+    fn marker_x(&self, kept_edge: Option<f32>) -> f32 {
+        match (self.rtl, kept_edge) {
+            (false, Some(right)) => right,
+            (false, None) => 0.0,
+            (true, Some(left)) => left - self.marker_width,
+            (true, None) => self.width - self.marker_width,
+        }
+    }
+}
+
+/// The `text-overflow` marker as text fragments at `x` (root
+/// coordinates) on a line of `line_height` whose baseline is `baseline`
+/// below its top. It has no node: nothing selects, finds or hits it.
+#[allow(clippy::too_many_arguments)]
+fn emit_marker(
+    marker: &Ellipsis,
+    style: &Arc<ComputedStyle>,
+    ox: f32,
+    oy: f32,
+    x: f32,
+    baseline: f32,
+    line_height: f32,
+    out: &mut Vec<Fragment>,
+) {
+    let Some(line) = marker.layout.lines().next() else { return };
+    for item in line.items() {
+        let PositionedLayoutItem::GlyphRun(run) = item else { continue };
+        let r = run.run();
+        let rm = r.metrics();
+        let synthesis = r.synthesis();
+        let x0 = x + run.offset();
+        let mut gx = run.offset();
+        let mut glyphs = Vec::new();
+        let mut clusters = Vec::new();
+        for cluster in r.visual_clusters() {
+            let range = cluster.text_range();
+            let cluster_x = gx - run.offset();
+            let mut advance = 0.0;
+            for g in cluster.glyphs() {
+                glyphs.push(PositionedGlyph {
+                    id: g.id,
+                    x: gx + g.x - run.offset(),
+                    y: g.y + baseline,
+                });
+                gx += g.advance;
+                advance += g.advance;
+            }
+            clusters.push(Cluster {
+                start: range.start,
+                end: range.end,
+                x: cluster_x,
+                advance,
+                rtl: r.is_rtl(),
+            });
+        }
+        let line = |on: bool, offset: f32, size: f32| {
+            on.then_some(Decoration {
+                y: baseline - offset,
+                thickness: size,
+                color: style.text_decoration_color,
+            })
+        };
+        let text = TextFragment {
+            font: r.font().clone(),
+            font_size: r.font_size(),
+            coords: r.normalized_coords().to_vec(),
+            glyphs,
+            text: marker.text.clone(),
+            range: 0..marker.text.len(),
+            clusters,
+            color: style.color,
+            embolden: synthesis.embolden(),
+            skew: synthesis.skew(),
+            underline: line(style.text_decoration.underline, rm.underline_offset, rm.underline_size),
+            strikethrough: line(style.text_decoration.line_through, rm.strikethrough_offset, rm.strikethrough_size),
+            underline_metrics: (baseline - rm.underline_offset, rm.underline_size),
+            strikethrough_metrics: (baseline - rm.strikethrough_offset, rm.strikethrough_size),
+            baseline,
+        };
+        out.push(Fragment {
+            rect: Rect::new(ox + x0, oy, run.advance(), line_height),
+            node: None,
+            style: style.clone(),
+            content: FragmentContent::Text(text),
+            children: Vec::new(),
+            padding: Default::default(),
+            margin: Default::default(),
+        });
+    }
+}
+
 /// Turn a parley layout into text and atomic fragments positioned at
-/// (`ox`, `oy`), the inline root's top-left.
+/// (`ox`, `oy`), the inline root's top-left. With `overflow` (the root's
+/// width and its `text-overflow` marker), a line that overflows the root
+/// is cut where the marker still fits and ends with the marker.
+#[allow(clippy::too_many_arguments)]
 fn emit_text_fragments(
     content: &InlineContent,
     text: &Arc<str>,
     layout: &parley::Layout<Brush>,
     ox: f32,
     oy: f32,
+    overflow: Option<(f32, &Ellipsis)>,
     out: &mut Vec<Fragment>,
 ) {
     let styles = layout.styles();
+    let rtl = layout.is_rtl();
     for line in layout.lines() {
         let metrics = line.metrics();
         let line_top = metrics.block_min_coord;
         let line_height = metrics.block_max_coord - metrics.block_min_coord;
+        let trunc = overflow.and_then(|(width, marker)| Truncation::for_line(&line, width, marker, rtl));
+        // The edge of the kept content nearest the marker, and whether
+        // anything was dropped.
+        let mut kept_edge: Option<f32> = None;
+        let mut truncated = false;
+        let line_first = out.len();
         // A run is one font over any number of DOM spans and parley styles;
         // parley yields one GlyphRun per style range, and identical styles
         // merge across spans. Each run is walked once, cluster by cluster,
@@ -952,7 +1143,7 @@ fn emit_text_fragments(
                     let rm = r.metrics();
                     let synthesis = r.synthesis();
                     let baseline = run.baseline();
-                    let rtl = r.is_rtl();
+                    let run_rtl = r.is_rtl();
 
                     let make = |x0: f32,
                                 x1: f32,
@@ -1027,6 +1218,19 @@ fn emit_text_fragments(
                     for cluster in r.visual_clusters() {
                         let text_range = cluster.text_range();
                         let start = text_range.start;
+                        if let Some(t) = &trunc
+                            && !t.keeps(x, x + cluster.advance())
+                        {
+                            truncated = true;
+                            if t.rtl {
+                                // Dropped from the left; the kept content
+                                // starts where the first kept cluster does.
+                                x += cluster.advance();
+                                frag_x0 = x;
+                                continue;
+                            }
+                            break;
+                        }
                         let span = content.spans.iter().position(|s| s.start <= start && start < s.end);
                         let style_idx = cluster
                             .glyphs()
@@ -1049,6 +1253,7 @@ fn emit_text_fragments(
                         }
                         current = Some(key);
                         let cluster_x = x - frag_x0;
+                        let cluster_left = x;
                         let mut advance = 0.0;
                         for g in cluster.glyphs() {
                             glyphs.push(PositionedGlyph {
@@ -1064,7 +1269,13 @@ fn emit_text_fragments(
                             end: text_range.end,
                             x: cluster_x,
                             advance,
-                            rtl,
+                            rtl: run_rtl,
+                        });
+                        kept_edge = Some(match kept_edge {
+                            Some(k) if rtl => k.min(cluster_left),
+                            Some(k) => k.max(x),
+                            None if rtl => cluster_left,
+                            None => x,
                         });
                     }
                     if !glyphs.is_empty()
@@ -1072,17 +1283,65 @@ fn emit_text_fragments(
                     {
                         out.push(make(frag_x0, x, glyphs, clusters, span, style_idx));
                     }
+                    // Left to right, everything after the cut is dropped.
+                    if truncated && !rtl {
+                        break;
+                    }
                 }
                 PositionedLayoutItem::InlineBox(b) => {
+                    if let Some(t) = &trunc
+                        && !t.keeps(b.x, b.x + b.width)
+                    {
+                        truncated = true;
+                        if t.rtl {
+                            continue;
+                        }
+                        break;
+                    }
                     if let Some(atomic) = content.atomics.get(b.id as usize)
                         && let Some(result) = &atomic.result
                     {
                         let mut fragment = result.fragment.clone();
                         fragment.translate(ox + b.x, oy + b.y);
                         out.push(fragment);
+                        kept_edge = Some(match kept_edge {
+                            Some(k) if rtl => k.min(b.x),
+                            Some(k) => k.max(b.x + b.width),
+                            None if rtl => b.x,
+                            None => b.x + b.width,
+                        });
                     }
                 }
             }
+        }
+        if truncated
+            && let (Some(t), Some((_, marker))) = (&trunc, overflow)
+        {
+            // The dropped clusters are the logical end of the line. The
+            // text is still there, as in browsers: select-all and a
+            // triple click take it, so the last kept fragment's range
+            // runs to the line's end while its clusters stay what shows.
+            let line_end = line.text_range().end;
+            let last = out[line_first..]
+                .iter_mut()
+                .filter_map(|f| match &mut f.content {
+                    FragmentContent::Text(t) if f.node.is_some() && Arc::ptr_eq(&t.text, text) => Some(t),
+                    _ => None,
+                })
+                .max_by_key(|t| t.range.end);
+            if let Some(t) = last {
+                t.range.end = t.range.end.max(line_end);
+            }
+            emit_marker(
+                marker,
+                &content.container,
+                ox,
+                oy + line_top,
+                t.marker_x(kept_edge),
+                metrics.baseline - line_top,
+                line_height,
+                out,
+            );
         }
     }
 }
@@ -1269,6 +1528,190 @@ mod tests {
         let (rect, padding) = found.expect("the div's fragment");
         assert_eq!((rect.width, rect.height), (480.0, 120.0));
         assert_eq!((padding.top, padding.right, padding.bottom, padding.left), (40.0, 40.0, 40.0, 40.0));
+    }
+
+    /// Text fragments with their rectangles.
+    type Texts = Vec<(Rect, TextFragment)>;
+
+    /// Text fragments of the first element with the tag, and the marker
+    /// fragments (no node) under the same inline root.
+    fn texts_of(doc: &Document, tree: &LayoutTree, tag: &str) -> (Texts, Texts) {
+        let id = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == tag))
+            .expect("element");
+        let mut texts = Vec::new();
+        let mut markers = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let FragmentContent::Text(t) = &f.content {
+                match f.node {
+                    Some(n) if doc.parent(n) == Some(id) => texts.push((f.rect, t.clone())),
+                    None => markers.push((f.rect, t.clone())),
+                    _ => {}
+                }
+            }
+        });
+        (texts, markers)
+    }
+
+    #[test]
+    fn letter_spacing_widens_the_text() {
+        let html = |spacing: &str| {
+            format!("<body style='margin:0;font-size:16px'><p style='margin:0;white-space:nowrap;letter-spacing:{spacing}'>abcdefghij</p></body>")
+        };
+        let (doc, plain) = layout(&html("normal"), "");
+        let (doc2, spaced) = layout(&html("4px"), "");
+        // A `calc()` of one unit sums; mixed units wait for roadmap item
+        // 4a block 8 (layout `calc()`).
+        let (doc3, calc) = layout(&html("calc(1px + 3px)"), "");
+        let width = |doc: &Document, tree: &LayoutTree| texts_of(doc, tree, "p").0.iter().map(|(r, _)| r.width).sum::<f32>();
+        let (w0, w1, w2) = (width(&doc, &plain), width(&doc2, &spaced), width(&doc3, &calc));
+        // Ten characters, 4px each.
+        assert!((w1 - w0 - 40.0).abs() < 1.0, "normal {w0}, 4px {w1}");
+        assert!((w2 - w1).abs() < 1.0, "calc(1px + 3px) is 4px: {w2} vs {w1}");
+        // The clusters carry the spacing too, so hit testing follows it.
+        let (texts, _) = texts_of(&doc2, &spaced, "p");
+        let c = &texts[0].1.clusters;
+        assert!((c[1].x - c[0].x - c[0].advance).abs() < 0.01 && c[0].advance > 4.0);
+    }
+
+    #[test]
+    fn word_break_and_overflow_wrap_break_long_words() {
+        let page = |css: &str| {
+            layout(
+                &format!("<body style='margin:0;font-size:16px'><p style='margin:0;width:100px;{css}'>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bb</p></body>"),
+                "",
+            )
+        };
+        let lines = |doc: &Document, tree: &LayoutTree| {
+            let (texts, _) = texts_of(doc, tree, "p");
+            let mut ys: Vec<i32> = texts.iter().map(|(r, _)| r.y.round() as i32).collect();
+            ys.dedup();
+            (ys.len(), texts.iter().map(|(r, _)| r.right()).fold(0.0f32, f32::max))
+        };
+        // By default the word cannot break: one long line past the box.
+        let (doc, tree) = page("");
+        let (n, right) = lines(&doc, &tree);
+        assert!(right > 100.0, "overflows: {right}");
+        assert!(n <= 2, "{n} lines");
+        // `break-all`, `overflow-wrap: anywhere`, `break-word` (both
+        // spellings) and `word-wrap`: broken to fit.
+        for css in ["word-break: break-all", "overflow-wrap: anywhere", "overflow-wrap: break-word", "word-break: break-word", "word-wrap: break-word"] {
+            let (doc, tree) = page(css);
+            let (n, right) = lines(&doc, &tree);
+            assert!(n >= 4, "{css}: {n} lines");
+            assert!(right <= 100.5, "{css}: right {right}");
+        }
+        // `keep-all` keeps CJK runs whole where `normal` breaks between
+        // ideographs.
+        let cjk = |css: &str| {
+            layout(
+                &format!("<body style='margin:0;font-size:16px'><p style='margin:0;width:60px;{css}'>日本語の文章 です</p></body>"),
+                "",
+            )
+        };
+        let (doc, tree) = cjk("word-break: keep-all");
+        let (keep, _) = lines(&doc, &tree);
+        let (doc, tree) = cjk("word-break: normal");
+        let (normal, _) = lines(&doc, &tree);
+        assert!(keep < normal, "keep-all {keep} lines, normal {normal}");
+    }
+
+    #[test]
+    fn nowrap_text_is_aligned_within_its_box() {
+        // A line that may not wrap still has the box's width to align in;
+        // one that overflows is start-aligned (CSS Text 3). Found while
+        // building `text-overflow`: before, a `nowrap` line had no width
+        // and `text-align: center` did nothing.
+        let page = |css: &str, text: &str| {
+            layout(
+                &format!("<body style='margin:0;font-size:16px'><p style='margin:0;width:300px;white-space:nowrap;{css}'>{text}</p></body>"),
+                "",
+            )
+        };
+        let extent = |doc: &Document, tree: &LayoutTree| {
+            let (texts, _) = texts_of(doc, tree, "p");
+            let left = texts.iter().map(|(r, _)| r.x).fold(f32::MAX, f32::min);
+            let right = texts.iter().map(|(r, _)| r.right()).fold(f32::MIN, f32::max);
+            (left, right)
+        };
+        let (doc, tree) = page("text-align: center", "short");
+        let (l, r) = extent(&doc, &tree);
+        assert!((l - (300.0 - r)).abs() < 1.0, "centered: {l}..{r}");
+        let (doc, tree) = page("text-align: right", "short");
+        let (_, r) = extent(&doc, &tree);
+        assert!((r - 300.0).abs() < 1.0, "right-aligned: ends at {r}");
+        // Overflowing: starts at the left edge whatever the alignment.
+        let (doc, tree) = page("text-align: center", &"wide ".repeat(30));
+        let (l, r) = extent(&doc, &tree);
+        assert!(l.abs() < 0.5 && r > 300.0, "{l}..{r}");
+        // A `nowrap` span inside a wrapping paragraph stays whole.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px'><p style='margin:0;width:100px'>a b c d e f <span style='white-space:nowrap'>one two three four five</span></p></body>",
+            "",
+        );
+        let (texts, _) = texts_of(&doc, &tree, "span");
+        let mut ys: Vec<i32> = texts.iter().map(|(r, _)| r.y.round() as i32).collect();
+        ys.dedup();
+        assert_eq!(ys.len(), 1, "the span is on one line: {texts:?}");
+    }
+
+    #[test]
+    fn text_overflow_ends_an_overflowing_line_with_the_marker() {
+        const TEXT: &str = "The quick brown fox jumps over the lazy dog";
+        let page = |css: &str| {
+            layout(
+                &format!("<body style='margin:0;font-size:16px'><p style='margin:0;width:120px;white-space:nowrap;{css}'>{TEXT}</p></body>"),
+                "",
+            )
+        };
+        // Visible overflow: no marker, the text runs past the box.
+        let (doc, tree) = page("text-overflow: ellipsis");
+        let (texts, markers) = texts_of(&doc, &tree, "p");
+        assert!(markers.is_empty());
+        assert!(texts.iter().map(|(r, _)| r.right()).fold(0.0f32, f32::max) > 120.0);
+        // Clipped: the marker stands after what fits, inside the box, and
+        // the text fragments stop before it.
+        let (doc, tree) = page("overflow: hidden; text-overflow: ellipsis");
+        let (texts, markers) = texts_of(&doc, &tree, "p");
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        let (mr, mt) = &markers[0];
+        assert_eq!(&*mt.text, "\u{2026}");
+        assert!(mr.right() <= 120.01 && mr.width > 0.0, "{mr:?}");
+        let text_right = texts.iter().map(|(r, _)| r.right()).fold(0.0f32, f32::max);
+        assert!((text_right - mr.x).abs() < 0.01, "marker right after the kept text: {text_right} vs {mr:?}");
+        let kept: usize = texts.iter().map(|(_, t)| t.clusters.len()).sum();
+        assert!(kept > 5 && kept < TEXT.len(), "{kept} clusters kept");
+        assert_eq!(mr.y, texts[0].0.y, "on the line");
+        assert_eq!(mt.baseline, texts[0].1.baseline, "on the baseline");
+        // The marker is not selectable: the extent of the text ends at
+        // the real text's end, not the marker.
+        let (_, end) = crate::selection::text_extent(&tree).expect("extent");
+        assert_eq!(end.offset, TEXT.len());
+        // A string marker; `clip` and a fitting line: no marker.
+        let (doc, tree) = page("overflow: hidden; text-overflow: \">>\"");
+        let (_, markers) = texts_of(&doc, &tree, "p");
+        assert_eq!(&*markers[0].1.text, ">>");
+        let (doc, tree) = page("overflow: hidden; text-overflow: clip");
+        assert!(texts_of(&doc, &tree, "p").1.is_empty());
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px'><p style='margin:0;width:400px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>fits</p></body>",
+            "",
+        );
+        assert!(texts_of(&doc, &tree, "p").1.is_empty());
+        // Right to left: the marker sits at the left edge of the box and
+        // the kept text runs to its right.
+        let (doc, tree) = layout(
+            &format!("<body style='margin:0;font-size:16px'><p dir=rtl style='margin:0;width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl'>{}</p></body>", "שלום עולם זהו משפט ארוך מאוד שלא נכנס"),
+            "",
+        );
+        let (texts, markers) = texts_of(&doc, &tree, "p");
+        assert_eq!(markers.len(), 1);
+        let mr = markers[0].0;
+        assert!(mr.x >= -0.01, "{mr:?}");
+        let text_left = texts.iter().map(|(r, _)| r.x).fold(f32::MAX, f32::min);
+        assert!((text_left - mr.right()).abs() < 0.01, "kept text starts at the marker's right: {text_left} vs {mr:?}");
+        assert!(texts.iter().all(|(r, _)| r.right() <= 120.5));
     }
 
     #[test]

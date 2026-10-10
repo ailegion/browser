@@ -1180,17 +1180,78 @@ Work:
       do; today nothing shows until the whole document is parsed), and
       bring the layout of a 12,000-row table under a second (2 s today,
       paid again on every resize).
-   4a. **Engine properties (next, before 5).** Properties the engine
-      does not know, so neither the cascade, layout, paint nor the CSSOM
-      (which is table-driven and gets them for free once they are in the
-      table) handle them: `transform`, `transition`, `animation`,
+   4a. **Engine properties (in progress, before 5).** Properties the
+      engine does not know, so neither the cascade, layout, paint nor the
+      CSSOM (which is table-driven and gets them for free once they are in
+      the table) handle them: `transform`, `transition`, `animation`,
       `box-shadow`, `cursor`, `z-index`, `outline`, `letter-spacing`,
       `word-break`, `text-overflow`, `pointer-events`, `user-select`,
       `grid-*`; and painting for the longhands block 2 added to the table
       without paint (`background-position`/`size`/`repeat`/`attachment`/
       `origin`/`clip`, `text-decoration-style`/`thickness`,
       `font-variant: small-caps`, `font-stretch`, `list-style-position`/
-      `image`). Each: parse, compute, lay out, paint.
+      `image`). Each: parse, compute, lay out, paint. Blocks, placed by
+      the owner 2026-10-11 and done in this order: (1) text at layout:
+      `letter-spacing`, `word-break`, `overflow-wrap` (added by the
+      owner, with its `word-wrap` alias), `text-overflow`; (2) font,
+      decoration and list paint: `font-variant: small-caps`,
+      `font-stretch`, `text-decoration-style`/`-thickness`,
+      `list-style-position`/`-image`; (3) backgrounds: every layer with
+      its position, size, repeat, attachment, origin and clip; (4)
+      `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
+      `cursor` (every keyword, `none`, `url()`), `pointer-events`,
+      `user-select`; (5) `z-index` and `transform`/`transform-origin`
+      with stacking contexts, paint order and hit testing through
+      transforms; (6) `grid-*` through taffy grid; (7) `transition-*`,
+      `animation-*`, `@keyframes` with the tab's animation clock and
+      events; (8) `calc()` with mixed units at layout (added by the
+      owner; `values.rs` folds a mixed sum to its first operand today).
+      **Block 1 done 2026-10-11: `letter-spacing`, `word-break`,
+      `overflow-wrap`, `text-overflow`.** Table (`crates/style`):
+      `letter-spacing` (`normal` or a length, `calc()` of lengths too,
+      percentages refused as browsers refuse them; computed as `normal`
+      or px; inherited), `word-break` (`normal | break-all | keep-all |
+      break-word`; inherited), `overflow-wrap` (`normal | break-word |
+      anywhere`; inherited) with `word-wrap` as its alias the way
+      `grid-gap` is `gap`'s (parsed and serialized as `overflow-wrap`,
+      `style.wordWrap` and `getComputedStyle().wordWrap` answer), and
+      `text-overflow` (`clip | ellipsis | <string>`, one value as Chrome
+      and Safari take it; not inherited). All four are layout-affecting
+      for the restyle split, serialize as written and resolve per CSSOM.
+      Layout (`crates/layout`): the three text properties go to parley
+      per span (`LetterSpacing`, `WordBreak`, `OverflowWrap`;
+      `word-break: break-word` lays out as `normal` plus `overflow-wrap:
+      anywhere` per CSS Text 3). `text-overflow` is built here, parley
+      has none: when the block container clips (`overflow-x` not
+      `visible`) and asks for a marker, the marker (an ellipsis or the
+      string) is laid out once in the container's font when the inline
+      root's width is final (`InlineContent::ellipsis`), and a line whose
+      content passes the root's end edge (hanging whitespace not counted)
+      is cut at the last cluster or inline box that fits before the
+      marker, which is placed right after the kept content at the line's
+      baseline (at the start edge when nothing fits); right-to-left lines
+      are cut at their left edge. The marker is a text fragment without
+      a node, so it is painted but never hit, selected or found; the
+      dropped text stays in the last kept fragment's range (its clusters
+      stay what shows), so select-all and a triple click copy the whole
+      line, as browsers do, while the mouse reaches only the shown text.
+      Found and fixed on the way: a `white-space: nowrap` (or `pre`) line
+      was broken with no width, so `text-align: center`/`right` did
+      nothing on it and an overflowing right-to-left line was anchored
+      at the wrong edge; now every span carries parley's `TextWrapMode`
+      from its own `white-space` (so a `nowrap` span inside a wrapping
+      paragraph stays whole, which is per-element as CSS says) and the
+      box's width always reaches parley, which start-aligns overflowing
+      lines as CSS Text 3 says. Tests: style (parsing of every form and
+      refusal, the alias both ways, serialization and resolved values),
+      layout (letter-spacing widens text and its clusters, `break-all`,
+      `anywhere`, `break-word` both ways and `word-wrap` break a long
+      word, `keep-all` keeps CJK runs, nowrap alignment and the nowrap
+      span, the ellipsis: placement, baseline, kept clusters, select-all
+      extent, a string marker, `clip`, a fitting line, right-to-left),
+      script (`wordWrap`/`overflowWrap` both ways, the four as written,
+      a percentage refused), tab harness (resolved values, inheritance
+      into a child, a `letter-spacing` write widening the box at once).
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.

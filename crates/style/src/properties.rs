@@ -690,6 +690,95 @@ impl WhiteSpace {
     }
 }
 
+/// `letter-spacing` as written: `normal`, or a length (a `calc()` of
+/// lengths too). Percentages are refused, as browsers refuse them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LetterSpacingValue {
+    Normal,
+    Length(Length),
+    Calc(Calc),
+}
+
+impl LetterSpacingValue {
+    pub fn to_css(&self) -> String {
+        match self {
+            LetterSpacingValue::Normal => "normal".to_owned(),
+            LetterSpacingValue::Length(l) => l.to_css(),
+            LetterSpacingValue::Calc(c) => c.to_css(),
+        }
+    }
+}
+
+/// `word-break`. `break-word` is the legacy keyword that lays out as
+/// `normal` with `overflow-wrap: anywhere` (CSS Text 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WordBreak {
+    #[default]
+    Normal,
+    BreakAll,
+    KeepAll,
+    BreakWord,
+}
+
+impl WordBreak {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            WordBreak::Normal => "normal",
+            WordBreak::BreakAll => "break-all",
+            WordBreak::KeepAll => "keep-all",
+            WordBreak::BreakWord => "break-word",
+        }
+    }
+}
+
+/// `overflow-wrap` (`word-wrap` is its legacy alias).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverflowWrap {
+    #[default]
+    Normal,
+    BreakWord,
+    Anywhere,
+}
+
+impl OverflowWrap {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            OverflowWrap::Normal => "normal",
+            OverflowWrap::BreakWord => "break-word",
+            OverflowWrap::Anywhere => "anywhere",
+        }
+    }
+}
+
+/// `text-overflow`: what a line that overflows a block with `overflow`
+/// other than `visible` ends with.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum TextOverflow {
+    #[default]
+    Clip,
+    Ellipsis,
+    String(Arc<str>),
+}
+
+impl TextOverflow {
+    /// The text drawn in place of what overflowed, if any.
+    pub fn marker(&self) -> Option<&str> {
+        match self {
+            TextOverflow::Clip => None,
+            TextOverflow::Ellipsis => Some("\u{2026}"),
+            TextOverflow::String(s) => Some(s),
+        }
+    }
+
+    pub fn to_css(&self) -> String {
+        match self {
+            TextOverflow::Clip => "clip".to_owned(),
+            TextOverflow::Ellipsis => "ellipsis".to_owned(),
+            TextOverflow::String(s) => css_string(s),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ListStyleType {
     None,
@@ -1370,6 +1459,10 @@ longhands! {
     TextDecorationThickness: "text-decoration-thickness" => TextDecorationThickness, false;
     TextTransform: "text-transform" => TextTransform, true;
     WhiteSpace: "white-space" => WhiteSpace, true;
+    LetterSpacing: "letter-spacing" => LetterSpacingValue, true;
+    WordBreak: "word-break" => WordBreak, true;
+    OverflowWrap: "overflow-wrap" => OverflowWrap, true;
+    TextOverflow: "text-overflow" => TextOverflow, false;
     ListStyleType: "list-style-type" => ListStyleTypeValue, true;
     ListStylePosition: "list-style-position" => ListStylePosition, true;
     ListStyleImage: "list-style-image" => ImageValue, true;
@@ -1465,9 +1558,10 @@ pub fn is_shorthand(name: &str) -> bool {
 }
 
 /// Every shorthand name, in the order the CSSOM tries them when it
-/// serializes a declaration block (the widest first; `grid-gap` is the
-/// legacy alias of `gap`, never written).
-pub const SHORTHANDS: [&str; 23] = [
+/// serializes a declaration block (the widest first; `grid-gap` and
+/// `word-wrap` are the legacy aliases of `gap` and `overflow-wrap`,
+/// never written).
+pub const SHORTHANDS: [&str; 24] = [
     "border",
     "border-width",
     "border-style",
@@ -1491,6 +1585,7 @@ pub const SHORTHANDS: [&str; 23] = [
     "place-content",
     "place-items",
     "grid-gap",
+    "word-wrap",
 ];
 
 /// One declaration in a block, with its `!important` flag.
@@ -1631,6 +1726,12 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "normal" => WhiteSpace::Normal, "nowrap" => WhiteSpace::Nowrap, "pre" => WhiteSpace::Pre,
             "pre-wrap" => WhiteSpace::PreWrap, "pre-line" => WhiteSpace::PreLine,
             "break-spaces" => WhiteSpace::BreakSpaces, _ => return None }))?),
+        PropertyId::LetterSpacing => P::LetterSpacing(parse_letter_spacing(input)?),
+        PropertyId::WordBreak => P::WordBreak(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "normal" => WordBreak::Normal, "break-all" => WordBreak::BreakAll, "keep-all" => WordBreak::KeepAll,
+            "break-word" => WordBreak::BreakWord, _ => return None }))?),
+        PropertyId::OverflowWrap => P::OverflowWrap(parse_overflow_wrap(input)?),
+        PropertyId::TextOverflow => P::TextOverflow(parse_text_overflow(input)?),
         PropertyId::ListStyleType => P::ListStyleType(parse_list_style_type(input)?),
         PropertyId::ListStylePosition => P::ListStylePosition(parse_list_style_position(input)?),
         PropertyId::ListStyleImage => P::ListStyleImage(parse_image(input)?),
@@ -2087,6 +2188,33 @@ fn parse_text_decoration_thickness<'i>(
     Ok(TextDecorationThickness::Length(parse_length_percentage(input)?))
 }
 
+fn parse_letter_spacing<'i>(input: &mut Parser<'i, '_>) -> Result<LetterSpacingValue, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("normal")).is_ok() {
+        return Ok(LetterSpacingValue::Normal);
+    }
+    Ok(match parse_length_percentage(input)? {
+        LengthPercentage::Length(l) => LetterSpacingValue::Length(l),
+        LengthPercentage::Calc(c) => LetterSpacingValue::Calc(c),
+        LengthPercentage::Percent(_) => return Err(input.new_custom_error(())),
+    })
+}
+
+fn parse_overflow_wrap<'i>(input: &mut Parser<'i, '_>) -> Result<OverflowWrap, ParseErr<'i>> {
+    keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "normal" => OverflowWrap::Normal, "break-word" => OverflowWrap::BreakWord,
+        "anywhere" => OverflowWrap::Anywhere, _ => return None }))
+}
+
+/// `clip | ellipsis | <string>`: one value, as Chrome and Safari take it
+/// (the two-value form is Firefox only).
+fn parse_text_overflow<'i>(input: &mut Parser<'i, '_>) -> Result<TextOverflow, ParseErr<'i>> {
+    if let Ok(s) = input.try_parse(|i| i.expect_string().map(|s| s.to_string())) {
+        return Ok(TextOverflow::String(Arc::from(s.as_str())));
+    }
+    keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "clip" => TextOverflow::Clip, "ellipsis" => TextOverflow::Ellipsis, _ => return None }))
+}
+
 fn parse_list_style_type<'i>(input: &mut Parser<'i, '_>) -> Result<ListStyleTypeValue, ParseErr<'i>> {
     if let Ok(s) = input.try_parse(|i| i.expect_string().map(|s| s.to_string())) {
         return Ok(ListStyleTypeValue::String(Arc::from(s.as_str())));
@@ -2188,6 +2316,7 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
         "gap" | "grid-gap" => &[RowGap, ColumnGap],
+        "word-wrap" => &[OverflowWrap],
         "text-decoration" => &[TextDecorationLine, TextDecorationThickness, TextDecorationStyle, TextDecorationColor],
         "list-style" => &[ListStyleType, ListStylePosition, ListStyleImage],
         "place-items" => &[AlignItems],
@@ -2278,6 +2407,8 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
             let c = input.try_parse(parse_gap_value).unwrap_or_else(|_| r.clone());
             vec![P::RowGap(r), P::ColumnGap(c)]
         },
+        // The legacy alias: parsed and stored as `overflow-wrap`.
+        "word-wrap" => vec![P::OverflowWrap(parse_overflow_wrap(input)?)],
         "text-decoration" => {
             // <line> || <thickness> || <style> || <color>, in any order,
             // each at most once; the line keywords may come one at a
@@ -2837,6 +2968,31 @@ mod tests {
         assert_eq!(parse("margin", "revert-layer").len(), 4);
         assert_eq!(parse("gap", "inherit").len(), 2);
         assert_eq!(parse("grid-gap", "inherit").len(), 2);
+    }
+
+    #[test]
+    fn text_properties_of_4a_block_1() {
+        let one = |name: &str, s: &str| parse(name, s).pop();
+        use DeclaredValue as D;
+        use PropertyDeclaration as P;
+        assert_eq!(one("letter-spacing", "normal"), Some(D::Value(P::LetterSpacing(LetterSpacingValue::Normal))));
+        assert_eq!(one("letter-spacing", "2px"), Some(D::Value(P::LetterSpacing(LetterSpacingValue::Length(Length::Px(2.0))))));
+        assert_eq!(one("letter-spacing", "-0.05em"), Some(D::Value(P::LetterSpacing(LetterSpacingValue::Length(Length::Em(-0.05))))));
+        assert!(matches!(one("letter-spacing", "calc(1px + 1em)"), Some(D::Value(P::LetterSpacing(LetterSpacingValue::Calc(_))))));
+        assert_eq!(one("letter-spacing", "5%"), None, "percentages are refused");
+        assert_eq!(one("letter-spacing", "2"), None);
+        assert_eq!(one("word-break", "keep-all"), Some(D::Value(P::WordBreak(WordBreak::KeepAll))));
+        assert_eq!(one("word-break", "break-word"), Some(D::Value(P::WordBreak(WordBreak::BreakWord))));
+        assert_eq!(one("word-break", "anywhere"), None);
+        assert_eq!(one("overflow-wrap", "anywhere"), Some(D::Value(P::OverflowWrap(OverflowWrap::Anywhere))));
+        // The legacy alias expands to the one longhand.
+        assert_eq!(parse("word-wrap", "break-word"), vec![D::Value(P::OverflowWrap(OverflowWrap::BreakWord))]);
+        assert_eq!(parse("word-wrap", "unset"), vec![D::Unset(PropertyId::OverflowWrap)]);
+        assert_eq!(longhands_of("word-wrap"), Some(vec![PropertyId::OverflowWrap]));
+        assert_eq!(one("text-overflow", "ellipsis"), Some(D::Value(P::TextOverflow(TextOverflow::Ellipsis))));
+        assert_eq!(one("text-overflow", "'...'"), Some(D::Value(P::TextOverflow(TextOverflow::String("...".into())))));
+        assert_eq!(one("text-overflow", "fade"), None);
+        assert_eq!(one("text-overflow", "clip clip"), None);
     }
 
     #[test]

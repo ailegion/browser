@@ -7,7 +7,9 @@
 //! name, lengths in the unit written. Shorthands are rebuilt from their
 //! longhands and omit the parts that are at their initial value.
 
-use crate::computed::{ComputedBackgroundSize, ComputedStyle, DecorationThickness, LineHeight, PositionOffset};
+use crate::computed::{
+    ComputedBackgroundSize, ComputedStyle, DecorationThickness, LetterSpacing, LineHeight, PositionOffset,
+};
 use crate::properties::*;
 use crate::values::*;
 
@@ -72,6 +74,10 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         },
         P::TextTransform(t) => t.keyword().to_owned(),
         P::WhiteSpace(w) => w.keyword().to_owned(),
+        P::LetterSpacing(l) => l.to_css(),
+        P::WordBreak(w) => w.keyword().to_owned(),
+        P::OverflowWrap(w) => w.keyword().to_owned(),
+        P::TextOverflow(t) => t.to_css(),
         P::ListStyleType(t) => t.to_css(),
         P::ListStylePosition(p) => p.keyword().to_owned(),
         P::VerticalAlign(v) => match v {
@@ -390,7 +396,7 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             }
             parts.join(" ")
         }
-        "place-items" => v(0).to_owned(),
+        "place-items" | "word-wrap" => v(0).to_owned(),
         _ => return None,
     })
 }
@@ -428,7 +434,8 @@ fn border_side_css(width: &str, style: &str, color: &str) -> String {
 /// them (`SHORTHANDS`).
 fn shorthands_of(id: PropertyId) -> impl Iterator<Item = &'static str> {
     // A shorthand that expands to a single longhand here (`place-items`,
-    // whose other longhand the table lacks) is not written in its place.
+    // whose other longhand the table lacks; the `word-wrap` alias) is not
+    // written in its place.
     SHORTHANDS
         .iter()
         .copied()
@@ -698,6 +705,13 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         },
         Id::TextTransform => style.text_transform.keyword().to_owned(),
         Id::WhiteSpace => style.white_space.keyword().to_owned(),
+        Id::LetterSpacing => match style.letter_spacing {
+            LetterSpacing::Normal => "normal".to_owned(),
+            LetterSpacing::Px(p) => px(p),
+        },
+        Id::WordBreak => style.word_break.keyword().to_owned(),
+        Id::OverflowWrap => style.overflow_wrap.keyword().to_owned(),
+        Id::TextOverflow => style.text_overflow.to_css(),
         Id::ListStyleType => style.list_style_type.keyword().to_owned(),
         Id::ListStylePosition => style.list_style_position.keyword().to_owned(),
         Id::ListStyleImage => style.list_style_image.as_deref().map_or("none".to_owned(), css_url),
@@ -769,6 +783,18 @@ mod tests {
             ("background-position: left 10px top, center", "background-position: left 10px top, center center;"),
             ("color: red !IMPORTANT", "color: red !important;"),
             ("zzz: 1; color: blue", "color: blue;"),
+            ("letter-spacing: normal", "letter-spacing: normal;"),
+            ("letter-spacing: 0.10EM", "letter-spacing: 0.1em;"),
+            ("letter-spacing: calc(1px + 1px)", "letter-spacing: calc(2px);"),
+            ("letter-spacing: 10%", ""),
+            ("word-break: BREAK-ALL", "word-break: break-all;"),
+            ("word-break: break-word", "word-break: break-word;"),
+            ("overflow-wrap: anywhere", "overflow-wrap: anywhere;"),
+            ("word-wrap: break-word", "overflow-wrap: break-word;"),
+            ("word-wrap: inherit", "overflow-wrap: inherit;"),
+            ("text-overflow: ELLIPSIS", "text-overflow: ellipsis;"),
+            ("text-overflow: \"--\"", "text-overflow: \"--\";"),
+            ("text-overflow: clip ellipsis", ""),
         ];
         for (input, expected) in cases {
             assert_eq!(block(input), expected, "for {input}");
@@ -851,7 +877,14 @@ mod tests {
         style.font_family = std::sync::Arc::from("\"Helvetica Neue\", \"Arial\", sans-serif");
         style.border_width.top = 2.0;
         style.inset.top = ComputedLpAuto::Px(5.0);
+        style.text_overflow = TextOverflow::String("~".into());
         // Not rendered: computed values.
+        assert_eq!(resolved_value(&style, PropertyId::LetterSpacing, None), "normal");
+        style.letter_spacing = LetterSpacing::Px(1.5);
+        assert_eq!(resolved_value(&style, PropertyId::LetterSpacing, None), "1.5px");
+        assert_eq!(resolved_value(&style, PropertyId::WordBreak, None), "normal");
+        assert_eq!(resolved_value(&style, PropertyId::OverflowWrap, None), "normal");
+        assert_eq!(resolved_value(&style, PropertyId::TextOverflow, None), "\"~\"");
         assert_eq!(resolved_value(&style, PropertyId::Width, None), "50%");
         assert_eq!(resolved_value(&style, PropertyId::PaddingLeft, None), "10%");
         assert_eq!(resolved_value(&style, PropertyId::MarginLeft, None), "auto");
