@@ -2017,6 +2017,12 @@ mod tests {
         );
         // A method called on the proxy itself finds its declarations.
         assert_eq!(s(&mut h, "CSSStyleDeclaration.prototype.getPropertyValue.call(st, 'margin-top')").as_deref(), Ok("\"1px\""));
+        // `grid-gap` is `gap`; `revert` reads back as written; layer lists.
+        assert_eq!(
+            s(&mut h, "st.cssText = ''; st.gridGap = '1px'; st.color = 'revert'; st.backgroundImage = 'url(a.png), none'; st.textDecoration = 'underline wavy red'; \
+                       [st.gap, st.gridGap, st.cssText, st.backgroundImage, st.textDecoration].join('|')").as_deref(),
+            Ok("\"1px|1px|gap: 1px; color: revert; background-image: url(\\\"a.png\\\"), none; text-decoration: underline wavy red;|url(\\\"a.png\\\"), none|underline wavy red\"")
+        );
         // Computed style without a view lent: empty, and read-only.
         assert_eq!(
             s(&mut h, "var cs = getComputedStyle(d); var errs = []; var tryit = f => { try { f() } catch (e) { errs.push(e.name) } }; \

@@ -39,12 +39,13 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::OverflowX(o) | P::OverflowY(o) => o.keyword().to_owned(),
         P::Visibility(v) => v.keyword().to_owned(),
         P::Color(c) | P::BackgroundColor(c) | P::TextDecorationColor(c) => c.to_css(),
-        P::BackgroundImage(i) | P::ListStyleImage(i) => i.to_css(),
-        P::BackgroundPosition(p) => p.to_css(),
-        P::BackgroundSize(s) => s.to_css(),
-        P::BackgroundRepeat(r) => r.to_css(),
-        P::BackgroundAttachment(a) => a.keyword().to_owned(),
-        P::BackgroundOrigin(b) | P::BackgroundClip(b) => b.keyword().to_owned(),
+        P::ListStyleImage(i) => i.to_css(),
+        P::BackgroundImage(list) => layers(list.iter().map(ImageValue::to_css)),
+        P::BackgroundPosition(list) => layers(list.iter().map(BackgroundPosition::to_css)),
+        P::BackgroundSize(list) => layers(list.iter().map(BackgroundSize::to_css)),
+        P::BackgroundRepeat(list) => layers(list.iter().map(|r| r.to_css())),
+        P::BackgroundAttachment(list) => layers(list.iter().map(|a| a.keyword().to_owned())),
+        P::BackgroundOrigin(list) | P::BackgroundClip(list) => layers(list.iter().map(|b| b.keyword().to_owned())),
         P::FontFamily(f) => font_family_css(f),
         P::FontSize(s) => font_size_css(s),
         P::FontWeight(w) => match w {
@@ -56,7 +57,7 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
             FontStyleValue::Normal => "normal".to_owned(),
             FontStyleValue::Italic => "italic".to_owned(),
             FontStyleValue::Oblique(None) => "oblique".to_owned(),
-            FontStyleValue::Oblique(Some(l)) => format!("oblique {}", l.to_css()),
+            FontStyleValue::Oblique(Some(deg)) => format!("oblique {}deg", css_number(*deg)),
         },
         P::FontVariant(v) => v.keyword().to_owned(),
         P::FontStretch(s) => s.to_css(),
@@ -94,6 +95,8 @@ pub fn serialize_declared(v: &DeclaredValue) -> String {
         DeclaredValue::Inherit(_) => "inherit".to_owned(),
         DeclaredValue::Initial(_) => "initial".to_owned(),
         DeclaredValue::Unset(_) => "unset".to_owned(),
+        DeclaredValue::Revert(_) => "revert".to_owned(),
+        DeclaredValue::RevertLayer(_) => "revert-layer".to_owned(),
         DeclaredValue::Custom { value, .. } => match value {
             CustomValue::Raw(raw) => raw.to_string(),
             CustomValue::Initial => "initial".to_owned(),
@@ -101,6 +104,45 @@ pub fn serialize_declared(v: &DeclaredValue) -> String {
         },
         DeclaredValue::Pending { raw, .. } => raw.to_string(),
     }
+}
+
+/// A comma-separated layer list.
+fn layers(items: impl Iterator<Item = String>) -> String {
+    items.collect::<Vec<_>>().join(", ")
+}
+
+/// Split a serialized layer list at its top-level commas (not those
+/// inside functions or strings).
+fn split_layers(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0u32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
 }
 
 fn border_width_css(w: &BorderWidth) -> String {
@@ -229,43 +271,60 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             border_side_css(v(0), v(4), v(8))
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => border_side_css(v(0), v(1), v(2)),
-        "overflow" | "gap" | "place-content" => {
+        "overflow" | "gap" | "grid-gap" | "place-content" => {
             if v(0) == v(1) { v(0).to_owned() } else { format!("{} {}", v(0), v(1)) }
         }
         "background" => {
-            let (color, image, position, size, repeat, attachment, origin, clip) =
-                (v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7));
-            let mut parts: Vec<String> = Vec::new();
-            if color != "transparent" {
-                parts.push(color.to_owned());
+            // One layer per entry of the lists, which must agree in
+            // length; the color goes with the last layer.
+            let color = v(0);
+            let lists: Vec<Vec<&str>> = (1..8).map(|i| split_layers(v(i))).collect();
+            let count = lists[0].len();
+            if lists.iter().any(|l| l.len() != count) || count == 0 {
+                return None;
             }
-            if image != "none" {
-                parts.push(image.to_owned());
-            }
-            let size_set = size != "auto";
-            if position != "0% 0%" || size_set {
-                parts.push(if size_set { format!("{position} / {size}") } else { position.to_owned() });
-            }
-            if repeat != "repeat" {
-                parts.push(repeat.to_owned());
-            }
-            if attachment != "scroll" {
-                parts.push(attachment.to_owned());
-            }
-            if origin != "padding-box" || clip != "border-box" {
-                parts.push(origin.to_owned());
-                if clip != origin {
-                    parts.push(clip.to_owned());
+            let mut out: Vec<String> = Vec::with_capacity(count);
+            for (layer, &image) in lists[0].iter().enumerate() {
+                let (position, size, repeat, attachment, origin, clip) = (
+                    lists[1][layer],
+                    lists[2][layer],
+                    lists[3][layer],
+                    lists[4][layer],
+                    lists[5][layer],
+                    lists[6][layer],
+                );
+                let mut parts: Vec<String> = Vec::new();
+                if layer == count - 1 && color != "transparent" {
+                    parts.push(color.to_owned());
                 }
+                if image != "none" {
+                    parts.push(image.to_owned());
+                }
+                let size_set = size != "auto";
+                if position != "0% 0%" || size_set {
+                    parts.push(if size_set { format!("{position} / {size}") } else { position.to_owned() });
+                }
+                if repeat != "repeat" {
+                    parts.push(repeat.to_owned());
+                }
+                if attachment != "scroll" {
+                    parts.push(attachment.to_owned());
+                }
+                if origin != "padding-box" || clip != "border-box" {
+                    parts.push(origin.to_owned());
+                    if clip != origin {
+                        parts.push(clip.to_owned());
+                    }
+                }
+                out.push(if parts.is_empty() { "none".to_owned() } else { parts.join(" ") });
             }
-            if parts.is_empty() { "none".to_owned() } else { parts.join(" ") }
+            out.join(", ")
         }
         "font" => {
             let (style, variant, weight, stretch, size, line_height, family) =
                 (v(0), v(1), v(2), v(3), v(4), v(5), v(6));
-            // The shorthand cannot express a keyword stretch other than
-            // the ones it takes, nor an `oblique` with a length.
-            if style.starts_with("oblique ") || stretch.ends_with('%') && stretch != "100%" {
+            // The shorthand takes only the keyword stretches.
+            if stretch.ends_with('%') && stretch != "100%" {
                 return None;
             }
             let mut parts: Vec<String> = Vec::new();
@@ -434,6 +493,8 @@ pub fn shorthand_value(name: &str, values: &[&DeclaredValue]) -> Option<String> 
         DeclaredValue::Inherit(_) => Some("inherit"),
         DeclaredValue::Initial(_) => Some("initial"),
         DeclaredValue::Unset(_) => Some("unset"),
+        DeclaredValue::Revert(_) => Some("revert"),
+        DeclaredValue::RevertLayer(_) => Some("revert-layer"),
         _ => None,
     };
     let first = values.first()?;
@@ -597,24 +658,25 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::Visibility => style.visibility.keyword().to_owned(),
         Id::Color => style.color.to_css(),
         Id::BackgroundColor => style.background_color.to_css(),
-        Id::BackgroundImage => style.background_image.as_deref().map_or("none".to_owned(), css_url),
-        Id::BackgroundPosition => format!(
-            "{} {}",
-            position_offset_css(style.background_position.x),
-            position_offset_css(style.background_position.y)
+        Id::BackgroundImage => layers(style.background_images.iter().map(ImageValue::to_css)),
+        Id::BackgroundPosition => layers(
+            style
+                .background_position
+                .iter()
+                .map(|p| format!("{} {}", position_offset_css(p.x), position_offset_css(p.y))),
         ),
-        Id::BackgroundSize => match style.background_size {
+        Id::BackgroundSize => layers(style.background_size.iter().map(|s| match *s {
             ComputedBackgroundSize::Cover => "cover".to_owned(),
             ComputedBackgroundSize::Contain => "contain".to_owned(),
             ComputedBackgroundSize::Explicit(x, y) => match y {
                 ComputedLpAuto::Auto => lpa_css(x),
                 y => format!("{} {}", lpa_css(x), lpa_css(y)),
             },
-        },
-        Id::BackgroundRepeat => style.background_repeat.to_css(),
-        Id::BackgroundAttachment => style.background_attachment.keyword().to_owned(),
-        Id::BackgroundOrigin => style.background_origin.keyword().to_owned(),
-        Id::BackgroundClip => style.background_clip.keyword().to_owned(),
+        })),
+        Id::BackgroundRepeat => layers(style.background_repeat.iter().map(|r| r.to_css())),
+        Id::BackgroundAttachment => layers(style.background_attachment.iter().map(|a| a.keyword().to_owned())),
+        Id::BackgroundOrigin => layers(style.background_origin.iter().map(|b| b.keyword().to_owned())),
+        Id::BackgroundClip => layers(style.background_clip.iter().map(|b| b.keyword().to_owned())),
         Id::FontFamily => computed_font_family_css(&style.font_family),
         Id::FontSize => px(style.font_size),
         Id::FontWeight => style.font_weight.to_string(),
@@ -699,6 +761,12 @@ mod tests {
             ("margin: var(--m) !important", "margin: var(--m) !important;"),
             ("color: inherit", "color: inherit;"),
             ("margin: unset", "margin: unset;"),
+            ("color: revert", "color: revert;"),
+            ("margin: revert-layer", "margin: revert-layer;"),
+            ("font-style: oblique 10deg", "font-style: oblique 10deg;"),
+            ("align-items: first baseline", "align-items: first baseline;"),
+            ("background-image: url(a.png), none, linear-gradient(red, blue)", "background-image: url(\"a.png\"), none, linear-gradient(red, blue);"),
+            ("background-position: left 10px top, center", "background-position: left 10px top, center center;"),
             ("color: red !IMPORTANT", "color: red !important;"),
             ("zzz: 1; color: blue", "color: blue;"),
         ];
@@ -728,6 +796,13 @@ mod tests {
             ("background: red", "background: red;"),
             ("background: url(a.png) no-repeat center / cover", "background: url(\"a.png\") center center / cover no-repeat;"),
             ("background: none", "background: none;"),
+            ("background: url(a.png) no-repeat, url(b.png) center red", "background: url(\"a.png\") no-repeat, red url(\"b.png\") center center;"),
+            // The later `background-image` replaces the shorthand's and
+            // moves to the end; the lists no longer agree, so no shorthand.
+            ("background: url(a.png); background-image: url(a.png), url(b.png)", "background-color: transparent; background-position: 0% 0%; background-size: auto; background-repeat: repeat; background-attachment: scroll; background-origin: padding-box; background-clip: border-box; background-image: url(\"a.png\"), url(\"b.png\");"),
+            ("text-decoration: underline dotted red", "text-decoration: underline dotted red;"),
+            ("grid-gap: 1px 2px", "gap: 1px 2px;"),
+            ("font: oblique 10deg 12px serif", "font: oblique 10deg 12px serif;"),
             ("font: italic bold 12px/1.5 serif", "font: italic 700 12px / 1.5 serif;"),
             ("font: 12px Arial", "font: 12px Arial;"),
             ("font: menu", "font: 13px system-ui;"),

@@ -388,13 +388,13 @@ impl FontStyle {
     }
 }
 
-/// `font-style` as written; `oblique` may carry the length the parser
-/// accepts after it (it is not used).
+/// `font-style` as written; `oblique` may carry its angle in degrees
+/// (the engine slants by a fixed amount).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FontStyleValue {
     Normal,
     Italic,
-    Oblique(Option<Length>),
+    Oblique(Option<f32>),
 }
 
 impl FontStyleValue {
@@ -920,8 +920,8 @@ pub enum AlignKeyword {
     FlexEnd,
     Center,
     Baseline,
-    First,
-    Last,
+    FirstBaseline,
+    LastBaseline,
     SpaceBetween,
     SpaceAround,
     SpaceEvenly,
@@ -939,7 +939,7 @@ impl AlignKeyword {
             FlexStart => AlignValue::FlexStart,
             FlexEnd => AlignValue::FlexEnd,
             Center => AlignValue::Center,
-            Baseline | First | Last => AlignValue::Baseline,
+            Baseline | FirstBaseline | LastBaseline => AlignValue::Baseline,
             SpaceBetween => AlignValue::SpaceBetween,
             SpaceAround => AlignValue::SpaceAround,
             SpaceEvenly => AlignValue::SpaceEvenly,
@@ -953,30 +953,41 @@ impl AlignKeyword {
             SelfEnd => "self-end",
             Left => "left",
             Right => "right",
-            First => "first",
-            Last => "last",
+            FirstBaseline => "first baseline",
+            LastBaseline => "last baseline",
             other => other.computed().keyword(),
         }
     }
+
+    /// The keywords `safe`/`unsafe` may precede (CSS Box Alignment).
+    fn is_positional(self) -> bool {
+        use AlignKeyword::*;
+        matches!(self, Start | SelfStart | Left | End | SelfEnd | Right | FlexStart | FlexEnd | Center)
+    }
 }
 
-/// An alignment value as written: the optional `safe`/`unsafe` prefixes
-/// and the keyword.
+/// `safe` or `unsafe` before a positional alignment keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowAlignment {
+    Safe,
+    Unsafe,
+}
+
+/// An alignment value as written: the optional overflow prefix and the
+/// keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Alignment {
-    pub safe: bool,
-    pub unsafe_: bool,
+    pub overflow: Option<OverflowAlignment>,
     pub keyword: AlignKeyword,
 }
 
 impl Alignment {
     pub fn to_css(self) -> String {
         let mut out = String::new();
-        if self.safe {
-            out.push_str("safe ");
-        }
-        if self.unsafe_ {
-            out.push_str("unsafe ");
+        match self.overflow {
+            Some(OverflowAlignment::Safe) => out.push_str("safe "),
+            Some(OverflowAlignment::Unsafe) => out.push_str("unsafe "),
+            None => {}
         }
         out.push_str(self.keyword.keyword());
         out
@@ -1338,13 +1349,13 @@ longhands! {
     Visibility: "visibility" => Visibility, true;
     Color: "color" => Color, true;
     BackgroundColor: "background-color" => Color, false;
-    BackgroundImage: "background-image" => ImageValue, false;
-    BackgroundPosition: "background-position" => BackgroundPosition, false;
-    BackgroundSize: "background-size" => BackgroundSize, false;
-    BackgroundRepeat: "background-repeat" => BackgroundRepeat, false;
-    BackgroundAttachment: "background-attachment" => BackgroundAttachment, false;
-    BackgroundOrigin: "background-origin" => BackgroundBox, false;
-    BackgroundClip: "background-clip" => BackgroundBox, false;
+    BackgroundImage: "background-image" => Vec<ImageValue>, false;
+    BackgroundPosition: "background-position" => Vec<BackgroundPosition>, false;
+    BackgroundSize: "background-size" => Vec<BackgroundSize>, false;
+    BackgroundRepeat: "background-repeat" => Vec<BackgroundRepeat>, false;
+    BackgroundAttachment: "background-attachment" => Vec<BackgroundAttachment>, false;
+    BackgroundOrigin: "background-origin" => Vec<BackgroundBox>, false;
+    BackgroundClip: "background-clip" => Vec<BackgroundBox>, false;
     FontFamily: "font-family" => Vec<FamilyName>, true;
     FontSize: "font-size" => FontSize, true;
     FontWeight: "font-weight" => FontWeight, true;
@@ -1395,6 +1406,13 @@ pub enum DeclaredValue {
     Inherit(PropertyId),
     Initial(PropertyId),
     Unset(PropertyId),
+    /// `revert`: the value the previous origin cascaded (the user-agent
+    /// sheet's for an author declaration), else `unset`. The cascade
+    /// replaces it before the property table sees it.
+    Revert(PropertyId),
+    /// `revert-layer`: the previous cascade layer's value; sheets are not
+    /// layered here, so the previous origin's, as `revert`.
+    RevertLayer(PropertyId),
     /// `--name: value`, kept as text; see `crate::custom`.
     Custom { name: Arc<str>, value: CustomValue },
     /// A known property whose value contains `var()`; substituted and
@@ -1408,7 +1426,11 @@ impl DeclaredValue {
     pub fn id(&self) -> Option<PropertyId> {
         match self {
             DeclaredValue::Value(v) => Some(v.id()),
-            DeclaredValue::Inherit(id) | DeclaredValue::Initial(id) | DeclaredValue::Unset(id) => Some(*id),
+            DeclaredValue::Inherit(id)
+            | DeclaredValue::Initial(id)
+            | DeclaredValue::Unset(id)
+            | DeclaredValue::Revert(id)
+            | DeclaredValue::RevertLayer(id) => Some(*id),
             DeclaredValue::Custom { .. } | DeclaredValue::Pending { .. } => None,
         }
     }
@@ -1419,7 +1441,11 @@ impl DeclaredValue {
     pub fn property_name(&self) -> &str {
         match self {
             DeclaredValue::Value(v) => v.id().name(),
-            DeclaredValue::Inherit(id) | DeclaredValue::Initial(id) | DeclaredValue::Unset(id) => id.name(),
+            DeclaredValue::Inherit(id)
+            | DeclaredValue::Initial(id)
+            | DeclaredValue::Unset(id)
+            | DeclaredValue::Revert(id)
+            | DeclaredValue::RevertLayer(id) => id.name(),
             DeclaredValue::Custom { name, .. } | DeclaredValue::Pending { name, .. } => name,
         }
     }
@@ -1439,8 +1465,9 @@ pub fn is_shorthand(name: &str) -> bool {
 }
 
 /// Every shorthand name, in the order the CSSOM tries them when it
-/// serializes a declaration block (the widest first).
-pub const SHORTHANDS: [&str; 22] = [
+/// serializes a declaration block (the widest first; `grid-gap` is the
+/// legacy alias of `gap`, never written).
+pub const SHORTHANDS: [&str; 23] = [
     "border",
     "border-width",
     "border-style",
@@ -1463,6 +1490,7 @@ pub const SHORTHANDS: [&str; 22] = [
     "list-style",
     "place-content",
     "place-items",
+    "grid-gap",
 ];
 
 /// One declaration in a block, with its `!important` flag.
@@ -1491,7 +1519,9 @@ pub fn parse_property<'i>(
         let make: Option<fn(PropertyId) -> DeclaredValue> = match_ignore_ascii_case! { &kw,
             "inherit" => Some(DeclaredValue::Inherit),
             "initial" => Some(DeclaredValue::Initial),
-            "unset" | "revert" | "revert-layer" => Some(DeclaredValue::Unset),
+            "unset" => Some(DeclaredValue::Unset),
+            "revert" => Some(DeclaredValue::Revert),
+            "revert-layer" => Some(DeclaredValue::RevertLayer),
             _ => None,
         };
         if let Some(make) = make {
@@ -1568,13 +1598,15 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             _ => return None }))?),
         PropertyId::Color => P::Color(parse_color(input)?),
         PropertyId::BackgroundColor => P::BackgroundColor(parse_color(input)?),
-        PropertyId::BackgroundImage => P::BackgroundImage(parse_image(input)?),
-        PropertyId::BackgroundPosition => P::BackgroundPosition(parse_background_position(input)?),
-        PropertyId::BackgroundSize => P::BackgroundSize(parse_background_size(input)?),
-        PropertyId::BackgroundRepeat => P::BackgroundRepeat(parse_background_repeat(input)?),
-        PropertyId::BackgroundAttachment => P::BackgroundAttachment(parse_background_attachment(input)?),
-        PropertyId::BackgroundOrigin => P::BackgroundOrigin(parse_background_box(input, false)?),
-        PropertyId::BackgroundClip => P::BackgroundClip(parse_background_box(input, true)?),
+        PropertyId::BackgroundImage => P::BackgroundImage(input.parse_comma_separated(parse_image)?),
+        PropertyId::BackgroundPosition => P::BackgroundPosition(input.parse_comma_separated(parse_background_position)?),
+        PropertyId::BackgroundSize => P::BackgroundSize(input.parse_comma_separated(parse_background_size)?),
+        PropertyId::BackgroundRepeat => P::BackgroundRepeat(input.parse_comma_separated(parse_background_repeat)?),
+        PropertyId::BackgroundAttachment => {
+            P::BackgroundAttachment(input.parse_comma_separated(parse_background_attachment)?)
+        }
+        PropertyId::BackgroundOrigin => P::BackgroundOrigin(input.parse_comma_separated(|i| parse_background_box(i, false))?),
+        PropertyId::BackgroundClip => P::BackgroundClip(input.parse_comma_separated(|i| parse_background_box(i, true))?),
         PropertyId::FontFamily => P::FontFamily(parse_font_family(input)?),
         PropertyId::FontSize => P::FontSize(parse_font_size(input)?),
         PropertyId::FontWeight => P::FontWeight(parse_font_weight(input)?),
@@ -1956,11 +1988,29 @@ fn parse_font_style<'i>(input: &mut Parser<'i, '_>) -> Result<FontStyleValue, Pa
         "normal" => FontStyleValue::Normal, "italic" => FontStyleValue::Italic,
         "oblique" => FontStyleValue::Oblique(None), _ => return None }))?;
     if let FontStyleValue::Oblique(_) = s {
-        // The length after `oblique` is accepted and kept, not used.
-        let angle = input.try_parse(parse_length).ok();
+        // `oblique <angle>`: -90deg to 90deg (CSS Fonts 4).
+        let angle = input.try_parse(parse_angle).ok();
+        if angle.is_some_and(|a| !(-90.0..=90.0).contains(&a)) {
+            return Err(input.new_custom_error(()));
+        }
         return Ok(FontStyleValue::Oblique(angle));
     }
     Ok(s)
+}
+
+/// An `<angle>` in degrees.
+fn parse_angle<'i>(input: &mut Parser<'i, '_>) -> Result<f32, ParseErr<'i>> {
+    let location = input.current_source_location();
+    match input.next()?.clone() {
+        Token::Dimension { value, unit, .. } => Ok(match_ignore_ascii_case! { &unit,
+            "deg" => value,
+            "grad" => value * 0.9,
+            "rad" => value.to_degrees(),
+            "turn" => value * 360.0,
+            _ => return Err(location.new_unexpected_token_error(Token::Ident(unit))),
+        }),
+        t => Err(location.new_unexpected_token_error(t)),
+    }
 }
 
 fn parse_font_stretch<'i>(input: &mut Parser<'i, '_>) -> Result<FontStretch, ParseErr<'i>> {
@@ -2069,20 +2119,31 @@ fn parse_vertical_align<'i>(input: &mut Parser<'i, '_>) -> Result<VerticalAlignV
 }
 
 fn parse_align<'i>(input: &mut Parser<'i, '_>) -> Result<Alignment, ParseErr<'i>> {
-    // `safe`/`unsafe` prefixes, kept.
-    let safe = input.try_parse(|i| i.expect_ident_matching("safe")).is_ok();
-    let unsafe_ = input.try_parse(|i| i.expect_ident_matching("unsafe")).is_ok();
+    // `safe`/`unsafe` before a positional keyword; `first`/`last` only
+    // with `baseline` (CSS Box Alignment).
+    let overflow = input
+        .try_parse(|i| {
+            keyword(i, |k| Some(match_ignore_ascii_case! { k,
+                "safe" => OverflowAlignment::Safe, "unsafe" => OverflowAlignment::Unsafe, _ => return None }))
+        })
+        .ok();
     let keyword = keyword(input, |k| Some(match_ignore_ascii_case! { k,
         "auto" => AlignKeyword::Auto, "normal" => AlignKeyword::Normal, "stretch" => AlignKeyword::Stretch,
         "start" => AlignKeyword::Start, "self-start" => AlignKeyword::SelfStart, "left" => AlignKeyword::Left,
         "end" => AlignKeyword::End, "self-end" => AlignKeyword::SelfEnd, "right" => AlignKeyword::Right,
         "flex-start" => AlignKeyword::FlexStart, "flex-end" => AlignKeyword::FlexEnd,
         "center" => AlignKeyword::Center, "baseline" => AlignKeyword::Baseline,
-        "first" => AlignKeyword::First, "last" => AlignKeyword::Last,
+        "first" => AlignKeyword::FirstBaseline, "last" => AlignKeyword::LastBaseline,
         "space-between" => AlignKeyword::SpaceBetween, "space-around" => AlignKeyword::SpaceAround,
         "space-evenly" => AlignKeyword::SpaceEvenly,
         _ => return None }))?;
-    Ok(Alignment { safe, unsafe_, keyword })
+    if matches!(keyword, AlignKeyword::FirstBaseline | AlignKeyword::LastBaseline) {
+        input.expect_ident_matching("baseline")?;
+    }
+    if overflow.is_some() && !keyword.is_positional() {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(Alignment { overflow, keyword })
 }
 
 fn parse_flex_basis<'i>(input: &mut Parser<'i, '_>) -> Result<SizeValue, ParseErr<'i>> {
@@ -2126,7 +2187,7 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "overflow" => &[OverflowX, OverflowY],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
-        "gap" => &[RowGap, ColumnGap],
+        "gap" | "grid-gap" => &[RowGap, ColumnGap],
         "text-decoration" => &[TextDecorationLine, TextDecorationThickness, TextDecorationStyle, TextDecorationColor],
         "list-style" => &[ListStyleType, ListStylePosition, ListStyleImage],
         "place-items" => &[AlignItems],
@@ -2218,36 +2279,58 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
             vec![P::RowGap(r), P::ColumnGap(c)]
         },
         "text-decoration" => {
-            // <line> || <style> || <color> || <thickness>, any order; a
-            // repeated part keeps the last one.
+            // <line> || <thickness> || <style> || <color>, in any order,
+            // each at most once; the line keywords may come one at a
+            // time (`underline dotted overline`).
             let mut line = TextDecorationLine::default();
-            let mut style = TextDecorationStyle::Solid;
-            let mut color = Color::CurrentColor;
-            let mut thickness = TextDecorationThickness::Auto;
+            let mut line_none = false;
+            let mut style = None;
+            let mut color = None;
+            let mut thickness = None;
             let mut any = false;
             loop {
-                if let Ok(l) = input.try_parse(parse_text_decoration_line) {
-                    line = l;
+                let line_kw = input.try_parse(|i| {
+                    keyword(i, |k| Some(match_ignore_ascii_case! { k,
+                        "none" => 0u8, "underline" => 1, "overline" => 2, "line-through" => 3, "blink" => 4,
+                        _ => return None }))
+                });
+                if let Ok(kw) = line_kw {
+                    let taken = match kw {
+                        0 => std::mem::replace(&mut line_none, true),
+                        1 => std::mem::replace(&mut line.underline, true),
+                        2 => std::mem::replace(&mut line.overline, true),
+                        3 => std::mem::replace(&mut line.line_through, true),
+                        _ => std::mem::replace(&mut line.blink, true),
+                    };
+                    if taken || (line_none && !line.is_none()) {
+                        return Err(input.new_custom_error(()));
+                    }
                     any = true;
-                } else if let Ok(c) = input.try_parse(parse_color) {
-                    color = c;
-                    any = true;
-                } else if let Ok(s) = input.try_parse(parse_text_decoration_style) {
-                    style = s;
-                    any = true;
-                } else if let Ok(t) = input.try_parse(parse_length) {
-                    thickness = TextDecorationThickness::Length(LengthPercentage::Length(t));
-                    any = true;
-                } else {
-                    break;
+                    continue;
                 }
+                if style.is_none() && let Ok(s) = input.try_parse(parse_text_decoration_style) {
+                    style = Some(s);
+                    any = true;
+                    continue;
+                }
+                if color.is_none() && let Ok(c) = input.try_parse(parse_color) {
+                    color = Some(c);
+                    any = true;
+                    continue;
+                }
+                if thickness.is_none() && let Ok(t) = input.try_parse(parse_text_decoration_thickness) {
+                    thickness = Some(t);
+                    any = true;
+                    continue;
+                }
+                break;
             }
             if !any { return Err(input.new_custom_error(())); }
             vec![
                 P::TextDecorationLine(line),
-                P::TextDecorationThickness(thickness),
-                P::TextDecorationStyle(style),
-                P::TextDecorationColor(color),
+                P::TextDecorationThickness(thickness.unwrap_or(TextDecorationThickness::Auto)),
+                P::TextDecorationStyle(style.unwrap_or(TextDecorationStyle::Solid)),
+                P::TextDecorationColor(color.unwrap_or(Color::CurrentColor)),
             ]
         },
         "list-style" => {
@@ -2423,43 +2506,57 @@ fn parse_background<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclar
     use PropertyDeclaration as P;
     let start = input.state();
     // The grammar first: comma-separated layers, the color only in the
-    // last one. One image is painted, so the last layer's values are the
-    // ones kept (as before this shorthand stored its parts).
+    // last one; each longhand gets one value per layer.
     let strict = input.try_parse(|i| {
-        let mut image: Option<ImageValue> = None;
-        let layer = loop {
+        let mut layers = Vec::new();
+        loop {
             let layer = parse_background_layer(i)?;
-            if let Some(img) = &layer.image
-                && !matches!(img, ImageValue::None)
-            {
-                image = Some(img.clone());
-            }
-            if i.try_parse(|i| i.expect_comma()).is_err() {
-                break layer;
-            }
-            if layer.color.is_some() {
+            let more = i.try_parse(|i| i.expect_comma()).is_ok();
+            if more && layer.color.is_some() {
                 return Err(i.new_custom_error(()));
             }
-        };
+            layers.push(layer);
+            if !more {
+                break;
+            }
+        }
         i.expect_exhausted()?;
-        Ok::<_, ParseErr<'i>>((layer, image))
+        Ok::<_, ParseErr<'i>>(layers)
     });
     match strict {
-        Ok((layer, image)) => {
-            let origin = layer.boxes.first().copied().unwrap_or(BackgroundBox::PaddingBox);
-            let clip = layer.boxes.get(1).copied().unwrap_or(match layer.boxes.first() {
-                Some(b) => *b,
-                None => BackgroundBox::BorderBox,
-            });
+        Ok(layers) => {
+            let color = layers.last().and_then(|l| l.color).unwrap_or(Color::Transparent);
+            let mut images = Vec::with_capacity(layers.len());
+            let mut positions = Vec::with_capacity(layers.len());
+            let mut sizes = Vec::with_capacity(layers.len());
+            let mut repeats = Vec::with_capacity(layers.len());
+            let mut attachments = Vec::with_capacity(layers.len());
+            let mut origins = Vec::with_capacity(layers.len());
+            let mut clips = Vec::with_capacity(layers.len());
+            for layer in layers {
+                images.push(layer.image.unwrap_or(ImageValue::None));
+                positions.push(layer.position.unwrap_or(BackgroundPosition::INITIAL));
+                sizes.push(layer.size.unwrap_or(BackgroundSize::Explicit(None, None)));
+                repeats.push(layer.repeat.unwrap_or_default());
+                attachments.push(layer.attachment.unwrap_or_default());
+                // One box sets both origin and clip; two set them in order.
+                let origin = layer.boxes.first().copied().unwrap_or(BackgroundBox::PaddingBox);
+                let clip = layer.boxes.get(1).copied().unwrap_or(match layer.boxes.first() {
+                    Some(b) => *b,
+                    None => BackgroundBox::BorderBox,
+                });
+                origins.push(origin);
+                clips.push(clip);
+            }
             Ok(vec![
-                P::BackgroundColor(layer.color.unwrap_or(Color::Transparent)),
-                P::BackgroundImage(image.unwrap_or(ImageValue::None)),
-                P::BackgroundPosition(layer.position.unwrap_or(BackgroundPosition::INITIAL)),
-                P::BackgroundSize(layer.size.unwrap_or(BackgroundSize::Explicit(None, None))),
-                P::BackgroundRepeat(layer.repeat.unwrap_or_default()),
-                P::BackgroundAttachment(layer.attachment.unwrap_or_default()),
-                P::BackgroundOrigin(origin),
-                P::BackgroundClip(clip),
+                P::BackgroundColor(color),
+                P::BackgroundImage(images),
+                P::BackgroundPosition(positions),
+                P::BackgroundSize(sizes),
+                P::BackgroundRepeat(repeats),
+                P::BackgroundAttachment(attachments),
+                P::BackgroundOrigin(origins),
+                P::BackgroundClip(clips),
             ])
         }
         Err(_) => {
@@ -2502,13 +2599,13 @@ fn parse_background<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclar
             }
             Ok(vec![
                 P::BackgroundColor(color),
-                P::BackgroundImage(image),
-                P::BackgroundPosition(BackgroundPosition::INITIAL),
-                P::BackgroundSize(BackgroundSize::Explicit(None, None)),
-                P::BackgroundRepeat(BackgroundRepeat::default()),
-                P::BackgroundAttachment(BackgroundAttachment::default()),
-                P::BackgroundOrigin(BackgroundBox::PaddingBox),
-                P::BackgroundClip(BackgroundBox::BorderBox),
+                P::BackgroundImage(vec![image]),
+                P::BackgroundPosition(vec![BackgroundPosition::INITIAL]),
+                P::BackgroundSize(vec![BackgroundSize::Explicit(None, None)]),
+                P::BackgroundRepeat(vec![BackgroundRepeat::default()]),
+                P::BackgroundAttachment(vec![BackgroundAttachment::default()]),
+                P::BackgroundOrigin(vec![BackgroundBox::PaddingBox]),
+                P::BackgroundClip(vec![BackgroundBox::BorderBox]),
             ])
         }
     }
@@ -2690,25 +2787,62 @@ mod tests {
     fn background_layers_and_lenient_fallback() {
         let v = parse("background", "url(a.png) no-repeat right 10px top / cover fixed content-box, red");
         assert_eq!(v.len(), 8);
-        let img = &v[1];
-        assert!(matches!(img, DeclaredValue::Value(PropertyDeclaration::BackgroundImage(ImageValue::Url(u))) if &**u == "a.png"));
+        let DeclaredValue::Value(PropertyDeclaration::BackgroundImage(images)) = &v[1] else { panic!("{v:?}") };
+        assert!(matches!(&images[..], [ImageValue::Url(u), ImageValue::None] if &**u == "a.png"));
         assert!(matches!(&v[0], DeclaredValue::Value(PropertyDeclaration::BackgroundColor(Color::Named(_)))));
-        assert!(matches!(&v[3], DeclaredValue::Value(PropertyDeclaration::BackgroundSize(BackgroundSize::Explicit(None, None)))), "the last layer's size");
+        let DeclaredValue::Value(PropertyDeclaration::BackgroundSize(sizes)) = &v[3] else { panic!("{v:?}") };
+        assert_eq!(sizes, &[BackgroundSize::Cover, BackgroundSize::Explicit(None, None)]);
+        let DeclaredValue::Value(PropertyDeclaration::BackgroundClip(clips)) = &v[7] else { panic!("{v:?}") };
+        assert_eq!(clips, &[BackgroundBox::ContentBox, BackgroundBox::BorderBox]);
         // Junk the grammar refuses is still read leniently: the color
         // and image survive, the rest is initial.
         let v = parse("background", "foo bar red 10px url(b.png)");
         assert_eq!(v.len(), 8);
-        assert!(matches!(&v[1], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(ImageValue::Url(u))) if &**u == "b.png"));
+        assert!(matches!(&v[1], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(i)) if matches!(&i[..], [ImageValue::Url(u)] if &**u == "b.png")));
         assert!(matches!(&v[0], DeclaredValue::Value(PropertyDeclaration::BackgroundColor(Color::Named(_)))));
         assert!(parse("background", "").is_empty());
         let v = parse("background", "linear-gradient(red, blue)");
-        assert!(matches!(&v[1], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(ImageValue::Function(f))) if &**f == "linear-gradient(red, blue)"));
+        assert!(matches!(&v[1], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(i)) if matches!(&i[..], [ImageValue::Function(f)] if &**f == "linear-gradient(red, blue)")));
+        // The longhands take layer lists too.
+        let v = parse("background-image", "url(a.png), none, url(b.png)");
+        assert!(matches!(&v[0], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(i)) if i.len() == 3));
+        let v = parse("background-repeat", "repeat-x, no-repeat");
+        assert!(matches!(&v[0], DeclaredValue::Value(PropertyDeclaration::BackgroundRepeat(r)) if r.len() == 2));
+    }
+
+    #[test]
+    fn alignment_font_style_and_revert_forms() {
+        let align = |s: &str| match parse("align-items", s).pop() {
+            Some(DeclaredValue::Value(PropertyDeclaration::AlignItems(a))) => a.to_css(),
+            _ => "invalid".to_owned(),
+        };
+        assert_eq!(align("first baseline"), "first baseline");
+        assert_eq!(align("last baseline"), "last baseline");
+        assert_eq!(align("first"), "invalid");
+        assert_eq!(align("safe center"), "safe center");
+        assert_eq!(align("unsafe flex-end"), "unsafe flex-end");
+        assert_eq!(align("safe unsafe center"), "invalid");
+        assert_eq!(align("safe baseline"), "invalid");
+        assert_eq!(align("safe space-between"), "invalid");
+        let style = |s: &str| match parse("font-style", s).pop() {
+            Some(DeclaredValue::Value(PropertyDeclaration::FontStyle(v))) => v,
+            _ => FontStyleValue::Normal,
+        };
+        assert_eq!(style("oblique 10deg"), FontStyleValue::Oblique(Some(10.0)));
+        assert_eq!(style("oblique 0.25turn"), FontStyleValue::Oblique(Some(90.0)));
+        assert_eq!(style("oblique"), FontStyleValue::Oblique(None));
+        assert!(parse("font-style", "oblique 10px").is_empty());
+        assert!(parse("font-style", "oblique 91deg").is_empty());
+        assert_eq!(parse("color", "revert"), vec![DeclaredValue::Revert(PropertyId::Color)]);
+        assert_eq!(parse("margin", "revert-layer").len(), 4);
+        assert_eq!(parse("gap", "inherit").len(), 2);
+        assert_eq!(parse("grid-gap", "inherit").len(), 2);
     }
 
     #[test]
     fn background_position_forms() {
         let pos = |s: &str| match parse("background-position", s).pop() {
-            Some(DeclaredValue::Value(PropertyDeclaration::BackgroundPosition(p))) => p.to_css(),
+            Some(DeclaredValue::Value(PropertyDeclaration::BackgroundPosition(p))) => p[0].to_css(),
             _ => "invalid".to_owned(),
         };
         assert_eq!(pos("center"), "center center");
@@ -2730,11 +2864,18 @@ mod tests {
         let v = parse("list-style", "inside url(m.png) square");
         assert_eq!(v[0], DeclaredValue::Value(PropertyDeclaration::ListStyleType(ListStyleTypeValue::Square)));
         assert_eq!(v[1], DeclaredValue::Value(PropertyDeclaration::ListStylePosition(ListStylePosition::Inside)));
-        // As before: the line keywords must come last (an identifier after
-        // them is read as another line keyword).
-        let v = parse("text-decoration", "red dotted 2px underline");
+        // Any order; the line keywords one at a time; each part once.
+        let v = parse("text-decoration", "underline dotted red 2px");
         assert_eq!(v[0], DeclaredValue::Value(PropertyDeclaration::TextDecorationLine(TextDecorationLine { underline: true, ..Default::default() })));
+        assert_eq!(v[1], DeclaredValue::Value(PropertyDeclaration::TextDecorationThickness(TextDecorationThickness::Length(LengthPercentage::Length(Length::Px(2.0))))));
         assert_eq!(v[2], DeclaredValue::Value(PropertyDeclaration::TextDecorationStyle(TextDecorationStyle::Dotted)));
         assert!(matches!(&v[3], DeclaredValue::Value(PropertyDeclaration::TextDecorationColor(Color::Named(_)))));
+        let v = parse("text-decoration", "underline wavy overline");
+        assert_eq!(v[0], DeclaredValue::Value(PropertyDeclaration::TextDecorationLine(TextDecorationLine { underline: true, overline: true, ..Default::default() })));
+        let v = parse("text-decoration", "none red");
+        assert_eq!(v[0], DeclaredValue::Value(PropertyDeclaration::TextDecorationLine(TextDecorationLine::default())));
+        assert!(parse("text-decoration", "underline underline").is_empty());
+        assert!(parse("text-decoration", "none underline").is_empty());
+        assert!(parse("text-decoration", "red blue").is_empty());
     }
 }

@@ -5558,6 +5558,12 @@ mod tests {
             run_js(&mut h, "var e = document.createElement('div'); e.style.color = 'red'; [JSON.stringify(cs(e).color), cs(e).length, e.style.color].join('|')"),
             "\"\\\"\\\"|0|red\""
         );
+        // `revert` in the style attribute rolls back past the author
+        // sheet: no UA color for a div, so the inherited black.
+        assert_eq!(
+            run_js(&mut h, "a.style.color = 'revert'; [a.style.color, cs(a).color, cs(em).color].join('|')"),
+            "\"revert|rgb(0, 0, 0)|rgb(0, 0, 0)\""
+        );
     }
 }
 

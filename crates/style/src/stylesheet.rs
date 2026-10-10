@@ -80,10 +80,16 @@ impl Stylesheet {
                     Rule::Style(s) => {
                         for d in &mut s.declarations {
                             match &mut d.value {
-                                DeclaredValue::Value(
-                                    PropertyDeclaration::BackgroundImage(ImageValue::Url(u))
-                                    | PropertyDeclaration::ListStyleImage(ImageValue::Url(u)),
-                                ) => {
+                                DeclaredValue::Value(PropertyDeclaration::BackgroundImage(images)) => {
+                                    for img in images {
+                                        if let ImageValue::Url(u) = img
+                                            && let Ok(abs) = base.join(u)
+                                        {
+                                            *u = Arc::from(abs.as_str());
+                                        }
+                                    }
+                                }
+                                DeclaredValue::Value(PropertyDeclaration::ListStyleImage(ImageValue::Url(u))) => {
                                     if let Ok(abs) = base.join(u) {
                                         *u = Arc::from(abs.as_str());
                                     }

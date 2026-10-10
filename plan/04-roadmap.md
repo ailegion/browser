@@ -1088,9 +1088,8 @@ Work:
       `background-attachment`, `background-origin`, `background-clip`,
       `font-variant`, `font-stretch`, `list-style-position`,
       `list-style-image`. The `background` shorthand parses the layer
-      grammar (color before image, the last layer's values kept, one
-      image painted as before) and falls back to the old lenient reading
-      for what the grammar refuses. `getComputedStyle(el, pseudo)`
+      grammar (color before image) and falls back to the old lenient
+      reading for what the grammar refuses. `getComputedStyle(el, pseudo)`
       returns a read-only declaration (setters, `setProperty`,
       `removeProperty` and `cssText =` throw `NoModificationAllowedError`;
       `cssText` reads empty) listing every longhand then the custom
@@ -1120,6 +1119,31 @@ Work:
       `removeProperty`, the `cssText` setter and the computed flag,
       serialize-a-declaration-block, the resolved-value list, and
       `getComputedStyle`'s pseudo-element steps.
+      **Fixes 2026-10-10 (parsers brought to what browsers do, found by
+      the CSSOM's exact readback):** the `text-decoration` shorthand
+      takes its parts in any order, the line keywords one at a time,
+      each part once (`underline dotted red`; before, an identifier after
+      a line keyword dropped the declaration); `first baseline`/`last
+      baseline` are accepted and a bare `first`/`last` is not; `safe`/
+      `unsafe` is one prefix, before a positional keyword only;
+      `font-style: oblique <angle>` (deg/grad/rad/turn, within ±90deg)
+      replaces the length the parser took; the seven `background-*`
+      longhands are comma-separated layer lists (specified and computed,
+      the shorthand gives one entry per layer and serializes layer by
+      layer; the painter still draws the last layer with a `url()`, all
+      layers in 4a); `calc()` sums terms of one unit (`calc(1em + 1em)`
+      is `2em`; a sum of mixed units still keeps its first operand until
+      4a's layout calc); `grid-gap` is the alias of `gap` (`gridGap`
+      too); `revert` and `revert-layer` are kept as written and the
+      cascade applies them: an author `revert` takes the user-agent
+      origin's cascaded value for the property (`unset` when it has
+      none), a user-agent `revert` is `unset`, `revert-layer` is the same
+      since sheets are not layered (a custom property's own `revert` is
+      the keyword for that property, as the spec says, not text). Tests:
+      style (each form, the cascade rollback over an inline style and
+      over author rules), the script and tab CSSOM tests extended. Vertical percentage padding
+      (laid out as a share of the box's own width, reported as 0 by
+      taffy) is a layout bug and the next block.
    4a. **Engine properties (next, before 5).** Properties the engine
       does not know, so neither the cascade, layout, paint nor the CSSOM
       (which is table-driven and gets them for free once they are in the

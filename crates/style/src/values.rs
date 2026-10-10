@@ -78,6 +78,27 @@ impl Length {
         let (v, unit) = self.parts();
         format!("{}{unit}", css_number(v))
     }
+
+    /// `self` with its number replaced.
+    fn with_value(self, v: f32) -> Length {
+        match self {
+            Length::Px(_) => Length::Px(v),
+            Length::Em(_) => Length::Em(v),
+            Length::Rem(_) => Length::Rem(v),
+            Length::Vw(_) => Length::Vw(v),
+            Length::Vh(_) => Length::Vh(v),
+            Length::Vmin(_) => Length::Vmin(v),
+            Length::Vmax(_) => Length::Vmax(v),
+            Length::Ch(_) => Length::Ch(v),
+            Length::Ex(_) => Length::Ex(v),
+            Length::Pt(_) => Length::Pt(v),
+            Length::Pc(_) => Length::Pc(v),
+            Length::In(_) => Length::In(v),
+            Length::Cm(_) => Length::Cm(v),
+            Length::Mm(_) => Length::Mm(v),
+            Length::Q(_) => Length::Q(v),
+        }
+    }
 }
 
 /// Serialize a CSS number: the shortest form with at most six decimals,
@@ -115,8 +136,10 @@ pub enum CalcValue {
 }
 
 impl Calc {
-    /// The value the engine uses: `px` terms sum with `px`, `%` with `%`;
-    /// anything else keeps what was accumulated so far.
+    /// The value the engine uses: terms of one unit (or all percentages)
+    /// sum; a sum of mixed units keeps its first operand until layout
+    /// can take a `calc()` (roadmap item 4a). A nested `calc()` is
+    /// folded on its own first.
     fn fold(&self) -> LengthPercentage {
         let value = |t: &CalcTerm| match &t.value {
             CalcValue::Length(l) => LengthPercentage::Length(*l),
@@ -131,11 +154,10 @@ impl Calc {
         for next in iter {
             let op = if next.negative { -1.0 } else { 1.0 };
             acc = match (acc, value(next)) {
-                (LengthPercentage::Length(Length::Px(a)), LengthPercentage::Length(Length::Px(b))) => {
-                    LengthPercentage::Length(Length::Px(a + op * b))
+                (LengthPercentage::Length(a), LengthPercentage::Length(b)) if a.parts().1 == b.parts().1 => {
+                    LengthPercentage::Length(a.with_value(a.parts().0 + op * b.parts().0))
                 }
                 (LengthPercentage::Percent(a), LengthPercentage::Percent(b)) => LengthPercentage::Percent(a + op * b),
-                // Mixed units are not supported yet; keep the first operand.
                 (a, _) => a,
             };
         }
@@ -920,12 +942,15 @@ mod tests {
         assert_eq!(lp("calc(1px + 2px)").map(|v| v.to_css()).as_deref(), Some("calc(3px)"));
         assert_eq!(lp("calc(10px - 5%)").map(|v| v.to_css()).as_deref(), Some("calc(-5% + 10px)"));
         assert_eq!(lp("calc(1em + 2px - 1px)").map(|v| v.to_css()).as_deref(), Some("calc(1em + 1px)"));
-        // The engine's value is unchanged: like kinds sum, mixed keeps the first.
+        // The engine's value: one unit sums, mixed units keep the first.
         let ctx = LengthContext { font_size: 10.0, root_font_size: 10.0, viewport_width: 100.0, viewport_height: 100.0 };
         assert_eq!(lp("calc(1px + 2px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(3.0)));
         assert_eq!(lp("calc(10px + 5%)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(10.0)));
         assert_eq!(lp("calc(5% + 10px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Percent(5.0)));
-        assert_eq!(lp("calc(1em + 1em)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(10.0)));
+        assert_eq!(lp("calc(1em + 1em)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(20.0)));
+        assert_eq!(lp("calc(3em - 1em)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(20.0)));
+        assert_eq!(lp("calc(1em + calc(1em + 1em))").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(30.0)));
+        assert_eq!(lp("calc(1em + 1px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(10.0)));
         let c = |s: &str| {
             let mut input = ParserInput::new(s);
             let mut parser = Parser::new(&mut input);

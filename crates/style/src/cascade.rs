@@ -499,20 +499,50 @@ impl<'a> Restyler<'a> {
             Vec::new()
         };
 
+        // The values a declaration stands for: its own, or the expansion
+        // of its `var()`s; nothing for a custom property.
+        fn values_of<'v>(d: &'v Declaration, expanded: &mut std::slice::Iter<'v, Vec<DeclaredValue>>) -> &'v [DeclaredValue] {
+            match &d.value {
+                DeclaredValue::Pending { .. } => expanded.next().map_or(&[], Vec::as_slice),
+                DeclaredValue::Custom { .. } => &[],
+                v => std::slice::from_ref(v),
+            }
+        }
+        let is_ua = |level: u8| matches!(level, 0 | 3);
+
+        // The user-agent origin's cascaded values first: `revert` in an
+        // author declaration rolls back to them. A `revert` in the
+        // user-agent sheet has nothing below it: `unset`.
+        let mut ua = DeclaredValues::new();
+        let mut expanded_iter = expanded.iter();
+        for (level, _, _, d) in &matched {
+            let values = values_of(d, &mut expanded_iter);
+            if !is_ua(*level) {
+                continue;
+            }
+            for v in values {
+                match v {
+                    DeclaredValue::Revert(id) | DeclaredValue::RevertLayer(id) => ua.clear(*id),
+                    v => ua.set(v),
+                }
+            }
+        }
+
         let mut decls = DeclaredValues::new();
         decls.custom = custom;
         let mut expanded_iter = expanded.iter();
-        for (_, _, _, d) in &matched {
-            match &d.value {
-                DeclaredValue::Pending { .. } => {
-                    if let Some(values) = expanded_iter.next() {
-                        for v in values {
-                            decls.set(v);
+        for (level, _, _, d) in &matched {
+            for v in values_of(d, &mut expanded_iter) {
+                match v {
+                    DeclaredValue::Revert(id) | DeclaredValue::RevertLayer(id) => {
+                        if is_ua(*level) {
+                            decls.clear(*id);
+                        } else {
+                            decls.copy_from(&ua, *id);
                         }
                     }
+                    v => decls.set(v),
                 }
-                DeclaredValue::Custom { .. } => {}
-                v => decls.set(v),
             }
         }
 
@@ -849,6 +879,27 @@ mod tests {
         assert_eq!(styles[a].color.to_rgba8(), [0x33, 0x44, 0x88, 255]);
         let div = find(&doc, "div");
         assert_eq!(styles[div].opacity, 0.8);
+    }
+
+    #[test]
+    fn revert_rolls_back_to_the_user_agent_sheet() {
+        // `b` reverts to the UA sheet's bold; `p` reverts a color the UA
+        // sheet does not set, which is `unset`: inherited from `div`;
+        // `revert-layer` without layers is the same; `em` reverts to the
+        // UA sheet's italic over an author rule.
+        let (doc, styles) = styles_for(
+            "<div><p style='color: revert'>t <b>x</b></p><em>e</em></div>",
+            "div { color: blue } p { color: red; font-size: 30px } b { font-weight: revert; font-size: revert-layer } em { font-style: normal } em { font-style: revert }",
+        );
+        let p = find(&doc, "p");
+        assert_eq!(styles[p].color.to_rgba8(), [0, 0, 255, 255]);
+        assert_eq!(styles[p].font_size, 30.0);
+        let b = find(&doc, "b");
+        assert_eq!(styles[b].font_weight, 700);
+        assert_eq!(styles[b].font_size, 30.0, "unset: inherited");
+        assert_eq!(styles[b].color.to_rgba8(), [0, 0, 255, 255]);
+        let em = find(&doc, "em");
+        assert_eq!(styles[em].font_style, crate::properties::FontStyle::Italic, "the UA sheet's italic");
     }
 
     #[test]

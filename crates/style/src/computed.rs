@@ -91,13 +91,18 @@ pub struct ComputedStyle {
     pub visibility: Visibility,
     pub color: Rgba,
     pub background_color: Rgba,
+    /// The image the painter draws: the last layer with a `url()` (one
+    /// layer is painted until roadmap item 4a paints them all).
     pub background_image: Option<Arc<str>>,
-    pub background_position: ComputedPosition,
-    pub background_size: ComputedBackgroundSize,
-    pub background_repeat: BackgroundRepeat,
-    pub background_attachment: BackgroundAttachment,
-    pub background_origin: BackgroundBox,
-    pub background_clip: BackgroundBox,
+    /// The background layers, one entry per layer for each longhand
+    /// (`getComputedStyle` reports them all).
+    pub background_images: Vec<ImageValue>,
+    pub background_position: Vec<ComputedPosition>,
+    pub background_size: Vec<ComputedBackgroundSize>,
+    pub background_repeat: Vec<BackgroundRepeat>,
+    pub background_attachment: Vec<BackgroundAttachment>,
+    pub background_origin: Vec<BackgroundBox>,
+    pub background_clip: Vec<BackgroundBox>,
     pub font_family: Arc<str>,
     pub font_size: f32,
     pub font_weight: u16,
@@ -190,12 +195,13 @@ impl ComputedStyle {
             color: Rgba::BLACK,
             background_color: Rgba::TRANSPARENT,
             background_image: None,
-            background_position: ComputedPosition::default(),
-            background_size: ComputedBackgroundSize::default(),
-            background_repeat: BackgroundRepeat::default(),
-            background_attachment: BackgroundAttachment::Scroll,
-            background_origin: BackgroundBox::PaddingBox,
-            background_clip: BackgroundBox::BorderBox,
+            background_images: vec![ImageValue::None],
+            background_position: vec![ComputedPosition::default()],
+            background_size: vec![ComputedBackgroundSize::default()],
+            background_repeat: vec![BackgroundRepeat::default()],
+            background_attachment: vec![BackgroundAttachment::Scroll],
+            background_origin: vec![BackgroundBox::PaddingBox],
+            background_clip: vec![BackgroundBox::BorderBox],
             font_family: Arc::from(DEFAULT_FONT_FAMILY),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -307,6 +313,16 @@ impl<'a> DeclaredValues<'a> {
     pub fn get(&self, id: PropertyId) -> Option<&'a DeclaredValue> {
         self.slots[id.index()]
     }
+
+    /// Forget the value of `id` (it resolves as `unset`).
+    pub fn clear(&mut self, id: PropertyId) {
+        self.slots[id.index()] = None;
+    }
+
+    /// Take `id`'s value from `other` (none if it has none).
+    pub fn copy_from(&mut self, other: &DeclaredValues<'a>, id: PropertyId) {
+        self.slots[id.index()] = other.slots[id.index()];
+    }
 }
 
 impl Default for DeclaredValues<'_> {
@@ -328,7 +344,15 @@ fn resolve<'a>(decls: &DeclaredValues<'a>, id: PropertyId) -> Resolved<'a> {
         Some(DeclaredValue::Inherit(_)) => Resolved::Inherit,
         Some(DeclaredValue::Initial(_)) => Resolved::Initial,
         // Custom and pending never reach a slot (`set` skips them).
-        Some(DeclaredValue::Unset(_) | DeclaredValue::Custom { .. } | DeclaredValue::Pending { .. }) | None => {
+        // Revert is replaced by the cascade; an unreplaced one is unset.
+        Some(
+            DeclaredValue::Unset(_)
+            | DeclaredValue::Revert(_)
+            | DeclaredValue::RevertLayer(_)
+            | DeclaredValue::Custom { .. }
+            | DeclaredValue::Pending { .. },
+        )
+        | None => {
             if id.is_inherited() {
                 Resolved::Inherit
             } else {
@@ -530,29 +554,37 @@ pub fn compute(
     pick!(overflow_y, OverflowY, OverflowY, |v| v.computed());
     pick!(visibility, Visibility, Visibility, |v| *v);
     pick!(background_color, BackgroundColor, BackgroundColor, |v| v.resolve(current));
-    pick!(background_image, BackgroundImage, BackgroundImage, |v| v.url());
-    pick!(background_position, BackgroundPosition, BackgroundPosition, |v| ComputedPosition {
-        x: position_offset(&v.x, &ctx),
-        y: position_offset(&v.y, &ctx),
-    });
-    pick!(background_size, BackgroundSize, BackgroundSize, |v| match v {
-        BackgroundSize::Cover => ComputedBackgroundSize::Cover,
-        BackgroundSize::Contain => ComputedBackgroundSize::Contain,
-        BackgroundSize::Explicit(x, y) => {
-            let one = |v: &Option<LengthPercentage>| match v {
-                None => ComputedLpAuto::Auto,
-                Some(v) => match lp(v) {
-                    ComputedLp::Px(px) => ComputedLpAuto::Px(px),
-                    ComputedLp::Percent(p) => ComputedLpAuto::Percent(p),
-                },
-            };
-            ComputedBackgroundSize::Explicit(one(x), one(y))
-        }
-    });
-    pick!(background_repeat, BackgroundRepeat, BackgroundRepeat, |v| *v);
-    pick!(background_attachment, BackgroundAttachment, BackgroundAttachment, |v| *v);
-    pick!(background_origin, BackgroundOrigin, BackgroundOrigin, |v| *v);
-    pick!(background_clip, BackgroundClip, BackgroundClip, |v| *v);
+    pick!(background_images, BackgroundImage, BackgroundImage, |v| v.clone());
+    // The painted image: the last layer with a URL.
+    out.background_image = out.background_images.iter().rev().find_map(ImageValue::url);
+    pick!(background_position, BackgroundPosition, BackgroundPosition, |v| v
+        .iter()
+        .map(|p| ComputedPosition {
+            x: position_offset(&p.x, &ctx),
+            y: position_offset(&p.y, &ctx),
+        })
+        .collect());
+    pick!(background_size, BackgroundSize, BackgroundSize, |v| v
+        .iter()
+        .map(|s| match s {
+            BackgroundSize::Cover => ComputedBackgroundSize::Cover,
+            BackgroundSize::Contain => ComputedBackgroundSize::Contain,
+            BackgroundSize::Explicit(x, y) => {
+                let one = |v: &Option<LengthPercentage>| match v {
+                    None => ComputedLpAuto::Auto,
+                    Some(v) => match lp(v) {
+                        ComputedLp::Px(px) => ComputedLpAuto::Px(px),
+                        ComputedLp::Percent(p) => ComputedLpAuto::Percent(p),
+                    },
+                };
+                ComputedBackgroundSize::Explicit(one(x), one(y))
+            }
+        })
+        .collect());
+    pick!(background_repeat, BackgroundRepeat, BackgroundRepeat, |v| v.clone());
+    pick!(background_attachment, BackgroundAttachment, BackgroundAttachment, |v| v.clone());
+    pick!(background_origin, BackgroundOrigin, BackgroundOrigin, |v| v.clone());
+    pick!(background_clip, BackgroundClip, BackgroundClip, |v| v.clone());
     pick!(font_family, FontFamily, FontFamily, |v| font_family_computed(v));
     pick!(font_style, FontStyle, FontStyle, |v| v.computed());
     pick!(font_variant, FontVariant, FontVariant, |v| *v);
