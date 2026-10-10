@@ -27,6 +27,43 @@ impl LineHeight {
     }
 }
 
+/// Computed `text-decoration-thickness`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum DecorationThickness {
+    #[default]
+    Auto,
+    FromFont,
+    Length(ComputedLp),
+}
+
+/// One axis of a computed `background-position`: a percentage of the
+/// box plus a pixel offset (`right 10px` is 100% and -10px).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PositionOffset {
+    pub percent: f32,
+    pub px: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ComputedPosition {
+    pub x: PositionOffset,
+    pub y: PositionOffset,
+}
+
+/// Computed `background-size`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ComputedBackgroundSize {
+    Cover,
+    Contain,
+    Explicit(ComputedLpAuto, ComputedLpAuto),
+}
+
+impl Default for ComputedBackgroundSize {
+    fn default() -> Self {
+        ComputedBackgroundSize::Explicit(ComputedLpAuto::Auto, ComputedLpAuto::Auto)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     pub display: Display,
@@ -55,16 +92,35 @@ pub struct ComputedStyle {
     pub color: Rgba,
     pub background_color: Rgba,
     pub background_image: Option<Arc<str>>,
+    pub background_position: ComputedPosition,
+    pub background_size: ComputedBackgroundSize,
+    pub background_repeat: BackgroundRepeat,
+    pub background_attachment: BackgroundAttachment,
+    pub background_origin: BackgroundBox,
+    pub background_clip: BackgroundBox,
     pub font_family: Arc<str>,
     pub font_size: f32,
     pub font_weight: u16,
     pub font_style: FontStyle,
+    pub font_variant: FontVariant,
+    /// `font-stretch` as a percentage.
+    pub font_stretch: f32,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
+    /// The decoration lines in effect on this element's text: its own
+    /// and those propagated from its ancestors.
     pub text_decoration: TextDecorationLine,
+    /// The element's own `text-decoration-line` (what `getComputedStyle`
+    /// reports).
+    pub text_decoration_line: TextDecorationLine,
+    pub text_decoration_style: TextDecorationStyle,
+    pub text_decoration_color: Rgba,
+    pub text_decoration_thickness: DecorationThickness,
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
     pub list_style_type: ListStyleType,
+    pub list_style_position: ListStylePosition,
+    pub list_style_image: Option<Arc<str>>,
     pub vertical_align: VerticalAlign,
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
@@ -134,16 +190,30 @@ impl ComputedStyle {
             color: Rgba::BLACK,
             background_color: Rgba::TRANSPARENT,
             background_image: None,
+            background_position: ComputedPosition::default(),
+            background_size: ComputedBackgroundSize::default(),
+            background_repeat: BackgroundRepeat::default(),
+            background_attachment: BackgroundAttachment::Scroll,
+            background_origin: BackgroundBox::PaddingBox,
+            background_clip: BackgroundBox::BorderBox,
             font_family: Arc::from(DEFAULT_FONT_FAMILY),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
             font_style: FontStyle::Normal,
+            font_variant: FontVariant::Normal,
+            font_stretch: 100.0,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Start,
             text_decoration: TextDecorationLine::default(),
+            text_decoration_line: TextDecorationLine::default(),
+            text_decoration_style: TextDecorationStyle::Solid,
+            text_decoration_color: Rgba::BLACK,
+            text_decoration_thickness: DecorationThickness::Auto,
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             list_style_type: ListStyleType::Disc,
+            list_style_position: ListStylePosition::Outside,
+            list_style_image: None,
             vertical_align: VerticalAlign::Baseline,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
@@ -176,11 +246,15 @@ impl ComputedStyle {
         self.font_size = p.font_size;
         self.font_weight = p.font_weight;
         self.font_style = p.font_style;
+        self.font_variant = p.font_variant;
+        self.font_stretch = p.font_stretch;
         self.line_height = p.line_height;
         self.text_align = p.text_align;
         self.text_transform = p.text_transform;
         self.white_space = p.white_space;
         self.list_style_type = p.list_style_type;
+        self.list_style_position = p.list_style_position;
+        self.list_style_image = p.list_style_image.clone();
         self.custom = p.custom.clone();
         // Not inherited by spec, but the decoration propagates to all
         // descendant text, which is what this achieves for now.
@@ -264,6 +338,32 @@ fn resolve<'a>(decls: &DeclaredValues<'a>, id: PropertyId) -> Resolved<'a> {
     }
 }
 
+/// A `background-position` axis as computed: keywords become
+/// percentages, an offset from the end edge is subtracted.
+fn position_offset(c: &PositionComponent, ctx: &LengthContext) -> PositionOffset {
+    let lp = |v: &LengthPercentage| match v.to_computed(ctx) {
+        ComputedLp::Px(px) => PositionOffset { percent: 0.0, px },
+        ComputedLp::Percent(percent) => PositionOffset { percent, px: 0.0 },
+    };
+    match c {
+        PositionComponent::Length(v) => lp(v),
+        PositionComponent::Keyword(edge, offset) => {
+            let off = offset.as_ref().map(lp).unwrap_or_default();
+            match edge {
+                PositionEdge::Start => off,
+                PositionEdge::Center => PositionOffset {
+                    percent: 50.0 + off.percent,
+                    px: off.px,
+                },
+                PositionEdge::End => PositionOffset {
+                    percent: 100.0 - off.percent,
+                    px: -off.px,
+                },
+            }
+        }
+    }
+}
+
 /// Compute the style of an element from its declared values and its parent.
 pub fn compute(
     decls: &DeclaredValues<'_>,
@@ -285,12 +385,16 @@ pub fn compute(
                 viewport_width: viewport.width,
                 viewport_height: viewport.height,
             };
-            match *fs {
+            match fs {
                 FontSize::Length(l) => l.to_px(&parent_ctx),
                 FontSize::Percent(p) => parent.font_size * p / 100.0,
+                FontSize::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(&parent_ctx) {
+                    ComputedLp::Px(px) => px,
+                    ComputedLp::Percent(p) => parent.font_size * p / 100.0,
+                },
                 FontSize::Keyword(k) => {
                     const SIZES: [f32; 8] = [9.0, 10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0];
-                    SIZES[(k as usize).min(7)]
+                    SIZES[(*k as usize).min(7)]
                 }
                 FontSize::Smaller => parent.font_size / 1.2,
                 FontSize::Larger => parent.font_size * 1.2,
@@ -324,28 +428,13 @@ pub fn compute(
         };
     }
 
-    let lpa = |v: &LengthPercentageAuto| match *v {
-        LengthPercentageAuto::Length(l) => ComputedLpAuto::Px(l.to_px(&ctx)),
-        LengthPercentageAuto::Percent(p) => ComputedLpAuto::Percent(p),
-        LengthPercentageAuto::Auto => ComputedLpAuto::Auto,
-    };
-    let lp = |v: &LengthPercentage| match *v {
-        LengthPercentage::Length(l) => ComputedLp::Px(l.to_px(&ctx)),
-        LengthPercentage::Percent(p) => ComputedLp::Percent(p),
-    };
-    let size = |v: &SizeValue| match *v {
-        SizeValue::Auto => ComputedSize::Auto,
-        SizeValue::Length(l) => ComputedSize::Px(l.to_px(&ctx)),
-        SizeValue::Percent(p) => ComputedSize::Percent(p),
-        SizeValue::MinContent => ComputedSize::MinContent,
-        SizeValue::MaxContent => ComputedSize::MaxContent,
-        SizeValue::FitContent => ComputedSize::FitContent,
-        SizeValue::None => ComputedSize::None,
-    };
+    let lpa = |v: &LengthPercentageAuto| v.to_computed(&ctx);
+    let lp = |v: &LengthPercentage| v.to_computed(&ctx);
+    let size = |v: &SizeValue| v.to_computed(&ctx);
 
-    pick!(display, Display, Display, |v| *v);
+    pick!(display, Display, Display, |v| v.computed());
     pick!(position, Position, Position, |v| *v);
-    pick!(float, Float, Float, |v| *v);
+    pick!(float, Float, Float, |v| v.computed());
     pick!(clear, Clear, Clear, |v| *v);
     pick!(box_sizing, BoxSizing, BoxSizing, |v| *v);
 
@@ -426,10 +515,10 @@ pub fn compute(
         }
     }
 
-    side!(border_radius.top, BorderTopLeftRadius, BorderTopLeftRadius, |v| lp(v));
-    side!(border_radius.right, BorderTopRightRadius, BorderTopRightRadius, |v| lp(v));
-    side!(border_radius.bottom, BorderBottomRightRadius, BorderBottomRightRadius, |v| lp(v));
-    side!(border_radius.left, BorderBottomLeftRadius, BorderBottomLeftRadius, |v| lp(v));
+    side!(border_radius.top, BorderTopLeftRadius, BorderTopLeftRadius, |v| lp(&v.x));
+    side!(border_radius.right, BorderTopRightRadius, BorderTopRightRadius, |v| lp(&v.x));
+    side!(border_radius.bottom, BorderBottomRightRadius, BorderBottomRightRadius, |v| lp(&v.x));
+    side!(border_radius.left, BorderBottomLeftRadius, BorderBottomLeftRadius, |v| lp(&v.x));
 
     pick!(width, Width, Width, |v| size(v));
     pick!(height, Height, Height, |v| size(v));
@@ -437,13 +526,37 @@ pub fn compute(
     pick!(min_height, MinHeight, MinHeight, |v| size(v));
     pick!(max_width, MaxWidth, MaxWidth, |v| size(v));
     pick!(max_height, MaxHeight, MaxHeight, |v| size(v));
-    pick!(overflow_x, OverflowX, OverflowX, |v| *v);
-    pick!(overflow_y, OverflowY, OverflowY, |v| *v);
+    pick!(overflow_x, OverflowX, OverflowX, |v| v.computed());
+    pick!(overflow_y, OverflowY, OverflowY, |v| v.computed());
     pick!(visibility, Visibility, Visibility, |v| *v);
     pick!(background_color, BackgroundColor, BackgroundColor, |v| v.resolve(current));
-    pick!(background_image, BackgroundImage, BackgroundImage, |v| v.clone());
-    pick!(font_family, FontFamily, FontFamily, |v| v.clone());
-    pick!(font_style, FontStyle, FontStyle, |v| *v);
+    pick!(background_image, BackgroundImage, BackgroundImage, |v| v.url());
+    pick!(background_position, BackgroundPosition, BackgroundPosition, |v| ComputedPosition {
+        x: position_offset(&v.x, &ctx),
+        y: position_offset(&v.y, &ctx),
+    });
+    pick!(background_size, BackgroundSize, BackgroundSize, |v| match v {
+        BackgroundSize::Cover => ComputedBackgroundSize::Cover,
+        BackgroundSize::Contain => ComputedBackgroundSize::Contain,
+        BackgroundSize::Explicit(x, y) => {
+            let one = |v: &Option<LengthPercentage>| match v {
+                None => ComputedLpAuto::Auto,
+                Some(v) => match lp(v) {
+                    ComputedLp::Px(px) => ComputedLpAuto::Px(px),
+                    ComputedLp::Percent(p) => ComputedLpAuto::Percent(p),
+                },
+            };
+            ComputedBackgroundSize::Explicit(one(x), one(y))
+        }
+    });
+    pick!(background_repeat, BackgroundRepeat, BackgroundRepeat, |v| *v);
+    pick!(background_attachment, BackgroundAttachment, BackgroundAttachment, |v| *v);
+    pick!(background_origin, BackgroundOrigin, BackgroundOrigin, |v| *v);
+    pick!(background_clip, BackgroundClip, BackgroundClip, |v| *v);
+    pick!(font_family, FontFamily, FontFamily, |v| font_family_computed(v));
+    pick!(font_style, FontStyle, FontStyle, |v| v.computed());
+    pick!(font_variant, FontVariant, FontVariant, |v| *v);
+    pick!(font_stretch, FontStretch, FontStretch, |v| v.percent());
 
     out.font_weight = match resolve(decls, PropertyId::FontWeight) {
         Resolved::Specified(PropertyDeclaration::FontWeight(w)) => match *w {
@@ -464,32 +577,49 @@ pub fn compute(
     };
 
     out.line_height = match resolve(decls, PropertyId::LineHeight) {
-        Resolved::Specified(PropertyDeclaration::LineHeight(lh)) => match *lh {
+        Resolved::Specified(PropertyDeclaration::LineHeight(lh)) => match lh {
             LineHeightValue::Normal => LineHeight::Normal,
-            LineHeightValue::Number(n) => LineHeight::Number(n),
+            LineHeightValue::Number(n) => LineHeight::Number(*n),
             LineHeightValue::Length(l) => LineHeight::Px(l.to_px(&ctx)),
             LineHeightValue::Percent(p) => LineHeight::Px(out.font_size * p / 100.0),
+            LineHeightValue::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(&ctx) {
+                ComputedLp::Px(px) => LineHeight::Px(px),
+                ComputedLp::Percent(p) => LineHeight::Px(out.font_size * p / 100.0),
+            },
         },
         Resolved::Inherit => parent.line_height,
         _ => LineHeight::Normal,
     };
 
-    pick!(text_align, TextAlign, TextAlign, |v| *v);
+    pick!(text_align, TextAlign, TextAlign, |v| v.computed());
     pick!(text_decoration, TextDecorationLine, TextDecorationLine, |v| *v);
+    out.text_decoration_line = out.text_decoration;
     // Decoration propagates: union with the parent's.
     out.text_decoration.underline |= parent.text_decoration.underline;
     out.text_decoration.overline |= parent.text_decoration.overline;
     out.text_decoration.line_through |= parent.text_decoration.line_through;
+    pick!(text_decoration_style, TextDecorationStyle, TextDecorationStyle, |v| *v);
+    pick!(text_decoration_color, TextDecorationColor, TextDecorationColor, |v| v.resolve(current));
+    if matches!(resolve(decls, PropertyId::TextDecorationColor), Resolved::Initial) {
+        out.text_decoration_color = current;
+    }
+    pick!(text_decoration_thickness, TextDecorationThickness, TextDecorationThickness, |v| match v {
+        TextDecorationThickness::Auto => DecorationThickness::Auto,
+        TextDecorationThickness::FromFont => DecorationThickness::FromFont,
+        TextDecorationThickness::Length(l) => DecorationThickness::Length(lp(l)),
+    });
     pick!(text_transform, TextTransform, TextTransform, |v| *v);
     pick!(white_space, WhiteSpace, WhiteSpace, |v| *v);
-    pick!(list_style_type, ListStyleType, ListStyleType, |v| *v);
-    pick!(vertical_align, VerticalAlign, VerticalAlign, |v| *v);
+    pick!(list_style_type, ListStyleType, ListStyleType, |v| v.computed());
+    pick!(list_style_position, ListStylePosition, ListStylePosition, |v| *v);
+    pick!(list_style_image, ListStyleImage, ListStyleImage, |v| v.url());
+    pick!(vertical_align, VerticalAlign, VerticalAlign, |v| v.computed());
     pick!(flex_direction, FlexDirection, FlexDirection, |v| *v);
     pick!(flex_wrap, FlexWrap, FlexWrap, |v| *v);
-    pick!(justify_content, JustifyContent, JustifyContent, |v| *v);
-    pick!(align_items, AlignItems, AlignItems, |v| *v);
-    pick!(align_self, AlignSelf, AlignSelf, |v| *v);
-    pick!(align_content, AlignContent, AlignContent, |v| *v);
+    pick!(justify_content, JustifyContent, JustifyContent, |v| v.keyword.computed());
+    pick!(align_items, AlignItems, AlignItems, |v| v.keyword.computed());
+    pick!(align_self, AlignSelf, AlignSelf, |v| v.keyword.computed());
+    pick!(align_content, AlignContent, AlignContent, |v| v.keyword.computed());
     pick!(flex_grow, FlexGrow, FlexGrow, |v| *v);
     pick!(flex_shrink, FlexShrink, FlexShrink, |v| *v);
     pick!(flex_basis, FlexBasis, FlexBasis, |v| size(v));

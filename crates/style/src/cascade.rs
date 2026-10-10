@@ -704,7 +704,7 @@ fn compound_key(compound: &[&Component<BrowserSelectors>]) -> SubjectKey {
 /// HTML attributes that map to CSS (a subset of the rendering section of
 /// the HTML spec). These sit below author styles.
 fn presentational_hints(e: &browser_dom::Element) -> Vec<Declaration> {
-    use crate::properties::{DeclaredValue as D, PropertyDeclaration as P, TextAlign};
+    use crate::properties::{DeclaredValue as D, DisplayValue, PropertyDeclaration as P, TextAlignValue};
     use crate::values::{Length, SizeValue};
 
     let mut out = Vec::new();
@@ -735,10 +735,10 @@ fn presentational_hints(e: &browser_dom::Element) -> Vec<Declaration> {
     }
     if let Some(a) = e.attr("align") {
         let ta = match a.to_ascii_lowercase().as_str() {
-            "left" => Some(TextAlign::Left),
-            "right" => Some(TextAlign::Right),
-            "center" | "middle" => Some(TextAlign::Center),
-            "justify" => Some(TextAlign::Justify),
+            "left" => Some(TextAlignValue::Left),
+            "right" => Some(TextAlignValue::Right),
+            "center" | "middle" => Some(TextAlignValue::Center),
+            "justify" => Some(TextAlignValue::Justify),
             _ => None,
         };
         if let Some(ta) = ta && matches!(tag, "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "td" | "th" | "tr" | "caption" | "table" | "center") {
@@ -760,7 +760,7 @@ fn presentational_hints(e: &browser_dom::Element) -> Vec<Declaration> {
         }
     }
     if e.attr("hidden").is_some() {
-        push(&mut out, P::Display(crate::properties::Display::None));
+        push(&mut out, P::Display(DisplayValue::None));
     }
     out
 }

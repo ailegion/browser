@@ -28,7 +28,8 @@ use browser_layout::{Fragment, ImageSizes, LayoutEngine, LayoutTree, Rect};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
-    ElementStates, InteractionDeps, Origin, Position, Rule, StyleMap, Stylesheet, Stylist, Viewport, compute_styles_with,
+    ElementStates, InteractionDeps, Origin, Position, Rule, Sides, StyleMap, Stylesheet, Stylist, Viewport,
+    compute_styles_with,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -79,8 +80,18 @@ pub struct View {
     pub scroll_changed: bool,
     /// Inline `<style>` sheets parsed here, by text hash.
     inline_cache: HashMap<u64, Arc<Stylesheet>>,
-    /// Fragment rectangles by node, in tree order, for the current layout.
-    rect_index: Option<HashMap<NodeId, Vec<(u32, Rect)>>>,
+    /// Fragment boxes by node, in tree order, for the current layout.
+    rect_index: Option<HashMap<NodeId, Vec<FragmentBox>>>,
+}
+
+/// One fragment of an element in the current layout: its border box
+/// and the used padding and margin layout gave it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FragmentBox {
+    order: u32,
+    pub(crate) rect: Rect,
+    pub(crate) padding: Sides<f32>,
+    pub(crate) margin: Sides<f32>,
 }
 
 fn hash_text(text: &str) -> u64 {
@@ -209,13 +220,18 @@ impl View {
         }
     }
 
-    fn index(&mut self) -> &HashMap<NodeId, Vec<(u32, Rect)>> {
+    fn index(&mut self) -> &HashMap<NodeId, Vec<FragmentBox>> {
         if self.rect_index.is_none() {
-            let mut index: HashMap<NodeId, Vec<(u32, Rect)>> = HashMap::new();
+            let mut index: HashMap<NodeId, Vec<FragmentBox>> = HashMap::new();
             let mut order = 0u32;
-            fn visit(f: &Fragment, order: &mut u32, index: &mut HashMap<NodeId, Vec<(u32, Rect)>>) {
+            fn visit(f: &Fragment, order: &mut u32, index: &mut HashMap<NodeId, Vec<FragmentBox>>) {
                 if let Some(n) = f.node {
-                    index.entry(n).or_default().push((*order, f.rect));
+                    index.entry(n).or_default().push(FragmentBox {
+                        order: *order,
+                        rect: f.rect,
+                        padding: f.padding,
+                        margin: f.margin,
+                    });
                     *order += 1;
                 }
                 for c in &f.children {
@@ -236,15 +252,15 @@ impl View {
     pub fn rects_of(&mut self, doc: &Document, id: NodeId) -> Vec<Rect> {
         let index = self.index();
         if let Some(own) = index.get(&id) {
-            return own.iter().map(|&(_, r)| r).collect();
+            return own.iter().map(|b| b.rect).collect();
         }
         if !doc.contains(id) {
             return Vec::new();
         }
         let mut found: Vec<(u32, Rect)> = Vec::new();
         for d in doc.descendants(id) {
-            if let Some(rects) = index.get(&d) {
-                found.extend(rects.iter().copied());
+            if let Some(boxes) = index.get(&d) {
+                found.extend(boxes.iter().map(|b| (b.order, b.rect)));
             }
         }
         found.sort_by_key(|&(o, _)| o);
@@ -261,7 +277,13 @@ impl View {
 
     /// The first box of `id`, if it has one.
     pub fn own_rect(&mut self, id: NodeId) -> Option<Rect> {
-        self.index().get(&id).and_then(|v| v.first()).map(|&(_, r)| r)
+        self.own_box(id).map(|b| b.rect)
+    }
+
+    /// The first fragment of `id` with its used padding and margin, if
+    /// it has a box of its own.
+    pub(crate) fn own_box(&mut self, id: NodeId) -> Option<FragmentBox> {
+        self.index().get(&id).and_then(|v| v.first()).copied()
     }
 
     /// The smallest rectangle around all of an element's boxes; zero
@@ -276,10 +298,10 @@ impl View {
         let index = self.index();
         let (mut w, mut h) = (padding_box.width, padding_box.height);
         for d in doc.descendants(id) {
-            if let Some(rects) = index.get(&d) {
-                for &(_, r) in rects {
-                    w = w.max(r.right() - padding_box.x);
-                    h = h.max(r.bottom() - padding_box.y);
+            if let Some(boxes) = index.get(&d) {
+                for b in boxes {
+                    w = w.max(b.rect.right() - padding_box.x);
+                    h = h.max(b.rect.bottom() - padding_box.y);
                 }
             }
         }
@@ -311,7 +333,10 @@ fn padding_box(rect: Rect, style: &browser_style::ComputedStyle) -> Rect {
 
 /// Run `f` with the document's layout current, the view and the document
 /// borrowed apart. `None` when no view is lent (nothing runs then).
-fn with_layout<T>(context: &mut Context, f: impl FnOnce(&mut View, &Document, bool) -> T) -> JsResult<Option<T>> {
+pub(crate) fn with_layout<T>(
+    context: &mut Context,
+    f: impl FnOnce(&mut View, &Document, bool) -> T,
+) -> JsResult<Option<T>> {
     let quirks = host_state(context)?.borrow().info.quirks;
     let shared = dom(context)?;
     let mut guard = shared.borrow_mut();

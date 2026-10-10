@@ -70,6 +70,8 @@ pub struct Decoration {
     /// Top of the line, relative to the fragment's top.
     pub y: f32,
     pub thickness: f32,
+    /// `text-decoration-color`, resolved (the text color by default).
+    pub color: browser_style::Rgba,
 }
 
 /// One grapheme cluster of a text fragment: the bytes of the inline root's
@@ -143,6 +145,10 @@ pub struct Fragment {
     pub style: Arc<ComputedStyle>,
     pub content: FragmentContent,
     pub children: Vec<Fragment>,
+    /// The used padding and margin layout decided for this box (what
+    /// `getComputedStyle` reports); zero for text and anonymous boxes.
+    pub padding: browser_style::Sides<f32>,
+    pub margin: browser_style::Sides<f32>,
 }
 
 impl Fragment {

@@ -558,7 +558,7 @@ impl Painter<'_> {
                 rect.right() as f64,
                 (rect.y + deco.y + deco.thickness.max(1.0)) as f64,
             );
-            self.scene.fill(Fill::NonZero, self.transform, brush, None, &line);
+            self.scene.fill(Fill::NonZero, self.transform, color(deco.color), None, &line);
         }
         self.composition_underline(rect, t, node);
     }

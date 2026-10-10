@@ -15,6 +15,7 @@ pub mod custom;
 pub mod media;
 pub mod properties;
 pub mod selector_impl;
+pub mod serialize;
 pub mod state;
 pub mod stylesheet;
 pub mod ua;
@@ -25,8 +26,11 @@ pub use state::{ElementStates, InteractionDeps, Reach, Scope, StateKind, StateRu
 pub use computed::{ComputedStyle, LineHeight, Viewport};
 pub use properties::*;
 pub use media::MediaQueryList;
-pub use stylesheet::{Origin, Rule, StyleRule, Stylesheet, parse_declaration_block};
-pub use values::{ComputedLp, ComputedLpAuto, ComputedSize, Rgba};
+pub use serialize::{UsedValues, resolved_value, serialize_block, serialize_declared, serialize_shorthand};
+pub use stylesheet::{
+    Origin, Rule, StyleRule, Stylesheet, parse_cssom_block, parse_declaration_block, parse_declaration_value,
+};
+pub use values::{ComputedLp, ComputedLpAuto, ComputedSize, Rgba, css_number};
 
 /// Parse error type used by all value parsers; the custom payload is unit
 /// because a failed declaration is simply dropped.

@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cssom;
 mod dom;
 mod events;
 mod view;
@@ -1948,5 +1949,87 @@ mod tests {
         let l = lines(&mut h);
         assert_eq!(l.len(), 1, "{l:?}");
         assert!(l[0].contains("RangeError: boom"), "{l:?}");
+    }
+
+    #[test]
+    fn element_style_edits_the_style_attribute_and_computed_style_is_read_only() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><html><body><div id=d style='color: RED; margin: 1px 2px; --x: 7; width: var(--w)'>t</div><p id=p></p></body></html>",
+        );
+        h.lend_document(doc, false, Default::default());
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+
+        // Reads: camelCase, dashed, shorthands rebuilt, custom properties,
+        // `var()` as written, indices and length.
+        assert_eq!(
+            s(&mut h, "var d = document.getElementById('d'), st = d.style; \
+                       [st instanceof CSSStyleDeclaration, st === d.style, st.color, st.getPropertyValue('COLOR'), st['margin-top'], st.marginRight, st.margin, st.getPropertyValue('--x'), st.width, st.marginTop, \
+                        st.length, st.item(0), st[1], JSON.stringify(st.item(99)), st.cssText, String(st.parentRule), 'color' in st, 'backgroundColor' in st, 'cssFloat' in st, 'transform' in st, 0 in st, 7 in st, Object.keys(st).join(), [...st].length].join('|')").as_deref(),
+            Ok("\"true|true|red|red|1px|2px|1px 2px|7|var(--w)|1px|7|color|margin-top|\\\"\\\"|color: red; margin: 1px 2px; --x: 7; width: var(--w);|null|true|true|true|false|true|false|0,1,2,3,4,5,6|7\"")
+        );
+        assert!(!h.take_dom_mutated(), "reading changes nothing");
+        // Writes: normalized values, priorities, cssFloat, an unknown
+        // property, an invalid value.
+        assert_eq!(
+            s(&mut h, "st.backgroundColor = '#ff0000'; st.setProperty('padding-left', '3px', 'important'); st.cssFloat = 'left'; st.display = 'TABLE'; st.nope = 'x'; st.color = 'notacolor'; st.setProperty('color', 'blue', 'bogus'); st.setProperty('transform', 'rotate(1deg)'); \
+                       [d.getAttribute('style'), st.getPropertyPriority('padding-left'), st.getPropertyPriority('color'), st.float, st.display, st.color, st.nope, st.length].join('|')").as_deref(),
+            Ok("\"color: red; margin: 1px 2px; --x: 7; width: var(--w); background-color: rgb(255, 0, 0); padding-left: 3px !important; float: left; display: table;|important||left|table|red|x|11\"")
+        );
+        assert!(h.take_dom_mutated(), "a write restyles");
+        // An unchanged write changes nothing; a removal gives the old value.
+        assert_eq!(s(&mut h, "st.display = 'table'; st.setProperty('padding-left', '3px', 'IMPORTANT'); st.length").as_deref(), Ok("11"));
+        assert!(!h.take_dom_mutated());
+        assert_eq!(
+            s(&mut h, "[st.removeProperty('margin'), JSON.stringify(st.removeProperty('nothing')), st.length, st.margin, st.marginTop, d.getAttribute('style')].join('|')").as_deref(),
+            Ok("\"1px 2px|\\\"\\\"|7|||color: red; --x: 7; width: var(--w); background-color: rgb(255, 0, 0); padding-left: 3px !important; float: left; display: table;\"")
+        );
+        assert!(h.take_dom_mutated());
+        // cssText replaces the block (invalid parts dropped, a repeated
+        // property kept once, a shorthand collapsed); the attribute follows.
+        assert_eq!(
+            s(&mut h, "st.cssText = 'color: blue; color: green; zzz: 1; border: 1px solid; width: calc(100% - 10px)'; \
+                       [st.length, st.cssText, d.getAttribute('style') === st.cssText, st.borderTopStyle, st.border, st.borderColor, st.width].join('|')").as_deref(),
+            Ok("\"14|color: green; border: 1px solid; width: calc(100% - 10px);|true|solid|1px solid|currentcolor|calc(100% - 10px)\"")
+        );
+        // `setAttribute` is seen at once; `!important` through it; an
+        // empty or null value removes; custom properties are trimmed.
+        assert_eq!(
+            s(&mut h, "d.setAttribute('style', 'opacity: .5; color: red !important'); var a = [st.opacity, st.length, st.getPropertyPriority('color'), st.cssText]; \
+                       st.color = ''; st.setProperty('--my-var', '  12px '); st.opacity = null; \
+                       a.push(st.length, st.getPropertyValue('--my-var'), d.getAttribute('style')); a.join('|')").as_deref(),
+            Ok("\"0.5|2|important|opacity: 0.5; color: red !important;|1|12px|--my-var: 12px;\"")
+        );
+        // A `var()` under a shorthand name reads back there, not on the
+        // longhands; a longhand set afterwards replaces it.
+        assert_eq!(
+            s(&mut h, "st.margin = 'var(--m)'; var a = [st.margin, JSON.stringify(st.marginTop), st.cssText]; st.marginTop = '1px'; a.push(st.cssText); a.join('|')").as_deref(),
+            Ok("\"var(--m)|\\\"\\\"|--my-var: 12px; margin: var(--m);|--my-var: 12px; margin-top: 1px;\"")
+        );
+        // Errors: wrong receivers, a text node has no style.
+        assert_eq!(
+            s(&mut h, "var errs = []; var tryit = f => { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } }; \
+                       tryit(() => Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, 'color').get.call({})); \
+                       tryit(() => CSSStyleDeclaration.prototype.getPropertyValue.call(1, 'color')); \
+                       tryit(() => Object.getOwnPropertyDescriptor(Element.prototype, 'style').get.call(d.firstChild)); tryit(() => new CSSStyleDeclaration()); \
+                       tryit(() => getComputedStyle({})); tryit(() => getComputedStyle(document)); tryit(() => getComputedStyle(d.firstChild)); errs.join(',')").as_deref(),
+            Ok("\"TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError\"")
+        );
+        // A method called on the proxy itself finds its declarations.
+        assert_eq!(s(&mut h, "CSSStyleDeclaration.prototype.getPropertyValue.call(st, 'margin-top')").as_deref(), Ok("\"1px\""));
+        // Computed style without a view lent: empty, and read-only.
+        assert_eq!(
+            s(&mut h, "var cs = getComputedStyle(d); var errs = []; var tryit = f => { try { f() } catch (e) { errs.push(e.name) } }; \
+                       tryit(() => cs.color = 'red'); tryit(() => cs.setProperty('color', 'red')); tryit(() => cs.removeProperty('color')); tryit(() => cs.cssText = ''); \
+                       [cs instanceof CSSStyleDeclaration, cs.length, JSON.stringify(cs.color), JSON.stringify(cs.cssText), getComputedStyle(d, '::nope').length, getComputedStyle(d, null) !== cs, errs.join(',')].join('|')").as_deref(),
+            Ok("\"true|0|\\\"\\\"|\\\"\\\"|0|true|NoModificationAllowedError,NoModificationAllowedError,NoModificationAllowedError,NoModificationAllowedError\"")
+        );
+        // A detached element's style works and is not a tree change.
+        h.take_dom_mutated();
+        assert_eq!(
+            s(&mut h, "var e = document.createElement('div'); e.style.color = 'red'; e.style.setProperty('width', '10px', 'important'); [e.style.cssText, e.getAttribute('style')].join('|')").as_deref(),
+            Ok("\"color: red; width: 10px !important;|color: red; width: 10px !important;\"")
+        );
+        assert!(!h.take_dom_mutated(), "a detached element is not on screen");
     }
 }

@@ -73,14 +73,17 @@ impl Stylesheet {
     }
 
     fn resolve_urls(&mut self, base: &url::Url) {
-        use crate::properties::PropertyDeclaration;
+        use crate::properties::{ImageValue, PropertyDeclaration};
         fn walk(rules: &mut [Rule], base: &url::Url) {
             for r in rules {
                 match r {
                     Rule::Style(s) => {
                         for d in &mut s.declarations {
                             match &mut d.value {
-                                DeclaredValue::Value(PropertyDeclaration::BackgroundImage(Some(u))) => {
+                                DeclaredValue::Value(
+                                    PropertyDeclaration::BackgroundImage(ImageValue::Url(u))
+                                    | PropertyDeclaration::ListStyleImage(ImageValue::Url(u)),
+                                ) => {
                                     if let Ok(abs) = base.join(u) {
                                         *u = Arc::from(abs.as_str());
                                     }
@@ -131,6 +134,61 @@ pub fn parse_declaration_block(css: &str) -> Vec<Declaration> {
     let mut input = ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
     parse_declarations(&mut parser)
+}
+
+/// Parse one declaration's value for `name`, as a declaration block would
+/// (custom properties and `var()` values kept as text, shorthands
+/// expanded, CSS-wide keywords applied). `None` when the property is not
+/// supported or the value is invalid for it; the `!important` flag is not
+/// part of `value` here.
+pub fn parse_declaration_value(name: &str, value: &str) -> Option<Vec<DeclaredValue>> {
+    let raw = value.trim();
+    if name.starts_with("--") {
+        let value = match_ignore_ascii_case! { raw,
+            "initial" => CustomValue::Initial,
+            "inherit" | "unset" | "revert" | "revert-layer" => CustomValue::Inherit,
+            _ => CustomValue::Raw(Arc::from(raw)),
+        };
+        return Some(vec![DeclaredValue::Custom {
+            name: Arc::from(name),
+            value,
+        }]);
+    }
+    if contains_var(raw) {
+        longhands_of(name)?;
+        return Some(vec![DeclaredValue::Pending {
+            name: Arc::from(name),
+            raw: Arc::from(raw),
+        }]);
+    }
+    let mut input = ParserInput::new(raw);
+    let mut parser = Parser::new(&mut input);
+    let values = parse_property(name, &mut parser).ok()?;
+    (!values.is_empty()).then_some(values)
+}
+
+/// Parse a declaration block as the CSSOM holds it: each longhand, custom
+/// property or `var()` declaration name at most once. A later declaration
+/// of the same property replaces an earlier one and takes its place at
+/// the end, unless the earlier is `!important` and the later is not, in
+/// which case the later is dropped (what the cascade would do with them).
+pub fn parse_cssom_block(css: &str) -> Vec<Declaration> {
+    let mut out: Vec<Declaration> = Vec::new();
+    for d in parse_declaration_block(css) {
+        let same = |x: &Declaration| match (x.value.id(), d.value.id()) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => x.value.property_name() == d.value.property_name(),
+            _ => false,
+        };
+        if let Some(pos) = out.iter().position(same) {
+            if out[pos].important && !d.important {
+                continue;
+            }
+            out.remove(pos);
+        }
+        out.push(d);
+    }
+    out
 }
 
 fn parse_declarations(input: &mut Parser<'_, '_>) -> Vec<Declaration> {

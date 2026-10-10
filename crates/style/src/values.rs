@@ -4,7 +4,9 @@ use cssparser::{Parser, Token, match_ignore_ascii_case};
 
 use crate::ParseErr;
 
-/// A CSS length before computation. Percentages are kept separate.
+/// A CSS length before computation, in the unit it was written in (the
+/// CSSOM serializes a specified value as written). Percentages are kept
+/// separate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Length {
     Px(f32),
@@ -17,6 +19,13 @@ pub enum Length {
     /// `ch`, `ex`: approximated from font size at compute time.
     Ch(f32),
     Ex(f32),
+    /// The absolute units: fixed ratios to `px`.
+    Pt(f32),
+    Pc(f32),
+    In(f32),
+    Cm(f32),
+    Mm(f32),
+    Q(f32),
 }
 
 impl Length {
@@ -34,7 +43,152 @@ impl Length {
             Length::Vmax(v) => v * ctx.viewport_width.max(ctx.viewport_height) / 100.0,
             Length::Ch(v) => v * ctx.font_size * 0.5,
             Length::Ex(v) => v * ctx.font_size * 0.5,
+            Length::Pt(v) => v * 96.0 / 72.0,
+            Length::Pc(v) => v * 16.0,
+            Length::In(v) => v * 96.0,
+            Length::Cm(v) => v * 96.0 / 2.54,
+            Length::Mm(v) => v * 96.0 / 25.4,
+            Length::Q(v) => v * 96.0 / 25.4 / 4.0,
         }
+    }
+
+    /// The number and the unit, as written.
+    pub fn parts(self) -> (f32, &'static str) {
+        match self {
+            Length::Px(v) => (v, "px"),
+            Length::Em(v) => (v, "em"),
+            Length::Rem(v) => (v, "rem"),
+            Length::Vw(v) => (v, "vw"),
+            Length::Vh(v) => (v, "vh"),
+            Length::Vmin(v) => (v, "vmin"),
+            Length::Vmax(v) => (v, "vmax"),
+            Length::Ch(v) => (v, "ch"),
+            Length::Ex(v) => (v, "ex"),
+            Length::Pt(v) => (v, "pt"),
+            Length::Pc(v) => (v, "pc"),
+            Length::In(v) => (v, "in"),
+            Length::Cm(v) => (v, "cm"),
+            Length::Mm(v) => (v, "mm"),
+            Length::Q(v) => (v, "q"),
+        }
+    }
+
+    /// Serialize as written: `<number><unit>`.
+    pub fn to_css(self) -> String {
+        let (v, unit) = self.parts();
+        format!("{}{unit}", css_number(v))
+    }
+}
+
+/// Serialize a CSS number: the shortest form with at most six decimals,
+/// no trailing zeros, no negative zero (what browsers print).
+pub fn css_number(v: f32) -> String {
+    if !v.is_finite() {
+        return "0".to_owned();
+    }
+    let s = format!("{:.6}", v);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    let s = if s.is_empty() || s == "-" || s == "-0" { "0" } else { s };
+    s.to_owned()
+}
+
+/// A `calc()` sum of lengths and percentages, kept as its terms so it can
+/// be serialized; `+`/`-` are folded into the signs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calc {
+    pub terms: Vec<CalcTerm>,
+}
+
+/// One operand of a `calc()` sum, with the sign of the `+`/`-` before it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalcTerm {
+    pub negative: bool,
+    pub value: CalcValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CalcValue {
+    Length(Length),
+    Percent(f32),
+    /// A nested `calc()`, folded on its own before it joins the sum.
+    Nested(Calc),
+}
+
+impl Calc {
+    /// The value the engine uses: `px` terms sum with `px`, `%` with `%`;
+    /// anything else keeps what was accumulated so far.
+    fn fold(&self) -> LengthPercentage {
+        let value = |t: &CalcTerm| match &t.value {
+            CalcValue::Length(l) => LengthPercentage::Length(*l),
+            CalcValue::Percent(p) => LengthPercentage::Percent(*p),
+            CalcValue::Nested(c) => c.fold(),
+        };
+        let mut iter = self.terms.iter();
+        let mut acc = match iter.next() {
+            Some(t) => value(t),
+            None => LengthPercentage::ZERO,
+        };
+        for next in iter {
+            let op = if next.negative { -1.0 } else { 1.0 };
+            acc = match (acc, value(next)) {
+                (LengthPercentage::Length(Length::Px(a)), LengthPercentage::Length(Length::Px(b))) => {
+                    LengthPercentage::Length(Length::Px(a + op * b))
+                }
+                (LengthPercentage::Percent(a), LengthPercentage::Percent(b)) => LengthPercentage::Percent(a + op * b),
+                // Mixed units are not supported yet; keep the first operand.
+                (a, _) => a,
+            };
+        }
+        acc
+    }
+
+    /// Sum every term into `percent` and `lengths` by unit, nested sums
+    /// flattened, signs applied.
+    fn collect(&self, sign: f32, percent: &mut Option<f32>, lengths: &mut Vec<(&'static str, f32)>) {
+        for t in &self.terms {
+            let s = if t.negative { -sign } else { sign };
+            match &t.value {
+                CalcValue::Percent(p) => *percent = Some(percent.unwrap_or(0.0) + s * p),
+                CalcValue::Length(l) => {
+                    let (v, unit) = l.parts();
+                    match lengths.iter_mut().find(|(u, _)| *u == unit) {
+                        Some(slot) => slot.1 += s * v,
+                        None => lengths.push((unit, s * v)),
+                    }
+                }
+                CalcValue::Nested(c) => c.collect(s, percent, lengths),
+            }
+        }
+    }
+
+    /// Serialize per CSS Values 4: like terms summed, percentages first,
+    /// then lengths by unit, inside `calc()`.
+    pub fn to_css(&self) -> String {
+        let mut percent: Option<f32> = None;
+        let mut lengths: Vec<(&'static str, f32)> = Vec::new();
+        self.collect(1.0, &mut percent, &mut lengths);
+        lengths.sort_by(|a, b| a.0.cmp(b.0));
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = percent {
+            parts.push(format!("{}%", css_number(p)));
+        }
+        for (unit, v) in lengths {
+            parts.push(format!("{}{unit}", css_number(v)));
+        }
+        let mut out = String::from("calc(");
+        for (i, p) in parts.iter().enumerate() {
+            if i == 0 {
+                out.push_str(p);
+            } else if let Some(rest) = p.strip_prefix('-') {
+                out.push_str(" - ");
+                out.push_str(rest);
+            } else {
+                out.push_str(" + ");
+                out.push_str(p);
+            }
+        }
+        out.push(')');
+        out
     }
 }
 
@@ -47,21 +201,72 @@ pub struct LengthContext {
     pub viewport_height: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LengthPercentage {
     Length(Length),
     Percent(f32),
+    /// A `calc()`, kept as written; `fold` gives what the engine uses.
+    Calc(Calc),
 }
 
 impl LengthPercentage {
     pub const ZERO: LengthPercentage = LengthPercentage::Length(Length::ZERO);
+
+    /// The engine's value: a plain length or percentage.
+    pub fn folded(&self) -> LengthPercentage {
+        match self {
+            LengthPercentage::Calc(c) => c.fold(),
+            other => other.clone(),
+        }
+    }
+
+    pub fn to_computed(&self, ctx: &LengthContext) -> ComputedLp {
+        match self.folded() {
+            LengthPercentage::Length(l) => ComputedLp::Px(l.to_px(ctx)),
+            LengthPercentage::Percent(p) => ComputedLp::Percent(p),
+            LengthPercentage::Calc(_) => ComputedLp::ZERO,
+        }
+    }
+
+    pub fn to_css(&self) -> String {
+        match self {
+            LengthPercentage::Length(l) => l.to_css(),
+            LengthPercentage::Percent(p) => format!("{}%", css_number(*p)),
+            LengthPercentage::Calc(c) => c.to_css(),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LengthPercentageAuto {
     Length(Length),
     Percent(f32),
+    Calc(Calc),
     Auto,
+}
+
+impl LengthPercentageAuto {
+    pub fn to_computed(&self, ctx: &LengthContext) -> ComputedLpAuto {
+        match self {
+            LengthPercentageAuto::Auto => ComputedLpAuto::Auto,
+            LengthPercentageAuto::Length(l) => ComputedLpAuto::Px(l.to_px(ctx)),
+            LengthPercentageAuto::Percent(p) => ComputedLpAuto::Percent(*p),
+            LengthPercentageAuto::Calc(c) => match c.fold() {
+                LengthPercentage::Length(l) => ComputedLpAuto::Px(l.to_px(ctx)),
+                LengthPercentage::Percent(p) => ComputedLpAuto::Percent(p),
+                LengthPercentage::Calc(_) => ComputedLpAuto::Px(0.0),
+            },
+        }
+    }
+
+    pub fn to_css(&self) -> String {
+        match self {
+            LengthPercentageAuto::Auto => "auto".to_owned(),
+            LengthPercentageAuto::Length(l) => l.to_css(),
+            LengthPercentageAuto::Percent(p) => format!("{}%", css_number(*p)),
+            LengthPercentageAuto::Calc(c) => c.to_css(),
+        }
+    }
 }
 
 /// Computed length-or-percentage: lengths are in px.
@@ -100,16 +305,57 @@ impl ComputedLpAuto {
 }
 
 /// Size value: auto, length, percentage, or the keywords taffy understands.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SizeValue {
     Auto,
     Length(Length),
     Percent(f32),
+    Calc(Calc),
     MinContent,
     MaxContent,
     FitContent,
     /// `none` for max-width/max-height.
     None,
+}
+
+impl SizeValue {
+    fn from_lp(lp: LengthPercentage) -> SizeValue {
+        match lp {
+            LengthPercentage::Length(l) => SizeValue::Length(l),
+            LengthPercentage::Percent(p) => SizeValue::Percent(p),
+            LengthPercentage::Calc(c) => SizeValue::Calc(c),
+        }
+    }
+
+    pub fn to_computed(&self, ctx: &LengthContext) -> ComputedSize {
+        match self {
+            SizeValue::Auto => ComputedSize::Auto,
+            SizeValue::Length(l) => ComputedSize::Px(l.to_px(ctx)),
+            SizeValue::Percent(p) => ComputedSize::Percent(*p),
+            SizeValue::Calc(c) => match c.fold() {
+                LengthPercentage::Length(l) => ComputedSize::Px(l.to_px(ctx)),
+                LengthPercentage::Percent(p) => ComputedSize::Percent(p),
+                LengthPercentage::Calc(_) => ComputedSize::Px(0.0),
+            },
+            SizeValue::MinContent => ComputedSize::MinContent,
+            SizeValue::MaxContent => ComputedSize::MaxContent,
+            SizeValue::FitContent => ComputedSize::FitContent,
+            SizeValue::None => ComputedSize::None,
+        }
+    }
+
+    pub fn to_css(&self) -> String {
+        match self {
+            SizeValue::Auto => "auto".to_owned(),
+            SizeValue::Length(l) => l.to_css(),
+            SizeValue::Percent(p) => format!("{}%", css_number(*p)),
+            SizeValue::Calc(c) => c.to_css(),
+            SizeValue::MinContent => "min-content".to_owned(),
+            SizeValue::MaxContent => "max-content".to_owned(),
+            SizeValue::FitContent => "fit-content".to_owned(),
+            SizeValue::None => "none".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -155,12 +401,31 @@ impl Rgba {
         let f = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         [f(self.r), f(self.g), f(self.b), f(self.a)]
     }
+
+    /// Serialize per CSS Color 4: `rgb(r, g, b)`, or `rgba(r, g, b, a)`
+    /// when not opaque (alpha with up to three decimals).
+    pub fn to_css(&self) -> String {
+        let [r, g, b, _] = self.to_rgba8();
+        let a = self.a.clamp(0.0, 1.0);
+        if a >= 1.0 {
+            format!("rgb({r}, {g}, {b})")
+        } else {
+            let s = format!("{:.3}", a);
+            let s = s.trim_end_matches('0').trim_end_matches('.');
+            let s = if s.is_empty() { "0" } else { s };
+            format!("rgba({r}, {g}, {b}, {s})")
+        }
+    }
 }
 
-/// Specified color: a concrete color or `currentcolor`.
+/// Specified color: a concrete color, a named color (kept by name, as the
+/// CSSOM serializes it), `transparent` or `currentcolor`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Color {
     Rgba(Rgba),
+    /// Index into `NAMED_COLORS`.
+    Named(u8),
+    Transparent,
     CurrentColor,
 }
 
@@ -168,9 +433,26 @@ impl Color {
     pub fn resolve(self, current: Rgba) -> Rgba {
         match self {
             Color::Rgba(c) => c,
+            Color::Named(i) => named_rgba(i),
+            Color::Transparent => Rgba::TRANSPARENT,
             Color::CurrentColor => current,
         }
     }
+
+    /// Serialize the specified value as written (keywords stay keywords).
+    pub fn to_css(self) -> String {
+        match self {
+            Color::Rgba(c) => c.to_css(),
+            Color::Named(i) => NAMED_COLORS[i as usize].0.to_owned(),
+            Color::Transparent => "transparent".to_owned(),
+            Color::CurrentColor => "currentcolor".to_owned(),
+        }
+    }
+}
+
+fn named_rgba(i: u8) -> Rgba {
+    let v = NAMED_COLORS[i as usize].1;
+    Rgba::rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
 }
 
 // ----- parsing -----
@@ -197,12 +479,12 @@ fn length_from_unit(value: f32, unit: &str) -> Option<Length> {
         "vmax" => Length::Vmax(value),
         "ch" => Length::Ch(value),
         "ex" => Length::Ex(value),
-        "pt" => Length::Px(value * 96.0 / 72.0),
-        "pc" => Length::Px(value * 16.0),
-        "in" => Length::Px(value * 96.0),
-        "cm" => Length::Px(value * 96.0 / 2.54),
-        "mm" => Length::Px(value * 96.0 / 25.4),
-        "q" => Length::Px(value * 96.0 / 25.4 / 4.0),
+        "pt" => Length::Pt(value),
+        "pc" => Length::Pc(value),
+        "in" => Length::In(value),
+        "cm" => Length::Cm(value),
+        "mm" => Length::Mm(value),
+        "q" => Length::Q(value),
         _ => return None,
     })
 }
@@ -219,37 +501,36 @@ pub fn parse_length_percentage<'i>(
         Token::Percentage { unit_value, .. } => Ok(LengthPercentage::Percent(unit_value * 100.0)),
         Token::Number { value, .. } if value == 0.0 => Ok(LengthPercentage::ZERO),
         Token::Function(ref name) if name.eq_ignore_ascii_case("calc") => {
-            // Minimal calc: a single length or percentage inside, optionally
-            // "a + b" of the same kind. Anything else is rejected.
-            input.parse_nested_block(parse_simple_calc)
+            // Minimal calc: lengths and percentages joined by `+`/`-`, kept
+            // as written (`Calc::fold` gives the engine's value). Anything
+            // else is rejected.
+            let terms = input.parse_nested_block(parse_simple_calc)?;
+            Ok(LengthPercentage::Calc(Calc { terms }))
         }
         t => Err(location.new_unexpected_token_error(t)),
     }
 }
 
-fn parse_simple_calc<'i>(input: &mut Parser<'i, '_>) -> Result<LengthPercentage, ParseErr<'i>> {
-    let first = parse_length_percentage(input)?;
-    let mut acc = first;
+fn parse_simple_calc<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<CalcTerm>, ParseErr<'i>> {
+    fn term(lp: LengthPercentage, negative: bool) -> CalcTerm {
+        let value = match lp {
+            LengthPercentage::Length(l) => CalcValue::Length(l),
+            LengthPercentage::Percent(p) => CalcValue::Percent(p),
+            LengthPercentage::Calc(c) => CalcValue::Nested(c),
+        };
+        CalcTerm { negative, value }
+    }
+    let mut terms = vec![term(parse_length_percentage(input)?, false)];
     while !input.is_exhausted() {
         let location = input.current_source_location();
-        let op = match input.next()?.clone() {
-            Token::Delim('+') => 1.0,
-            Token::Delim('-') => -1.0,
+        let negative = match input.next()?.clone() {
+            Token::Delim('+') => false,
+            Token::Delim('-') => true,
             t => return Err(location.new_unexpected_token_error(t)),
         };
-        let next = parse_length_percentage(input)?;
-        acc = match (acc, next) {
-            (LengthPercentage::Length(Length::Px(a)), LengthPercentage::Length(Length::Px(b))) => {
-                LengthPercentage::Length(Length::Px(a + op * b))
-            }
-            (LengthPercentage::Percent(a), LengthPercentage::Percent(b)) => {
-                LengthPercentage::Percent(a + op * b)
-            }
-            // Mixed units are not supported yet; keep the first operand.
-            (a, _) => a,
-        };
+        terms.push(term(parse_length_percentage(input)?, negative));
     }
-    Ok(acc)
+    Ok(terms)
 }
 
 pub fn parse_length_percentage_auto<'i>(
@@ -264,6 +545,7 @@ pub fn parse_length_percentage_auto<'i>(
     Ok(match parse_length_percentage(input)? {
         LengthPercentage::Length(l) => LengthPercentageAuto::Length(l),
         LengthPercentage::Percent(p) => LengthPercentageAuto::Percent(p),
+        LengthPercentage::Calc(c) => LengthPercentageAuto::Calc(c),
     })
 }
 
@@ -278,10 +560,7 @@ pub fn parse_size<'i>(input: &mut Parser<'i, '_>, allow_none: bool) -> Result<Si
             _ => return Err(input.new_custom_error(())),
         });
     }
-    Ok(match parse_length_percentage(input)? {
-        LengthPercentage::Length(l) => SizeValue::Length(l),
-        LengthPercentage::Percent(p) => SizeValue::Percent(p),
-    })
+    Ok(SizeValue::from_lp(parse_length_percentage(input)?))
 }
 
 pub fn parse_number<'i>(input: &mut Parser<'i, '_>) -> Result<f32, ParseErr<'i>> {
@@ -307,10 +586,10 @@ pub fn parse_color<'i>(input: &mut Parser<'i, '_>) -> Result<Color, ParseErr<'i>
                 return Ok(Color::CurrentColor);
             }
             if name.eq_ignore_ascii_case("transparent") {
-                return Ok(Color::Rgba(Rgba::TRANSPARENT));
+                return Ok(Color::Transparent);
             }
             named_color(&name)
-                .map(Color::Rgba)
+                .map(Color::Named)
                 .ok_or_else(|| location.new_unexpected_token_error(Token::Ident(name)))
         }
         Token::IDHash(hex) | Token::Hash(hex) => parse_hex_color(&hex)
@@ -447,19 +726,17 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     (f(h + 1.0 / 3.0), f(h), f(h - 1.0 / 3.0))
 }
 
-fn named_color(name: &str) -> Option<Rgba> {
+/// The index of a named color (case-insensitive), if there is one.
+fn named_color(name: &str) -> Option<u8> {
     let lower = name.to_ascii_lowercase();
     NAMED_COLORS
         .binary_search_by(|(n, _)| n.cmp(&lower.as_str()))
         .ok()
-        .map(|i| {
-            let v = NAMED_COLORS[i].1;
-            Rgba::rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
-        })
+        .map(|i| i as u8)
 }
 
 /// CSS Color Level 4 named colors, sorted by name for binary search.
-static NAMED_COLORS: [(&str, u32); 148] = [
+pub static NAMED_COLORS: [(&str, u32); 148] = [
     ("aliceblue", 0xF0F8FF),
     ("antiquewhite", 0xFAEBD7),
     ("aqua", 0x00FFFF),
@@ -619,9 +896,48 @@ mod tests {
         let mut input = ParserInput::new(s);
         let mut parser = Parser::new(&mut input);
         match parse_color(&mut parser) {
-            Ok(Color::Rgba(c)) => Some(c),
-            _ => None,
+            Ok(Color::CurrentColor) | Err(_) => None,
+            Ok(c) => Some(c.resolve(Rgba::BLACK)),
         }
+    }
+
+    fn lp(s: &str) -> Option<LengthPercentage> {
+        let mut input = ParserInput::new(s);
+        let mut parser = Parser::new(&mut input);
+        parse_length_percentage(&mut parser).ok()
+    }
+
+    #[test]
+    fn serializes_numbers_lengths_calc_and_colors() {
+        assert_eq!(css_number(10.0), "10");
+        assert_eq!(css_number(0.5), "0.5");
+        assert_eq!(css_number(-0.0), "0");
+        assert_eq!(css_number(0.123_456_8), "0.123457");
+        assert_eq!(css_number(1.10), "1.1");
+        assert_eq!(lp("10PT").map(|v| v.to_css()).as_deref(), Some("10pt"));
+        assert_eq!(lp("0").map(|v| v.to_css()).as_deref(), Some("0px"));
+        assert_eq!(lp("1.50%").map(|v| v.to_css()).as_deref(), Some("1.5%"));
+        assert_eq!(lp("calc(1px + 2px)").map(|v| v.to_css()).as_deref(), Some("calc(3px)"));
+        assert_eq!(lp("calc(10px - 5%)").map(|v| v.to_css()).as_deref(), Some("calc(-5% + 10px)"));
+        assert_eq!(lp("calc(1em + 2px - 1px)").map(|v| v.to_css()).as_deref(), Some("calc(1em + 1px)"));
+        // The engine's value is unchanged: like kinds sum, mixed keeps the first.
+        let ctx = LengthContext { font_size: 10.0, root_font_size: 10.0, viewport_width: 100.0, viewport_height: 100.0 };
+        assert_eq!(lp("calc(1px + 2px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(3.0)));
+        assert_eq!(lp("calc(10px + 5%)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(10.0)));
+        assert_eq!(lp("calc(5% + 10px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Percent(5.0)));
+        assert_eq!(lp("calc(1em + 1em)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(10.0)));
+        let c = |s: &str| {
+            let mut input = ParserInput::new(s);
+            let mut parser = Parser::new(&mut input);
+            parse_color(&mut parser).map(|c| c.to_css()).ok()
+        };
+        assert_eq!(c("Red").as_deref(), Some("red"));
+        assert_eq!(c("#ff0000").as_deref(), Some("rgb(255, 0, 0)"));
+        assert_eq!(c("#00ff0080").as_deref(), Some("rgba(0, 255, 0, 0.502)"));
+        assert_eq!(c("rgba(1, 2, 3, 0.5)").as_deref(), Some("rgba(1, 2, 3, 0.5)"));
+        assert_eq!(c("transparent").as_deref(), Some("transparent"));
+        assert_eq!(c("CurrentColor").as_deref(), Some("currentcolor"));
+        assert_eq!(c("hsl(120, 100%, 50%)").as_deref(), Some("rgb(0, 255, 0)"));
     }
 
     #[test]

@@ -110,6 +110,8 @@ impl LayoutEngine {
                     style: root_style,
                     content: FragmentContent::Anonymous,
                     children: Vec::new(),
+                    padding: Default::default(),
+                    margin: Default::default(),
                 },
                 content_width: viewport_width,
                 content_height: viewport_height,
@@ -165,6 +167,8 @@ impl LayoutEngine {
                 style: root_style,
                 content: FragmentContent::Anonymous,
                 children: vec![html_fragment],
+                padding: Default::default(),
+                margin: Default::default(),
             },
             content_width,
             content_height: content_height.max(viewport_height),
@@ -199,6 +203,8 @@ impl LayoutEngine {
                     None => FragmentContent::Box,
                 },
                 children: Vec::new(),
+                padding: Default::default(),
+                margin: Default::default(),
             };
             return AtomicResult {
                 width: w,
@@ -425,6 +431,14 @@ impl LayoutEngine {
         let x = ox + layout.location.x;
         let y = oy + layout.location.y;
         let rect = Rect::new(x, y, layout.size.width, layout.size.height);
+        let sides = |r: taffy::Rect<f32>| browser_style::Sides {
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+            left: r.left,
+        };
+        let padding = sides(layout.padding);
+        let margin = sides(layout.margin);
 
         match &node.kind {
             BoxKind::Inline(content) => {
@@ -439,6 +453,8 @@ impl LayoutEngine {
                     style: node.style.clone(),
                     content: FragmentContent::Anonymous,
                     children,
+                    padding,
+                    margin,
                 }
             }
             BoxKind::Image { url, .. } => Fragment {
@@ -450,6 +466,8 @@ impl LayoutEngine {
                     None => FragmentContent::Box,
                 },
                 children: Vec::new(),
+                padding,
+                margin,
             },
             BoxKind::Block | BoxKind::Flex => {
                 let children = node
@@ -467,6 +485,8 @@ impl LayoutEngine {
                         None => FragmentContent::Box,
                     },
                     children,
+                    padding,
+                    margin,
                 }
             }
         }
@@ -869,7 +889,10 @@ fn push_style(
     range: Option<std::ops::Range<usize>>,
 ) {
     let color = Brush(style.color.to_rgba8());
-    let props: [StyleProperty<'_, Brush>; 8] = [
+    // The decoration lines take `text-decoration-color` (the text color
+    // unless set).
+    let decoration = Brush(style.text_decoration_color.to_rgba8());
+    let props: [StyleProperty<'_, Brush>; 10] = [
         StyleProperty::FontFamily(FontFamily::Source(std::borrow::Cow::Borrowed(&style.font_family))),
         StyleProperty::FontSize(style.font_size.max(0.0)),
         StyleProperty::FontWeight(FontWeight::new(style.font_weight as f32)),
@@ -886,6 +909,8 @@ fn push_style(
         }),
         StyleProperty::Underline(style.text_decoration.underline),
         StyleProperty::Strikethrough(style.text_decoration.line_through),
+        StyleProperty::UnderlineBrush(Some(decoration)),
+        StyleProperty::StrikethroughBrush(Some(decoration)),
     ];
     for p in props {
         match &range {
@@ -938,9 +963,18 @@ fn emit_text_fragments(
                         let style = &styles[style_idx];
                         let color = style.brush.0;
                         let deco = |d: &Option<parley::layout::Decoration<Brush>>, default_offset: f32, default_size: f32| {
-                            d.as_ref().map(|d| Decoration {
-                                y: baseline - line_top - d.offset.unwrap_or(default_offset),
-                                thickness: d.size.unwrap_or(default_size),
+                            d.as_ref().map(|d| {
+                                let c = d.brush.0;
+                                Decoration {
+                                    y: baseline - line_top - d.offset.unwrap_or(default_offset),
+                                    thickness: d.size.unwrap_or(default_size),
+                                    color: browser_style::Rgba {
+                                        r: c[0] as f32 / 255.0,
+                                        g: c[1] as f32 / 255.0,
+                                        b: c[2] as f32 / 255.0,
+                                        a: c[3] as f32 / 255.0,
+                                    },
+                                }
                             })
                         };
                         let range = clusters.iter().map(|c| c.start).min().unwrap_or(0)
@@ -975,6 +1009,8 @@ fn emit_text_fragments(
                             style,
                             content: FragmentContent::Text(text),
                             children: Vec::new(),
+                            padding: Default::default(),
+                            margin: Default::default(),
                         }
                     };
 

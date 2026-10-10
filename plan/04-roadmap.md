@@ -1040,14 +1040,97 @@ Work:
       `change`, the rectangle classes). Checked against CSSOM View
       2026-10-09: `offsetTop` under a collapsed margin (first built with
       the wrong expectation in the test, corrected the same day).
-      **Block 2 (next):** `element.style` as a `CSSStyleDeclaration`
-      over the `style` attribute (camelCase and dashed names,
-      `setProperty`/`getPropertyValue`/`removeProperty`/
-      `getPropertyPriority`, `cssText`, `length`/`item`, `cssFloat`,
-      shorthands, invalid values dropped as the cascade drops them,
-      every write restyling), and `getComputedStyle` with resolved
-      values serialized for every longhand and the shorthands the
-      property table expands.
+      **Block 2 done 2026-10-10: `element.style` and
+      `getComputedStyle`. Item 3.3.4 complete.** `crates/script/src/
+      cssom.rs`. `CSSStyleDeclaration` objects are `Proxy`s (as
+      `dataset`) over a target carrying the element and the kind, so
+      `style[0]`, `length` and iteration work beside the prototype's
+      accessors: every longhand and shorthand of the property table in
+      camelCase (`backgroundColor`) and dashed form (`style['background-
+      color']`), `cssFloat` and `float`, `cssText`, `length`, `item`,
+      `parentRule`, `getPropertyValue`, `getPropertyPriority`,
+      `setProperty`, `removeProperty`. `element.style` (one per element,
+      on `Element`) has no state: a read parses the element's current
+      `style` attribute (cached by its text, so `setAttribute('style')`
+      shows at once; duplicates collapse as Blink does, later wins unless
+      the earlier is `!important`), a write follows CSSOM `setProperty`
+      (unknown property ignored, empty or null value removes, a priority
+      other than `important` ignored, the value parsed by the property
+      table so an invalid value is dropped as the cascade drops it,
+      shorthands expanded, `--x` and `var()` kept as text, an unchanged
+      declaration left alone, a changed one removed and appended) and
+      rewrites the attribute with the block's serialization, which is a
+      tree change the tab restyles for (`generation`/`mutated`).
+      Serialization (`crates/style/src/serialize.rs`, per CSSOM): values
+      as browsers normalize them (keywords lower-case, numbers with up to
+      six decimals, hex colors as `rgb()`/`rgba()`, named colors by name,
+      lengths in the unit written, `calc()` simplified, family names
+      quoted only when needed), shorthands rebuilt from their longhands
+      with initial parts left out and the block collapsing runs of
+      longhands into their shorthand (`margin`, `border`, `font`,
+      `background`, …; same importance required). So that readback is
+      exact, the specified value types now keep what was written where
+      the engine used to fold it: `display` keywords (`table-cell`,
+      `flow-root`, …), `float: inline-start/end`, `overflow: overlay`,
+      `-webkit-center`, `self-start`/`left`/`right`/`first`/`last` and
+      `safe`/`unsafe` alignments, `vertical-align` lengths, both radii of
+      a corner, `list-style-type` strings and the `-latin`/
+      `decimal-leading-zero` keywords, `oblique`'s length, the absolute
+      length units (`pt`, `cm`, …), `calc()` as its terms (folded for the
+      engine exactly as before), named colors, `transparent`,
+      `currentcolor`, image functions (gradients) as written, and each
+      family name; computed values are unchanged. Thirteen longhands the
+      shorthands used to parse and drop are now in the table and the
+      computed style (not yet painted, see 4a below):
+      `text-decoration-style`, `text-decoration-color` (painted: the
+      underline takes it), `text-decoration-thickness`,
+      `background-position`, `background-size`, `background-repeat`,
+      `background-attachment`, `background-origin`, `background-clip`,
+      `font-variant`, `font-stretch`, `list-style-position`,
+      `list-style-image`. The `background` shorthand parses the layer
+      grammar (color before image, the last layer's values kept, one
+      image painted as before) and falls back to the old lenient reading
+      for what the grammar refuses. `getComputedStyle(el, pseudo)`
+      returns a read-only declaration (setters, `setProperty`,
+      `removeProperty` and `cssText =` throw `NoModificationAllowedError`;
+      `cssText` reads empty) listing every longhand then the custom
+      properties in effect; values are resolved per CSSOM through the
+      lent view with style and layout current (a write earlier in the
+      script is applied first; the tab keeps the result): used width and
+      height as `box-sizing` says (`Fragment` now carries taffy's used
+      padding and margin), used margins and paddings, used insets from
+      the containing block for absolute and fixed boxes, `line-height` in
+      pixels unless `normal`, colors as `rgb()`, the computed value for
+      the rest and for an unrendered element; a disconnected element and
+      an unknown pseudo-element give an empty list; a pseudo-element
+      (`::before`, `::after`, `::marker`, …) has no rules or box in this
+      engine and answers as an anonymous child of the element; a name
+      without a colon is the element itself. `ComputedStyle` keeps the
+      element's own `text-decoration-line` beside the propagated union so
+      `getComputedStyle` reports the element's value. Tests: style
+      (serialization of every value kind and each shorthand, block
+      collapsing and dedup, resolved values with and without used
+      values), script (every `element.style` member and error, the
+      attribute both ways, `var()` on a shorthand, computed style without
+      a view), tab harness (resolved values against a laid-out page,
+      box-sizing, auto margins, positioned insets, `display: none`,
+      inline, pseudo-elements, custom properties, a write read back in
+      the same script and kept by the tab, `!important`, a detached
+      element). Checked against CSSOM 2026-10-10: `setProperty`,
+      `removeProperty`, the `cssText` setter and the computed flag,
+      serialize-a-declaration-block, the resolved-value list, and
+      `getComputedStyle`'s pseudo-element steps.
+   4a. **Engine properties (next, before 5).** Properties the engine
+      does not know, so neither the cascade, layout, paint nor the CSSOM
+      (which is table-driven and gets them for free once they are in the
+      table) handle them: `transform`, `transition`, `animation`,
+      `box-shadow`, `cursor`, `z-index`, `outline`, `letter-spacing`,
+      `word-break`, `text-overflow`, `pointer-events`, `user-select`,
+      `grid-*`; and painting for the longhands block 2 added to the table
+      without paint (`background-position`/`size`/`repeat`/`attachment`/
+      `origin`/`clip`, `text-decoration-style`/`thickness`,
+      `font-variant: small-caps`, `font-stretch`, `list-style-position`/
+      `image`). Each: parse, compute, lay out, paint.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.

@@ -5494,6 +5494,71 @@ mod tests {
         h.send(ShellToTab::Scroll { dx: 0.0, dy: 50.0 });
         assert_eq!(h.style("a").background_color.to_rgba8(), [255, 0, 0, 255]);
     }
+
+    #[test]
+    fn computed_style_reports_resolved_values_and_style_writes_restyle() {
+        let html = "<!DOCTYPE html><title>CSSOM</title>\
+             <style>body { margin: 0 } :root { --theme: dark } \
+                    #a { width: 50%; height: 40px; padding: 20px 5%; margin: 10px auto; border: 2px solid; line-height: 1.5; font-size: 20px; color: #123456; background: rgba(255, 0, 0, .5) url(x.png) no-repeat; font-family: Helvetica Neue, serif; text-decoration: dotted underline } \
+                    #rel { position: relative } #abs { position: absolute; top: 10px; left: 20px; width: 30px; height: 30px } \
+                    #none { display: none; width: 100px } #em { font-size: 2em }</style>\
+             <div id=a>t<em id=em>e</em></div><div id=rel><div id=abs></div></div><div id=none></div><span id=inl>x</span>\
+             <script>var a = document.getElementById('a'), em = document.getElementById('em'), abs = document.getElementById('abs'), none = document.getElementById('none'), inl = document.getElementById('inl'); \
+                     var cs = el => getComputedStyle(el);</script>";
+        let mut h = Harness::load(html);
+        // Used values: the content box width, percentage padding and
+        // auto margins in pixels, the line height in pixels; colors as
+        // rgb(); the computed keyword for the rest.
+        assert_eq!(
+            run_js(&mut h, "var c = cs(a); [c.width, c.height, c.paddingLeft, c.paddingTop, c.paddingBottom, a.offsetHeight, c.marginLeft, c.marginTop, c.margin, c.borderTopWidth, c.borderTopColor, c.lineHeight, c.fontSize, c.color, c.backgroundColor, c.backgroundImage.endsWith('x.png\")'), c.backgroundRepeat, c.display, c.position, c.fontFamily, c.textDecorationLine, c.textDecorationStyle, c.boxSizing].join('|')"),
+            "\"400px|40px|40px|20px|20px|84|158px|10px|10px 158px|2px|rgb(18, 52, 86)|30px|20px|rgb(18, 52, 86)|rgba(255, 0, 0, 0.5)|true|no-repeat|block|static|\\\"Helvetica Neue\\\", serif|underline|dotted|content-box\""
+        );
+        // The decoration propagates to the text but the child's own value
+        // is none; `em` resolves against the parent's size; the shorthand
+        // `font` is rebuilt from resolved values.
+        assert_eq!(
+            run_js(&mut h, "var c = cs(em); [c.textDecorationLine, c.fontSize, c.font, c.fontStyle].join('|')"),
+            "\"none|40px|italic 40px / 60px \\\"Helvetica Neue\\\", serif|italic\""
+        );
+        // Positioned: used insets from the containing block; display
+        // none: computed values; an inline element: no used size.
+        assert_eq!(
+            run_js(&mut h, "[cs(abs).top, cs(abs).left, cs(abs).right, cs(none).width, cs(none).display, cs(inl).width, cs(inl).display, cs(inl).marginLeft].join('|')"),
+            "\"10px|20px|750px|100px|none|auto|inline|0px\""
+        );
+        // Custom properties are listed after the longhands; the list is
+        // read-only and `cssText` empty.
+        assert_eq!(
+            run_js(&mut h, "var c = cs(document.body); [c.getPropertyValue('--theme'), c.length > 80, c.item(c.length - 1), c.item(0), JSON.stringify(c.cssText), c.getPropertyValue('nope'), (() => { try { c.width = '1px'; return 'set' } catch (e) { return e.name } })()].join('|')"),
+            "\"dark|true|--theme|display|\\\"\\\"||NoModificationAllowedError\""
+        );
+        // A write then a read in one script: style and layout are current
+        // at once; the tab keeps the result.
+        assert_eq!(
+            run_js(&mut h, "a.style.width = '100px'; a.style.boxSizing = 'border-box'; var w1 = cs(a).width; a.style.boxSizing = ''; [w1, cs(a).width, a.getBoundingClientRect().width, a.getAttribute('style')].join('|')"),
+            "\"100px|100px|184|width: 100px;\""
+        );
+        assert_eq!(
+            run_js(&mut h, "a.style.setProperty('color', 'blue', 'important'); a.style.display = 'none'; [cs(a).color, cs(a).width, a.offsetWidth, cs(em).color].join('|')"),
+            "\"rgb(0, 0, 255)|100px|0|rgb(0, 0, 255)\""
+        );
+        // The tab restyled and laid out after the script: nothing is
+        // left on screen for `a`, and the attribute set back clears it.
+        assert_eq!(run_js(&mut h, "a.offsetWidth"), "0");
+        assert_eq!(run_js(&mut h, "a.setAttribute('style', ''); [a.style.length, cs(a).display, a.offsetWidth].join('|')"), "\"0|block|484\"");
+        // Pseudo-elements: no rules or boxes here, so they inherit from
+        // the element; an unknown one is empty; a name without a colon
+        // is the element itself.
+        assert_eq!(
+            run_js(&mut h, "[cs(a, '::before').color, getComputedStyle(a, ':after').display, getComputedStyle(a, '::nope').length, getComputedStyle(a, 'garbage').width].join('|')"),
+            "\"rgb(18, 52, 86)|inline|0|400px\""
+        );
+        // A detached element has inline style but no computed style.
+        assert_eq!(
+            run_js(&mut h, "var e = document.createElement('div'); e.style.color = 'red'; [JSON.stringify(cs(e).color), cs(e).length, e.style.color].join('|')"),
+            "\"\\\"\\\"|0|red\""
+        );
+    }
 }
 
 pub(crate) fn escape(s: &str) -> String {

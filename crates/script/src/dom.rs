@@ -52,7 +52,7 @@ pub(crate) struct Dom {
     /// The wrapper of the document node, which is the `document` global.
     document: Option<JsObject>,
     /// A script changed the connected tree since the tab last asked.
-    mutated: bool,
+    pub(crate) mutated: bool,
     /// The parser is still building the document: nodes it may hold open
     /// must stay in the arena, so nothing is freed while this is set.
     parsing: bool,
@@ -88,6 +88,10 @@ pub(crate) struct Dom {
     pub(crate) media_lists: Vec<crate::view::MediaList>,
     /// The id of `visualViewport`'s target.
     pub(crate) visual_viewport: Option<u64>,
+    /// One `element.style` object per element (`cssom.rs`).
+    pub(crate) styles: HashMap<NodeId, JsObject>,
+    /// The private key a declaration proxy answers with its target.
+    pub(crate) style_key: Option<boa_engine::JsSymbol>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -288,6 +292,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     dom(context)?.borrow_mut().document = Some(document.clone());
     context.register_global_property(js_string!("document"), document, Attribute::ENUMERABLE)?;
     crate::view::register(context)?;
+    crate::cssom::register(context)?;
     Ok(())
 }
 
@@ -537,6 +542,7 @@ fn init_element(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     crate::events::add_handler_attributes(class);
     crate::events::add_pointer_capture_methods(class);
     crate::view::add_element_geometry(class);
+    crate::cssom::add_style_accessor(class);
     Ok(())
 }
 
