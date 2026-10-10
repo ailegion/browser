@@ -1141,9 +1141,17 @@ Work:
       since sheets are not layered (a custom property's own `revert` is
       the keyword for that property, as the spec says, not text). Tests:
       style (each form, the cascade rollback over an inline style and
-      over author rules), the script and tab CSSOM tests extended. Vertical percentage padding
-      (laid out as a share of the box's own width, reported as 0 by
-      taffy) is a layout bug and the next block.
+      over author rules), the script and tab CSSOM tests extended.
+      **Layout fix 2026-10-10:** vertical percentage padding and border
+      were wrong in taffy 0.14.0's block layout (a container resolved
+      its children's against its own height, `None` when auto, while
+      the child's own pass used the width: sized and reported wrong).
+      Fixed with the one-token change from taffy's main branch in a
+      vendored copy, `vendor/taffy/`, through `[patch.crates-io]`
+      (owner's choice A, recorded in `plan/03-crates.md`; drop when a
+      release carries it). Tests: layout (5% padding on every side of a
+      box in an 800px body is 40px in the box and in the reported
+      padding), the tab CSSOM test measures `padding: 5%` again.
    4a. **Engine properties (next, before 5).** Properties the engine
       does not know, so neither the cascade, layout, paint nor the CSSOM
       (which is table-driven and gets them for free once they are in the

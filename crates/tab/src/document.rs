@@ -5499,7 +5499,7 @@ mod tests {
     fn computed_style_reports_resolved_values_and_style_writes_restyle() {
         let html = "<!DOCTYPE html><title>CSSOM</title>\
              <style>body { margin: 0 } :root { --theme: dark } \
-                    #a { width: 50%; height: 40px; padding: 20px 5%; margin: 10px auto; border: 2px solid; line-height: 1.5; font-size: 20px; color: #123456; background: rgba(255, 0, 0, .5) url(x.png) no-repeat; font-family: Helvetica Neue, serif; text-decoration: dotted underline } \
+                    #a { width: 50%; height: 40px; padding: 5%; margin: 10px auto; border: 2px solid; line-height: 1.5; font-size: 20px; color: #123456; background: rgba(255, 0, 0, .5) url(x.png) no-repeat; font-family: Helvetica Neue, serif; text-decoration: dotted underline } \
                     #rel { position: relative } #abs { position: absolute; top: 10px; left: 20px; width: 30px; height: 30px } \
                     #none { display: none; width: 100px } #em { font-size: 2em }</style>\
              <div id=a>t<em id=em>e</em></div><div id=rel><div id=abs></div></div><div id=none></div><span id=inl>x</span>\
@@ -5511,7 +5511,7 @@ mod tests {
         // rgb(); the computed keyword for the rest.
         assert_eq!(
             run_js(&mut h, "var c = cs(a); [c.width, c.height, c.paddingLeft, c.paddingTop, c.paddingBottom, a.offsetHeight, c.marginLeft, c.marginTop, c.margin, c.borderTopWidth, c.borderTopColor, c.lineHeight, c.fontSize, c.color, c.backgroundColor, c.backgroundImage.endsWith('x.png\")'), c.backgroundRepeat, c.display, c.position, c.fontFamily, c.textDecorationLine, c.textDecorationStyle, c.boxSizing].join('|')"),
-            "\"400px|40px|40px|20px|20px|84|158px|10px|10px 158px|2px|rgb(18, 52, 86)|30px|20px|rgb(18, 52, 86)|rgba(255, 0, 0, 0.5)|true|no-repeat|block|static|\\\"Helvetica Neue\\\", serif|underline|dotted|content-box\""
+            "\"400px|40px|40px|40px|40px|124|158px|10px|10px 158px|2px|rgb(18, 52, 86)|30px|20px|rgb(18, 52, 86)|rgba(255, 0, 0, 0.5)|true|no-repeat|block|static|\\\"Helvetica Neue\\\", serif|underline|dotted|content-box\""
         );
         // The decoration propagates to the text but the child's own value
         // is none; `em` resolves against the parent's size; the shorthand

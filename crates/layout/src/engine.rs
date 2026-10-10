@@ -1198,6 +1198,29 @@ mod tests {
     }
 
     #[test]
+    fn percentage_padding_resolves_against_the_containing_block_width() {
+        // 5% of the 800px body on every side, the vertical ones too, both
+        // in the box's size and in the used padding layout reports.
+        let (doc, tree) = layout(
+            "<body style='margin:0'><div style='width:50%;height:40px;padding:5%'>t</div></body>",
+            "",
+        );
+        let div = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "div"))
+            .expect("div");
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(div) && found.is_none() {
+                found = Some((f.rect, f.padding));
+            }
+        });
+        let (rect, padding) = found.expect("the div's fragment");
+        assert_eq!((rect.width, rect.height), (480.0, 120.0));
+        assert_eq!((padding.top, padding.right, padding.bottom, padding.left), (40.0, 40.0, 40.0, 40.0));
+    }
+
+    #[test]
     fn empty_document_does_not_panic() {
         let (_doc, tree) = layout("", "");
         assert_eq!(tree.content_height, 600.0);

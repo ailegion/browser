@@ -40,7 +40,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `xml5ever` | not added | XHTML, inline SVG | Phase 5; match html5ever's version |
 | `cssparser` | 0.37.0 | CSS tokens and parser framework | Pinned to `0.37` because `selectors` 0.40 requires it. 0.38 exists; bump both together |
 | `selectors` | 0.40.0 | Selector parsing, matching, specificity | |
-| `taffy` | 0.14.0 | Block, flex, grid layout | Has `float`/`clear` support for block-level boxes; no tables. Line-box shortening around floats is ours to do (O12) |
+| `taffy` | 0.14.0 | Block, flex, grid layout | Has `float`/`clear` support for block-level boxes; no tables. Line-box shortening around floats is ours to do (O12). **Patched** (2026-10-10, owner's choice): `vendor/taffy/` is 0.14.0 as published plus the one-token fix from taffy's main branch in `src/compute/block.rs` `generate_item_list` (children's percentage padding and border resolve against the container's width, not its size: vertical `5%` was 0 for an auto-height parent while the child's own pass used the width, so the child was sized and reported wrong). `[patch.crates-io]` in the workspace `Cargo.toml` points at it; remove both when a taffy release carries the fix |
 | `slotmap` | 1.1.1 | DOM node arena | |
 | `boa_engine` | 0.22.0 | JavaScript | Interpreter, no JIT; accepted |
 | `boa_gc` | 0.22.0 | GC traits for DOM wrappers | |
