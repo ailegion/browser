@@ -1,30 +1,44 @@
 //! The layout engine: runs taffy over the box tree with parley measuring
 //! inline roots, then produces fragments.
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use browser_dom::Document;
 use browser_style::{
-    ComputedStyle, Float, FontStyle, LineHeight, Overflow, OverflowWrap, Position, StyleMap, TextAlign, WordBreak,
+    ComputedStyle, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position, StyleMap, TextAlign,
+    WordBreak,
 };
+use fontique::{GenericFamily, QueryFamily, QueryStatus};
 use parley::layout::YieldData;
-use parley::style::{FontFamily, FontStyle as PFontStyle, FontWeight, LineHeight as PLineHeight, StyleProperty};
-use parley::{
-    Alignment, AlignmentOptions, FontContext, InlineBox, InlineBoxKind, LayoutContext, OverflowWrap as POverflowWrap,
-    PositionedLayoutItem, TextWrapMode, WordBreak as PWordBreak,
+use parley::style::{
+    FontFamily, FontFamilyName, FontFeatures, FontStyle as PFontStyle, FontWeight, FontWidth, LineHeight as PLineHeight,
+    StyleProperty,
 };
+use parley::{
+    Alignment, AlignmentOptions, FontContext, IndentOptions, InlineBox, InlineBoxKind, LayoutContext,
+    OverflowWrap as POverflowWrap, PositionedLayoutItem, TextWrapMode, WordBreak as PWordBreak,
+};
+use read_fonts::TableProvider;
 use taffy::prelude::*;
 
 use crate::boxes::{
     Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineContent, InlineLayout, TaffyId,
 };
 use crate::convert::to_taffy;
-use crate::{Brush, Cluster, Decoration, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
+use crate::{
+    Brush, Cluster, Decoration, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment,
+    decoration_thickness,
+};
 
 /// Owns the font system and parley's scratch state. One per tab thread.
 pub struct LayoutEngine {
     fonts: FontContext,
     lcx: LayoutContext<Brush>,
+    /// Whether the first font of a `font-family` list has the `smcp`
+    /// feature (real small caps), by list text; probed once each.
+    small_caps: HashMap<Arc<str>, bool>,
 }
 
 impl std::fmt::Debug for LayoutEngine {
@@ -91,7 +105,58 @@ impl LayoutEngine {
         Self {
             fonts: FontContext::new(),
             lcx: LayoutContext::new(),
+            small_caps: HashMap::new(),
         }
+    }
+
+    /// Whether the first font of the `font-family` list `family` (the
+    /// list text as the style keeps it) has an OpenType `smcp` feature,
+    /// so `font-variant: small-caps` can use the font's own small
+    /// capitals rather than synthesized ones. Unknown families count as
+    /// lacking it: whatever font stands in for them gets the synthesis.
+    pub fn font_has_small_caps(&mut self, family: &Arc<str>) -> bool {
+        if let Some(&has) = self.small_caps.get(family) {
+            return has;
+        }
+        enum Family {
+            Named(String),
+            Generic(GenericFamily),
+        }
+        let families: Vec<Family> = FontFamilyName::parse_css_list(family)
+            .map_while(Result::ok)
+            .map(|f| match f {
+                FontFamilyName::Named(name) => Family::Named(name.to_string()),
+                FontFamilyName::Generic(generic) => Family::Generic(generic),
+            })
+            .collect();
+        let mut has = false;
+        {
+            let mut query = self.fonts.collection.query(&mut self.fonts.source_cache);
+            query.set_families(families.iter().map(|f| match f {
+                Family::Named(name) => QueryFamily::Named(name.as_str()),
+                Family::Generic(generic) => QueryFamily::Generic(*generic),
+            }));
+            query.matches_with(|font| {
+                has = font_has_feature(font.blob.as_ref(), font.index, b"smcp");
+                QueryStatus::Stop
+            });
+        }
+        self.small_caps.insert(family.clone(), has);
+        has
+    }
+
+    /// The family lists in `styles` whose small caps must be synthesized.
+    fn small_caps_synth(&mut self, styles: &StyleMap) -> HashSet<Arc<str>> {
+        let mut out = HashSet::new();
+        for (_, style) in styles.iter() {
+            if style.font_variant == FontVariant::SmallCaps
+                && !out.contains(&style.font_family)
+                && !self.font_has_small_caps(&style.font_family)
+            {
+                out.insert(style.font_family.clone());
+            }
+        }
+        out
     }
 
     /// Lay out a whole document in a viewport of the given size.
@@ -103,10 +168,12 @@ impl LayoutEngine {
         viewport_height: f32,
         images: &dyn ImageSizes,
     ) -> LayoutTree {
+        let small_caps_synth = self.small_caps_synth(styles);
         let builder = BoxBuilder {
             doc,
             styles,
             images,
+            small_caps_synth: &small_caps_synth,
         };
         let root_style = Arc::new(ComputedStyle::initial());
         let Some(mut html) = builder.build_root() else {
@@ -743,6 +810,14 @@ fn build_parley_layout(
         });
     }
     let mut layout = builder.build(&content.text);
+    // An outside list marker hangs left of the content edge: the first
+    // line is indented back by the marker's width, measured on the text
+    // laid out unbroken.
+    if content.marker_outside && content.marker_len > 0 {
+        layout.break_all_lines(None);
+        let width = marker_width(&layout, content);
+        layout.set_text_indent(-width, IndentOptions::default());
+    }
     // Spans that may not wrap carry `TextWrapMode::NoWrap` (`push_style`),
     // so the width goes to parley in every case.
     let wrap = container.white_space.allows_wrap();
@@ -765,6 +840,43 @@ fn build_parley_layout(
     };
     layout.align(alignment, AlignmentOptions::default());
     (layout, height)
+}
+
+/// The advance of the list marker at the start of `content`'s text: the
+/// right edge of its glyphs and of its image box on the first line.
+fn marker_width(layout: &parley::Layout<Brush>, content: &InlineContent) -> f32 {
+    let Some(line) = layout.lines().next() else { return 0.0 };
+    let mut right = 0.0f32;
+    for item in line.items() {
+        match item {
+            PositionedLayoutItem::GlyphRun(run) => {
+                let mut x = run.offset();
+                for cluster in run.run().visual_clusters() {
+                    if cluster.text_range().start < content.marker_len {
+                        right = right.max(x + cluster.advance());
+                    }
+                    x += cluster.advance();
+                }
+            }
+            PositionedLayoutItem::InlineBox(b) => {
+                if content.atomics.get(b.id as usize).is_some_and(|a| a.index < content.marker_len) {
+                    right = right.max(b.x + b.width);
+                }
+            }
+        }
+    }
+    right
+}
+
+/// Whether the font (at `index` in a collection file) lists the OpenType
+/// `tag` among its GSUB features.
+fn font_has_feature(data: &[u8], index: u32, tag: &[u8; 4]) -> bool {
+    let tag = read_fonts::types::Tag::new(tag);
+    read_fonts::FontRef::from_index(data, index)
+        .ok()
+        .and_then(|font| font.gsub().ok())
+        .and_then(|gsub| gsub.feature_list().ok())
+        .is_some_and(|list| list.feature_records().iter().any(|r| r.feature_tag() == tag))
 }
 
 /// Line-break `layout` in a box `width` wide whose lines must keep clear of
@@ -909,9 +1021,9 @@ fn push_style(
     range: Option<std::ops::Range<usize>>,
 ) {
     let color = Brush(style.color.to_rgba8());
-    // The decoration lines take `text-decoration-color` (the text color
-    // unless set).
-    let decoration = Brush(style.text_decoration_color.to_rgba8());
+    // The decoration lines take the decorating box's colour (its text
+    // colour unless set).
+    let decoration = Brush(style.decoration_color.to_rgba8());
     // `word-break: break-word` lays out as `normal` with `overflow-wrap:
     // anywhere`, whatever `overflow-wrap` says (CSS Text 3).
     let (word_break, overflow_wrap) = match style.word_break {
@@ -934,10 +1046,11 @@ fn push_style(
     } else {
         TextWrapMode::NoWrap
     };
-    let props: [StyleProperty<'_, Brush>; 14] = [
-        StyleProperty::FontFamily(FontFamily::Source(std::borrow::Cow::Borrowed(&style.font_family))),
+    let props: [StyleProperty<'_, Brush>; 15] = [
+        StyleProperty::FontFamily(FontFamily::Source(Cow::Borrowed(&style.font_family))),
         StyleProperty::FontSize(style.font_size.max(0.0)),
         StyleProperty::FontWeight(FontWeight::new(style.font_weight as f32)),
+        StyleProperty::FontWidth(FontWidth::from_percentage(style.font_stretch)),
         StyleProperty::FontStyle(match style.font_style {
             FontStyle::Normal => PFontStyle::Normal,
             FontStyle::Italic => PFontStyle::Italic,
@@ -962,6 +1075,15 @@ fn push_style(
         match &range {
             Some(r) => builder.push(p, r.clone()),
             None => builder.push_default(p),
+        }
+    }
+    // Small caps from the font's own `smcp` feature; a font without it
+    // ignores the feature and the box builder synthesized them.
+    if style.font_variant == FontVariant::SmallCaps {
+        let feature = StyleProperty::FontFeatures(FontFeatures::Source(Cow::Borrowed("\"smcp\"")));
+        match &range {
+            Some(r) => builder.push(feature, r.clone()),
+            None => builder.push_default(feature),
         }
     }
 }
@@ -1067,8 +1189,9 @@ fn emit_marker(
         let line = |on: bool, offset: f32, size: f32| {
             on.then_some(Decoration {
                 y: baseline - offset,
-                thickness: size,
-                color: style.text_decoration_color,
+                thickness: decoration_thickness(style, r.font_size(), size),
+                color: style.decoration_color,
+                style: style.decoration_style,
             })
         };
         let text = TextFragment {
@@ -1151,6 +1274,10 @@ fn emit_text_fragments(
                                 clusters: Vec<Cluster>,
                                 span: Option<usize>,
                                 style_idx: usize| {
+                        let (span_style, node) = span
+                            .and_then(|i| content.spans.get(i))
+                            .map(|s| (s.style.clone(), s.node))
+                            .unwrap_or((content.container.clone(), None));
                         let style = &styles[style_idx];
                         let color = style.brush.0;
                         let deco = |d: &Option<parley::layout::Decoration<Brush>>, default_offset: f32, default_size: f32| {
@@ -1158,13 +1285,14 @@ fn emit_text_fragments(
                                 let c = d.brush.0;
                                 Decoration {
                                     y: baseline - line_top - d.offset.unwrap_or(default_offset),
-                                    thickness: d.size.unwrap_or(default_size),
+                                    thickness: decoration_thickness(&span_style, r.font_size(), d.size.unwrap_or(default_size)),
                                     color: browser_style::Rgba {
                                         r: c[0] as f32 / 255.0,
                                         g: c[1] as f32 / 255.0,
                                         b: c[2] as f32 / 255.0,
                                         a: c[3] as f32 / 255.0,
                                     },
+                                    style: span_style.decoration_style,
                                 }
                             })
                         };
@@ -1195,14 +1323,10 @@ fn emit_text_fragments(
                             strikethrough_metrics,
                             baseline: baseline - line_top,
                         };
-                        let (style, node) = span
-                            .and_then(|i| content.spans.get(i))
-                            .map(|s| (s.style.clone(), s.node))
-                            .unwrap_or((content.container.clone(), None));
                         Fragment {
                             rect: Rect::new(ox + x0, oy + line_top, x1 - x0, line_height),
                             node,
-                            style,
+                            style: span_style,
                             content: FragmentContent::Text(text),
                             children: Vec::new(),
                             padding: Default::default(),
@@ -1615,6 +1739,130 @@ mod tests {
         let (doc, tree) = cjk("word-break: normal");
         let (normal, _) = lines(&doc, &tree);
         assert!(keep < normal, "keep-all {keep} lines, normal {normal}");
+    }
+
+    /// Twelve-pixel squares for every URL.
+    struct Squares;
+    impl ImageSizes for Squares {
+        fn intrinsic_size(&self, _url: &url::Url) -> Option<(f32, f32)> {
+            Some((12.0, 12.0))
+        }
+    }
+
+    #[test]
+    fn list_markers_hang_outside_the_content_edge_or_sit_inside() {
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px'><ul style='margin:0;padding-left:40px'>\
+             <li>one</li><li style='list-style-position:inside'>two</li>\
+             <li style='list-style-image:url(http://x/m.png)'>three</li></ul></body>",
+            "",
+        );
+        let items: Vec<browser_dom::NodeId> = doc
+            .descendants(doc.root())
+            .filter(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "li"))
+            .collect();
+        // Every text fragment under an item: (x, right, is marker).
+        let texts = |li: browser_dom::NodeId| {
+            let mut out = Vec::new();
+            tree.root.walk(&mut |f| {
+                if f.node == Some(li) {
+                    f.walk(&mut |g| match (&g.content, g.node) {
+                        (FragmentContent::Text(_), n) => out.push((g.rect.x, g.rect.right(), n.is_none())),
+                        (FragmentContent::Image(_), None) => out.push((g.rect.x, g.rect.right(), true)),
+                        _ => {}
+                    });
+                }
+            });
+            out
+        };
+        // Outside: the marker ("• " including its space) ends at the
+        // content edge (x = 40) and the text starts there.
+        let one = texts(items[0]);
+        let marker = one.iter().find(|t| t.2).expect("marker");
+        let text = one.iter().find(|t| !t.2).expect("text");
+        assert!(marker.0 < 40.0 && (marker.1 - 40.0).abs() < 0.5, "{one:?}");
+        assert!((text.0 - 40.0).abs() < 0.5, "{one:?}");
+        // Inside: the marker starts at the content edge, the text after it.
+        let two = texts(items[1]);
+        let marker = two.iter().find(|t| t.2).expect("marker");
+        let text = two.iter().find(|t| !t.2).expect("text");
+        assert!((marker.0 - 40.0).abs() < 0.5 && text.0 > marker.0, "{two:?}");
+        // No image known: the type's text stands in.
+        assert!(texts(items[2]).iter().any(|t| t.2));
+    }
+
+    #[test]
+    fn list_style_image_marker_is_an_image_box_outside_the_item() {
+        let doc = browser_dom::parse_html(
+            b"<body style='margin:0;font-size:16px'><ul style='margin:0;padding-left:40px'>\
+              <li style='list-style-image:url(http://x/m.png)'>three</li></ul></body>",
+        );
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        let mut engine = LayoutEngine::new();
+        let tree = engine.layout(&doc, &styles, 800.0, 600.0, &Squares);
+        let mut image = None;
+        let mut text = None;
+        tree.root.walk(&mut |f| match (&f.content, f.node) {
+            (FragmentContent::Image(u), None) => image = Some((f.rect, u.to_string())),
+            (FragmentContent::Text(_), Some(_)) if text.is_none() => text = Some(f.rect),
+            _ => {}
+        });
+        let (rect, url) = image.expect("image marker");
+        assert_eq!(url, "http://x/m.png");
+        assert_eq!((rect.width, rect.height), (12.0, 12.0));
+        let text = text.expect("text");
+        assert!(rect.right() < 40.0 && rect.x >= 20.0, "hangs in the padding: {rect:?}");
+        assert!((text.x - 40.0).abs() < 0.5, "{text:?}");
+    }
+
+    #[test]
+    fn decoration_lines_carry_their_style_thickness_and_decorating_colour() {
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:20px'><p style='margin:0'>\
+             <u style='text-decoration: underline wavy red 3px'>a<em>b</em></u> \
+             <s style='text-decoration-thickness: 10%'>c</s> <i style='text-decoration: underline from-font'>d</i></p></body>",
+            "",
+        );
+        let (texts, _) = texts_of(&doc, &tree, "p");
+        let _ = texts;
+        let mut by_text: Vec<(String, Option<Decoration>, Option<Decoration>)> = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node) {
+                by_text.push((t.text[t.range.clone()].to_owned(), t.underline, t.strikethrough));
+            }
+        });
+        let find = |s: &str| by_text.iter().find(|(t, _, _)| t == s).unwrap_or_else(|| panic!("fragment {s}: {by_text:?}"));
+        use browser_style::TextDecorationStyle as S;
+        let a = find("a").1.expect("underline");
+        assert_eq!((a.style, a.thickness, a.color.to_rgba8()), (S::Wavy, 3.0, [255, 0, 0, 255]));
+        // `em` declares no lines: the look of `u` comes with the line.
+        let b = find("b").1.expect("propagated underline");
+        assert_eq!((b.style, b.thickness, b.color.to_rgba8()), (S::Wavy, 3.0, [255, 0, 0, 255]));
+        // A percentage is of the font size; `from-font` is the font's.
+        let c = find("c").2.expect("line-through");
+        assert_eq!((c.style, c.thickness), (S::Solid, 2.0));
+        let d = find("d").1.expect("underline");
+        assert!(d.thickness > 0.0 && d.thickness < 5.0, "{d:?}");
+        assert_eq!(d.style, S::Solid);
+    }
+
+    #[test]
+    fn font_stretch_and_small_caps_reach_the_font_system() {
+        // Both lay out; the probe answers once per family and is cached.
+        let (doc, tree) = layout(
+            "<body style='margin:0'><p style='font-stretch: condensed'>narrow</p><p style='font-variant: small-caps'>Small Caps</p></body>",
+            "",
+        );
+        let (texts, _) = texts_of(&doc, &tree, "p");
+        assert!(!texts.is_empty());
+        let mut engine = LayoutEngine::new();
+        let family: Arc<str> = Arc::from("serif");
+        let first = engine.font_has_small_caps(&family);
+        assert_eq!(engine.font_has_small_caps(&family), first);
+        assert_eq!(engine.small_caps.len(), 1);
+        assert!(!engine.font_has_small_caps(&Arc::from("\"No Such Font Family Here\"")), "unknown: synthesized");
     }
 
     #[test]

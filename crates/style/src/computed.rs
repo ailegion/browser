@@ -139,6 +139,14 @@ pub struct ComputedStyle {
     pub text_decoration_style: TextDecorationStyle,
     pub text_decoration_color: Rgba,
     pub text_decoration_thickness: DecorationThickness,
+    /// How the lines on this element's text are drawn: the decorating
+    /// box's style, colour and thickness (this element's own when it
+    /// declares lines, else the nearest ancestor's that does), as CSS
+    /// Text Decoration paints propagated lines. `text_decoration_*` above
+    /// stay the element's own values for `getComputedStyle`.
+    pub decoration_style: TextDecorationStyle,
+    pub decoration_color: Rgba,
+    pub decoration_thickness: DecorationThickness,
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
     pub letter_spacing: LetterSpacing,
@@ -237,6 +245,9 @@ impl ComputedStyle {
             text_decoration_style: TextDecorationStyle::Solid,
             text_decoration_color: Rgba::BLACK,
             text_decoration_thickness: DecorationThickness::Auto,
+            decoration_style: TextDecorationStyle::Solid,
+            decoration_color: Rgba::BLACK,
+            decoration_thickness: DecorationThickness::Auto,
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             letter_spacing: LetterSpacing::Normal,
@@ -292,8 +303,12 @@ impl ComputedStyle {
         self.list_style_image = p.list_style_image.clone();
         self.custom = p.custom.clone();
         // Not inherited by spec, but the decoration propagates to all
-        // descendant text, which is what this achieves for now.
+        // descendant text, which is what this achieves for now; its look
+        // comes along with it.
         self.text_decoration = p.text_decoration;
+        self.decoration_style = p.decoration_style;
+        self.decoration_color = p.decoration_color;
+        self.decoration_thickness = p.decoration_thickness;
     }
 
     pub fn is_block_container(&self) -> bool {
@@ -723,6 +738,19 @@ pub fn compute(
         TextDecorationThickness::FromFont => DecorationThickness::FromFont,
         TextDecorationThickness::Length(l) => DecorationThickness::Length(lp(l)),
     });
+    // The lines are drawn as the decorating box says: this element when
+    // it declares lines of its own, else the ancestor whose lines
+    // propagate to it (CSS Text Decoration 3, "painting text
+    // decorations").
+    if out.text_decoration_line.is_none() {
+        out.decoration_style = parent.decoration_style;
+        out.decoration_color = parent.decoration_color;
+        out.decoration_thickness = parent.decoration_thickness;
+    } else {
+        out.decoration_style = out.text_decoration_style;
+        out.decoration_color = out.text_decoration_color;
+        out.decoration_thickness = out.text_decoration_thickness;
+    }
     pick!(text_transform, TextTransform, TextTransform, |v| *v);
     pick!(white_space, WhiteSpace, WhiteSpace, |v| *v);
     pick!(letter_spacing, LetterSpacing, LetterSpacing, |v| match v {

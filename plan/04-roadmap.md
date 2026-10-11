@@ -1252,6 +1252,58 @@ Work:
       script (`wordWrap`/`overflowWrap` both ways, the four as written,
       a percentage refused), tab harness (resolved values, inheritance
       into a child, a `letter-spacing` write widening the box at once).
+      **Block 2 done 2026-10-11: `font-variant: small-caps`,
+      `font-stretch`, `text-decoration-style`/`-thickness` paint,
+      `list-style-position`/`-image`.** Decorations: the lines on an
+      element's text are drawn as the decorating box says (CSS Text
+      Decoration 3): `ComputedStyle` carries `decoration_style`/
+      `_color`/`_thickness` in effect beside the element's own
+      `text_decoration_*` (which `getComputedStyle` reports), taken from
+      the element when it declares lines and from the ancestor whose
+      lines propagate otherwise, so `<u style="... wavy red"><em>` draws
+      `em`'s underline wavy and red (before, its own solid currentcolor;
+      the colour path changed with the owner's go). A layout
+      `Decoration` carries style and thickness; the thickness is the
+      font's for `auto` and `from-font`, else the length, a percentage
+      being of the font size; `refresh_styles` updates them paint-only.
+      The painter draws `solid`, `double` (two lines a thickness apart),
+      `dotted` and `dashed` (dash patterns phased from the page x axis
+      so a line runs unbroken across fragments), `wavy` (a stroked quad
+      wave, clipped to the fragment). `font-stretch` goes to parley as
+      `FontWidth`. Small caps: `LayoutEngine::font_has_small_caps`
+      resolves the `font-family` list's first font through fontique and
+      reads its GSUB feature list with `read-fonts` (new direct
+      dependency, `03-crates.md`), cached per list; a font with `smcp`
+      gets the feature, one without (or an unknown family) gets Blink's
+      synthesis in the box builder: lowercase letters become capitals in
+      runs 0.7 times the size, each run its own span of the text node,
+      after `text-transform`. Markers: `list-style-image` (fetched by
+      the tab beside background images) replaces the type's text with an
+      inline image box at its intrinsic size followed by a space, the
+      image winning over `list-style-type: none`; until the image is
+      known the type's text stands in. `list-style-position: outside`
+      (the default) hangs the marker left of the content edge: the first
+      line of the item's inline root is indented back by the marker's
+      width (parley's text indent, the width measured on the text laid
+      out unbroken), so bullets and numbers now sit in the `<ul>`
+      padding with their end at the content edge, as in browsers;
+      `inside` keeps the marker in the line as before. Found and fixed on
+      the way: the 2000-nested-`<span>` malformed case overflowed the
+      paint test thread's 2 MiB stack (a tab thread has 16 MiB; the
+      box builder's recursion is bounded at 400 levels but its debug
+      frame had grown): `collect_inline` now leaves element
+      classification, `<br>` and atomic handling to helpers and the case
+      passes with a 1 MiB stack. Snapshot `01-text-and-boxes.png` was
+      regenerated for the moved markers (nothing else in it changed).
+      Tests: style (the decorating box's look propagates, own values
+      stay for the CSSOM), layout (synthesized small caps runs and spans,
+      the `smcp` probe cached and false for an unknown family, markers
+      outside/inside/image at the box and fragment level with the text
+      at the content edge, decoration style/thickness/colour on
+      fragments including propagation, percentages and `from-font`,
+      `font-stretch` laid out), paint (double and dotted lines by pixel),
+      tab harness (a `data:` `list-style-image` fetched and laid out
+      outside the item).
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.

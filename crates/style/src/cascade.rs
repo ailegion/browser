@@ -913,6 +913,34 @@ mod tests {
     }
 
     #[test]
+    fn decoration_look_comes_from_the_decorating_box() {
+        // `em` declares no lines: the lines it gets from `u` keep `u`'s
+        // wavy red 2px look, while its own `text-decoration-*` stay
+        // initial for `getComputedStyle`. `b` declares its own line, so
+        // its lines take its own look (currentcolor, solid), even though
+        // `s` around it sets a colour.
+        let (doc, styles) = styles_for(
+            "<u style='text-decoration: underline wavy red 2px'><em>x</em></u>\
+             <s style='text-decoration-color: blue'><b style='text-decoration: underline; color: green'>y</b></s>",
+            "",
+        );
+        use crate::properties::TextDecorationStyle;
+        let em = find(&doc, "em");
+        assert_eq!(styles[em].decoration_style, TextDecorationStyle::Wavy);
+        assert_eq!(styles[em].decoration_color.to_rgba8(), [255, 0, 0, 255]);
+        assert_eq!(styles[em].decoration_thickness, crate::computed::DecorationThickness::Length(crate::values::ComputedLp::Px(2.0)));
+        assert!(styles[em].text_decoration.underline, "the line propagates");
+        assert_eq!(styles[em].text_decoration_style, TextDecorationStyle::Solid, "own value for the CSSOM");
+        assert_eq!(styles[em].text_decoration_color.to_rgba8(), [0, 0, 0, 255]);
+        let b = find(&doc, "b");
+        assert!(styles[b].text_decoration.underline && styles[b].text_decoration.line_through);
+        assert_eq!(styles[b].decoration_color.to_rgba8(), [0, 128, 0, 255], "its own currentcolor");
+        assert_eq!(styles[b].decoration_style, TextDecorationStyle::Solid);
+        let s = find(&doc, "s");
+        assert_eq!(styles[s].decoration_color.to_rgba8(), [0, 0, 255, 255]);
+    }
+
+    #[test]
     fn hidden_and_head_are_display_none() {
         let (doc, styles) = styles_for("<div hidden>x</div>", "");
         assert_eq!(styles[find(&doc, "div")].display, Display::None);

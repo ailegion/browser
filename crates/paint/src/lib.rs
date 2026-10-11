@@ -12,10 +12,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use browser_dom::NodeId;
-use browser_layout::{Control, Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment};
-use browser_style::{BorderStyle, ComputedStyle, Rgba, Visibility};
+use browser_layout::{Control, Decoration, Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment};
+use browser_style::{BorderStyle, ComputedStyle, Rgba, TextDecorationStyle, Visibility};
 use url::Url;
-use vello::kurbo::{Affine, BezPath, Circle, Point, Rect as KRect, RoundedRect, RoundedRectRadii, Shape as _, Stroke};
+use vello::kurbo::{
+    Affine, BezPath, Cap, Circle, Line, Point, Rect as KRect, RoundedRect, RoundedRectRadii, Shape as _, Stroke,
+};
 use vello::peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat, Mix};
 use vello::{Glyph, Scene};
 
@@ -552,15 +554,64 @@ impl Painter<'_> {
                 }),
             );
         for deco in [t.underline, t.strikethrough].into_iter().flatten() {
-            let line = KRect::new(
-                rect.x as f64,
-                (rect.y + deco.y) as f64,
-                rect.right() as f64,
-                (rect.y + deco.y + deco.thickness.max(1.0)) as f64,
-            );
-            self.scene.fill(Fill::NonZero, self.transform, color(deco.color), None, &line);
+            self.decoration_line(rect, &deco);
         }
         self.composition_underline(rect, t, node);
+    }
+
+    /// One decoration line across the fragment, in its
+    /// `text-decoration-style`. Dots, dashes and waves are phased from
+    /// the page's x axis, so a line continues unbroken from one fragment
+    /// of a run into the next.
+    fn decoration_line(&mut self, rect: &Rect, deco: &Decoration) {
+        let t = deco.thickness.max(1.0) as f64;
+        let (x0, x1) = (rect.x as f64, rect.right() as f64);
+        let y = (rect.y + deco.y) as f64;
+        let c = color(deco.color);
+        let band = |top: f64| KRect::new(x0, top, x1, top + t);
+        match deco.style {
+            TextDecorationStyle::Solid => {
+                self.scene.fill(Fill::NonZero, self.transform, c, None, &band(y));
+            }
+            TextDecorationStyle::Double => {
+                // Two lines with a gap of one thickness between them.
+                self.scene.fill(Fill::NonZero, self.transform, c, None, &band(y));
+                self.scene.fill(Fill::NonZero, self.transform, c, None, &band(y + 2.0 * t));
+            }
+            TextDecorationStyle::Dotted | TextDecorationStyle::Dashed => {
+                let (dash, gap) = if deco.style == TextDecorationStyle::Dotted { (t, t) } else { (3.0 * t, 3.0 * t) };
+                let period = dash + gap;
+                let stroke = Stroke::new(t)
+                    .with_caps(Cap::Butt)
+                    .with_dashes(x0.rem_euclid(period), [dash, gap]);
+                let line = Line::new((x0, y + t / 2.0), (x1, y + t / 2.0));
+                self.scene.stroke(&stroke, self.transform, c, None, &line);
+            }
+            TextDecorationStyle::Wavy => {
+                // A wave one thickness high (peak to trough: twice the
+                // amplitude) with a half wavelength of two thicknesses,
+                // clipped to the fragment's width.
+                let amplitude = t;
+                let half = 2.0 * t;
+                let cy = y + amplitude + t / 2.0;
+                let start = (x0 / (2.0 * half)).floor() * 2.0 * half;
+                let mut path = BezPath::new();
+                path.move_to((start, cy));
+                let mut x = start;
+                let mut up = true;
+                while x < x1 {
+                    let peak = if up { cy - 2.0 * amplitude } else { cy + 2.0 * amplitude };
+                    path.quad_to((x + half / 2.0, peak), (x + half, cy));
+                    x += half;
+                    up = !up;
+                }
+                let clip = KRect::new(x0, y - t, x1, cy + 2.0 * amplitude + t);
+                self.scene.push_clip_layer(Fill::NonZero, self.transform, &clip);
+                let stroke = Stroke::new(t).with_caps(Cap::Round);
+                self.scene.stroke(&stroke, self.transform, c, None, &path);
+                self.scene.pop_layer();
+            }
+        }
     }
 
     fn image(&mut self, rect: &Rect, style: &ComputedStyle, url: &Url) {
@@ -803,6 +854,66 @@ mod tests {
         let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
         let p = at(&pixels);
         assert!(p.iter().all(|&c| c < 128), "the underline is dark: {p:?}");
+    }
+
+    /// A double underline is two red bands with a gap; a dotted one
+    /// alternates ink and canvas along the line.
+    #[test]
+    fn decoration_styles_paint() {
+        let html = b"<body style='margin:0;font-size:20px;line-height:30px;color:#000'>\
+            <p style='margin:0;text-decoration:underline double red 2px'>HHHH</p>\
+            <p style='margin:0;text-decoration:underline dotted red 2px'>HHHH</p></body>";
+        let doc = browser_dom::parse_html(html);
+        let mut stylist = browser_style::Stylist::new();
+        stylist.add_sheet(browser_style::ua::ua_stylesheet());
+        let vp = browser_style::Viewport {
+            width: 200.0,
+            height: 100.0,
+            scale_factor: 1.0,
+            prefers_dark: false,
+        };
+        let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+        let mut engine = browser_layout::LayoutEngine::new();
+        let images = ImageStore::new();
+        let tree = engine.layout(&doc, &styles, 200.0, 100.0, &images);
+        let mut lines = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
+                && let Some(u) = t.underline
+            {
+                lines.push((f.rect, u));
+            }
+        });
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let options = PaintOptions {
+            viewport_width: 200.0,
+            viewport_height: 100.0,
+            scale: 1.0,
+            ..PaintOptions::default()
+        };
+        let mut scene = Scene::new();
+        paint(&tree, &images, &options, &mut scene);
+        let Some(pixels) = render_offscreen(&scene, 200, 100, Color::WHITE) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let px = |x: f32, y: f32| {
+            let i = (y as usize * 200 + x as usize) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        let red = [255, 0, 0];
+        let (r, u) = lines[0];
+        assert_eq!(u.thickness, 2.0);
+        let x = r.x + 2.0;
+        assert_eq!(px(x, r.y + u.y + 1.0), red, "double: first line");
+        assert_eq!(px(x, r.y + u.y + 3.0), [255, 255, 255], "double: the gap");
+        assert_eq!(px(x, r.y + u.y + 5.0), red, "double: second line");
+        let (r, u) = lines[1];
+        let y = r.y + u.y + 1.0;
+        // Dashes of one thickness from the fragment's left edge (x = 0).
+        assert_eq!(px(r.x + 0.5, y), red, "dotted: ink");
+        assert_eq!(px(r.x + 2.5, y), [255, 255, 255], "dotted: gap");
+        assert_eq!(px(r.x + 4.5, y), red, "dotted: ink again");
     }
 
     #[test]

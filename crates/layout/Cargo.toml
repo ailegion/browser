@@ -15,6 +15,9 @@ browser-style.workspace = true
 taffy.workspace = true
 parley.workspace = true
 fontique.workspace = true
+# To read a font's GSUB feature list (`smcp` for small caps); the same
+# version parley's skrifa uses.
+read-fonts.workspace = true
 url.workspace = true
 html5ever.workspace = true
 tracing.workspace = true

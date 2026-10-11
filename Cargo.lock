@@ -595,6 +595,7 @@ dependencies = [
  "fontique",
  "html5ever",
  "parley",
+ "read-fonts",
  "taffy",
  "tracing",
  "url",

@@ -18,7 +18,7 @@ pub mod selection;
 use std::sync::Arc;
 
 use browser_dom::NodeId;
-use browser_style::{ComputedStyle, Rgba};
+use browser_style::{ComputedStyle, DecorationThickness, Rgba, TextDecorationStyle};
 use url::Url;
 
 pub use engine::{LayoutEngine, layout_document};
@@ -69,9 +69,25 @@ pub struct PositionedGlyph {
 pub struct Decoration {
     /// Top of the line, relative to the fragment's top.
     pub y: f32,
+    /// The line's thickness: the font's, or the declared
+    /// `text-decoration-thickness`.
     pub thickness: f32,
-    /// `text-decoration-color`, resolved (the text color by default).
+    /// The decorating box's `text-decoration-color`, resolved (its text
+    /// color by default).
     pub color: browser_style::Rgba,
+    /// The decorating box's `text-decoration-style`.
+    pub style: TextDecorationStyle,
+}
+
+/// The thickness of a decoration line on text of `font_size`: the font's
+/// own (`from_font`) for `auto` and `from-font`, else the declared
+/// length, a percentage being of the font size (CSS Text Decoration 4).
+pub fn decoration_thickness(style: &ComputedStyle, font_size: f32, from_font: f32) -> f32 {
+    match style.decoration_thickness {
+        DecorationThickness::Auto | DecorationThickness::FromFont => from_font,
+        DecorationThickness::Length(lp) => lp.resolve(font_size),
+    }
+    .max(0.0)
 }
 
 /// One grapheme cluster of a text fragment: the bytes of the inline root's
@@ -212,11 +228,13 @@ impl LayoutTree {
                     f.style = s.clone();
                     if let FragmentContent::Text(t) = &mut f.content {
                         t.color = s.color;
-                        let line = |on: bool, (y, thickness): (f32, f32)| {
+                        let font_size = t.font_size;
+                        let line = |on: bool, (y, from_font): (f32, f32)| {
                             on.then_some(Decoration {
                                 y,
-                                thickness,
-                                color: s.text_decoration_color,
+                                thickness: decoration_thickness(s, font_size, from_font),
+                                color: s.decoration_color,
+                                style: s.decoration_style,
                             })
                         };
                         t.underline = line(s.text_decoration.underline, t.underline_metrics);

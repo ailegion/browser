@@ -2946,14 +2946,15 @@ impl TabState {
         self.fetch(request, PendingKind::Image { url });
     }
 
-    /// Background images only become known after the cascade.
+    /// Background and list marker images only become known after the
+    /// cascade.
     fn fetch_background_images(&mut self) {
         let mut urls = Vec::new();
         for (_, style) in self.styles.iter() {
-            if let Some(u) = &style.background_image
-                && let Ok(url) = Url::parse(u)
-            {
-                urls.push(url);
+            for u in [&style.background_image, &style.list_style_image].into_iter().flatten() {
+                if let Ok(url) = Url::parse(u) {
+                    urls.push(url);
+                }
             }
         }
         for url in urls {
@@ -4525,6 +4526,32 @@ mod tests {
             h.state.script.as_mut().and_then(|s| s.eval_to_string("log.slice(4).join(' ')").ok()).as_deref(),
             Some("\"rsc:complete onrsc:complete load:complete:true:false\"")
         );
+    }
+
+    #[test]
+    fn list_style_image_is_fetched_and_hangs_outside_the_item() {
+        // A 1x1 PNG. The cascade names it, the tab fetches it like a
+        // background image, and the next layout puts it before the
+        // item's text, left of the content edge.
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let html = format!(
+            "<!DOCTYPE html><body style='margin:0'><ul style='margin:0;padding-left:40px;list-style-image:url({png})'><li>item</li></ul>"
+        );
+        let mut h = Harness::load(&html);
+        h.pump_until(|h| !h.state.images.is_empty());
+        h.pump();
+        let tree = h.state.layout.as_ref().expect("layout");
+        let mut image = None;
+        let mut text = None;
+        tree.root.walk(&mut |f| match (&f.content, f.node) {
+            (browser_layout::FragmentContent::Image(_), None) => image = Some(f.rect),
+            (browser_layout::FragmentContent::Text(_), Some(_)) if text.is_none() => text = Some(f.rect),
+            _ => {}
+        });
+        let image = image.expect("the image marker is laid out");
+        let text = text.expect("text");
+        assert_eq!((image.width, image.height), (1.0, 1.0));
+        assert!(image.right() < 40.0 && (text.x - 40.0).abs() < 0.5, "{image:?} {text:?}");
     }
 
     #[test]

@@ -46,6 +46,8 @@ parley = "0.11.1"
 # binding load the system library at runtime instead of probing it with
 # pkg-config at build time (plan/03-crates.md, "OS bindings on Linux").
 fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
+# Font table parsing (Fontations); pinned to the version skrifa 0.44 pulls.
+read-fonts = "0.41"
 pollster = "0.4"
 
 # content (Servo parsing group)

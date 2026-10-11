@@ -1,10 +1,14 @@
 //! Box tree construction: DOM + computed styles -> boxes that taffy lays
 //! out, with inline content gathered into inline roots.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use browser_dom::{Document, NodeId, NodeKind};
-use browser_style::{ComputedStyle, Display, Float, ListStyleType, Rgba, StyleMap, TextTransform, WhiteSpace};
+use browser_style::{
+    ComputedStyle, Display, Float, FontVariant, ListStylePosition, ListStyleType, Rgba, StyleMap, TextTransform,
+    WhiteSpace,
+};
 use html5ever::{local_name, ns};
 use url::Url;
 
@@ -115,6 +119,13 @@ pub(crate) struct InlineContent {
     /// clips its overflow; set by the engine once the root's width is
     /// final. A line that overflows the root ends with it.
     pub ellipsis: Option<Ellipsis>,
+    /// The list marker at the start of the text: its byte length (an
+    /// image marker is an atomic at index 0 followed by a space), and
+    /// whether it hangs outside the item (`list-style-position:
+    /// outside`), in which case the first line starts that far left of
+    /// the content edge.
+    pub marker_len: usize,
+    pub marker_outside: bool,
 }
 
 /// The laid-out `text-overflow` marker of an inline root.
@@ -133,6 +144,8 @@ impl InlineContent {
             cache: Vec::new(),
             floats: Vec::new(),
             ellipsis: None,
+            marker_len: 0,
+            marker_outside: false,
         }
     }
 
@@ -202,6 +215,16 @@ enum ControlKind {
     Select,
 }
 
+/// How an inline-level element joins its inline root.
+enum InlineKind {
+    /// A `<br>`.
+    Break,
+    /// Laid out on its own, placed in the line as a box.
+    Atomic,
+    /// Its children join the run.
+    Plain,
+}
+
 /// Whitespace collapsing state while gathering one inline root.
 struct WsState {
     /// The last emitted character was a collapsible space.
@@ -214,6 +237,10 @@ pub(crate) struct BoxBuilder<'a> {
     pub doc: &'a Document,
     pub styles: &'a StyleMap,
     pub images: &'a dyn ImageSizes,
+    /// Font family lists whose first font has no `smcp` feature:
+    /// `font-variant: small-caps` text in them is synthesized (lowercase
+    /// letters as smaller capitals). Probed by the engine.
+    pub small_caps_synth: &'a HashSet<Arc<str>>,
 }
 
 /// Element nesting deeper than this is flattened: a stack overflow aborts
@@ -234,6 +261,11 @@ impl BoxBuilder<'_> {
 
     fn style_of(&self, id: NodeId) -> Option<Arc<ComputedStyle>> {
         self.styles.get(id).cloned()
+    }
+
+    /// Whether small caps in this style are synthesized.
+    fn synth_small_caps(&self, style: &ComputedStyle) -> bool {
+        style.font_variant == FontVariant::SmallCaps && self.small_caps_synth.contains(&style.font_family)
     }
 
     fn is_image(&self, id: NodeId) -> bool {
@@ -355,7 +387,8 @@ impl BoxBuilder<'_> {
             last_was_space: false,
             at_line_start: true,
         };
-        append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws);
+        let synth = self.synth_small_caps(&text_style);
+        append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws, synth);
         let mut inline = BoxNode::new(BoxKind::Inline(content), None, container);
         inline.anonymous = true;
         b.children.push(inline);
@@ -391,7 +424,8 @@ impl BoxBuilder<'_> {
                 last_was_space: false,
                 at_line_start: true,
             };
-            append_text(&mut content, &self.doc.text_content(id), style.clone(), None, &mut ws);
+            let synth = self.synth_small_caps(&style);
+            append_text(&mut content, &self.doc.text_content(id), style.clone(), None, &mut ws, synth);
             let mut inline = BoxNode::new(BoxKind::Inline(content), None, Arc::new(ComputedStyle::anonymous_from(&style)));
             inline.anonymous = true;
             vec![inline]
@@ -435,7 +469,8 @@ impl BoxBuilder<'_> {
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
                     let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
-                    append_text(content, text, container.clone(), Some(child), &mut ws);
+                    let synth = self.synth_small_caps(container);
+                    append_text(content, text, container.clone(), Some(child), &mut ws, synth);
                 }
                 NodeKind::Element(_) => {
                     let Some(style) = self.style_of(child) else { continue };
@@ -459,34 +494,12 @@ impl BoxBuilder<'_> {
         out
     }
 
-    /// Gather an inline-level element into the current inline root.
-    fn collect_inline(
-        &self,
-        id: NodeId,
-        style: Arc<ComputedStyle>,
-        content: &mut InlineContent,
-        ws: &mut WsState,
-        depth: usize,
-    ) {
-        if depth >= MAX_DEPTH {
-            append_text(content, &self.doc.text_content(id), style, Some(id), ws);
-            return;
-        }
+    /// What an inline-level element contributes to its inline root.
+    fn inline_kind(&self, id: NodeId, style: &ComputedStyle) -> InlineKind {
         let element = self.doc.element(id);
-        let is_br = element.is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("br"));
-        if is_br {
-            content.text.push('\n');
-            content.spans.push(TextSpan {
-                start: content.text.len() - 1,
-                end: content.text.len(),
-                style,
-                node: Some(id),
-            });
-            ws.last_was_space = true;
-            ws.at_line_start = true;
-            return;
+        if element.is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("br")) {
+            return InlineKind::Break;
         }
-
         let atomic = self.is_image(id)
             || matches!(style.display, Display::InlineBlock | Display::InlineFlex)
             || element.is_some_and(|e| {
@@ -503,23 +516,64 @@ impl BoxBuilder<'_> {
                             | local_name!("svg")
                     )
             });
-        if atomic {
-            let node = self.build_element(id, style, depth + 1);
-            content.atomics.push(Atomic {
-                index: content.text.len(),
-                node,
-                result: None,
-            });
-            ws.last_was_space = false;
-            ws.at_line_start = false;
+        if atomic { InlineKind::Atomic } else { InlineKind::Plain }
+    }
+
+    /// A `<br>`: a forced line break in the run.
+    fn push_break(id: NodeId, style: Arc<ComputedStyle>, content: &mut InlineContent, ws: &mut WsState) {
+        content.text.push('\n');
+        content.spans.push(TextSpan {
+            start: content.text.len() - 1,
+            end: content.text.len(),
+            style,
+            node: Some(id),
+        });
+        ws.last_was_space = true;
+        ws.at_line_start = true;
+    }
+
+    /// An element laid out on its own and placed in the line as a box:
+    /// an inline-block, image or control, or a block inside an inline
+    /// (laid out as an atomic so its content still shows; proper
+    /// splitting is later).
+    fn push_atomic(&self, id: NodeId, style: Arc<ComputedStyle>, content: &mut InlineContent, ws: &mut WsState, depth: usize) {
+        let node = self.build_element(id, style, depth + 1);
+        content.atomics.push(Atomic {
+            index: content.text.len(),
+            node,
+            result: None,
+        });
+        ws.last_was_space = false;
+        ws.at_line_start = false;
+    }
+
+    /// Gather an inline-level element into the current inline root. This
+    /// recurses per nesting level (bounded by `MAX_DEPTH`), so it keeps
+    /// its own frame small and leaves the per-element work to helpers.
+    fn collect_inline(
+        &self,
+        id: NodeId,
+        style: Arc<ComputedStyle>,
+        content: &mut InlineContent,
+        ws: &mut WsState,
+        depth: usize,
+    ) {
+        if depth >= MAX_DEPTH {
+            let synth = self.synth_small_caps(&style);
+            append_text(content, &self.doc.text_content(id), style, Some(id), ws, synth);
             return;
         }
-
+        match self.inline_kind(id, &style) {
+            InlineKind::Break => return Self::push_break(id, style, content, ws),
+            InlineKind::Atomic => return self.push_atomic(id, style, content, ws, depth),
+            InlineKind::Plain => {}
+        }
         // A plain inline element: its text joins the run with its own style.
+        let synth = self.synth_small_caps(&style);
         for child in self.doc.children(id) {
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
-                    append_text(content, text, style.clone(), Some(child), ws);
+                    append_text(content, text, style.clone(), Some(child), ws, synth);
                 }
                 NodeKind::Element(_) => {
                     let Some(cs) = self.style_of(child) else { continue };
@@ -529,16 +583,7 @@ impl BoxBuilder<'_> {
                     if is_inline_level(&cs) {
                         self.collect_inline(child, cs, content, ws, depth + 1);
                     } else {
-                        // Block inside inline: lay it out as an atomic box so
-                        // its content still shows. Proper splitting is later.
-                        let node = self.build_element(child, cs, depth + 1);
-                        content.atomics.push(Atomic {
-                            index: content.text.len(),
-                            node,
-                            result: None,
-                        });
-                        ws.last_was_space = false;
-                        ws.at_line_start = false;
+                        self.push_atomic(child, cs, content, ws, depth);
                     }
                 }
                 _ => {}
@@ -546,38 +591,66 @@ impl BoxBuilder<'_> {
         }
     }
 
+    /// The list item's marker, at the start of its first line: the
+    /// `list-style-image` when the image is known (followed by a space),
+    /// else the `list-style-type`'s text. `list-style-position: outside`
+    /// hangs it left of the content edge (the engine indents the first
+    /// line by its width); `inside` keeps it in the line.
     fn add_marker(&self, id: NodeId, style: &Arc<ComputedStyle>, b: &mut BoxNode) {
-        let marker = match style.list_style_type {
-            ListStyleType::None => return,
-            ListStyleType::Disc => "\u{2022} ".to_owned(),
-            ListStyleType::Circle => "\u{25E6} ".to_owned(),
-            ListStyleType::Square => "\u{25AA} ".to_owned(),
-            numbered => {
-                let n = self.list_index(id);
-                match numbered {
-                    ListStyleType::LowerAlpha => format!("{}. ", alpha(n, false)),
-                    ListStyleType::UpperAlpha => format!("{}. ", alpha(n, true)),
-                    ListStyleType::LowerRoman => format!("{}. ", roman(n).to_ascii_lowercase()),
-                    ListStyleType::UpperRoman => format!("{}. ", roman(n)),
-                    _ => format!("{n}. "),
+        let image = style
+            .list_style_image
+            .as_deref()
+            .and_then(|u| Url::parse(u).ok())
+            .and_then(|url| self.images.intrinsic_size(&url).map(|size| (url, size)));
+        let text = if image.is_some() {
+            " ".to_owned()
+        } else {
+            match style.list_style_type {
+                ListStyleType::None => return,
+                ListStyleType::Disc => "\u{2022} ".to_owned(),
+                ListStyleType::Circle => "\u{25E6} ".to_owned(),
+                ListStyleType::Square => "\u{25AA} ".to_owned(),
+                numbered => {
+                    let n = self.list_index(id);
+                    match numbered {
+                        ListStyleType::LowerAlpha => format!("{}. ", alpha(n, false)),
+                        ListStyleType::UpperAlpha => format!("{}. ", alpha(n, true)),
+                        ListStyleType::LowerRoman => format!("{}. ", roman(n).to_ascii_lowercase()),
+                        ListStyleType::UpperRoman => format!("{}. ", roman(n)),
+                        _ => format!("{n}. "),
+                    }
                 }
             }
         };
         let marker_style = Arc::new(ComputedStyle::anonymous_from(style));
-        match b.children.first_mut() {
-            Some(first) if first.is_inline_root() => {
-                if let BoxKind::Inline(content) = &mut first.kind {
-                    content.prepend(&marker, marker_style);
-                }
-            }
-            _ => {
-                let mut content = InlineContent::new(style.clone());
-                content.prepend(&marker, marker_style.clone());
-                let mut m = BoxNode::new(BoxKind::Inline(content), None, marker_style);
-                m.anonymous = true;
-                b.children.insert(0, m);
-            }
+        if !b.children.first().is_some_and(BoxNode::is_inline_root) {
+            let mut m = BoxNode::new(BoxKind::Inline(InlineContent::new(style.clone())), None, marker_style.clone());
+            m.anonymous = true;
+            b.children.insert(0, m);
         }
+        let Some(first) = b.children.first_mut() else { return };
+        let BoxKind::Inline(root) = &mut first.kind else { return };
+        root.prepend(&text, marker_style.clone());
+        if let Some((url, intrinsic)) = image {
+            let node = BoxNode::new(
+                BoxKind::Image {
+                    url: Some(url),
+                    intrinsic: Some(intrinsic),
+                },
+                None,
+                marker_style,
+            );
+            root.atomics.insert(
+                0,
+                Atomic {
+                    index: 0,
+                    node,
+                    result: None,
+                },
+            );
+        }
+        root.marker_len = text.len();
+        root.marker_outside = style.list_style_position == ListStylePosition::Outside;
     }
 
     /// 1-based position among list-item siblings, honoring `<ol start>` and
@@ -617,30 +690,94 @@ fn is_inline_level(style: &ComputedStyle) -> bool {
     )
 }
 
+/// The style spans one text node's characters go into: the node's style,
+/// and for synthesized small caps a second one for the runs of lowercase
+/// letters shown as capitals at 0.7 times the size (Blink's ratio).
+struct SpanRuns {
+    style: Arc<ComputedStyle>,
+    small: Option<Arc<ComputedStyle>>,
+    node: Option<NodeId>,
+    /// Where the current run began, and whether it is the small one.
+    run_start: usize,
+    run_small: bool,
+}
+
+impl SpanRuns {
+    fn new(style: Arc<ComputedStyle>, node: Option<NodeId>, synth: bool, start: usize) -> Self {
+        let small = synth.then(|| {
+            let mut s = (*style).clone();
+            s.font_size *= 0.7;
+            Arc::new(s)
+        });
+        Self {
+            style,
+            small,
+            node,
+            run_start: start,
+            run_small: false,
+        }
+    }
+
+    fn close(&mut self, content: &mut InlineContent) {
+        let end = content.text.len();
+        if end > self.run_start {
+            let style = match (&self.small, self.run_small) {
+                (Some(small), true) => small.clone(),
+                _ => self.style.clone(),
+            };
+            content.spans.push(TextSpan {
+                start: self.run_start,
+                end,
+                style,
+                node: self.node,
+            });
+        }
+        self.run_start = end;
+    }
+
+    /// Push one character of the node's text; a lowercase letter under
+    /// synthesized small caps becomes its capital in the small run.
+    fn push(&mut self, content: &mut InlineContent, ch: char) {
+        let small = self.small.is_some() && ch.is_lowercase();
+        if small != self.run_small {
+            self.close(content);
+            self.run_small = small;
+        }
+        if small {
+            content.text.extend(ch.to_uppercase());
+        } else {
+            content.text.push(ch);
+        }
+    }
+}
+
 /// Append a text node's content with CSS white-space processing and
-/// text-transform applied, recording a style span for it.
+/// text-transform applied, recording a style span for it (two kinds of
+/// span when small caps are synthesized, see `SpanRuns`).
 fn append_text(
     content: &mut InlineContent,
     text: &str,
     style: Arc<ComputedStyle>,
     node: Option<NodeId>,
     ws: &mut WsState,
+    synth: bool,
 ) {
     let start = content.text.len();
     let mode = style.white_space;
     let transform = style.text_transform;
     let mut capitalize_next = true;
+    let mut runs = SpanRuns::new(style, node, synth, start);
 
     let mut push_char = |content: &mut InlineContent, ch: char| {
         match transform {
-            TextTransform::None => content.text.push(ch),
-            TextTransform::Uppercase => content.text.extend(ch.to_uppercase()),
-            TextTransform::Lowercase => content.text.extend(ch.to_lowercase()),
+            TextTransform::None => runs.push(content, ch),
+            TextTransform::Uppercase => ch.to_uppercase().for_each(|c| runs.push(content, c)),
+            TextTransform::Lowercase => ch.to_lowercase().for_each(|c| runs.push(content, c)),
             TextTransform::Capitalize => {
                 if capitalize_next && ch.is_alphanumeric() {
-                    content.text.extend(ch.to_uppercase());
+                    ch.to_uppercase().for_each(|c| runs.push(content, c));
                 } else {
-                    content.text.push(ch);
+                    runs.push(content, ch);
                 }
                 capitalize_next = !ch.is_alphanumeric();
             }
@@ -658,7 +795,7 @@ fn append_text(
             WhiteSpace::Normal | WhiteSpace::Nowrap => {
                 if is_space {
                     if !ws.last_was_space && !ws.at_line_start {
-                        content.text.push(' ');
+                        push_char(content, ' ');
                         ws.last_was_space = true;
                     }
                 } else {
@@ -673,12 +810,12 @@ fn append_text(
                     if ws.last_was_space && content.text.ends_with(' ') && content.text.len() > start {
                         content.text.pop();
                     }
-                    content.text.push('\n');
+                    push_char(content, '\n');
                     ws.last_was_space = true;
                     ws.at_line_start = true;
                 } else if is_space {
                     if !ws.last_was_space && !ws.at_line_start {
-                        content.text.push(' ');
+                        push_char(content, ' ');
                         ws.last_was_space = true;
                     }
                 } else {
@@ -689,12 +826,14 @@ fn append_text(
             }
             WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces => {
                 if is_newline {
-                    content.text.push('\n');
+                    push_char(content, '\n');
                     ws.at_line_start = true;
                 } else if ch == '\t' {
                     // Tabs render as spaces to the next multiple of 8 columns is
                     // not tracked; four spaces is the common approximation.
-                    content.text.push_str("    ");
+                    for _ in 0..4 {
+                        push_char(content, ' ');
+                    }
                     ws.at_line_start = false;
                 } else {
                     push_char(content, ch);
@@ -704,16 +843,7 @@ fn append_text(
             }
         }
     }
-
-    let end = content.text.len();
-    if end > start {
-        content.spans.push(TextSpan {
-            start,
-            end,
-            style,
-            node,
-        });
-    }
+    runs.close(content);
 }
 
 fn alpha(n: i64, upper: bool) -> String {
@@ -759,6 +889,68 @@ mod tests {
         (doc, styles)
     }
 
+    /// Twelve-pixel squares for every URL.
+    struct Squares;
+    impl ImageSizes for Squares {
+        fn intrinsic_size(&self, _url: &Url) -> Option<(f32, f32)> {
+            Some((12.0, 12.0))
+        }
+    }
+
+    #[test]
+    fn small_caps_are_synthesized_for_fonts_without_the_feature() {
+        let (doc, styles) = build("<p style='font-variant: small-caps; font-size: 20px'>Hello <b>ab</b>!</p>");
+        let family = styles[doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "p")).expect("p")]
+            .font_family
+            .clone();
+        // The family lacks `smcp`: lowercase letters become capitals in
+        // runs 0.7 times the size, each run a span of its node.
+        let synth: HashSet<Arc<str>> = [family].into_iter().collect();
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &synth };
+        let root = builder.build_root().expect("root");
+        let p = &root.children[0].children[0];
+        let BoxKind::Inline(c) = &p.children[0].kind else { panic!("inline root") };
+        assert_eq!(c.text, "HELLO AB!");
+        let runs: Vec<(usize, usize, f32)> = c.spans.iter().map(|s| (s.start, s.end, s.style.font_size)).collect();
+        assert_eq!(runs, vec![(0, 1, 20.0), (1, 5, 14.0), (5, 6, 20.0), (6, 8, 14.0), (8, 9, 20.0)]);
+        assert_eq!(c.spans[1].node, c.spans[0].node, "both runs belong to the text node");
+        // The family has `smcp`: the text is left to the font.
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
+        let root = builder.build_root().expect("root");
+        let BoxKind::Inline(c) = &root.children[0].children[0].children[0].kind else { panic!("inline root") };
+        assert_eq!(c.text, "Hello ab!");
+        assert_eq!(c.spans.len(), 3);
+    }
+
+    #[test]
+    fn list_markers_hang_outside_or_sit_inside_and_images_replace_the_type() {
+        let (doc, styles) = build(
+            "<ul><li>one</li><li style='list-style-position: inside'>two</li>\
+             <li style='list-style-image: url(http://x/m.png)'>three</li>\
+             <li style='list-style-type: none; list-style-image: url(http://x/m.png)'>four</li>\
+             <li style='list-style-type: none'>five</li></ul>",
+        );
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares, small_caps_synth: &HashSet::new() };
+        let root = builder.build_root().expect("root");
+        let ul = &root.children[0].children[0];
+        let items: Vec<&InlineContent> = ul
+            .children
+            .iter()
+            .map(|li| match &li.children[0].kind {
+                BoxKind::Inline(c) => c,
+                _ => panic!("inline root"),
+            })
+            .collect();
+        assert_eq!((items[0].marker_len, items[0].marker_outside), (4, true));
+        assert_eq!((items[1].marker_len, items[1].marker_outside), (4, false));
+        // An image marker: the atomic at index 0, then a space.
+        assert_eq!((items[2].text.as_str(), items[2].marker_len, items[2].marker_outside), (" three", 1, true));
+        assert!(matches!(items[2].atomics.first(), Some(a) if a.index == 0 && matches!(a.node.kind, BoxKind::Image { intrinsic: Some((12.0, 12.0)), .. })));
+        // The image wins over `none`; `none` without an image: no marker.
+        assert_eq!(items[3].marker_len, 1);
+        assert_eq!((items[4].text.as_str(), items[4].marker_len), ("five", 0));
+    }
+
     fn inline_text(b: &BoxNode) -> Vec<String> {
         let mut out = Vec::new();
         if let BoxKind::Inline(c) = &b.kind {
@@ -773,7 +965,7 @@ mod tests {
     #[test]
     fn collapses_whitespace_and_splits_blocks() {
         let (doc, styles) = build("<body>  Hello   <b>big</b>\n world <div>block</div> tail  </body>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["Hello big world", "block", "tail"]);
@@ -782,7 +974,7 @@ mod tests {
     #[test]
     fn pre_keeps_newlines_and_br_breaks() {
         let (doc, styles) = build("<pre>a\n  b</pre><p>x<br>y</p>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["a\n  b", "x\ny"]);
@@ -791,7 +983,7 @@ mod tests {
     #[test]
     fn list_markers() {
         let (doc, styles) = build("<ol start=3><li>a<li value=7>b<li>c</ol><ul><li>d</ul>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["3. a", "7. b", "8. c", "\u{2022} d"]);
@@ -804,7 +996,7 @@ mod tests {
              <input type=checkbox checked><input type=radio><select><option>One<option selected>Two</select>\
              <input type=submit><input type=button value='Go'><textarea>text\nhere</textarea><button>Push</button></body>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
         let root = builder.build_root().expect("root");
         // Controls are inline-level, so they sit in the body's inline
         // root as atomics; visit those too.
