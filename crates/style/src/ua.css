@@ -37,6 +37,17 @@ ul ul ul, ol ul ul, ol ol ul { list-style-type: square; }
 dd { margin-left: 40px; }
 li { text-align: start; }
 
+/* Bidirectional text (HTML rendering, "the bidi algorithm"). */
+[dir]:dir(ltr), bdi:dir(ltr), input[type=tel i]:dir(ltr) { direction: ltr; }
+[dir]:dir(rtl), bdi:dir(rtl) { direction: rtl; }
+address, blockquote, center, div, figure, figcaption, footer, form, header,
+hr, legend, listing, main, p, plaintext, pre, summary, xmp, article, aside,
+h1, h2, h3, h4, h5, h6, hgroup, nav, section, table, caption, colgroup, col,
+thead, tbody, tfoot, tr, td, th, dir, dd, dl, dt, menu, ol, ul, li, bdi,
+output, [dir=ltr i], [dir=rtl i], [dir=auto i] { unicode-bidi: isolate; }
+bdo, bdo[dir] { unicode-bidi: isolate-override; }
+textarea[dir=auto i], pre[dir=auto i] { unicode-bidi: plaintext; }
+
 pre, code, kbd, samp, tt, xmp, plaintext, listing { font-family: monospace; }
 pre, xmp, plaintext, listing { white-space: pre; }
 textarea { white-space: pre-wrap; }

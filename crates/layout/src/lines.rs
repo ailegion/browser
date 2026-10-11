@@ -100,29 +100,33 @@ fn with_leading(ascent: f32, descent: f32, line_height: f32) -> (f32, f32) {
     (ascent + above, descent + below)
 }
 
-/// Place every line of `layout`. `tops` gives each line's top when the
-/// line breaker positioned them (around floats); otherwise lines stack.
-/// Returns the placements and the height of them all.
+/// Place every line of `layout`, the paragraph of `content` starting at
+/// byte `base` of its text, whose first line starts at `y0`. `tops` gives
+/// each line's top when the line breaker positioned them (around floats);
+/// otherwise lines stack. Returns the placements and the bottom of them
+/// all.
 pub(crate) fn place_lines(
     layout: &parley::Layout<Brush>,
     content: &InlineContent,
     decor: &mut Decorator,
     fonts: &mut FontContext,
     tops: Option<&[f32]>,
+    base: usize,
+    y0: f32,
 ) -> (Vec<LinePlacement>, f32) {
     let n = 1 + content.boxes.len() + content.atomics.len();
     let mut metrics: Vec<Option<BoxMetrics>> = vec![None; n];
     metrics[0] = Some(box_metrics(decor, fonts, &content.container));
     let count = layout.len();
     let mut out = Vec::with_capacity(count);
-    let mut y = 0.0f32;
-    let mut height = 0.0f32;
+    let mut y = y0;
+    let mut height = y0;
     for (i, line) in layout.lines().enumerate() {
         let top = tops.and_then(|t| t.get(i).copied()).unwrap_or(y);
-        let mut p = place_line(&line, content, decor, fonts, &mut metrics, top);
-        // As parley and browsers: the empty line after a trailing newline
-        // takes no room.
-        if i + 1 == count && i > 0 && line.is_empty() {
+        let mut p = place_line(&line, content, decor, fonts, &mut metrics, top, base);
+        // As browsers: the line parley makes after a trailing newline holds
+        // nothing and takes no room (`<p>a<br></p>` is one line tall).
+        if i + 1 == count && i > 0 && line.text_range().is_empty() {
             p.height = 0.0;
         }
         y = p.bottom();
@@ -214,6 +218,7 @@ fn place_line(
     fonts: &mut FontContext,
     metrics: &mut [Option<BoxMetrics>],
     top: f32,
+    base: usize,
 ) -> LinePlacement {
     let nb = content.boxes.len();
     let n = 1 + nb + content.atomics.len();
@@ -234,6 +239,7 @@ fn place_line(
             PositionedLayoutItem::GlyphRun(run) => {
                 let r = run.run();
                 let range = r.text_range();
+                let range = range.start + base..range.end + base;
                 let rm = r.metrics();
                 for span in content.spans.iter().filter(|s| s.start < range.end && s.end > range.start) {
                     state.open(span.inline_box, content, metrics, decor, fonts);

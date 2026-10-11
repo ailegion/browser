@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use browser_dom::Document;
 use browser_style::{
-    ComputedStyle, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position, StyleMap, TextAlign,
-    WordBreak,
+    ComputedStyle, Direction, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position, StyleMap,
+    TextAlign, WordBreak,
 };
 use parley::layout::YieldData;
 use parley::style::{
@@ -22,7 +22,8 @@ use read_fonts::TableProvider;
 use taffy::prelude::*;
 
 use crate::boxes::{
-    Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineContent, InlineLayout, TaffyId,
+    Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineContent, InlineLayout, Paragraph,
+    TaffyId,
 };
 use crate::convert::to_taffy;
 use crate::decor::Decorator;
@@ -286,16 +287,23 @@ impl LayoutEngine {
         let Some(il) = content.cache.first() else { return empty(&marker.style) };
         // The marker's trailing space is part of its box (the gap before
         // the text), so the full width counts.
-        let width = il.layout.full_width();
-        let first_baseline = il.lines.first().map(|l| l.baseline).unwrap_or(0.0);
-        let x = rect.x + layout.border.left + layout.padding.left - width;
+        let width = il.full_width();
+        let first_baseline = il.first_baseline();
+        // Left of the content edge, or right of it in a right-to-left item.
+        let x = if content.container.direction == Direction::Rtl {
+            rect.right() - layout.border.right - layout.padding.right
+        } else {
+            rect.x + layout.border.left + layout.padding.left - width
+        };
         let y = match first_baseline_of(children) {
             Some(baseline) => baseline - first_baseline,
             None => rect.y + layout.border.top + layout.padding.top,
         };
         let text: Arc<str> = Arc::from(content.text.as_str());
         let mut kids = Vec::new();
-        emit_text_fragments(content, &text, &il.layout, &il.lines, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
+        for p in &il.paragraphs {
+            emit_text_fragments(content, &text, p, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
+        }
         Fragment {
             rect: Rect::new(x, y, width, il.height),
             node: None,
@@ -592,27 +600,29 @@ impl LayoutEngine {
             BoxKind::Inline(content) => {
                 let mut children = Vec::new();
                 // A hanging marker (the item's one line) sits left of the
-                // content edge by its width.
-                let shift = match content.cache.first() {
-                    Some(il) if node.hangs => il.layout.full_width(),
-                    _ => 0.0,
+                // content edge by its width, right of it in a right-to-left
+                // item.
+                let x = match content.cache.first() {
+                    Some(il) if node.hangs && content.container.direction == Direction::Rtl => x + il.full_width(),
+                    Some(il) if node.hangs => x - il.full_width(),
+                    _ => x,
                 };
-                let x = x - shift;
                 if let Some(il) = content.cache.first() {
                     let text: Arc<str> = Arc::from(content.text.as_str());
                     let overflow = content.ellipsis.as_ref().map(|e| (rect.width, e));
-                    emit_text_fragments(
-                        content,
-                        &text,
-                        &il.layout,
-                        &il.lines,
-                        x,
-                        y,
-                        overflow,
-                        &mut children,
-                        &mut self.decor,
-                        &mut self.fonts,
-                    );
+                    for p in &il.paragraphs {
+                        emit_text_fragments(
+                            content,
+                            &text,
+                            p,
+                            x,
+                            y,
+                            overflow,
+                            &mut children,
+                            &mut self.decor,
+                            &mut self.fonts,
+                        );
+                    }
                 }
                 Fragment {
                     rect: Rect::new(x, y, rect.width, rect.height),
@@ -835,7 +845,7 @@ fn measure_inline(
         },
     };
     let il = ensure_layout(content, fonts, lcx, smcp, decor, max_width);
-    let width = known.width.unwrap_or_else(|| il.layout.width().max(0.0));
+    let width = known.width.unwrap_or_else(|| il.width().max(0.0));
     let height = known.height.unwrap_or_else(|| il.height.max(0.0));
     Size { width, height }
 }
@@ -857,80 +867,123 @@ fn ensure_layout<'a>(
     if let Some(pos) = content.cache.iter().position(|l| l.max_width == key) {
         return &content.cache[pos];
     }
-    let (mut layout, mut height, mut lines) = build_parley_layout(content, fonts, lcx, decor, key);
-    let ranges = small_caps_to_synthesize(&layout, content, smcp);
+    let (mut paragraphs, mut height) = build_paragraphs(content, fonts, lcx, decor, key);
+    let ranges: Vec<std::ops::Range<usize>> = paragraphs
+        .iter()
+        .flat_map(|p| small_caps_to_synthesize(&p.layout, content, smcp, p.range.start))
+        .collect();
     if !ranges.is_empty() && content.synthesize_small_caps(&ranges) {
-        (layout, height, lines) = build_parley_layout(content, fonts, lcx, decor, key);
+        (paragraphs, height) = build_paragraphs(content, fonts, lcx, decor, key);
     }
     if content.cache.len() >= 4 {
         content.cache.remove(0);
     }
     content.cache.push(InlineLayout {
         max_width: key,
-        layout,
+        paragraphs,
         height,
-        lines,
     });
     content.cache.last().expect("just pushed")
 }
 
-/// Shape and line-break the inline content and place its lines; returns
-/// the layout, the height of the lines (which includes any gap left by
-/// lines pushed below floats) and the placements.
-fn build_parley_layout(
+/// The byte ranges of a text's bidi paragraphs: each forced break ends
+/// one and stays with it; an empty text is one empty paragraph.
+fn paragraph_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if c == '\n' {
+            out.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    if start < text.len() || out.is_empty() {
+        out.push(start..text.len());
+    }
+    out
+}
+
+/// Shape, line-break and place the inline content paragraph by paragraph,
+/// each stacked under the one before; returns the paragraphs and the
+/// height of all their lines (which includes any gap left by lines pushed
+/// below floats).
+fn build_paragraphs(
     content: &InlineContent,
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
     decor: &mut Decorator,
     max_width: Option<f32>,
-) -> (parley::Layout<Brush>, f32, Vec<LinePlacement>) {
+) -> (Vec<Paragraph>, f32) {
     let container = &content.container;
-    let mut builder = lcx.ranged_builder(fonts, &content.text, 1.0, true);
-    push_style(&mut builder, container, None);
-    for span in &content.spans {
-        if span.start >= span.end {
-            continue;
+    let ranges = paragraph_ranges(&content.text);
+    let last = ranges.len() - 1;
+    let mut paragraphs = Vec::with_capacity(ranges.len());
+    let mut y = 0.0f32;
+    // Spans are in text order: each paragraph takes the ones overlapping
+    // it from where the previous one stopped.
+    let mut first_span = 0;
+    for (pi, range) in ranges.into_iter().enumerate() {
+        let base = range.start;
+        let slice = &content.text[range.clone()];
+        let mut builder = lcx.ranged_builder(fonts, slice, 1.0, true);
+        push_style(&mut builder, container, None);
+        while first_span < content.spans.len() && content.spans[first_span].end <= base && base < range.end {
+            first_span += 1;
         }
-        push_style(&mut builder, &span.style, Some(span.start..span.end));
+        for span in &content.spans[first_span..] {
+            if span.start >= range.end {
+                break;
+            }
+            let (start, end) = (span.start.max(base), span.end.min(range.end));
+            if start < end {
+                push_style(&mut builder, &span.style, Some(start - base..end - base));
+            }
+        }
+        for (i, atomic) in content.atomics.iter().enumerate() {
+            let inside = atomic.index >= base && (atomic.index < range.end || (pi == last && atomic.index == range.end));
+            if !inside {
+                continue;
+            }
+            let (w, h) = atomic
+                .result
+                .as_ref()
+                .map(|r| (r.width, r.height))
+                .unwrap_or((0.0, 0.0));
+            builder.push_inline_box(InlineBox {
+                id: i as u64,
+                kind: InlineBoxKind::InFlow,
+                index: atomic.index - base,
+                width: w,
+                height: h,
+            });
+        }
+        let mut layout = builder.build(slice);
+        // Spans that may not wrap carry `TextWrapMode::NoWrap`
+        // (`push_style`), so the width goes to parley in every case.
+        let wrap = container.white_space.allows_wrap();
+        let (height, lines) = match max_width {
+            Some(width) if width > 0.0 && !content.floats.is_empty() => {
+                break_around_floats(&mut layout, width, wrap, &content.floats, content, decor, fonts, base, y)
+            }
+            _ => {
+                layout.break_all_lines(max_width);
+                let (lines, height) = place_lines(&layout, content, decor, fonts, None, base, y);
+                (height, lines)
+            }
+        };
+        let alignment = match container.text_align {
+            TextAlign::Start => Alignment::Start,
+            TextAlign::Left => Alignment::Left,
+            TextAlign::Right => Alignment::Right,
+            TextAlign::Center => Alignment::Center,
+            TextAlign::Justify => Alignment::Justify,
+            TextAlign::End => Alignment::End,
+        };
+        layout.align(alignment, AlignmentOptions::default());
+        y = y.max(height);
+        paragraphs.push(Paragraph { range, layout, lines });
     }
-    for (i, atomic) in content.atomics.iter().enumerate() {
-        let (w, h) = atomic
-            .result
-            .as_ref()
-            .map(|r| (r.width, r.height))
-            .unwrap_or((0.0, 0.0));
-        builder.push_inline_box(InlineBox {
-            id: i as u64,
-            kind: InlineBoxKind::InFlow,
-            index: atomic.index,
-            width: w,
-            height: h,
-        });
-    }
-    let mut layout = builder.build(&content.text);
-    // Spans that may not wrap carry `TextWrapMode::NoWrap` (`push_style`),
-    // so the width goes to parley in every case.
-    let wrap = container.white_space.allows_wrap();
-    let (height, lines) = match max_width {
-        Some(width) if width > 0.0 && !content.floats.is_empty() => {
-            break_around_floats(&mut layout, width, wrap, &content.floats, content, decor, fonts)
-        }
-        _ => {
-            layout.break_all_lines(max_width);
-            let (lines, height) = place_lines(&layout, content, decor, fonts, None);
-            (height, lines)
-        }
-    };
-    let alignment = match container.text_align {
-        TextAlign::Start => Alignment::Start,
-        TextAlign::Left => Alignment::Left,
-        TextAlign::Right => Alignment::Right,
-        TextAlign::Center => Alignment::Center,
-        TextAlign::Justify => Alignment::Justify,
-        TextAlign::End => Alignment::End,
-    };
-    layout.align(alignment, AlignmentOptions::default());
-    (layout, height, lines)
+    (paragraphs, y)
 }
 
 /// Whether a fragment is out of the flow (a float or an absolutely
@@ -986,11 +1039,13 @@ fn last_baseline_of(fragments: &[Fragment]) -> Option<f32> {
 /// The byte ranges of `content`'s text, sorted and merged, that lie in a
 /// `font-variant: small-caps` span, were shaped with a font that has no
 /// `smcp` feature, and hold a lowercase letter, so small caps must be
-/// synthesized for them. `smcp` caches the per-font answer.
+/// synthesized for them. `layout` is the paragraph starting at byte
+/// `base` of the text; `smcp` caches the per-font answer.
 fn small_caps_to_synthesize(
     layout: &parley::Layout<Brush>,
     content: &InlineContent,
     smcp: &mut HashMap<(u64, u32), bool>,
+    base: usize,
 ) -> Vec<std::ops::Range<usize>> {
     if !content.spans.iter().any(|s| s.style.font_variant == FontVariant::SmallCaps) {
         return Vec::new();
@@ -1008,6 +1063,7 @@ fn small_caps_to_synthesize(
                 continue;
             }
             let range = r.text_range();
+            let range = range.start + base..range.end + base;
             for span in &content.spans {
                 if span.style.font_variant != FontVariant::SmallCaps {
                     continue;
@@ -1049,7 +1105,9 @@ fn font_has_feature(data: &[u8], index: u32, tag: &[u8; 4]) -> bool {
 /// lines' heights are the engine's (`place_lines`), not parley's, so after
 /// each pass the lines are stacked on the placed heights and broken again
 /// until nothing moves. Returns the height of the lines and their
-/// placements.
+/// placements. `layout` is the paragraph starting at byte `base` of the
+/// text, whose first line starts at `y0`.
+#[allow(clippy::too_many_arguments)]
 fn break_around_floats(
     layout: &mut parley::Layout<Brush>,
     width: f32,
@@ -1058,6 +1116,8 @@ fn break_around_floats(
     content: &InlineContent,
     decor: &mut Decorator,
     fonts: &mut FontContext,
+    base: usize,
+    y0: f32,
 ) -> (f32, Vec<LinePlacement>) {
     // A line that overflowed its gap is pinned lower on the next attempt.
     // Lines before it break identically, so a pin stays valid; each pin
@@ -1070,9 +1130,9 @@ fn break_around_floats(
     let max_attempts = 2 * bands.len() + 6;
     let mut result = (0.0, Vec::new());
     for attempt in 0..=max_attempts {
-        let ends = break_once(layout, width, bands, &pins, &tops, &hints);
+        let ends = break_once(layout, width, bands, &pins, &tops, &hints, y0);
         let line_tops: Vec<f32> = ends.iter().map(|e| e.0).collect();
-        let (lines, height) = place_lines(layout, content, decor, fonts, Some(&line_tops));
+        let (lines, height) = place_lines(layout, content, decor, fonts, Some(&line_tops), base, y0);
         // Stack the lines on the placed heights; a line whose gap would
         // differ over its placed height is broken again with that height.
         let mut next_tops = Vec::with_capacity(lines.len());
@@ -1127,8 +1187,8 @@ fn break_around_floats(
 
 /// One pass of line breaking around `bands`. `tops` and `hints` are the
 /// previous pass's placed line tops and heights, when there was one; a
-/// line without them starts where parley puts it. Returns each line's
-/// (top, parley's bottom).
+/// line without them starts where parley puts it, the first at `y0`.
+/// Returns each line's (top, parley's bottom).
 fn break_once(
     layout: &mut parley::Layout<Brush>,
     width: f32,
@@ -1136,13 +1196,15 @@ fn break_once(
     pins: &[(usize, f32)],
     tops: &[f32],
     hints: &[f32],
+    y0: f32,
 ) -> Vec<(f32, f32)> {
     let mut ends: Vec<(f32, f32)> = Vec::new();
     let mut breaker = layout.break_lines();
     breaker.state_mut().set_layout_max_advance(width);
     'lines: while !breaker.is_done() {
         let index = ends.len();
-        let mut y = tops.get(index).copied().unwrap_or(breaker.committed_y() as f32);
+        let parley_y = if index == 0 { y0 } else { breaker.committed_y() as f32 };
+        let mut y = tops.get(index).copied().unwrap_or(parley_y);
         for &(i, pin_y) in pins {
             if i == index {
                 y = y.max(pin_y);
@@ -1345,6 +1407,17 @@ fn decorate(fragment: &mut Fragment, decor: &mut Decorator, fonts: &mut FontCont
     }
 }
 
+/// Whether a fragment is nothing but the engine's bidi controls: zero
+/// width, nothing to paint, hit, select or find, so no fragment is made.
+fn controls_only(fragment: &Fragment) -> bool {
+    match &fragment.content {
+        FragmentContent::Text(t) => {
+            fragment.node.is_none() && t.text[t.range.clone()].chars().all(crate::boxes::is_bidi_control)
+        }
+        _ => false,
+    }
+}
+
 /// The `text-overflow` marker as text fragments at `x` (root
 /// coordinates) on a line of `line_height` whose baseline is `baseline`
 /// below its top. It has no node: nothing selects, finds or hits it.
@@ -1419,16 +1492,15 @@ fn emit_marker(
     }
 }
 
-/// Turn a parley layout into text and atomic fragments positioned at
-/// (`ox`, `oy`), the inline root's top-left. With `overflow` (the root's
-/// width and its `text-overflow` marker), a line that overflows the root
-/// is cut where the marker still fits and ends with the marker.
+/// Turn one paragraph of an inline root into text and atomic fragments
+/// positioned at (`ox`, `oy`), the root's top-left. With `overflow` (the
+/// root's width and its `text-overflow` marker), a line that overflows
+/// the root is cut where the marker still fits and ends with the marker.
 #[allow(clippy::too_many_arguments)]
 fn emit_text_fragments(
     content: &InlineContent,
     text: &Arc<str>,
-    layout: &parley::Layout<Brush>,
-    lines: &[LinePlacement],
+    paragraph: &Paragraph,
     ox: f32,
     oy: f32,
     overflow: Option<(f32, &Ellipsis)>,
@@ -1436,9 +1508,12 @@ fn emit_text_fragments(
     decor: &mut Decorator,
     fonts: &mut FontContext,
 ) {
+    let layout = &paragraph.layout;
+    // Parley's text offsets are the paragraph's; the root's add `base`.
+    let base = paragraph.range.start;
     let styles = layout.styles();
     let rtl = layout.is_rtl();
-    for (line, placement) in layout.lines().zip(lines) {
+    for (line, placement) in layout.lines().zip(&paragraph.lines) {
         let line_top = placement.top;
         let line_height = placement.height;
         let trunc = overflow.and_then(|(width, marker)| Truncation::for_line(&line, width, marker, rtl));
@@ -1519,6 +1594,7 @@ fn emit_text_fragments(
                     let mut current: Option<(Option<usize>, usize)> = None;
                     for cluster in r.visual_clusters() {
                         let text_range = cluster.text_range();
+                        let text_range = text_range.start + base..text_range.end + base;
                         let start = text_range.start;
                         if let Some(t) = &trunc
                             && !t.keeps(x, x + cluster.advance())
@@ -1551,8 +1627,10 @@ fn emit_text_fragments(
                                 prev_span,
                                 prev_style,
                             );
-                            decorate(&mut fragment, decor, fonts);
-                            out.push(fragment);
+                            if !controls_only(&fragment) {
+                                decorate(&mut fragment, decor, fonts);
+                                out.push(fragment);
+                            }
                             frag_x0 = x;
                         }
                         current = Some(key);
@@ -1588,8 +1666,10 @@ fn emit_text_fragments(
                         && let Some((span, style_idx)) = current
                     {
                         let mut fragment = make(frag_x0, x, glyphs, clusters, span, style_idx);
-                        decorate(&mut fragment, decor, fonts);
-                        out.push(fragment);
+                        if !controls_only(&fragment) {
+                            decorate(&mut fragment, decor, fonts);
+                            out.push(fragment);
+                        }
                     }
                     // Left to right, everything after the cut is dropped.
                     if truncated && !rtl {
@@ -1634,7 +1714,7 @@ fn emit_text_fragments(
             // text is still there, as in browsers: select-all and a
             // triple click take it, so the last kept fragment's range
             // runs to the line's end while its clusters stay what shows.
-            let line_end = line.text_range().end;
+            let line_end = line.text_range().end + base;
             let last = out[line_first..]
                 .iter_mut()
                 .filter_map(|f| match &mut f.content {
@@ -2383,6 +2463,174 @@ mod tests {
         }
         assert!(tops[0].1 - tops[0].0 > 40.0, "the image's line is tall: {tops:?}");
         assert!(texts.iter().all(|(r, _)| r.y >= 150.0 || r.x >= 50.0), "lines beside the float start after it");
+    }
+
+    #[test]
+    fn forced_breaks_make_bidi_paragraphs_with_their_own_direction() {
+        // Three paragraphs in one root: a Latin line, a Hebrew line, a
+        // Latin line. Under `unicode-bidi: plaintext` (`pre dir=auto`)
+        // each takes the direction of its first strong character, so the
+        // Hebrew line is start-aligned at the right edge while the Latin
+        // ones sit at the left; in a plain left-to-right `p` every
+        // paragraph is left-to-right and the Hebrew line sits at the left
+        // too. The lines stack as one block; `<br>` splits the same way; a
+        // trailing `<br>` adds no line.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px;line-height:20px'><pre dir=auto style='margin:0;width:300px'>abc\n\u{5e9}\u{5dc}\u{5d5}\u{5dd}\ndef</pre>\
+             <p style='margin:0;width:300px;white-space:pre'>abc\n\u{5e9}\u{5dc}\u{5d5}\u{5dd}\ndef</p>\
+             <div style='width:300px'>x<br>y<br></div></body>",
+            "",
+        );
+        let shown = |texts: &Texts| texts.iter().map(|(r, t)| (r.x, r.y, t.text[t.range.clone()].to_owned())).collect::<Vec<_>>();
+        let (texts, _) = texts_of(&doc, &tree, "pre");
+        assert_eq!(texts.len(), 3, "{:?}", shown(&texts));
+        let at = |texts: &Texts, s: &str| texts.iter().find(|(_, t)| t.text[t.range.clone()].starts_with(s)).map(|(r, _)| *r).expect(s);
+        let (abc, heb, def) = (at(&texts, "abc"), at(&texts, "\u{5e9}"), at(&texts, "def"));
+        assert!(abc.x.abs() < 0.5 && def.x.abs() < 0.5, "Latin at the left: {abc:?} {def:?}");
+        assert!((heb.right() - 300.0).abs() < 1.0, "plaintext: the Hebrew paragraph at the right edge: {heb:?}");
+        assert!((heb.y - abc.bottom()).abs() < 0.01 && (def.y - heb.bottom()).abs() < 0.01, "stacked: {abc:?} {heb:?} {def:?}");
+        let pre = find_by_tag(&doc, &tree, "pre");
+        assert!((pre.height - 60.0).abs() < 0.5, "{pre:?}");
+        let (texts, _) = texts_of(&doc, &tree, "p");
+        assert_eq!(texts.len(), 3, "{:?}", shown(&texts));
+        let heb = at(&texts, "\u{5e9}");
+        assert!(heb.x.abs() < 0.5, "direction ltr: the Hebrew paragraph at the left: {heb:?}");
+        let div = find_by_tag(&doc, &tree, "div");
+        assert!((div.height - 40.0).abs() < 0.5, "two lines, the trailing break adds none: {div:?}");
+    }
+
+    #[test]
+    fn direction_sets_the_base_direction_alignment_and_the_end_edge() {
+        // `dir=rtl` with Latin text: the paragraph is right-to-left, so
+        // `start` is the right edge and `end` the left; the Latin letters
+        // still read left-to-right inside. A left-to-right `p` starting
+        // with Hebrew stays left-to-right (the Hebrew word at the left,
+        // the Latin after it). The `text-overflow` marker goes to the
+        // left edge of a right-to-left line.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px;width:300px'>\
+             <p id=a dir=rtl style='margin:0'>abc</p>\
+             <p id=b dir=rtl style='margin:0;text-align:end'>abc</p>\
+             <p id=c style='margin:0'>\u{5e9}\u{5dc} abc</p>\
+             <p id=d dir=rtl style='margin:0;width:60px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>abcdefghijklmnop</p></body>",
+            "",
+        );
+        let rect_of = |id: &str| {
+            let n = doc
+                .descendants(doc.root())
+                .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+                .expect(id);
+            let mut texts = Vec::new();
+            let mut markers = Vec::new();
+            tree.root.walk(&mut |f| {
+                if let FragmentContent::Text(t) = &f.content {
+                    match f.node {
+                        Some(x) if doc.parent(x) == Some(n) => texts.push((f.rect, t.clone())),
+                        None if f.rect.y >= 0.0 => markers.push(f.rect),
+                        _ => {}
+                    }
+                }
+            });
+            (texts, markers)
+        };
+        let (a, _) = rect_of("a");
+        let abc = a.iter().find(|(_, t)| &t.text[t.range.clone()] == "abc").expect("abc");
+        assert!((abc.0.right() - 300.0).abs() < 1.0, "start is the right edge: {:?}", abc.0);
+        assert!(abc.1.clusters[0].x < abc.1.clusters[2].x, "Latin letters read left to right inside");
+        let (b, _) = rect_of("b");
+        assert!(b.iter().any(|(r, _)| r.x.abs() < 0.5), "end is the left edge: {:?}", b.iter().map(|(r, _)| *r).collect::<Vec<_>>());
+        let (c, _) = rect_of("c");
+        let heb = c.iter().find(|(_, t)| t.text[t.range.clone()].starts_with('\u{5e9}')).expect("hebrew").0;
+        let lat = c.iter().find(|(_, t)| t.text[t.range.clone()].contains("abc")).expect("latin").0;
+        assert!(heb.x.abs() < 0.5 && lat.x > heb.right() - 0.5, "left-to-right paragraph: {heb:?} then {lat:?}");
+        let (d, _) = rect_of("d");
+        let left = d.iter().map(|(r, _)| r.x).fold(f32::INFINITY, f32::min);
+        assert!(left > 5.0, "the right-to-left line is cut at its left edge, where the marker sits: {left}");
+    }
+
+    #[test]
+    fn bdo_reverses_and_dir_isolates() {
+        // `<bdo dir=rtl>def</bdo>` shows its letters right to left; a
+        // `<span dir=rtl>` isolate keeps its neighbours' order.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px'><p style='margin:0'>abc <bdo dir=rtl>def</bdo> <span dir=rtl>1 2</span> ghi</p></body>",
+            "",
+        );
+        // Every text fragment under the paragraph, nested elements included.
+        let p = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "p"))
+            .expect("p");
+        let mut texts: Texts = Vec::new();
+        tree.root.walk(&mut |f| {
+            if f.node == Some(p) {
+                f.walk(&mut |g| {
+                    if let (FragmentContent::Text(t), Some(_)) = (&g.content, g.node) {
+                        texts.push((g.rect, t.clone()));
+                    }
+                });
+            }
+        });
+        let shown: Vec<(f32, String)> = texts.iter().map(|(r, t)| (r.x, t.text[t.range.clone()].to_owned())).collect();
+        let bdo = texts.iter().find(|(_, t)| &t.text[t.range.clone()] == "def").unwrap_or_else(|| panic!("def in {shown:?}"));
+        let d = bdo.1.clusters.iter().find(|c| bdo.1.text[c.start..c.end].starts_with('d')).expect("d");
+        let f = bdo.1.clusters.iter().find(|c| bdo.1.text[c.start..c.end].starts_with('f')).expect("f");
+        assert!(d.x > f.x && d.rtl, "override: d right of f: {d:?} {f:?}");
+        let abc = texts.iter().find(|(_, t)| t.text[t.range.clone()].starts_with("abc")).expect("abc").0;
+        let ghi = texts.iter().find(|(_, t)| t.text[t.range.clone()].contains("ghi")).expect("ghi").0;
+        assert!(abc.x < bdo.0.x && bdo.0.right() <= ghi.x + 0.5, "order kept around the isolate: {abc:?} {:?} {ghi:?}", bdo.0);
+        assert!(texts.iter().all(|(_, t)| !t.text[t.range.clone()].chars().any(crate::boxes::is_bidi_control)), "no control shows in a node's fragment");
+    }
+
+    #[test]
+    fn rtl_markers_floats_and_flex_rows_run_from_the_right() {
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px;line-height:20px'><ul dir=rtl style='margin:0;padding:0 40px 0 0;width:200px'><li>one</li><li></li></ul>\
+             <div id=w dir=rtl style='width:300px'><i style='float:inline-start;width:50px;height:10px'></i>\
+             <div id=f style='display:flex'><span style='width:50px;height:10px'></span><b style='width:50px;height:10px'></b></div></div></body>",
+            "",
+        );
+        let items: Vec<browser_dom::NodeId> = doc
+            .descendants(doc.root())
+            .filter(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "li"))
+            .collect();
+        for &li in &items {
+            let mut marker = None;
+            let mut text = None;
+            let mut all = Vec::new();
+            tree.root.walk(&mut |f| {
+                if f.node == Some(li) {
+                    f.walk(&mut |g| {
+                        if g.node.is_none() && !matches!(g.content, FragmentContent::Text(_)) {
+                            all.push((g.rect, false, format!("{:?}", std::mem::discriminant(&g.content))));
+                        }
+                        if let FragmentContent::Text(t) = &g.content {
+                            all.push((g.rect, g.node.is_some(), t.text[t.range.clone()].to_owned()));
+                            if g.node.is_none() {
+                                marker = Some(g.rect);
+                            } else {
+                                text = Some(g.rect);
+                            }
+                        }
+                    });
+                }
+            });
+            let marker = marker.unwrap_or_else(|| panic!("marker in {all:?}"));
+            // The content box is 200px wide (content-box sizing) with the
+            // 40px padding to its right: the marker starts at the content
+            // edge, in the padding; the text ends there.
+            assert!((marker.x - 200.0).abs() < 1.0, "marker right of the content edge: {all:?}");
+            if let Some(text) = text {
+                assert!((text.right() - 200.0).abs() < 1.0, "text ends at the content edge: {text:?}");
+            }
+        }
+        let i = find_by_tag(&doc, &tree, "i");
+        assert!((i.x - 250.0).abs() < 0.5, "inline-start float at the right: {i:?}");
+        // The flex container keeps clear of the float, so it is 250px wide
+        // and its row runs from 250 leftward.
+        let span = find_by_tag(&doc, &tree, "span");
+        let b = find_by_tag(&doc, &tree, "b");
+        assert!((span.x - 200.0).abs() < 0.5 && (b.x - 150.0).abs() < 0.5, "flex row from the right: {span:?} {b:?}");
     }
 
     #[test]

@@ -24,6 +24,25 @@ slotmap::new_key_type! {
     pub struct NodeId;
 }
 
+/// A direction of text: what HTML's directionality and the `dir`
+/// attribute resolve to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Directionality {
+    Ltr,
+    Rtl,
+}
+
+/// The strong direction of a character (Unicode bidi classes L, R and
+/// AL), none for every other class.
+pub fn strong_direction(ch: char) -> Option<Directionality> {
+    use icu_properties::{CodePointMapData, props::BidiClass};
+    match CodePointMapData::<BidiClass>::new().get(ch) {
+        BidiClass::LeftToRight => Some(Directionality::Ltr),
+        BidiClass::RightToLeft | BidiClass::ArabicLetter => Some(Directionality::Rtl),
+        _ => None,
+    }
+}
+
 /// What a node is.
 #[derive(Debug, Clone)]
 pub enum NodeKind {
@@ -327,6 +346,75 @@ impl Document {
 
     pub fn body(&self) -> Option<NodeId> {
         self.find_child_element(self.document_element()?, &local_name!("body"))
+    }
+
+    /// The directionality of a node (HTML "the directionality"): `dir=ltr`
+    /// or `dir=rtl` as given; `dir=auto` (and `bdi` without `dir`) from
+    /// the first strong character of the element's text, skipping `bdi`,
+    /// `script`, `style`, `textarea` and elements with a `dir` attribute,
+    /// a text control from its value; a `tel` input left-to-right; else
+    /// the parent's, the document's root being left-to-right. What
+    /// `:dir()` matches.
+    pub fn directionality(&self, id: NodeId) -> Directionality {
+        let parent_dir = |doc: &Document| doc.parent(id).map_or(Directionality::Ltr, |p| doc.directionality(p));
+        let Some(e) = self.element(id) else { return parent_dir(self) };
+        let dir = e.attr("dir").map(str::to_ascii_lowercase);
+        match dir.as_deref() {
+            Some("ltr") => return Directionality::Ltr,
+            Some("rtl") => return Directionality::Rtl,
+            _ => {}
+        }
+        let name = &*e.name.local;
+        let text_control = e.is_html()
+            && (name == "textarea"
+                || (name == "input"
+                    && matches!(
+                        e.attr("type").map(str::to_ascii_lowercase).as_deref(),
+                        None | Some("text" | "search" | "tel" | "url" | "email")
+                    )));
+        if dir.is_none() && e.is_html() && name == "input" && e.attr("type").is_some_and(|t| t.eq_ignore_ascii_case("tel")) {
+            return Directionality::Ltr;
+        }
+        let auto = dir.as_deref() == Some("auto") || (dir.is_none() && e.is_html() && name == "bdi");
+        if auto {
+            if text_control {
+                // An R or AL before any L: rtl; any other non-empty value:
+                // ltr; empty: the parent's.
+                let value = if name == "textarea" { self.text_content(id) } else { e.attr("value").unwrap_or("").to_owned() };
+                if let Some(d) = value.chars().find_map(strong_direction) {
+                    return d;
+                }
+                if !value.is_empty() {
+                    return Directionality::Ltr;
+                }
+            } else if let Some(d) = self.text_direction(id) {
+                return d;
+            }
+        }
+        parent_dir(self)
+    }
+
+    /// The first strong character's direction among the text descendants
+    /// of `id` in tree order, skipping the subtrees HTML's auto
+    /// directionality skips.
+    fn text_direction(&self, id: NodeId) -> Option<Directionality> {
+        let mut stack: Vec<NodeId> = self.children(id).collect();
+        stack.reverse();
+        while let Some(n) = stack.pop() {
+            if let Some(t) = self.nodes[n].as_text() {
+                if let Some(d) = t.chars().find_map(strong_direction) {
+                    return Some(d);
+                }
+            } else if let Some(e) = self.nodes[n].as_element() {
+                let skip = e.is_html()
+                    && (matches!(&*e.name.local, "bdi" | "script" | "style" | "textarea") || e.attr("dir").is_some());
+                if !skip {
+                    let kids: Vec<NodeId> = self.children(n).collect();
+                    stack.extend(kids.into_iter().rev());
+                }
+            }
+        }
+        None
     }
 
     /// Concatenated text of all text descendants.
@@ -702,6 +790,39 @@ impl Iterator for Descendants<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directionality_follows_html() {
+        let doc = parse_html(
+            "<body><div id=r dir=RTL><p id=p>x</p></div><div id=a dir=auto>\u{5e9} abc</div>\
+             <div id=b dir=auto><bdi>\u{5e9}</bdi><span dir=rtl>\u{5e9}</span>abc</div><bdi id=c>\u{5e9}</bdi>\
+             <input id=i dir=auto value='\u{5e9}'><input id=t type=tel><div id=e dir=auto></div>\
+             <textarea id=x dir=auto>12 \u{627}</textarea><div id=n dir=nonsense>\u{5e9}</div></body>"
+                .as_bytes(),
+        );
+        let by_id = |id: &str| {
+            doc.descendants(doc.root())
+                .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+                .expect(id)
+        };
+        use Directionality::{Ltr, Rtl};
+        assert_eq!(doc.directionality(by_id("r")), Rtl, "dir attribute, any case");
+        assert_eq!(doc.directionality(by_id("p")), Rtl, "the parent's");
+        assert_eq!(doc.directionality(by_id("a")), Rtl, "auto: the first strong character");
+        assert_eq!(doc.directionality(by_id("b")), Ltr, "auto skips bdi and elements with dir");
+        assert_eq!(doc.directionality(by_id("c")), Rtl, "bdi is auto by default");
+        assert_eq!(doc.directionality(by_id("i")), Rtl, "a text control's value");
+        assert_eq!(doc.directionality(by_id("t")), Ltr, "tel inputs are ltr");
+        assert_eq!(doc.directionality(by_id("e")), Ltr, "auto with nothing strong: the parent's");
+        assert_eq!(doc.directionality(by_id("x")), Rtl, "an AL with no L before it");
+        assert_eq!(doc.directionality(by_id("n")), Ltr, "an invalid dir is no dir");
+        assert_eq!(doc.directionality(doc.body().expect("body")), Ltr);
+        assert_eq!(strong_direction('a'), Some(Ltr));
+        assert_eq!(strong_direction('\u{5e9}'), Some(Rtl));
+        assert_eq!(strong_direction('\u{627}'), Some(Rtl));
+        assert_eq!(strong_direction('1'), None);
+        assert_eq!(strong_direction(' '), None);
+    }
 
     #[test]
     fn parses_simple_document() {

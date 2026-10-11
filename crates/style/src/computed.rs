@@ -181,6 +181,8 @@ pub struct ComputedStyle {
     pub font_stretch: f32,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
+    pub direction: Direction,
+    pub unicode_bidi: UnicodeBidi,
     /// The element's own `text-decoration-*` (what `getComputedStyle`
     /// reports).
     pub text_decoration_line: TextDecorationLine,
@@ -290,6 +292,8 @@ impl ComputedStyle {
             font_stretch: 100.0,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Start,
+            direction: Direction::Ltr,
+            unicode_bidi: UnicodeBidi::Normal,
             text_decoration_line: TextDecorationLine::default(),
             text_decoration_style: TextDecorationStyle::Solid,
             text_decoration_color: Rgba::BLACK,
@@ -343,6 +347,7 @@ impl ComputedStyle {
         self.font_stretch = p.font_stretch;
         self.line_height = p.line_height;
         self.text_align = p.text_align;
+        self.direction = p.direction;
         self.text_transform = p.text_transform;
         self.white_space = p.white_space;
         self.letter_spacing = p.letter_spacing;
@@ -422,6 +427,8 @@ impl ComputedStyle {
             || self.font_stretch != other.font_stretch
             || self.line_height != other.line_height
             || self.text_align != other.text_align
+            || self.direction != other.direction
+            || self.unicode_bidi != other.unicode_bidi
             || self.text_transform != other.text_transform
             || self.white_space != other.white_space
             || self.letter_spacing != other.letter_spacing
@@ -618,8 +625,11 @@ pub fn compute(
 
     pick!(display, Display, Display, |v| v.computed());
     pick!(position, Position, Position, |v| *v);
-    pick!(float, Float, Float, |v| v.computed());
+    // `float: inline-start/end` resolves against the element's direction.
+    pick!(direction, Direction, Direction, |v| *v);
+    pick!(float, Float, Float, |v| v.computed(out.direction));
     pick!(clear, Clear, Clear, |v| *v);
+    pick!(unicode_bidi, UnicodeBidi, UnicodeBidi, |v| *v);
     pick!(box_sizing, BoxSizing, BoxSizing, |v| *v);
 
     pick!(color, Color, Color, |v| v.resolve(parent.color));

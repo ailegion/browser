@@ -1233,9 +1233,63 @@ Work:
       mapping stay one root per block, unchanged. `ensure_layout`, line
       placement, float breaking, fragment emission, truncation and the
       small-caps pass iterate paragraphs with a byte offset each.
-      **Block 3, `vertical-align` done 2026-10-11 (bidi paragraphs,
-      `direction`/`unicode-bidi` and the inline box model still to
-      build, in that order).** The computed value keeps lengths
+      **Block 3: `vertical-align` done 2026-10-11; bidi paragraphs and
+      `direction`/`unicode-bidi` done 2026-10-11; the inline box model
+      still to build.** Bidi paragraphs (`crates/layout/src/engine.rs`,
+      `Paragraph`): an inline root's text is split after every forced
+      break; each piece is shaped, line-broken, placed and aligned as a
+      parley layout of its own with its own base direction, its lines
+      stacked under the previous paragraph's (beside floats too); spans,
+      atomics, the DOM mapping, selection, caret and find still see one
+      root; a trailing forced break makes no line (`<p>a<br></p>` is one
+      line tall, which it was not before: parley's empty trailing line
+      counted). `direction` (`ltr`/`rtl`, inherited) and `unicode-bidi`
+      (`normal | embed | isolate | bidi-override | isolate-override |
+      plaintext`) are in the table, cascade and CSSOM; `float:
+      inline-start/end` resolve against `direction`. `:dir(ltr|rtl)`
+      matches HTML's directionality (`crates/dom`,
+      `Document::directionality`: `dir=ltr/rtl`; `dir=auto` and `bdi`
+      from the first strong character of the text skipping `bdi`,
+      `script`, `style`, `textarea` and elements with `dir`; text
+      controls from their value; `tel` inputs left-to-right; else the
+      parent's), with `icu_properties` bidi classes (new direct
+      dependency, `03-crates.md`). The UA sheet carries HTML's bidi rules
+      (`[dir]:dir()`, the block list and `[dir]` with `unicode-bidi:
+      isolate`, `bdo` isolate-override, `textarea`/`pre` `[dir=auto]`
+      plaintext). The box builder wraps an element's content in the
+      control characters CSS Writing Modes 3 §2.2 gives its
+      `unicode-bidi` (LRE/RLE…PDF, LRI/RLI…PDI, LRO/RLO…PDF, FSI+LRO/
+      RLO…PDF+PDI, FSI…PDI) as nodeless zero-width spans shaped without
+      letter spacing, never painted as fragments, selected, found or
+      copied; every open context closes before a forced break and reopens
+      after it (UAX #9 X8, as Blink re-enters them); a block's
+      `bidi-override`/`isolate-override` wraps its whole content; the
+      collapsible space before closing controls is still trimmed. A
+      paragraph's base direction is the container's `direction` (UAX #9
+      HL1), set by a left-to-right or right-to-left mark at each
+      paragraph's start, which P2/P3 then find first (left out of
+      left-to-right text with no right-to-left character, where it would
+      change nothing); `plaintext` sets no mark, so each paragraph takes
+      its first strong character's direction. On the base direction
+      parley aligns `text-align: start`/`end` and puts the `text-overflow`
+      marker at the end edge; `direction` goes to taffy, which places
+      block children, auto margins, floats and flex rows from the end;
+      the outside list marker sits right of the content edge in a
+      right-to-left item. Tests: dom (the directionality algorithm case
+      by case), style (`[dir]`, `bdi`, `bdo`, `pre[dir=auto]` through the
+      UA rules, `inline-start/end` floats, serialization), layout (box
+      builder: controls around a `dir=rtl` span with the trailing space
+      trimmed past them, `bdo` closed and reopened around `<br>`, marks
+      per paragraph in a right-to-left `pre`, a block override wrapping
+      its content, nodeless control spans; engine: `pre dir=auto`
+      paragraphs each in their own direction next to a left-to-right `p`
+      whose Hebrew line stays left, `dir=rtl` start/end alignment with
+      Latin letters still left-to-right inside, a left-to-right paragraph
+      starting with Hebrew, the ellipsis at the left of a right-to-left
+      line, `bdo` reversing letters and a `dir=rtl` span isolating, the
+      marker right of the content edge for a text and an empty item, an
+      `inline-start` float at the right, a flex row from the right beside
+      it). The computed value keeps lengths
       and percentages (`ComputedVerticalAlign`; `getComputedStyle` reports
       them). Line boxes are placed by the engine, not parley (`crates/
       layout/src/lines.rs`, CSS 2.1 §10.8): the box builder records each

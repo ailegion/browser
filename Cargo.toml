@@ -50,6 +50,8 @@ fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
 read-fonts = "0.41"
 # Font metrics and glyph outlines; the version parley and vello use.
 skrifa = "0.44"
+# Unicode character properties (bidi classes); the version parley uses.
+icu_properties = { version = "2", default-features = false, features = ["compiled_data"] }
 pollster = "0.4"
 
 # content (Servo parsing group)

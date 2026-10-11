@@ -956,6 +956,32 @@ mod tests {
     }
 
     #[test]
+    fn direction_and_unicode_bidi_cascade_through_the_ua_rules() {
+        let (doc, styles) = styles_for(
+            "<div dir=rtl><p>x<span style='float:inline-start'>f</span><i style='float:inline-end'>g</i>\
+             <bdo dir=ltr>y</bdo></p><pre dir=auto>\u{5e9}</pre><b dir=auto>\u{5e9}</b><u style='direction:ltr'>z</u></div>",
+            "",
+        );
+        use crate::properties::{Direction, Float, UnicodeBidi};
+        let div = &styles[find(&doc, "div")];
+        assert_eq!((div.direction, div.unicode_bidi), (Direction::Rtl, UnicodeBidi::Isolate), "[dir]:dir(rtl) and [dir=rtl]");
+        let p = &styles[find(&doc, "p")];
+        assert_eq!((p.direction, p.unicode_bidi), (Direction::Rtl, UnicodeBidi::Isolate), "inherited direction, block isolate");
+        assert_eq!(styles[find(&doc, "span")].float, Float::Right, "inline-start under rtl");
+        assert_eq!(styles[find(&doc, "i")].float, Float::Left, "inline-end under rtl");
+        let bdo = &styles[find(&doc, "bdo")];
+        assert_eq!((bdo.direction, bdo.unicode_bidi), (Direction::Ltr, UnicodeBidi::IsolateOverride));
+        let pre = &styles[find(&doc, "pre")];
+        assert_eq!((pre.direction, pre.unicode_bidi), (Direction::Rtl, UnicodeBidi::Plaintext), "dir=auto from the text");
+        let b = &styles[find(&doc, "b")];
+        assert_eq!((b.direction, b.unicode_bidi), (Direction::Rtl, UnicodeBidi::Isolate));
+        let u = &styles[find(&doc, "u")];
+        assert_eq!((u.direction, u.unicode_bidi), (Direction::Ltr, UnicodeBidi::Normal), "the property itself");
+        assert_eq!(crate::serialize::resolved_value(bdo, crate::properties::PropertyId::UnicodeBidi, None), "isolate-override");
+        assert_eq!(crate::serialize::resolved_value(div, crate::properties::PropertyId::Direction, None), "rtl");
+    }
+
+    #[test]
     fn underline_position_offset_and_skip_ink_compute_and_inherit() {
         let (doc, styles) = styles_for(
             "<p style='font-size: 20px; text-underline-position: under left; text-underline-offset: 50%; text-decoration-skip-ink: none; text-decoration: underline'>\

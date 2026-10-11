@@ -66,6 +66,8 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::FontStretch(s) => s.to_css(),
         P::LineHeight(l) => line_height_css(l),
         P::TextAlign(t) => t.keyword().to_owned(),
+        P::Direction(d) => d.keyword().to_owned(),
+        P::UnicodeBidi(u) => u.keyword().to_owned(),
         P::TextDecorationLine(l) => l.to_css(),
         P::TextDecorationStyle(s) => s.keyword().to_owned(),
         P::TextDecorationThickness(t) => match t {
@@ -702,6 +704,8 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
             lh => px(lh.to_px(style.font_size)),
         },
         Id::TextAlign => style.text_align.keyword().to_owned(),
+        Id::Direction => style.direction.keyword().to_owned(),
+        Id::UnicodeBidi => style.unicode_bidi.keyword().to_owned(),
         Id::TextDecorationLine => style.text_decoration_line.to_css(),
         Id::TextDecorationStyle => style.text_decoration_style.keyword().to_owned(),
         Id::TextDecorationColor => style.text_decoration_color.to_css(),

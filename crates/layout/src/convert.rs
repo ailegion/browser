@@ -1,7 +1,7 @@
 //! Computed style -> taffy style.
 
 use browser_style::{
-    AlignValue, BoxSizing, Clear, ComputedLp, ComputedLpAuto, ComputedSize, ComputedStyle, Display,
+    AlignValue, BoxSizing, Clear, ComputedLp, ComputedLpAuto, ComputedSize, ComputedStyle, Direction, Display,
     FlexDirection, FlexWrap, Float, Overflow, Position,
 };
 use taffy::prelude::*;
@@ -176,6 +176,12 @@ pub(crate) fn to_taffy(style: &ComputedStyle, is_flex_container: bool, is_replac
         flex_basis: dimension(style.flex_basis),
         flex_grow: style.flex_grow,
         flex_shrink: style.flex_shrink,
+        // Block children, flex rows, floats and auto margins run from the
+        // end in a right-to-left container.
+        direction: match style.direction {
+            Direction::Ltr => taffy::style::Direction::Ltr,
+            Direction::Rtl => taffy::style::Direction::Rtl,
+        },
         ..Style::default()
     }
 }

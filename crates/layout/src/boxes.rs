@@ -4,10 +4,10 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use browser_dom::{Document, NodeId, NodeKind};
+use browser_dom::{Directionality, Document, NodeId, NodeKind, strong_direction};
 use browser_style::{
-    ComputedStyle, Display, Float, FontVariant, ListStylePosition, ListStyleType, Rgba, StyleMap, TextTransform,
-    WhiteSpace,
+    ComputedStyle, Direction, Display, Float, FontVariant, LetterSpacing, ListStylePosition, ListStyleType, Rgba,
+    StyleMap, TextTransform, UnicodeBidi, WhiteSpace,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -112,16 +112,49 @@ pub(crate) struct AtomicResult {
     pub baseline: f32,
 }
 
-/// Cached parley layout for one width constraint.
+/// One bidi paragraph of an inline root: the text between forced breaks
+/// (the break included), shaped and line-broken as a parley layout of its
+/// own, so it has its own base direction (UAX #9: a paragraph separator
+/// ends a paragraph; `unicode-bidi: plaintext` decides per paragraph).
+pub(crate) struct Paragraph {
+    /// Byte range of the root's text this paragraph is.
+    pub range: Range<usize>,
+    pub layout: parley::Layout<crate::Brush>,
+    /// Where each line and everything in it sits, in the root's
+    /// coordinates (`vertical-align` and line box heights are the
+    /// engine's, not parley's).
+    pub lines: Vec<crate::lines::LinePlacement>,
+}
+
+/// Cached layout of an inline root for one width constraint: its
+/// paragraphs, stacked.
 pub(crate) struct InlineLayout {
     pub max_width: Option<f32>,
-    pub layout: parley::Layout<crate::Brush>,
-    /// Height of the laid-out lines, including gaps left when a line was
+    pub paragraphs: Vec<Paragraph>,
+    /// Height of all the lines, including gaps left when a line was
     /// pushed below a float.
     pub height: f32,
-    /// Where each line and everything in it sits (`vertical-align` and
-    /// line box heights are the engine's, not parley's).
-    pub lines: Vec<crate::lines::LinePlacement>,
+}
+
+impl InlineLayout {
+    /// The widest paragraph's width, trailing whitespace excluded.
+    pub fn width(&self) -> f32 {
+        self.paragraphs.iter().map(|p| p.layout.width()).fold(0.0, f32::max)
+    }
+
+    /// The widest paragraph's width, trailing whitespace included.
+    pub fn full_width(&self) -> f32 {
+        self.paragraphs.iter().map(|p| p.layout.full_width()).fold(0.0, f32::max)
+    }
+
+    /// The first line's baseline from the root's top.
+    pub fn first_baseline(&self) -> f32 {
+        self.paragraphs
+            .iter()
+            .find_map(|p| p.lines.first())
+            .map(|l| l.top + l.baseline)
+            .unwrap_or(0.0)
+    }
 }
 
 /// The vertical band a float occupies next to an inline root, in the root's
@@ -137,12 +170,54 @@ pub(crate) struct FloatBand {
     pub edge: f32,
 }
 
+/// A bidi context opened in an inline root's text by `unicode-bidi` (CSS
+/// Writing Modes 3 §2.2: the control characters an element's content is
+/// wrapped in), outermost first in `InlineContent::bidi`.
+pub(crate) struct BidiContext {
+    pub open: &'static str,
+    pub close: &'static str,
+    /// The style the controls are shaped in (the element's, without
+    /// letter spacing, so the zero-width characters add nothing).
+    pub style: Arc<ComputedStyle>,
+}
+
+/// The control characters `unicode-bidi` wraps an element's content in,
+/// for its `direction` (CSS Writing Modes 3 §2.2).
+pub(crate) fn bidi_controls(style: &ComputedStyle) -> Option<(&'static str, &'static str)> {
+    let rtl = style.direction == Direction::Rtl;
+    Some(match style.unicode_bidi {
+        UnicodeBidi::Normal => return None,
+        UnicodeBidi::Embed => (if rtl { "\u{202B}" } else { "\u{202A}" }, "\u{202C}"),
+        UnicodeBidi::Isolate => (if rtl { "\u{2067}" } else { "\u{2066}" }, "\u{2069}"),
+        UnicodeBidi::BidiOverride => (if rtl { "\u{202E}" } else { "\u{202D}" }, "\u{202C}"),
+        UnicodeBidi::IsolateOverride => {
+            (if rtl { "\u{2068}\u{202E}" } else { "\u{2068}\u{202D}" }, "\u{202C}\u{2069}")
+        }
+        UnicodeBidi::Plaintext => ("\u{2068}", "\u{2069}"),
+    })
+}
+
+/// Whether a character is one of the bidi controls the engine inserts
+/// (marks, embeddings, overrides, isolates and their terminators).
+pub(crate) fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The style bidi controls are shaped in: `style` without letter spacing.
+fn control_style(style: &ComputedStyle) -> Arc<ComputedStyle> {
+    let mut s = style.clone();
+    s.letter_spacing = LetterSpacing::Normal;
+    Arc::new(s)
+}
+
 pub(crate) struct InlineContent {
     pub text: String,
     pub spans: Vec<TextSpan>,
     pub atomics: Vec<Atomic>,
     /// The inline elements of this root, parents before children.
     pub boxes: Vec<InlineBoxInfo>,
+    /// The bidi contexts open at the end of the text, outermost first.
+    pub bidi: Vec<BidiContext>,
     /// Style of the block container: alignment, white-space, defaults.
     pub container: Arc<ComputedStyle>,
     pub cache: Vec<InlineLayout>,
@@ -169,16 +244,155 @@ pub(crate) struct Ellipsis {
 
 impl InlineContent {
     fn new(container: Arc<ComputedStyle>) -> Self {
-        Self {
+        let mut content = Self {
             text: String::new(),
             spans: Vec::new(),
             atomics: Vec::new(),
             boxes: Vec::new(),
-            container,
+            bidi: Vec::new(),
+            container: container.clone(),
             cache: Vec::new(),
             floats: Vec::new(),
             ellipsis: None,
             marker_len: 0,
+        };
+        // A block container's override applies to all of its inline
+        // content: the paragraph is wrapped in it (`finish` closes it).
+        if matches!(container.unicode_bidi, UnicodeBidi::BidiOverride | UnicodeBidi::IsolateOverride) {
+            let open = if container.direction == Direction::Rtl { "\u{202E}" } else { "\u{202D}" };
+            content.enter_bidi(BidiContext {
+                open,
+                close: "\u{202C}",
+                style: control_style(&container),
+            });
+        }
+        content
+    }
+
+    /// Append bidi control characters: a nodeless span the engine shapes
+    /// (zero width) and nothing selects, finds or copies.
+    fn push_control(&mut self, s: &str, style: Arc<ComputedStyle>) {
+        let start = self.text.len();
+        self.text.push_str(s);
+        self.spans.push(TextSpan {
+            start,
+            end: self.text.len(),
+            style,
+            node: None,
+            inline_box: None,
+        });
+    }
+
+    /// Open a bidi context: its opening controls go into the text now,
+    /// its closing ones at `exit_bidi`.
+    pub(crate) fn enter_bidi(&mut self, ctx: BidiContext) {
+        self.push_control(ctx.open, ctx.style.clone());
+        self.bidi.push(ctx);
+    }
+
+    pub(crate) fn exit_bidi(&mut self) {
+        if let Some(ctx) = self.bidi.pop() {
+            self.push_control(ctx.close, ctx.style);
+        }
+    }
+
+    /// A forced line break (`<br>`, a preserved newline): every open bidi
+    /// context ends before it and starts again after it, since a
+    /// paragraph separator terminates embeddings, overrides and isolates
+    /// (UAX #9 X8) and the next paragraph must get them back, as Blink
+    /// re-enters its bidi contexts after a forced break.
+    pub(crate) fn forced_break(&mut self, style: Arc<ComputedStyle>, node: Option<NodeId>, inline_box: Option<usize>) {
+        for i in (0..self.bidi.len()).rev() {
+            let (close, st) = (self.bidi[i].close, self.bidi[i].style.clone());
+            self.push_control(close, st);
+        }
+        let start = self.text.len();
+        self.text.push('\n');
+        self.spans.push(TextSpan {
+            start,
+            end: start + 1,
+            style,
+            node,
+            inline_box,
+        });
+        for i in 0..self.bidi.len() {
+            let (open, st) = (self.bidi[i].open, self.bidi[i].style.clone());
+            self.push_control(open, st);
+        }
+    }
+
+    /// Close the root's text: the block's own context ends, and every
+    /// paragraph gets its base direction. The container's `direction` is
+    /// the explicit paragraph level (UAX #9 HL1), set by a left-to-right
+    /// or right-to-left mark at the paragraph's start, which the
+    /// algorithm's P2/P3 then find first; the mark is left out of
+    /// left-to-right text with no right-to-left character, where it would
+    /// change nothing. `unicode-bidi: plaintext` sets no mark: each
+    /// paragraph takes the direction of its first strong character.
+    pub(crate) fn finish(&mut self) {
+        while !self.bidi.is_empty() {
+            self.exit_bidi();
+        }
+        let container = self.container.clone();
+        if container.unicode_bidi == UnicodeBidi::Plaintext {
+            return;
+        }
+        let rtl = container.direction == Direction::Rtl;
+        if !rtl && !self.text.chars().any(|c| strong_direction(c) == Some(Directionality::Rtl)) {
+            return;
+        }
+        let mark = if rtl { "\u{200F}" } else { "\u{200E}" };
+        let mut starts = vec![0];
+        starts.extend(
+            self.text
+                .char_indices()
+                .filter(|&(_, c)| c == '\n')
+                .map(|(i, _)| i + 1)
+                .filter(|&p| p < self.text.len()),
+        );
+        let style = control_style(&container);
+        for p in starts.into_iter().rev() {
+            self.insert_control(p, mark, style.clone());
+        }
+    }
+
+    /// Insert control characters at byte `pos`, splitting the span they
+    /// land in and moving everything after them.
+    fn insert_control(&mut self, pos: usize, s: &str, style: Arc<ComputedStyle>) {
+        let n = s.len();
+        self.text.insert_str(pos, s);
+        let mut tails = Vec::new();
+        for span in &mut self.spans {
+            if span.start >= pos {
+                span.start += n;
+                span.end += n;
+            } else if span.end > pos {
+                tails.push(TextSpan {
+                    start: pos + n,
+                    end: span.end + n,
+                    style: span.style.clone(),
+                    node: span.node,
+                    inline_box: span.inline_box,
+                });
+                span.end = pos;
+            }
+        }
+        self.spans.extend(tails);
+        self.spans.push(TextSpan {
+            start: pos,
+            end: pos + n,
+            style,
+            node: None,
+            inline_box: None,
+        });
+        self.spans.sort_by_key(|s| s.start);
+        for a in &mut self.atomics {
+            if a.index >= pos {
+                a.index += n;
+            }
+        }
+        if self.marker_len > pos {
+            self.marker_len += n;
         }
     }
 
@@ -192,27 +406,38 @@ impl InlineContent {
         self.container.text_overflow.marker()
     }
 
+    /// Whether the root shows nothing: no atomics and no text beyond
+    /// white space and bidi controls.
     fn is_empty(&self) -> bool {
-        self.atomics.is_empty() && self.text.trim().is_empty()
+        self.atomics.is_empty() && self.text.chars().all(|c| c.is_whitespace() || is_bidi_control(c))
     }
 
     /// Remove a collapsible space at the end of the run (CSS Text 3, step
-    /// 4 of the white space processing rules).
+    /// 4 of the white space processing rules), looking past the bidi
+    /// controls that close the run after it.
     fn trim_trailing_space(&mut self) {
-        if !self.text.ends_with(' ') {
+        let content_end = self.text.trim_end_matches(is_bidi_control).len();
+        if content_end == 0 || !self.text[..content_end].ends_with(' ') {
             return;
         }
-        let end = self.text.len();
+        let pos = content_end - 1;
         // Only if no atomic box sits after the space.
-        if self.atomics.iter().any(|a| a.index >= end) {
+        if self.atomics.iter().any(|a| a.index > pos) {
             return;
         }
-        self.text.pop();
-        let new_end = self.text.len();
-        if let Some(last) = self.spans.last_mut() {
-            last.end = last.end.min(new_end);
-            if last.end <= last.start {
-                self.spans.pop();
+        self.text.remove(pos);
+        for span in &mut self.spans {
+            if span.start > pos {
+                span.start -= 1;
+            }
+            if span.end > pos {
+                span.end -= 1;
+            }
+        }
+        self.spans.retain(|s| s.end > s.start);
+        for a in &mut self.atomics {
+            if a.index > pos {
+                a.index -= 1;
             }
         }
     }
@@ -512,6 +737,7 @@ impl BoxBuilder<'_> {
             at_line_start: true,
         };
         append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws, None);
+        content.finish();
         let mut inline = BoxNode::new(BoxKind::Inline(content), None, container);
         inline.anonymous = true;
         b.children.push(inline);
@@ -548,6 +774,7 @@ impl BoxBuilder<'_> {
                 at_line_start: true,
             };
             append_text(&mut content, &self.doc.text_content(id), style.clone(), None, &mut ws, None);
+            content.finish();
             let mut inline = BoxNode::new(BoxKind::Inline(content), None, Arc::new(ComputedStyle::anonymous_from(&style)));
             inline.anonymous = true;
             vec![inline]
@@ -578,6 +805,7 @@ impl BoxBuilder<'_> {
                 if ws.last_was_space {
                     content.trim_trailing_space();
                 }
+                content.finish();
                 let style = Arc::new(ComputedStyle::anonymous_from(&content.container));
                 let mut b = BoxNode::new(BoxKind::Inline(content), None, style);
                 b.anonymous = true;
@@ -648,14 +876,7 @@ impl BoxBuilder<'_> {
         ws: &mut WsState,
         inline_box: Option<usize>,
     ) {
-        content.text.push('\n');
-        content.spans.push(TextSpan {
-            start: content.text.len() - 1,
-            end: content.text.len(),
-            style,
-            node: Some(id),
-            inline_box,
-        });
+        content.forced_break(style, Some(id), inline_box);
         ws.last_was_space = true;
         ws.at_line_start = true;
     }
@@ -707,12 +928,21 @@ impl BoxBuilder<'_> {
             InlineKind::Plain => {}
         }
         // A plain inline element: an inline box of the root; its text
-        // joins the run with its own style.
+        // joins the run with its own style, inside the bidi controls its
+        // `unicode-bidi` asks for.
         content.boxes.push(InlineBoxInfo {
             parent,
             style: style.clone(),
         });
         let me = Some(content.boxes.len() - 1);
+        let controls = bidi_controls(&style);
+        if let Some((open, close)) = controls {
+            content.enter_bidi(BidiContext {
+                open,
+                close,
+                style: control_style(&style),
+            });
+        }
         for child in self.doc.children(id) {
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
@@ -731,6 +961,9 @@ impl BoxBuilder<'_> {
                 }
                 _ => {}
             }
+        }
+        if controls.is_some() {
+            content.exit_bidi();
         }
     }
 
@@ -815,6 +1048,7 @@ impl BoxBuilder<'_> {
             content.atomics.push(atomic);
         }
         content.marker_len = text.len();
+        content.finish();
         let mut m = BoxNode::new(BoxKind::Inline(content), None, marker_style);
         m.anonymous = true;
         if b.children.is_empty() {
@@ -878,6 +1112,24 @@ fn append_text(
     let mode = style.white_space;
     let transform = style.text_transform;
     let mut capitalize_next = true;
+    // The node's span, in pieces around the forced breaks (which carry
+    // bidi controls of their own).
+    let mut piece_start = start;
+    let span_style = style.clone();
+    let newline = |content: &mut InlineContent, piece_start: &mut usize| {
+        let end = content.text.len();
+        if end > *piece_start {
+            content.spans.push(TextSpan {
+                start: *piece_start,
+                end,
+                style: span_style.clone(),
+                node,
+                inline_box,
+            });
+        }
+        content.forced_break(span_style.clone(), node, inline_box);
+        *piece_start = content.text.len();
+    };
 
     let mut push_char = |content: &mut InlineContent, ch: char| {
         match transform {
@@ -921,7 +1173,7 @@ fn append_text(
                     if ws.last_was_space && content.text.ends_with(' ') && content.text.len() > start {
                         content.text.pop();
                     }
-                    push_char(content, '\n');
+                    newline(content, &mut piece_start);
                     ws.last_was_space = true;
                     ws.at_line_start = true;
                 } else if is_space {
@@ -937,7 +1189,7 @@ fn append_text(
             }
             WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces => {
                 if is_newline {
-                    push_char(content, '\n');
+                    newline(content, &mut piece_start);
                     ws.at_line_start = true;
                 } else if ch == '\t' {
                     // Tabs render as spaces to the next multiple of 8 columns is
@@ -955,9 +1207,9 @@ fn append_text(
         }
     }
     let end = content.text.len();
-    if end > start {
+    if end > piece_start {
         content.spans.push(TextSpan {
-            start,
+            start: piece_start,
             end,
             style,
             node,
@@ -1037,6 +1289,7 @@ mod tests {
                 .collect(),
             atomics: Vec::new(),
             boxes: Vec::new(),
+            bidi: Vec::new(),
             container: c.container.clone(),
             cache: Vec::new(),
             floats: Vec::new(),
@@ -1110,6 +1363,33 @@ mod tests {
         assert_eq!(marker(items[3]).map(|m| m.1), Some(1));
         assert!(marker(items[4]).is_none());
         assert_eq!(inline(&items[4].children[0]), "five");
+    }
+
+    #[test]
+    fn bidi_controls_wrap_elements_and_paragraphs() {
+        // `<span dir=rtl>` is an isolate (UA sheet): RLI … PDI around its
+        // text, nodeless; the collapsible space before the PDI is still
+        // trimmed; the paragraph gets no mark (left-to-right, nothing
+        // right-to-left in it). `<bdo dir=rtl>` is an isolate-override
+        // closed before the `<br>` and reopened after it. A right-to-left
+        // block starts every paragraph with a right-to-left mark; a
+        // block override wraps its content.
+        let (doc, styles) = build(
+            "<p>a <span dir=rtl>b </span></p><p><bdo dir=rtl>ab<br>cd</bdo></p>\
+             <div dir=rtl style='white-space:pre'>x\ny</div><div style='unicode-bidi:bidi-override'>q</div>",
+        );
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let root = builder.build_root().expect("root");
+        let texts = inline_text(&root);
+        assert_eq!(texts[0], "a \u{2067}b\u{2069}");
+        assert_eq!(texts[1], "\u{2068}\u{202E}ab\u{202C}\u{2069}\n\u{2068}\u{202E}cd\u{202C}\u{2069}");
+        assert_eq!(texts[2], "\u{200F}x\n\u{200F}y");
+        assert_eq!(texts[3], "\u{202D}q\u{202C}");
+        let body = &root.children[0];
+        let BoxKind::Inline(first) = &body.children[0].children[0].kind else { panic!("inline root") };
+        let nodeless: Vec<(usize, usize)> = first.spans.iter().filter(|s| s.node.is_none()).map(|s| (s.start, s.end)).collect();
+        assert_eq!(nodeless, vec![(2, 5), (6, 9)], "the controls are nodeless spans: {nodeless:?}");
+        assert!(first.spans.iter().filter(|s| s.node.is_some()).all(|s| !first.text[s.start..s.end].chars().any(is_bidi_control)));
     }
 
     #[test]

@@ -28,6 +28,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 |-------|---------|------|-------|
 | `parley` | 0.11.1 | Line breaking, shaping, bidi | |
 | `fontique` | 0.11.1 | System font enumeration and fallback | Direct dep only to set `fontconfig-dlopen`; see "OS bindings on Linux" |
+| `icu_properties` | 2.3.0 | Unicode character properties | Direct dep of `dom` since 2026-10-11 (D14): bidi classes for HTML's directionality (`dir=auto`, `bdi`, `:dir()`) and for the layout's paragraph marks. Already in the tree under parley; same version, `compiled_data` only |
 | `skrifa` | 0.44.0 | Font parsing, glyph outlines | Direct dep of `layout` since 2026-10-11 (D14): a decorating box's font metrics place its decoration lines on any text under it, and glyph outlines give the ranges where an underline skips ink (`text-decoration-skip-ink`). Already in the tree under vello and parley; same version |
 | `harfrust` | 0.12.0 | Shaping (pure-Rust HarfBuzz port) | via parley; parley 0.11 no longer uses `swash` |
 | `parlance` | 0.1.0 | Font family list parsing (`FontFamily::Source` takes the CSS list text) | via parley |

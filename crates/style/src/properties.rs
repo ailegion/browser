@@ -180,11 +180,16 @@ pub enum FloatValue {
 }
 
 impl FloatValue {
-    pub fn computed(self) -> Float {
+    /// The side floated to; `inline-start`/`inline-end` by the element's
+    /// `direction`.
+    pub fn computed(self, direction: Direction) -> Float {
+        let rtl = direction == Direction::Rtl;
         match self {
             FloatValue::None => Float::None,
-            FloatValue::Left | FloatValue::InlineStart => Float::Left,
-            FloatValue::Right | FloatValue::InlineEnd => Float::Right,
+            FloatValue::Left => Float::Left,
+            FloatValue::Right => Float::Right,
+            FloatValue::InlineStart => if rtl { Float::Right } else { Float::Left },
+            FloatValue::InlineEnd => if rtl { Float::Left } else { Float::Right },
         }
     }
 
@@ -206,6 +211,48 @@ pub enum Clear {
     Left,
     Right,
     Both,
+}
+
+/// `direction`: the inline base direction (inherited).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Direction {
+    #[default]
+    Ltr,
+    Rtl,
+}
+
+impl Direction {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Direction::Ltr => "ltr",
+            Direction::Rtl => "rtl",
+        }
+    }
+}
+
+/// `unicode-bidi`: how an element's content enters the bidi algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnicodeBidi {
+    #[default]
+    Normal,
+    Embed,
+    Isolate,
+    BidiOverride,
+    IsolateOverride,
+    Plaintext,
+}
+
+impl UnicodeBidi {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            UnicodeBidi::Normal => "normal",
+            UnicodeBidi::Embed => "embed",
+            UnicodeBidi::Isolate => "isolate",
+            UnicodeBidi::BidiOverride => "bidi-override",
+            UnicodeBidi::IsolateOverride => "isolate-override",
+            UnicodeBidi::Plaintext => "plaintext",
+        }
+    }
 }
 
 impl Clear {
@@ -1513,6 +1560,8 @@ longhands! {
     FontStretch: "font-stretch" => FontStretch, true;
     LineHeight: "line-height" => LineHeightValue, true;
     TextAlign: "text-align" => TextAlignValue, true;
+    Direction: "direction" => Direction, true;
+    UnicodeBidi: "unicode-bidi" => UnicodeBidi, false;
     TextDecorationLine: "text-decoration-line" => TextDecorationLine, false;
     TextDecorationStyle: "text-decoration-style" => TextDecorationStyle, false;
     TextDecorationColor: "text-decoration-color" => Color, false;
@@ -1777,6 +1826,12 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "start" => TextAlignValue::Start, "left" => TextAlignValue::Left, "right" => TextAlignValue::Right,
             "center" => TextAlignValue::Center, "justify" => TextAlignValue::Justify, "end" => TextAlignValue::End,
             "-webkit-center" => TextAlignValue::WebkitCenter, _ => return None }))?),
+        PropertyId::Direction => P::Direction(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "ltr" => Direction::Ltr, "rtl" => Direction::Rtl, _ => return None }))?),
+        PropertyId::UnicodeBidi => P::UnicodeBidi(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "normal" => UnicodeBidi::Normal, "embed" => UnicodeBidi::Embed, "isolate" => UnicodeBidi::Isolate,
+            "bidi-override" => UnicodeBidi::BidiOverride, "isolate-override" => UnicodeBidi::IsolateOverride,
+            "plaintext" => UnicodeBidi::Plaintext, _ => return None }))?),
         PropertyId::TextDecorationLine => P::TextDecorationLine(parse_text_decoration_line(input)?),
         PropertyId::TextDecorationStyle => P::TextDecorationStyle(parse_text_decoration_style(input)?),
         PropertyId::TextDecorationColor => P::TextDecorationColor(parse_color(input)?),

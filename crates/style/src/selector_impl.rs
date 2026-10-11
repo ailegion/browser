@@ -122,6 +122,9 @@ pub enum PseudoClass {
     Target,
     /// `:lang(x)` with its argument.
     Lang(String),
+    /// `:dir(ltr)` / `:dir(rtl)`; any other argument parses and matches
+    /// nothing.
+    Dir(Option<browser_dom::Directionality>),
 }
 
 impl NonTSPseudoClassTrait for PseudoClass {
@@ -159,6 +162,9 @@ impl ToCss for PseudoClass {
             PseudoClass::Enabled => ":enabled",
             PseudoClass::Target => ":target",
             PseudoClass::Lang(l) => return write!(dest, ":lang({l})"),
+            PseudoClass::Dir(Some(browser_dom::Directionality::Ltr)) => ":dir(ltr)",
+            PseudoClass::Dir(Some(browser_dom::Directionality::Rtl)) => ":dir(rtl)",
+            PseudoClass::Dir(None) => ":dir(auto)",
         };
         dest.write_str(s)
     }
@@ -269,6 +275,17 @@ impl<'i> parser::Parser<'i> for SelectorParser {
         if name.eq_ignore_ascii_case("lang") {
             let lang = parser.expect_ident_or_string()?.to_string();
             return Ok(PseudoClass::Lang(lang));
+        }
+        if name.eq_ignore_ascii_case("dir") {
+            let ident = parser.expect_ident()?;
+            let dir = if ident.eq_ignore_ascii_case("ltr") {
+                Some(browser_dom::Directionality::Ltr)
+            } else if ident.eq_ignore_ascii_case("rtl") {
+                Some(browser_dom::Directionality::Rtl)
+            } else {
+                None
+            };
+            return Ok(PseudoClass::Dir(dir));
         }
         Err(parser.new_custom_error(
             SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
@@ -453,6 +470,7 @@ impl selectors::Element for ElementRef<'_> {
                     "input" | "button" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
                 ) && e.attr("disabled").is_none()
             }
+            PseudoClass::Dir(dir) => dir.is_some_and(|d| self.doc.directionality(self.id) == d),
             PseudoClass::Lang(lang) => {
                 let mut cur = Some(self.id);
                 while let Some(n) = cur {
