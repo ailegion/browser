@@ -1212,9 +1212,30 @@ Work:
       side, flex `row` running from the end, the `text-overflow` marker
       at the end edge, and `unicode-bidi` (`normal`, `embed`, `isolate`,
       `bidi-override`, `isolate-override`, `plaintext`) as the embedding
-      and override controls around inline elements.
-      **Block 3, `vertical-align` done 2026-10-11 (`direction`/
-      `unicode-bidi` still to build).** The computed value keeps lengths
+      and override controls around inline elements; and the inline box
+      model (placed here 2026-10-11, found missing while building
+      `vertical-align`: the engine lays out and paints no padding,
+      border, margin or background on a `display: inline` element):
+      padding, border, margin and background of non-replaced inline
+      boxes per line fragment (CSS 2.1 §8, §10.8: the horizontal edges
+      take inline space and break with the text, the vertical ones paint
+      without affecting the line box, `box-decoration-break: slice` at the
+      line ends), an empty inline box with edges affecting the line box
+      as browsers let it, and `border-radius`/`background-clip` on those
+      fragments.
+      Bidi paragraphs (placed here 2026-10-11, built before `direction`/
+      `unicode-bidi`, which sit on it): inside one inline root, the text
+      is split at forced breaks into paragraphs; each paragraph is its
+      own parley layout with its own base direction (the container's
+      `direction`, or the paragraph's first strong character under
+      `unicode-bidi: plaintext`); the root's lines are the paragraphs'
+      lines stacked; spans, atomics, selection, caret, find and the DOM
+      mapping stay one root per block, unchanged. `ensure_layout`, line
+      placement, float breaking, fragment emission, truncation and the
+      small-caps pass iterate paragraphs with a byte offset each.
+      **Block 3, `vertical-align` done 2026-10-11 (bidi paragraphs,
+      `direction`/`unicode-bidi` and the inline box model still to
+      build, in that order).** The computed value keeps lengths
       and percentages (`ComputedVerticalAlign`; `getComputedStyle` reports
       them). Line boxes are placed by the engine, not parley (`crates/
       layout/src/lines.rs`, CSS 2.1 §10.8): the box builder records each
