@@ -1212,7 +1212,47 @@ Work:
       side, flex `row` running from the end, the `text-overflow` marker
       at the end edge, and `unicode-bidi` (`normal`, `embed`, `isolate`,
       `bidi-override`, `isolate-override`, `plaintext`) as the embedding
-      and override controls around inline elements; (4) backgrounds: every layer with
+      and override controls around inline elements.
+      **Block 3, `vertical-align` done 2026-10-11 (`direction`/
+      `unicode-bidi` still to build).** The computed value keeps lengths
+      and percentages (`ComputedVerticalAlign`; `getComputedStyle` reports
+      them). Line boxes are placed by the engine, not parley (`crates/
+      layout/src/lines.rs`, CSS 2.1 §10.8): the box builder records each
+      inline element as an inline box of its root (`InlineContent::
+      boxes`, parent chain) and tags every text span and atomic with its
+      innermost one; after parley breaks a line, every inline box on it,
+      every atomic and the root strut get a line-height box from their
+      first available font (ascent and descent rounded, the leading split
+      with the larger half below, as Chrome rounds; `line-height: normal`
+      is the rounded ascent, descent and line gap, Chrome's line spacing,
+      and then the fonts the runs were actually shaped with widen the box
+      too, as Blink's used fonts do), each box is shifted against its
+      parent's baseline (`baseline`; `sub`/`super` a fifth/a third of the
+      parent's font size plus a pixel, Blink's offsets; `text-top`/
+      `text-bottom` to the parent's content area; `middle` to half the
+      parent's x-height, the font's or the `x` glyph's measured; lengths;
+      percentages of the box's own line height), nested boxes move with
+      their parents, the line box takes the extent of all of them, and
+      `top`/`bottom` boxes are set against the finished line box and widen
+      it when taller. An atomic's baseline (`AtomicResult::baseline`) is
+      an inline-block's last in-flow line's when it has one and does not
+      clip its overflow, else its bottom margin edge; its margin box is
+      what aligns and its border box now sits inside its margins (before,
+      the border box was drawn at the margin edge). Beside floats the
+      breaker reruns with the lines stacked on their placed heights until
+      nothing moves, so a line made taller by an aligned box pushes the
+      lines below it and the gaps beside floats follow. Decoration lines
+      follow their decorating box's placed baseline. Lines now stack by
+      the rounded line height (parley stacked them by the unrounded font
+      height, 18.39px for 16px Arial where Chrome stacks 18px), so the
+      three paint snapshots were regenerated; nothing else in them moved.
+      Tests: style (serialization), layout (`sub`/`super`/length/
+      percentage shifts and a nested box, images by every keyword against
+      the parent's measured metrics with the line growing, an inline-
+      block's baseline from its last line, its bottom edge with
+      `overflow: hidden`, margins around it, lines stacking on placed
+      heights beside a float; `lines.rs` unit test for the leading split).
+      (4) backgrounds: every layer with
       its position, size, repeat, attachment, origin and clip; (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,

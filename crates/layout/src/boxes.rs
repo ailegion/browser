@@ -77,6 +77,17 @@ pub(crate) struct TextSpan {
     pub end: usize,
     pub style: Arc<ComputedStyle>,
     pub node: Option<NodeId>,
+    /// The innermost inline element around this text (`InlineContent::
+    /// boxes`), `None` when it sits directly in the root.
+    pub inline_box: Option<usize>,
+}
+
+/// An inline element (`display: inline`) inside an inline root: the chain
+/// of these, up to the root, is what `vertical-align` shifts a run or
+/// atomic against, and what contributes line-height boxes to the line.
+pub(crate) struct InlineBoxInfo {
+    pub parent: Option<usize>,
+    pub style: Arc<ComputedStyle>,
 }
 
 /// An inline-level box that is laid out on its own and placed in the line
@@ -87,12 +98,18 @@ pub(crate) struct Atomic {
     pub node: BoxNode,
     /// Filled by the engine before the containing inline root is measured.
     pub result: Option<AtomicResult>,
+    /// The innermost inline element around the box, as for a `TextSpan`.
+    pub inline_box: Option<usize>,
 }
 
 pub(crate) struct AtomicResult {
+    /// The margin box's size.
     pub width: f32,
     pub height: f32,
     pub fragment: Fragment,
+    /// The box's baseline from the top of its margin box: an inline-block's
+    /// last in-flow line's, else the bottom margin edge (CSS 2.1 §10.8).
+    pub baseline: f32,
 }
 
 /// Cached parley layout for one width constraint.
@@ -100,8 +117,11 @@ pub(crate) struct InlineLayout {
     pub max_width: Option<f32>,
     pub layout: parley::Layout<crate::Brush>,
     /// Height of the laid-out lines, including gaps left when a line was
-    /// pushed below a float. Equals `layout.height()` when there are none.
+    /// pushed below a float.
     pub height: f32,
+    /// Where each line and everything in it sits (`vertical-align` and
+    /// line box heights are the engine's, not parley's).
+    pub lines: Vec<crate::lines::LinePlacement>,
 }
 
 /// The vertical band a float occupies next to an inline root, in the root's
@@ -121,6 +141,8 @@ pub(crate) struct InlineContent {
     pub text: String,
     pub spans: Vec<TextSpan>,
     pub atomics: Vec<Atomic>,
+    /// The inline elements of this root, parents before children.
+    pub boxes: Vec<InlineBoxInfo>,
     /// Style of the block container: alignment, white-space, defaults.
     pub container: Arc<ComputedStyle>,
     pub cache: Vec<InlineLayout>,
@@ -151,6 +173,7 @@ impl InlineContent {
             text: String::new(),
             spans: Vec::new(),
             atomics: Vec::new(),
+            boxes: Vec::new(),
             container,
             cache: Vec::new(),
             floats: Vec::new(),
@@ -244,6 +267,7 @@ impl InlineContent {
                         end: new.len(),
                         style,
                         node: span.node,
+                        inline_box: span.inline_box,
                     });
                     run_start = new.len();
                 }
@@ -273,6 +297,7 @@ impl InlineContent {
                     end: new.len(),
                     style,
                     node: span.node,
+                    inline_box: span.inline_box,
                 });
             }
             cursor = span.end;
@@ -308,6 +333,7 @@ impl InlineContent {
                 end: n,
                 style,
                 node: None,
+                inline_box: None,
             },
         );
     }
@@ -485,7 +511,7 @@ impl BoxBuilder<'_> {
             last_was_space: false,
             at_line_start: true,
         };
-        append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws);
+        append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws, None);
         let mut inline = BoxNode::new(BoxKind::Inline(content), None, container);
         inline.anonymous = true;
         b.children.push(inline);
@@ -521,7 +547,7 @@ impl BoxBuilder<'_> {
                 last_was_space: false,
                 at_line_start: true,
             };
-            append_text(&mut content, &self.doc.text_content(id), style.clone(), None, &mut ws);
+            append_text(&mut content, &self.doc.text_content(id), style.clone(), None, &mut ws, None);
             let mut inline = BoxNode::new(BoxKind::Inline(content), None, Arc::new(ComputedStyle::anonymous_from(&style)));
             inline.anonymous = true;
             vec![inline]
@@ -565,7 +591,7 @@ impl BoxBuilder<'_> {
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
                     let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
-                    append_text(content, text, container.clone(), Some(child), &mut ws);
+                    append_text(content, text, container.clone(), Some(child), &mut ws, None);
                 }
                 NodeKind::Element(_) => {
                     let Some(style) = self.style_of(child) else { continue };
@@ -576,7 +602,7 @@ impl BoxBuilder<'_> {
                     // element is its own flex item.
                     if is_inline_level(&style) && !is_flex {
                         let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
-                        self.collect_inline(child, style, content, &mut ws, depth);
+                        self.collect_inline(child, style, content, &mut ws, depth, None);
                     } else {
                         flush(&mut pending, &mut out, &mut ws);
                         out.push(self.build_element(child, style, depth));
@@ -615,13 +641,20 @@ impl BoxBuilder<'_> {
     }
 
     /// A `<br>`: a forced line break in the run.
-    fn push_break(id: NodeId, style: Arc<ComputedStyle>, content: &mut InlineContent, ws: &mut WsState) {
+    fn push_break(
+        id: NodeId,
+        style: Arc<ComputedStyle>,
+        content: &mut InlineContent,
+        ws: &mut WsState,
+        inline_box: Option<usize>,
+    ) {
         content.text.push('\n');
         content.spans.push(TextSpan {
             start: content.text.len() - 1,
             end: content.text.len(),
             style,
             node: Some(id),
+            inline_box,
         });
         ws.last_was_space = true;
         ws.at_line_start = true;
@@ -631,20 +664,30 @@ impl BoxBuilder<'_> {
     /// an inline-block, image or control, or a block inside an inline
     /// (laid out as an atomic so its content still shows; proper
     /// splitting is later).
-    fn push_atomic(&self, id: NodeId, style: Arc<ComputedStyle>, content: &mut InlineContent, ws: &mut WsState, depth: usize) {
+    fn push_atomic(
+        &self,
+        id: NodeId,
+        style: Arc<ComputedStyle>,
+        content: &mut InlineContent,
+        ws: &mut WsState,
+        depth: usize,
+        inline_box: Option<usize>,
+    ) {
         let node = self.build_element(id, style, depth + 1);
         content.atomics.push(Atomic {
             index: content.text.len(),
             node,
             result: None,
+            inline_box,
         });
         ws.last_was_space = false;
         ws.at_line_start = false;
     }
 
-    /// Gather an inline-level element into the current inline root. This
-    /// recurses per nesting level (bounded by `MAX_DEPTH`), so it keeps
-    /// its own frame small and leaves the per-element work to helpers.
+    /// Gather an inline-level element into the current inline root, inside
+    /// the inline element `parent` (`None`: the root). This recurses per
+    /// nesting level (bounded by `MAX_DEPTH`), so it keeps its own frame
+    /// small and leaves the per-element work to helpers.
     fn collect_inline(
         &self,
         id: NodeId,
@@ -652,21 +695,28 @@ impl BoxBuilder<'_> {
         content: &mut InlineContent,
         ws: &mut WsState,
         depth: usize,
+        parent: Option<usize>,
     ) {
         if depth >= MAX_DEPTH {
-            append_text(content, &self.doc.text_content(id), style, Some(id), ws);
+            append_text(content, &self.doc.text_content(id), style, Some(id), ws, parent);
             return;
         }
         match self.inline_kind(id, &style) {
-            InlineKind::Break => return Self::push_break(id, style, content, ws),
-            InlineKind::Atomic => return self.push_atomic(id, style, content, ws, depth),
+            InlineKind::Break => return Self::push_break(id, style, content, ws, parent),
+            InlineKind::Atomic => return self.push_atomic(id, style, content, ws, depth, parent),
             InlineKind::Plain => {}
         }
-        // A plain inline element: its text joins the run with its own style.
+        // A plain inline element: an inline box of the root; its text
+        // joins the run with its own style.
+        content.boxes.push(InlineBoxInfo {
+            parent,
+            style: style.clone(),
+        });
+        let me = Some(content.boxes.len() - 1);
         for child in self.doc.children(id) {
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
-                    append_text(content, text, style.clone(), Some(child), ws);
+                    append_text(content, text, style.clone(), Some(child), ws, me);
                 }
                 NodeKind::Element(_) => {
                     let Some(cs) = self.style_of(child) else { continue };
@@ -674,9 +724,9 @@ impl BoxBuilder<'_> {
                         continue;
                     }
                     if is_inline_level(&cs) {
-                        self.collect_inline(child, cs, content, ws, depth + 1);
+                        self.collect_inline(child, cs, content, ws, depth + 1, me);
                     } else {
-                        self.push_atomic(child, cs, content, ws, depth);
+                        self.push_atomic(child, cs, content, ws, depth, me);
                     }
                 }
                 _ => {}
@@ -733,6 +783,7 @@ impl BoxBuilder<'_> {
                     index: 0,
                     node,
                     result: None,
+                    inline_box: None,
                 }
             })
         };
@@ -758,6 +809,7 @@ impl BoxBuilder<'_> {
             end: text.len(),
             style: marker_style.clone(),
             node: None,
+            inline_box: None,
         });
         if let Some(atomic) = image_box(marker_style.clone()) {
             content.atomics.push(atomic);
@@ -811,10 +863,17 @@ fn is_inline_level(style: &ComputedStyle) -> bool {
 }
 
 /// Append a text node's content with CSS white-space processing and
-/// text-transform applied, recording a style span for it. Small caps are
-/// not synthesized here: the engine does that per shaped run
-/// (`InlineContent::synthesize_small_caps`).
-fn append_text(content: &mut InlineContent, text: &str, style: Arc<ComputedStyle>, node: Option<NodeId>, ws: &mut WsState) {
+/// text-transform applied, recording a style span for it inside the
+/// inline element `inline_box`. Small caps are not synthesized here: the
+/// engine does that per shaped run (`InlineContent::synthesize_small_caps`).
+fn append_text(
+    content: &mut InlineContent,
+    text: &str,
+    style: Arc<ComputedStyle>,
+    node: Option<NodeId>,
+    ws: &mut WsState,
+    inline_box: Option<usize>,
+) {
     let start = content.text.len();
     let mode = style.white_space;
     let transform = style.text_transform;
@@ -897,7 +956,13 @@ fn append_text(content: &mut InlineContent, text: &str, style: Arc<ComputedStyle
     }
     let end = content.text.len();
     if end > start {
-        content.spans.push(TextSpan { start, end, style, node });
+        content.spans.push(TextSpan {
+            start,
+            end,
+            style,
+            node,
+            inline_box,
+        });
     }
 }
 
@@ -965,8 +1030,13 @@ mod tests {
         assert_eq!(c.atomics[0].index, 9);
         let mut c = InlineContent {
             text: c.text.clone(),
-            spans: c.spans.iter().map(|s| TextSpan { start: s.start, end: s.end, style: s.style.clone(), node: s.node }).collect(),
+            spans: c
+                .spans
+                .iter()
+                .map(|s| TextSpan { start: s.start, end: s.end, style: s.style.clone(), node: s.node, inline_box: s.inline_box })
+                .collect(),
             atomics: Vec::new(),
+            boxes: Vec::new(),
             container: c.container.clone(),
             cache: Vec::new(),
             floats: Vec::new(),
@@ -978,6 +1048,7 @@ mod tests {
             index: img_index,
             node: BoxNode::new(BoxKind::Image { url: None, intrinsic: None }, None, c.container.clone()),
             result: None,
+            inline_box: None,
         });
         // Only "Hello " and "straße" need synthesis (their runs' font has
         // no `smcp`); "ab" is left to its font. Lowercase letters become
@@ -991,6 +1062,7 @@ mod tests {
             vec![(0, 1, 20.0), (1, 5, 14.0), (5, 6, 20.0), (6, 8, 20.0), (8, 9, 20.0), (9, 10, 20.0), (10, 17, 14.0)]
         );
         assert_eq!(c.spans[1].node, c.spans[0].node, "both runs belong to the text node");
+        assert_eq!(c.spans[3].inline_box, Some(0), "the `b` run keeps its inline box");
         assert_eq!(c.spans[1].style.font_variant, FontVariant::Normal, "a synthesized run is not small caps again");
         assert_eq!(c.atomics[0].index, img_index);
         assert!(c.cache.is_empty());

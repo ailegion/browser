@@ -14,6 +14,7 @@ mod boxes;
 mod convert;
 mod decor;
 mod engine;
+mod lines;
 pub mod selection;
 
 use std::sync::Arc;

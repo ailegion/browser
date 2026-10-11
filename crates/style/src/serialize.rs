@@ -8,8 +8,8 @@
 //! longhands and omit the parts that are at their initial value.
 
 use crate::computed::{
-    ComputedBackgroundSize, ComputedStyle, DecorationThickness, LetterSpacing, LineHeight, PositionOffset,
-    UnderlineOffset,
+    ComputedBackgroundSize, ComputedStyle, ComputedVerticalAlign, DecorationThickness, LetterSpacing, LineHeight,
+    PositionOffset, UnderlineOffset,
 };
 use crate::properties::*;
 use crate::values::*;
@@ -728,7 +728,10 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::ListStyleType => style.list_style_type.keyword().to_owned(),
         Id::ListStylePosition => style.list_style_position.keyword().to_owned(),
         Id::ListStyleImage => style.list_style_image.as_deref().map_or("none".to_owned(), css_url),
-        Id::VerticalAlign => style.vertical_align.keyword().to_owned(),
+        Id::VerticalAlign => match style.vertical_align {
+            ComputedVerticalAlign::Keyword(k) => k.keyword().to_owned(),
+            ComputedVerticalAlign::Length(l) => lp_css(l),
+        },
         Id::FlexDirection => style.flex_direction.keyword().to_owned(),
         Id::FlexWrap => style.flex_wrap.keyword().to_owned(),
         Id::JustifyContent => style.justify_content.keyword().to_owned(),

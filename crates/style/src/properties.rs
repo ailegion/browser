@@ -1180,21 +1180,12 @@ impl VerticalAlign {
     }
 }
 
-/// `vertical-align` as written: a keyword, or a length the engine treats
-/// as `baseline`.
+/// `vertical-align` as written: a keyword, or a length (a percentage of
+/// the element's line height).
 #[derive(Debug, Clone, PartialEq)]
 pub enum VerticalAlignValue {
     Keyword(VerticalAlign),
     Length(LengthPercentage),
-}
-
-impl VerticalAlignValue {
-    pub fn computed(&self) -> VerticalAlign {
-        match self {
-            VerticalAlignValue::Keyword(k) => *k,
-            VerticalAlignValue::Length(_) => VerticalAlign::Baseline,
-        }
-    }
 }
 
 /// A corner's radii: the horizontal one (which the engine uses) and the

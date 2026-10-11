@@ -24,8 +24,8 @@ pub mod values;
 pub use cascade::{Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
 pub use state::{ElementStates, InteractionDeps, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 pub use computed::{
-    AppliedDecoration, ComputedStyle, DecorationFont, DecorationThickness, LetterSpacing, LineHeight, UnderlineOffset,
-    Viewport,
+    AppliedDecoration, ComputedStyle, ComputedVerticalAlign, DecorationFont, DecorationThickness, LetterSpacing,
+    LineHeight, UnderlineOffset, Viewport,
 };
 pub use properties::*;
 pub use media::MediaQueryList;

@@ -26,6 +26,7 @@ use crate::boxes::{
 };
 use crate::convert::to_taffy;
 use crate::decor::Decorator;
+use crate::lines::{LinePlacement, node_of_atomic, node_of_box, place_lines};
 use crate::{Brush, Cluster, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
 
 /// Owns the font system and parley's scratch state. One per tab thread.
@@ -255,7 +256,7 @@ impl LayoutEngine {
         if let Some(marker) = &mut node.marker {
             self.prepare_atomics(marker, available_width);
             if let BoxKind::Inline(content) = &mut marker.kind {
-                ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, None);
+                ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, &mut self.decor, None);
             }
         }
         if let BoxKind::Inline(content) = &mut node.kind {
@@ -286,7 +287,7 @@ impl LayoutEngine {
         // The marker's trailing space is part of its box (the gap before
         // the text), so the full width counts.
         let width = il.layout.full_width();
-        let first_baseline = il.layout.lines().next().map(|l| l.metrics().baseline).unwrap_or(0.0);
+        let first_baseline = il.lines.first().map(|l| l.baseline).unwrap_or(0.0);
         let x = rect.x + layout.border.left + layout.padding.left - width;
         let y = match first_baseline_of(children) {
             Some(baseline) => baseline - first_baseline,
@@ -294,7 +295,7 @@ impl LayoutEngine {
         };
         let text: Arc<str> = Arc::from(content.text.as_str());
         let mut kids = Vec::new();
-        emit_text_fragments(content, &text, &il.layout, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
+        emit_text_fragments(content, &text, &il.layout, &il.lines, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
         Fragment {
             rect: Rect::new(x, y, width, il.height),
             node: None,
@@ -327,6 +328,7 @@ impl LayoutEngine {
                 width: w,
                 height: h,
                 fragment,
+                baseline: h,
             };
         }
 
@@ -371,13 +373,27 @@ impl LayoutEngine {
 
         let layout = tree.layout(root).cloned().unwrap_or_default();
         let mut fragment = self.fragments(node, &tree, 0.0, 0.0);
-        // Position relative to the atomic's own origin, margins included by the
-        // line layout through the reported size.
+        // Position relative to the atomic's own border box origin; the
+        // margins are in the reported size and the line layout offsets
+        // the box by them.
         fragment.translate(-layout.location.x, -layout.location.y);
+        let height = layout.size.height + layout.margin.top + layout.margin.bottom;
+        // CSS 2.1 §10.8.1: an inline-block's baseline is its last in-flow
+        // line's, when it has one and does not clip its overflow; else its
+        // bottom margin edge.
+        let baseline = if matches!(node.style.overflow_x, Overflow::Visible)
+            && matches!(node.style.overflow_y, Overflow::Visible)
+            && let Some(b) = last_baseline_of(std::slice::from_ref(&fragment))
+        {
+            b + layout.margin.top
+        } else {
+            height
+        };
         AtomicResult {
             width: layout.size.width + layout.margin.left + layout.margin.right,
-            height: layout.size.height + layout.margin.top + layout.margin.bottom,
+            height,
             fragment,
+            baseline,
         }
     }
 
@@ -503,12 +519,13 @@ impl LayoutEngine {
         let fonts = &mut self.fonts;
         let lcx = &mut self.lcx;
         let smcp = &mut self.smcp;
+        let decor = &mut self.decor;
         let result = tree.compute_layout_with_measure(root, available, |inputs, _id, ctx, style| {
             match ctx {
                 Some(Leaf::Inline(idx)) => {
                     let content = &mut *inlines[*idx];
                     taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
-                        measure_inline(content, fonts, lcx, smcp, known, avail)
+                        measure_inline(content, fonts, lcx, smcp, decor, known, avail)
                     })
                 }
                 Some(Leaf::Image { intrinsic }) => {
@@ -534,7 +551,7 @@ impl LayoutEngine {
     ) {
         for (content, id) in inlines.iter_mut().zip(inline_ids) {
             let width = tree.layout(*id).map(|l| l.size.width).unwrap_or(0.0);
-            ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, Some(width));
+            ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, &mut self.decor, Some(width));
             // Keep only the final layout.
             content.cache.retain(|l| l.max_width == Some(width));
             // The `text-overflow` marker, in the container's font.
@@ -588,6 +605,7 @@ impl LayoutEngine {
                         content,
                         &text,
                         &il.layout,
+                        &il.lines,
                         x,
                         y,
                         overflow,
@@ -804,6 +822,7 @@ fn measure_inline(
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
     smcp: &mut HashMap<(u64, u32), bool>,
+    decor: &mut Decorator,
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
 ) -> Size<f32> {
@@ -815,7 +834,7 @@ fn measure_inline(
             AvailableSpace::MaxContent => None,
         },
     };
-    let il = ensure_layout(content, fonts, lcx, smcp, max_width);
+    let il = ensure_layout(content, fonts, lcx, smcp, decor, max_width);
     let width = known.width.unwrap_or_else(|| il.layout.width().max(0.0));
     let height = known.height.unwrap_or_else(|| il.height.max(0.0));
     Size { width, height }
@@ -831,16 +850,17 @@ fn ensure_layout<'a>(
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
     smcp: &mut HashMap<(u64, u32), bool>,
+    decor: &mut Decorator,
     max_width: Option<f32>,
 ) -> &'a InlineLayout {
     let key = max_width.map(|w| (w * 4.0).round() / 4.0);
     if let Some(pos) = content.cache.iter().position(|l| l.max_width == key) {
         return &content.cache[pos];
     }
-    let (mut layout, mut height) = build_parley_layout(content, fonts, lcx, key);
+    let (mut layout, mut height, mut lines) = build_parley_layout(content, fonts, lcx, decor, key);
     let ranges = small_caps_to_synthesize(&layout, content, smcp);
     if !ranges.is_empty() && content.synthesize_small_caps(&ranges) {
-        (layout, height) = build_parley_layout(content, fonts, lcx, key);
+        (layout, height, lines) = build_parley_layout(content, fonts, lcx, decor, key);
     }
     if content.cache.len() >= 4 {
         content.cache.remove(0);
@@ -849,18 +869,21 @@ fn ensure_layout<'a>(
         max_width: key,
         layout,
         height,
+        lines,
     });
     content.cache.last().expect("just pushed")
 }
 
-/// Shape and line-break the inline content; returns the layout and its
-/// height (which includes any gap left by lines pushed below floats).
+/// Shape and line-break the inline content and place its lines; returns
+/// the layout, the height of the lines (which includes any gap left by
+/// lines pushed below floats) and the placements.
 fn build_parley_layout(
     content: &InlineContent,
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
+    decor: &mut Decorator,
     max_width: Option<f32>,
-) -> (parley::Layout<Brush>, f32) {
+) -> (parley::Layout<Brush>, f32, Vec<LinePlacement>) {
     let container = &content.container;
     let mut builder = lcx.ranged_builder(fonts, &content.text, 1.0, true);
     push_style(&mut builder, container, None);
@@ -888,13 +911,14 @@ fn build_parley_layout(
     // Spans that may not wrap carry `TextWrapMode::NoWrap` (`push_style`),
     // so the width goes to parley in every case.
     let wrap = container.white_space.allows_wrap();
-    let height = match max_width {
+    let (height, lines) = match max_width {
         Some(width) if width > 0.0 && !content.floats.is_empty() => {
-            break_around_floats(&mut layout, width, wrap, &content.floats)
+            break_around_floats(&mut layout, width, wrap, &content.floats, content, decor, fonts)
         }
         _ => {
             layout.break_all_lines(max_width);
-            layout.height()
+            let (lines, height) = place_lines(&layout, content, decor, fonts, None);
+            (height, lines)
         }
     };
     let alignment = match container.text_align {
@@ -906,7 +930,13 @@ fn build_parley_layout(
         TextAlign::End => Alignment::End,
     };
     layout.align(alignment, AlignmentOptions::default());
-    (layout, height)
+    (layout, height, lines)
+}
+
+/// Whether a fragment is out of the flow (a float or an absolutely
+/// positioned box), so it makes no line of its container's.
+fn out_of_flow(f: &Fragment) -> bool {
+    f.node.is_some() && (f.style.float != Float::None || matches!(f.style.position, Position::Absolute | Position::Fixed))
 }
 
 /// The baseline (page y) of the first line among `fragments` in tree
@@ -916,9 +946,7 @@ fn build_parley_layout(
 /// no line of the item's.
 fn first_baseline_of(fragments: &[Fragment]) -> Option<f32> {
     for f in fragments {
-        if f.node.is_some()
-            && (f.style.float != Float::None || matches!(f.style.position, Position::Absolute | Position::Fixed))
-        {
+        if out_of_flow(f) {
             continue;
         }
         match &f.content {
@@ -926,6 +954,27 @@ fn first_baseline_of(fragments: &[Fragment]) -> Option<f32> {
             FragmentContent::Image(_) if f.node.is_some() => return Some(f.rect.bottom() + f.margin.bottom),
             _ => {
                 if let Some(b) = first_baseline_of(&f.children) {
+                    return Some(b);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The baseline of the last line among `fragments` in tree order (an
+/// inline-block's baseline), found as `first_baseline_of` finds the
+/// first.
+fn last_baseline_of(fragments: &[Fragment]) -> Option<f32> {
+    for f in fragments.iter().rev() {
+        if out_of_flow(f) {
+            continue;
+        }
+        match &f.content {
+            FragmentContent::Text(t) => return Some(f.rect.y + t.baseline),
+            FragmentContent::Image(_) if f.node.is_some() => return Some(f.rect.bottom() + f.margin.bottom),
+            _ => {
+                if let Some(b) = last_baseline_of(&f.children) {
                     return Some(b);
                 }
             }
@@ -993,27 +1042,71 @@ fn font_has_feature(data: &[u8], index: u32, tag: &[u8; 4]) -> bool {
 }
 
 /// Line-break `layout` in a box `width` wide whose lines must keep clear of
-/// `bands` (CSS 2.2 §9.5). Each line takes the gap between floats at its
-/// top. A line whose gap is too narrow for any of its content moves down to
-/// the bottom of the nearest float and tries again, which is what browsers
-/// do with a long word beside a float. Returns the height of the lines.
-fn break_around_floats(layout: &mut parley::Layout<Brush>, width: f32, wrap: bool, bands: &[FloatBand]) -> f32 {
+/// `bands` (CSS 2.2 §9.5) and place its lines. Each line takes the gap
+/// between floats at its top. A line whose gap is too narrow for any of
+/// its content moves down to the bottom of the nearest float and tries
+/// again, which is what browsers do with a long word beside a float. The
+/// lines' heights are the engine's (`place_lines`), not parley's, so after
+/// each pass the lines are stacked on the placed heights and broken again
+/// until nothing moves. Returns the height of the lines and their
+/// placements.
+fn break_around_floats(
+    layout: &mut parley::Layout<Brush>,
+    width: f32,
+    wrap: bool,
+    bands: &[FloatBand],
+    content: &InlineContent,
+    decor: &mut Decorator,
+    fonts: &mut FontContext,
+) -> (f32, Vec<LinePlacement>) {
     // A line that overflowed its gap is pinned lower on the next attempt.
     // Lines before it break identically, so a pin stays valid; each pin
     // moves a line strictly down, and a line below all floats is never
     // pinned, so the attempts are bounded even without the cap.
     let mut pins: Vec<(usize, f32)> = Vec::new();
-    let max_attempts = 2 * bands.len() + 2;
-    let mut height = 0.0;
+    // Each line's top and height from the previous pass's placement.
+    let mut tops: Vec<f32> = Vec::new();
+    let mut hints: Vec<f32> = Vec::new();
+    let max_attempts = 2 * bands.len() + 6;
+    let mut result = (0.0, Vec::new());
     for attempt in 0..=max_attempts {
-        let (h, ends) = break_once(layout, width, bands, &pins);
-        height = h;
-        if !wrap || attempt == max_attempts {
+        let ends = break_once(layout, width, bands, &pins, &tops, &hints);
+        let line_tops: Vec<f32> = ends.iter().map(|e| e.0).collect();
+        let (lines, height) = place_lines(layout, content, decor, fonts, Some(&line_tops));
+        // Stack the lines on the placed heights; a line whose gap would
+        // differ over its placed height is broken again with that height.
+        let mut next_tops = Vec::with_capacity(lines.len());
+        let mut moved = false;
+        let mut y = 0.0;
+        for (i, (l, &(top, parley_bottom))) in lines.iter().zip(&ends).enumerate() {
+            let t = if i == 0 { l.top } else { y };
+            if (t - l.top).abs() > 0.01 {
+                moved = true;
+            }
+            let probed = (top + hints.get(i).copied().unwrap_or(0.0)).max(parley_bottom);
+            if gap(bands, top, probed, width) != gap(bands, top, top + l.height, width) {
+                moved = true;
+            }
+            next_tops.push(t);
+            y = t + l.height;
+        }
+        let next_hints: Vec<f32> = lines.iter().map(|l| l.height).collect();
+        let bottoms: Vec<(f32, f32)> = lines.iter().map(|l| (l.top, l.bottom())).collect();
+        result = (height, lines);
+        if attempt == max_attempts {
+            break;
+        }
+        if moved {
+            tops = next_tops;
+            hints = next_hints;
+            continue;
+        }
+        if !wrap {
             break;
         }
         let overflow = layout
             .lines()
-            .zip(&ends)
+            .zip(&bottoms)
             .enumerate()
             .find_map(|(i, (line, &(top, bottom)))| {
                 let m = line.metrics();
@@ -1029,32 +1122,37 @@ fn break_around_floats(layout: &mut parley::Layout<Brush>, width: f32, wrap: boo
             None => break,
         }
     }
-    height
+    result
 }
 
-/// One pass of line breaking around `bands`. Returns the height and each
-/// line's (top, bottom).
+/// One pass of line breaking around `bands`. `tops` and `hints` are the
+/// previous pass's placed line tops and heights, when there was one; a
+/// line without them starts where parley puts it. Returns each line's
+/// (top, parley's bottom).
 fn break_once(
     layout: &mut parley::Layout<Brush>,
     width: f32,
     bands: &[FloatBand],
     pins: &[(usize, f32)],
-) -> (f32, Vec<(f32, f32)>) {
+    tops: &[f32],
+    hints: &[f32],
+) -> Vec<(f32, f32)> {
     let mut ends: Vec<(f32, f32)> = Vec::new();
     let mut breaker = layout.break_lines();
     breaker.state_mut().set_layout_max_advance(width);
     'lines: while !breaker.is_done() {
         let index = ends.len();
-        let mut y = breaker.committed_y() as f32;
+        let mut y = tops.get(index).copied().unwrap_or(breaker.committed_y() as f32);
         for &(i, pin_y) in pins {
             if i == index {
                 y = y.max(pin_y);
             }
         }
-        // The gap is taken at the line's top. If a float turns out to start
-        // partway down the line, the line is redone once with the narrower
-        // gap over its full height.
-        let mut probe_bottom = y;
+        // The gap is taken over the line's placed height when known, else
+        // at its top. If a float turns out to start partway down the line,
+        // the line is redone once with the narrower gap over its full
+        // height.
+        let mut probe_bottom = y + hints.get(index).copied().unwrap_or(0.0);
         let mut refined = false;
         loop {
             let (left, right) = gap(bands, y, probe_bottom, width);
@@ -1083,16 +1181,7 @@ fn break_once(
         }
     }
     breaker.finish();
-
-    // As parley does: an empty trailing line (text ending in a newline)
-    // adds no height.
-    let mut height = 0.0f32;
-    for (line, &(_, bottom)) in layout.lines().zip(&ends) {
-        if !line.is_empty() {
-            height = height.max(bottom);
-        }
-    }
-    (height, ends)
+    ends
 }
 
 fn band_overlaps(b: &FloatBand, top: f32, bottom: f32) -> bool {
@@ -1339,6 +1428,7 @@ fn emit_text_fragments(
     content: &InlineContent,
     text: &Arc<str>,
     layout: &parley::Layout<Brush>,
+    lines: &[LinePlacement],
     ox: f32,
     oy: f32,
     overflow: Option<(f32, &Ellipsis)>,
@@ -1348,10 +1438,9 @@ fn emit_text_fragments(
 ) {
     let styles = layout.styles();
     let rtl = layout.is_rtl();
-    for line in layout.lines() {
-        let metrics = line.metrics();
-        let line_top = metrics.block_min_coord;
-        let line_height = metrics.block_max_coord - metrics.block_min_coord;
+    for (line, placement) in layout.lines().zip(lines) {
+        let line_top = placement.top;
+        let line_height = placement.height;
         let trunc = overflow.and_then(|(width, marker)| Truncation::for_line(&line, width, marker, rtl));
         // The edge of the kept content nearest the marker, and whether
         // anything was dropped.
@@ -1373,19 +1462,23 @@ fn emit_text_fragments(
                     }
                     last_run = Some(r.text_range());
                     let synthesis = r.synthesis();
-                    let baseline = run.baseline();
                     let run_rtl = r.is_rtl();
 
                     let make = |x0: f32,
                                 x1: f32,
-                                glyphs: Vec<PositionedGlyph>,
+                                mut glyphs: Vec<PositionedGlyph>,
                                 clusters: Vec<Cluster>,
                                 span: Option<usize>,
                                 style_idx: usize| {
-                        let (span_style, node) = span
+                        let (span_style, node, inline_box) = span
                             .and_then(|i| content.spans.get(i))
-                            .map(|s| (s.style.clone(), s.node))
-                            .unwrap_or((content.container.clone(), None));
+                            .map(|s| (s.style.clone(), s.node, s.inline_box))
+                            .unwrap_or((content.container.clone(), None, None));
+                        // The baseline the span's inline box was placed on.
+                        let baseline = placement.node_baseline(node_of_box(inline_box));
+                        for g in &mut glyphs {
+                            g.y += baseline;
+                        }
                         let color = styles[style_idx].brush.0;
                         let range = clusters.iter().map(|c| c.start).min().unwrap_or(0)
                             ..clusters.iter().map(|c| c.end).max().unwrap_or(0);
@@ -1406,7 +1499,7 @@ fn emit_text_fragments(
                             embolden: synthesis.embolden(),
                             skew: synthesis.skew(),
                             decorations: Vec::new(),
-                            baseline: baseline - line_top,
+                            baseline,
                         };
                         Fragment {
                             rect: Rect::new(ox + x0, oy + line_top, x1 - x0, line_height),
@@ -1467,10 +1560,12 @@ fn emit_text_fragments(
                         let cluster_left = x;
                         let mut advance = 0.0;
                         for g in cluster.glyphs() {
+                            // Relative to the run's baseline; `make` adds
+                            // the placed baseline.
                             glyphs.push(PositionedGlyph {
                                 id: g.id,
                                 x: x + g.x - frag_x0,
-                                y: g.y + baseline - line_top,
+                                y: g.y,
                             });
                             x += g.advance;
                             advance += g.advance;
@@ -1514,8 +1609,13 @@ fn emit_text_fragments(
                     if let Some(atomic) = content.atomics.get(b.id as usize)
                         && let Some(result) = &atomic.result
                     {
+                        // The margin box's top is its baseline up by the
+                        // box's own baseline; the border box sits inside
+                        // the margins.
                         let mut fragment = result.fragment.clone();
-                        fragment.translate(ox + b.x, oy + b.y);
+                        let baseline = placement.node_baseline(node_of_atomic(content, b.id as usize));
+                        let margin = fragment.margin;
+                        fragment.translate(ox + b.x + margin.left, oy + line_top + baseline - result.baseline + margin.top);
                         out.push(fragment);
                         kept_edge = Some(match kept_edge {
                             Some(k) if rtl => k.min(b.x),
@@ -1551,7 +1651,7 @@ fn emit_text_fragments(
                 ox,
                 oy + line_top,
                 t.marker_x(kept_edge),
-                metrics.baseline - line_top,
+                placement.baseline,
                 line_height,
                 out,
                 decor,
@@ -2149,6 +2249,140 @@ mod tests {
         assert!(line(&lines_of(&tree, "Hg").0, L::Underline).gaps.is_empty());
         let (_, tree) = page("text-decoration-skip-ink: all");
         assert!(!line(&lines_of(&tree, "Hg").0, L::Underline).gaps.is_empty());
+    }
+
+    /// The first text fragment showing `s`: its rect and baseline y.
+    fn text_at(tree: &LayoutTree, s: &str) -> (Rect, f32) {
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
+                && found.is_none()
+                && &t.text[t.range.clone()] == s
+            {
+                found = Some((f.rect, f.rect.y + t.baseline));
+            }
+        });
+        found.unwrap_or_else(|| panic!("fragment {s}"))
+    }
+
+    #[test]
+    fn vertical_align_shifts_inline_boxes_against_their_parent() {
+        // Blink's `sub`/`super` offsets, lengths, percentages of the box's
+        // own line height; a nested box moves with its parent; the line
+        // grows to hold the raised box.
+        let (_doc, tree) = layout(
+            "<body style='margin:0;font-size:20px;line-height:40px'><p style='margin:0'>a\
+             <span style='vertical-align:super'>s<b>t</b></span><span style='vertical-align:sub'>b</span>\
+             <span style='vertical-align:4px'>c</span><span style='vertical-align:50%'>d</span>\
+             <span style='vertical-align:-10%'>e</span></p></body>",
+            "",
+        );
+        let base = text_at(&tree, "a").1;
+        let at = |s: &str| text_at(&tree, s).1 - base;
+        assert!((at("s") + (20.0 / 3.0 + 1.0)).abs() < 0.01, "super: {}", at("s"));
+        assert!((at("t") - at("s")).abs() < 0.01, "a nested box moves with its parent");
+        assert!((at("b") - 5.0).abs() < 0.01, "sub: {}", at("b"));
+        assert!((at("c") + 4.0).abs() < 0.01, "4px: {}", at("c"));
+        assert!((at("d") + 20.0).abs() < 0.01, "50% of the 40px line height: {}", at("d"));
+        assert!((at("e") - 4.0).abs() < 0.01, "-10%: {}", at("e"));
+        let line = text_at(&tree, "a").0;
+        assert!(line.height > 40.0 && line.height < 80.0, "the line holds the raised box: {line:?}");
+        let d = text_at(&tree, "d").0;
+        assert!((d.y, d.height) == (line.y, line.height), "every fragment spans the one line box: {d:?} vs {line:?}");
+    }
+
+    #[test]
+    fn vertical_align_places_atomic_boxes_by_the_keywords() {
+        let (doc, tree, mut engine) = layout_with_engine(
+            "<body style='margin:0;font-size:16px;line-height:20px'><p style='margin:0'>x\
+             <img style='width:30px;height:30px'><img style='width:30px;height:30px;vertical-align:middle'>\
+             <img style='width:30px;height:30px;vertical-align:text-top'><img style='width:30px;height:30px;vertical-align:text-bottom'>\
+             <img style='width:30px;height:30px;vertical-align:top'><img style='width:30px;height:30px;vertical-align:bottom'></p></body>",
+            "",
+        );
+        let p = find_by_tag(&doc, &tree, "p");
+        let (_, base) = text_at(&tree, "x");
+        let mut imgs = Vec::new();
+        let mut p_style = None;
+        tree.root.walk(&mut |f| {
+            if let Some(n) = f.node
+                && let Some(e) = doc.element(n)
+            {
+                if &*e.name.local == "img" {
+                    imgs.push(f.rect);
+                } else if &*e.name.local == "p" {
+                    p_style = Some(f.style.clone());
+                }
+            }
+        });
+        assert_eq!(imgs.len(), 6);
+        // The parent's font: rounded ascent and descent, x-height.
+        let style = p_style.expect("p");
+        let fm = engine.decor.font_metrics(&mut engine.fonts, &crate::decor::font_of(&style));
+        let (ascent, descent, x_height) = (fm.ascent.round(), fm.descent.round(), fm.x_height);
+        assert!(x_height > 4.0 && x_height < 12.0, "{x_height}");
+        assert!((imgs[0].bottom() - base).abs() < 0.01, "baseline: bottom on it: {:?} {base}", imgs[0]);
+        let mid = (imgs[1].y + imgs[1].bottom()) / 2.0;
+        assert!((mid - (base - x_height / 2.0)).abs() < 0.01, "middle: {mid} vs {base} - {x_height}/2");
+        assert!((imgs[2].y - (base - ascent)).abs() < 0.01, "text-top: {:?}", imgs[2]);
+        assert!((imgs[3].bottom() - (base + descent)).abs() < 0.01, "text-bottom: {:?}", imgs[3]);
+        assert!((imgs[4].y - p.y).abs() < 0.01, "top: {:?} in {p:?}", imgs[4]);
+        assert!((imgs[5].bottom() - p.bottom()).abs() < 0.01, "bottom: {:?} in {p:?}", imgs[5]);
+        // The line box holds the raised and lowered boxes.
+        assert!(p.height > 30.0 + descent, "{p:?}");
+        assert!(p.height < 100.0, "{p:?}");
+    }
+
+    #[test]
+    fn inline_block_baseline_is_its_last_line_or_its_bottom_edge() {
+        let (_doc, tree) = layout(
+            "<body style='margin:0;font-size:16px;line-height:20px'><p style='margin:0'>x\
+             <span style='display:inline-block;width:60px'>one<br>two</span>\
+             <span style='display:inline-block;width:40px;height:30px;overflow:hidden'>z</span>\
+             <span id=m style='display:inline-block;width:20px;height:20px;margin:10px'></span></p></body>",
+            "",
+        );
+        let (_, base) = text_at(&tree, "x");
+        // Two lines inside: the last one's baseline is the box's.
+        assert!((text_at(&tree, "two").1 - base).abs() < 0.01);
+        let mut boxes = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Box, Some(_)) = (&f.content, f.node)
+                && f.style.display == browser_style::Display::InlineBlock
+            {
+                boxes.push(f.rect);
+            }
+        });
+        assert_eq!(boxes.len(), 3, "{boxes:?}");
+        assert!((boxes[1].bottom() - base).abs() < 0.01, "overflow hidden: the bottom margin edge: {:?}", boxes[1]);
+        // Margins: the border box sits inside them, its bottom margin edge
+        // on the baseline.
+        assert!((boxes[2].bottom() + 10.0 - base).abs() < 0.01, "{:?} {base}", boxes[2]);
+        assert!((boxes[2].x - (boxes[1].right() + 10.0)).abs() < 0.01, "{:?} after {:?}", boxes[2], boxes[1]);
+    }
+
+    #[test]
+    fn placed_line_heights_stack_beside_floats() {
+        // A tall middle-aligned image makes its line taller than parley
+        // thought; the lines after it start where that line really ends,
+        // beside the float too.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px;line-height:20px;width:300px'>\
+             <div style='float:left;width:50px;height:150px'></div>\
+             <p style='margin:0'>one two <img style='width:10px;height:60px;vertical-align:middle'> three four five six seven \
+             eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen</p></body>",
+            "",
+        );
+        let (texts, _) = texts_of(&doc, &tree, "p");
+        let mut tops: Vec<(f32, f32)> = texts.iter().map(|(r, _)| (r.y, r.bottom())).collect();
+        tops.sort_by(|a, b| a.0.total_cmp(&b.0));
+        tops.dedup_by(|a, b| (a.0 - b.0).abs() < 0.01);
+        assert!(tops.len() >= 3, "{tops:?}");
+        for w in tops.windows(2) {
+            assert!((w[1].0 - w[0].1).abs() < 0.01, "lines stack on their placed heights: {tops:?}");
+        }
+        assert!(tops[0].1 - tops[0].0 > 40.0, "the image's line is tall: {tops:?}");
+        assert!(texts.iter().all(|(r, _)| r.y >= 150.0 || r.x >= 50.0), "lines beside the float start after it");
     }
 
     #[test]

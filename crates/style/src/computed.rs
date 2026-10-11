@@ -54,6 +54,20 @@ pub enum DecorationThickness {
     Length(ComputedLp),
 }
 
+/// Computed `vertical-align`: a keyword, or a length; a percentage stays
+/// one, of the element's own line height, resolved at layout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ComputedVerticalAlign {
+    Keyword(VerticalAlign),
+    Length(ComputedLp),
+}
+
+impl Default for ComputedVerticalAlign {
+    fn default() -> Self {
+        ComputedVerticalAlign::Keyword(VerticalAlign::Baseline)
+    }
+}
+
 /// Computed `text-underline-offset`: `auto`, or an absolute length (a
 /// percentage is of the element's `1em`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -192,7 +206,7 @@ pub struct ComputedStyle {
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
     pub list_style_image: Option<Arc<str>>,
-    pub vertical_align: VerticalAlign,
+    pub vertical_align: ComputedVerticalAlign,
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
     pub justify_content: AlignValue,
@@ -293,7 +307,7 @@ impl ComputedStyle {
             list_style_type: ListStyleType::Disc,
             list_style_position: ListStylePosition::Outside,
             list_style_image: None,
-            vertical_align: VerticalAlign::Baseline,
+            vertical_align: ComputedVerticalAlign::default(),
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: AlignValue::Normal,
@@ -834,7 +848,10 @@ pub fn compute(
     pick!(list_style_type, ListStyleType, ListStyleType, |v| v.computed());
     pick!(list_style_position, ListStylePosition, ListStylePosition, |v| *v);
     pick!(list_style_image, ListStyleImage, ListStyleImage, |v| v.url());
-    pick!(vertical_align, VerticalAlign, VerticalAlign, |v| v.computed());
+    pick!(vertical_align, VerticalAlign, VerticalAlign, |v| match v {
+        VerticalAlignValue::Keyword(k) => ComputedVerticalAlign::Keyword(*k),
+        VerticalAlignValue::Length(l) => ComputedVerticalAlign::Length(lp(l)),
+    });
     pick!(flex_direction, FlexDirection, FlexDirection, |v| *v);
     pick!(flex_wrap, FlexWrap, FlexWrap, |v| *v);
     pick!(justify_content, JustifyContent, JustifyContent, |v| v.keyword.computed());

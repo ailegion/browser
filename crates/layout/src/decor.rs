@@ -48,18 +48,34 @@ impl Family {
     }
 }
 
-/// A decorating box's font's line metrics at the box's font size, as
+/// A style's first available font's metrics at the style's font size, as
 /// distances from the baseline in px, positive away from it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DecorationMetrics {
+pub(crate) struct FontMetrics {
     pub ascent: f32,
     pub descent: f32,
+    /// The font's line gap.
+    pub leading: f32,
+    /// Height of the lowercase x: the font's own, else the `x` glyph's
+    /// measured, else half the ascent (as browsers fall back).
+    pub x_height: f32,
     /// Top of the underline, below the baseline (never above it).
     pub underline_top: f32,
     pub underline_thickness: f32,
     /// Top of the line-through, above the baseline.
     pub strikeout_top: f32,
     pub strikeout_thickness: f32,
+}
+
+/// The font a style asks for, as the key its metrics are looked up by.
+pub(crate) fn font_of(style: &ComputedStyle) -> DecorationFont {
+    DecorationFont {
+        family: style.font_family.clone(),
+        size: style.font_size,
+        weight: style.font_weight,
+        style: style.font_style,
+        stretch: style.font_stretch,
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -110,7 +126,7 @@ const FLATTEN_TOLERANCE: f32 = 0.1;
 /// Computes and caches decoration geometry for a `LayoutEngine`.
 #[derive(Default)]
 pub(crate) struct Decorator {
-    metrics: HashMap<FontKey, DecorationMetrics>,
+    metrics: HashMap<FontKey, FontMetrics>,
     /// Flattened glyph outlines as line segments in px, y up, origin at
     /// the glyph's baseline point.
     outlines: HashMap<GlyphKey, Arc<[[f32; 4]]>>,
@@ -134,7 +150,7 @@ impl Decorator {
         // in every script); line-throughs never skip.
         let skip_ink = style.text_decoration_skip_ink != TextDecorationSkipInk::None;
         for d in style.decorations.iter() {
-            let m = self.metrics(fonts, &d.font);
+            let m = self.font_metrics(fonts, &d.font);
             // `auto` and `from-font` take the decorating font's own
             // thickness; a length is as given, a percentage of the
             // decorating box's font size.
@@ -199,9 +215,9 @@ impl Decorator {
         out
     }
 
-    /// The line metrics of the first available font of `font`'s family
-    /// list at `font`'s size, weight, style and stretch; cached per font.
-    fn metrics(&mut self, fonts: &mut FontContext, font: &DecorationFont) -> DecorationMetrics {
+    /// The metrics of the first available font of `font`'s family list
+    /// at `font`'s size, weight, style and stretch; cached per font.
+    pub(crate) fn font_metrics(&mut self, fonts: &mut FontContext, font: &DecorationFont) -> FontMetrics {
         let key = FontKey::of(font);
         if let Some(m) = self.metrics.get(&key) {
             return *m;
@@ -289,10 +305,14 @@ impl Decorator {
 /// variation `vars` the query chose for it. Follows skrifa's `Metrics`
 /// (the same tables and precedence parley uses for its runs); a font
 /// without underline or strikeout metrics gets HarfBuzz's defaults.
-fn font_metrics(data: &[u8], index: u32, vars: &[(skrifa::Tag, f32)], size: f32) -> Option<DecorationMetrics> {
+fn font_metrics(data: &[u8], index: u32, vars: &[(skrifa::Tag, f32)], size: f32) -> Option<FontMetrics> {
     let font = skrifa::FontRef::from_index(data, index).ok()?;
     let location = font.axes().location(vars.iter().copied());
     let m = skrifa::metrics::Metrics::new(&font, Size::new(size), &location);
+    let x_height = match m.x_height {
+        Some(x) if x > 0.0 => x,
+        _ => measured_x_height(&font, size, &location).unwrap_or(m.ascent * 0.5),
+    };
     let (underline_top, underline_thickness) = match m.underline {
         // `post` gives the top of the underline from the baseline, negative
         // below it; a line above the baseline is clamped to it.
@@ -303,9 +323,11 @@ fn font_metrics(data: &[u8], index: u32, vars: &[(skrifa::Tag, f32)], size: f32)
         Some(s) => (s.offset, s.thickness.max(0.0)),
         None => (m.ascent / 2.0, size / 18.0),
     };
-    Some(DecorationMetrics {
+    Some(FontMetrics {
         ascent: m.ascent,
         descent: (-m.descent).max(0.0),
+        leading: m.leading.max(0.0),
+        x_height,
         underline_top,
         underline_thickness,
         strikeout_top,
@@ -313,12 +335,25 @@ fn font_metrics(data: &[u8], index: u32, vars: &[(skrifa::Tag, f32)], size: f32)
     })
 }
 
+/// The height of the font's `x` glyph above the baseline, for a font
+/// whose `OS/2` table gives no x-height.
+fn measured_x_height(font: &skrifa::FontRef<'_>, size: f32, location: &skrifa::instance::Location) -> Option<f32> {
+    let glyph = font.charmap().map('x')?;
+    let outline = font.outline_glyphs().get(glyph)?;
+    let mut pen = Flattener::default();
+    outline.draw(DrawSettings::unhinted(Size::new(size), location), &mut pen).ok()?;
+    let top = pen.segments.iter().map(|s| s[1].max(s[3])).fold(f32::NEG_INFINITY, f32::max);
+    (top > 0.0).then_some(top)
+}
+
 /// Metrics when no font at all answers the query (nothing shapes then
 /// either).
-fn fallback_metrics(size: f32) -> DecorationMetrics {
-    DecorationMetrics {
+fn fallback_metrics(size: f32) -> FontMetrics {
+    FontMetrics {
         ascent: size * 0.8,
         descent: size * 0.2,
+        leading: 0.0,
+        x_height: size * 0.5,
         underline_top: size / 18.0,
         underline_thickness: size / 18.0,
         strikeout_top: size * 0.3,
