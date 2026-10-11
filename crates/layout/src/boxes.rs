@@ -38,6 +38,17 @@ pub(crate) struct BoxNode {
     pub taffy: Option<TaffyId>,
     /// A form control with its own drawing.
     pub control: Option<Control>,
+    /// A list item's `list-style-position: outside` marker: an inline
+    /// root of its own, outside the flow (not a taffy child), laid out
+    /// unbroken and placed left of the item's content edge on its first
+    /// line's baseline (as browsers place the `::marker` box), so the
+    /// item's lines are aligned and broken without it.
+    pub marker: Option<Box<BoxNode>>,
+    /// An outside marker laid out in flow because the item has nothing
+    /// else to make a line (browsers give an empty item the marker's
+    /// line); its fragment is moved left of the content edge by its
+    /// width.
+    pub hangs: bool,
 }
 
 impl BoxNode {
@@ -50,6 +61,8 @@ impl BoxNode {
             anonymous: false,
             taffy: None,
             control: None,
+            marker: None,
+            hangs: false,
         }
     }
 
@@ -120,12 +133,10 @@ pub(crate) struct InlineContent {
     /// final. A line that overflows the root ends with it.
     pub ellipsis: Option<Ellipsis>,
     /// The list marker at the start of the text: its byte length (an
-    /// image marker is an atomic at index 0 followed by a space), and
-    /// whether it hangs outside the item (`list-style-position:
-    /// outside`), in which case the first line starts that far left of
-    /// the content edge.
+    /// image marker is an atomic at index 0 followed by a space). For an
+    /// `inside` marker this root is the item's first line; for an
+    /// `outside` one the root is the marker's own (`BoxNode::marker`).
     pub marker_len: usize,
-    pub marker_outside: bool,
 }
 
 /// The laid-out `text-overflow` marker of an inline root.
@@ -145,7 +156,6 @@ impl InlineContent {
             floats: Vec::new(),
             ellipsis: None,
             marker_len: 0,
-            marker_outside: false,
         }
     }
 
@@ -591,11 +601,14 @@ impl BoxBuilder<'_> {
         }
     }
 
-    /// The list item's marker, at the start of its first line: the
-    /// `list-style-image` when the image is known (followed by a space),
-    /// else the `list-style-type`'s text. `list-style-position: outside`
-    /// hangs it left of the content edge (the engine indents the first
-    /// line by its width); `inside` keeps it in the line.
+    /// The list item's marker: the `list-style-image` when the image is
+    /// known (followed by a space), else the `list-style-type`'s text.
+    /// `inside` puts it at the start of the item's first line;
+    /// `outside` (the default) makes it a box of its own that the engine
+    /// places left of the content edge, on the first line's baseline,
+    /// outside the flow (`BoxNode::marker`), or, when the item has
+    /// nothing else to make a line, as the item's one line moved left by
+    /// its width (`BoxNode::hangs`).
     fn add_marker(&self, id: NodeId, style: &Arc<ComputedStyle>, b: &mut BoxNode) {
         let image = style
             .list_style_image
@@ -623,34 +636,58 @@ impl BoxBuilder<'_> {
             }
         };
         let marker_style = Arc::new(ComputedStyle::anonymous_from(style));
-        if !b.children.first().is_some_and(BoxNode::is_inline_root) {
-            let mut m = BoxNode::new(BoxKind::Inline(InlineContent::new(style.clone())), None, marker_style.clone());
-            m.anonymous = true;
-            b.children.insert(0, m);
-        }
-        let Some(first) = b.children.first_mut() else { return };
-        let BoxKind::Inline(root) = &mut first.kind else { return };
-        root.prepend(&text, marker_style.clone());
-        if let Some((url, intrinsic)) = image {
-            let node = BoxNode::new(
-                BoxKind::Image {
-                    url: Some(url),
-                    intrinsic: Some(intrinsic),
-                },
-                None,
-                marker_style,
-            );
-            root.atomics.insert(
-                0,
+        let image_box = |marker_style: Arc<ComputedStyle>| {
+            image.map(|(url, intrinsic)| {
+                let node = BoxNode::new(
+                    BoxKind::Image {
+                        url: Some(url),
+                        intrinsic: Some(intrinsic),
+                    },
+                    None,
+                    marker_style,
+                );
                 Atomic {
                     index: 0,
                     node,
                     result: None,
-                },
-            );
+                }
+            })
+        };
+        if style.list_style_position == ListStylePosition::Inside {
+            if !b.children.first().is_some_and(BoxNode::is_inline_root) {
+                let mut m = BoxNode::new(BoxKind::Inline(InlineContent::new(style.clone())), None, marker_style.clone());
+                m.anonymous = true;
+                b.children.insert(0, m);
+            }
+            let Some(first) = b.children.first_mut() else { return };
+            let BoxKind::Inline(root) = &mut first.kind else { return };
+            root.prepend(&text, marker_style.clone());
+            if let Some(atomic) = image_box(marker_style) {
+                root.atomics.insert(0, atomic);
+            }
+            root.marker_len = text.len();
+            return;
         }
-        root.marker_len = text.len();
-        root.marker_outside = style.list_style_position == ListStylePosition::Outside;
+        let mut content = InlineContent::new(style.clone());
+        content.text = text.clone();
+        content.spans.push(TextSpan {
+            start: 0,
+            end: text.len(),
+            style: marker_style.clone(),
+            node: None,
+        });
+        if let Some(atomic) = image_box(marker_style.clone()) {
+            content.atomics.push(atomic);
+        }
+        content.marker_len = text.len();
+        let mut m = BoxNode::new(BoxKind::Inline(content), None, marker_style);
+        m.anonymous = true;
+        if b.children.is_empty() {
+            m.hangs = true;
+            b.children.push(m);
+        } else {
+            b.marker = Some(Box::new(m));
+        }
     }
 
     /// 1-based position among list-item siblings, honoring `<ol start>` and
@@ -933,28 +970,62 @@ mod tests {
         let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares, small_caps_synth: &HashSet::new() };
         let root = builder.build_root().expect("root");
         let ul = &root.children[0].children[0];
-        let items: Vec<&InlineContent> = ul
-            .children
-            .iter()
-            .map(|li| match &li.children[0].kind {
-                BoxKind::Inline(c) => c,
-                _ => panic!("inline root"),
-            })
-            .collect();
-        assert_eq!((items[0].marker_len, items[0].marker_outside), (4, true));
-        assert_eq!((items[1].marker_len, items[1].marker_outside), (4, false));
+        let inline = |b: &BoxNode| match &b.kind {
+            BoxKind::Inline(c) => c.text.clone(),
+            _ => panic!("inline root"),
+        };
+        let marker = |li: &BoxNode| match &li.marker {
+            Some(m) => match &m.kind {
+                BoxKind::Inline(c) => Some((c.text.clone(), c.marker_len, c.atomics.len())),
+                _ => panic!("marker root"),
+            },
+            None => None,
+        };
+        let items: Vec<&BoxNode> = ul.children.iter().collect();
+        // Outside: a root of its own, the item's text untouched.
+        assert_eq!(marker(items[0]), Some(("\u{2022} ".to_owned(), 4, 0)));
+        assert_eq!(inline(&items[0].children[0]), "one");
+        assert!(!items[0].children[0].hangs);
+        // Inside: at the start of the item's first line.
+        assert!(items[1].marker.is_none());
+        let BoxKind::Inline(two) = &items[1].children[0].kind else { panic!("inline root") };
+        assert_eq!((two.text.as_str(), two.marker_len), ("\u{2022} two", 4));
         // An image marker: the atomic at index 0, then a space.
-        assert_eq!((items[2].text.as_str(), items[2].marker_len, items[2].marker_outside), (" three", 1, true));
-        assert!(matches!(items[2].atomics.first(), Some(a) if a.index == 0 && matches!(a.node.kind, BoxKind::Image { intrinsic: Some((12.0, 12.0)), .. })));
+        assert_eq!(marker(items[2]), Some((" ".to_owned(), 1, 1)));
+        let Some(m) = &items[2].marker else { panic!("marker") };
+        let BoxKind::Inline(c) = &m.kind else { panic!("marker root") };
+        assert!(matches!(c.atomics.first(), Some(a) if a.index == 0 && matches!(a.node.kind, BoxKind::Image { intrinsic: Some((12.0, 12.0)), .. })));
         // The image wins over `none`; `none` without an image: no marker.
-        assert_eq!(items[3].marker_len, 1);
-        assert_eq!((items[4].text.as_str(), items[4].marker_len), ("five", 0));
+        assert_eq!(marker(items[3]).map(|m| m.1), Some(1));
+        assert!(marker(items[4]).is_none());
+        assert_eq!(inline(&items[4].children[0]), "five");
+    }
+
+    #[test]
+    fn an_empty_item_gets_its_marker_as_its_one_line() {
+        let (doc, styles) = build("<ul><li></li><li><div></div></li></ul>");
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
+        let root = builder.build_root().expect("root");
+        let ul = &root.children[0].children[0];
+        // Nothing else to make a line: the marker root is in flow, hanging.
+        let empty = &ul.children[0];
+        assert!(empty.marker.is_none());
+        assert_eq!(empty.children.len(), 1);
+        assert!(empty.children[0].hangs && empty.children[0].is_inline_root());
+        // A block child, even an empty one: the marker is out of flow.
+        let with_div = &ul.children[1];
+        assert!(with_div.marker.is_some());
+        assert_eq!(with_div.children.len(), 1);
+        assert!(!with_div.children[0].hangs);
     }
 
     fn inline_text(b: &BoxNode) -> Vec<String> {
         let mut out = Vec::new();
         if let BoxKind::Inline(c) = &b.kind {
             out.push(c.text.clone());
+        }
+        if let Some(m) = &b.marker {
+            out.extend(inline_text(m));
         }
         for c in &b.children {
             out.extend(inline_text(c));
@@ -986,7 +1057,7 @@ mod tests {
         let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
-        assert_eq!(texts, vec!["3. a", "7. b", "8. c", "\u{2022} d"]);
+        assert_eq!(texts, vec!["3. ", "a", "7. ", "b", "8. ", "c", "\u{2022} ", "d"]);
     }
 
     #[test]

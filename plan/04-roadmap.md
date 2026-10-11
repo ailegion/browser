@@ -1321,12 +1321,23 @@ Work:
       inline image box at its intrinsic size followed by a space, the
       image winning over `list-style-type: none`; until the image is
       known the type's text stands in. `list-style-position: outside`
-      (the default) hangs the marker left of the content edge: the first
-      line of the item's inline root is indented back by the marker's
-      width (parley's text indent, the width measured on the text laid
-      out unbroken), so bullets and numbers now sit in the `<ul>`
-      padding with their end at the content edge, as in browsers;
-      `inside` keeps the marker in the line as before. Found and fixed on
+      (the default; redone 2026-10-11, the first build was a negative
+      first-line indent that mis-aligned centred and right-aligned
+      items): the marker is a box of its own outside the flow
+      (`BoxNode::marker`, an inline root taffy never sees, laid out
+      unbroken), placed with its end (its trailing space included) at
+      the item's content edge and its first baseline on the item's first
+      line's baseline, the first in-flow text or image in tree order
+      (floats and out-of-flow boxes make no line), so an item that starts
+      with a block gets no extra line and the marker sits on the block's
+      first line; with no line at all the marker sits at the content
+      box's top. An item with nothing else in flow gets the marker as its
+      one line, moved left by its width, so an empty `<li>` is a line
+      tall as in browsers. Lines are broken and aligned without the
+      marker: `text-align: center`/`right` act on the text alone. The
+      marker fragment is `FragmentContent::Marker` with nodeless text
+      children: painted, never hit, selected or found. `inside` keeps the
+      marker at the start of the item's first line. Found and fixed on
       the way: the 2000-nested-`<span>` malformed case overflowed the
       paint test thread's 2 MiB stack (a tab thread has 16 MiB; the
       box builder's recursion is bounded at 400 levels but its debug
@@ -1354,13 +1365,17 @@ Work:
       under the descender with `skip-ink: none`), tab harness (a `data:`
       `list-style-image` fetched and laid out outside the item; a
       paint-only hover rebuilding the underline).
+      Marker tests: box builder (outside markers as their own root, inside
+      ones in the line, image markers, an empty item's hanging marker
+      versus an item with a block child), layout (centred and right-
+      aligned items align the text alone with the marker's end at the
+      content edge and on the text's baseline, a block first child, an
+      empty item one line tall, a float-only item zero height with the
+      marker at its top).
       SKIPPED, to be built before anything else in this block is called
-      done: (1) `list-style-position: outside` is a negative first-line
-      indent, so centred or right-aligned text aligns including the
-      marker's width; browsers put the marker in its own box outside the
-      line and align the text alone. (2) The `smcp` probe reads only the
-      family list's first installed font; browsers decide per the font
-      each run actually shapes with, fallback fonts included.
+      done: the `smcp` probe reads only the family list's first installed
+      font; browsers decide per the font each run actually shapes with,
+      fallback fonts included.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.

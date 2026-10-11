@@ -16,8 +16,8 @@ use parley::style::{
     FontFamily, FontFeatures, FontStyle as PFontStyle, FontWeight, FontWidth, LineHeight as PLineHeight, StyleProperty,
 };
 use parley::{
-    Alignment, AlignmentOptions, FontContext, IndentOptions, InlineBox, InlineBoxKind, LayoutContext,
-    OverflowWrap as POverflowWrap, PositionedLayoutItem, TextWrapMode, WordBreak as PWordBreak,
+    Alignment, AlignmentOptions, FontContext, InlineBox, InlineBoxKind, LayoutContext, OverflowWrap as POverflowWrap,
+    PositionedLayoutItem, TextWrapMode, WordBreak as PWordBreak,
 };
 use read_fonts::TableProvider;
 use taffy::prelude::*;
@@ -289,16 +289,64 @@ impl LayoutEngine {
     }
 
     /// Lay out every atomic inline box in the subtree, bottom-up, so that
-    /// inline roots can be measured with their sizes known.
+    /// inline roots can be measured with their sizes known; an outside
+    /// list marker, which taffy never sees, is laid out here too,
+    /// unbroken.
     fn prepare_atomics(&mut self, node: &mut BoxNode, available_width: f32) {
         for child in &mut node.children {
             self.prepare_atomics(child, available_width);
+        }
+        if let Some(marker) = &mut node.marker {
+            self.prepare_atomics(marker, available_width);
+            if let BoxKind::Inline(content) = &mut marker.kind {
+                ensure_layout(content, &mut self.fonts, &mut self.lcx, None);
+            }
         }
         if let BoxKind::Inline(content) = &mut node.kind {
             for atomic in &mut content.atomics {
                 let result = self.layout_atomic(atomic, available_width);
                 atomic.result = Some(result);
             }
+        }
+    }
+
+    /// The fragment of an item's outside marker: its lines laid out at
+    /// their own width, the box's right edge at the item's content edge
+    /// and its first baseline on the item's first line's baseline (the
+    /// first text or image in flow among `children`); with no line in the
+    /// item, at the top of its content box.
+    fn marker_fragment(&mut self, marker: &BoxNode, rect: Rect, layout: &Layout, children: &[Fragment]) -> Fragment {
+        let empty = |style: &Arc<ComputedStyle>| Fragment {
+            rect: Rect::new(rect.x, rect.y, 0.0, 0.0),
+            node: None,
+            style: style.clone(),
+            content: FragmentContent::Marker,
+            children: Vec::new(),
+            padding: Default::default(),
+            margin: Default::default(),
+        };
+        let BoxKind::Inline(content) = &marker.kind else { return empty(&marker.style) };
+        let Some(il) = content.cache.first() else { return empty(&marker.style) };
+        // The marker's trailing space is part of its box (the gap before
+        // the text), so the full width counts.
+        let width = il.layout.full_width();
+        let first_baseline = il.layout.lines().next().map(|l| l.metrics().baseline).unwrap_or(0.0);
+        let x = rect.x + layout.border.left + layout.padding.left - width;
+        let y = match first_baseline_of(children) {
+            Some(baseline) => baseline - first_baseline,
+            None => rect.y + layout.border.top + layout.padding.top,
+        };
+        let text: Arc<str> = Arc::from(content.text.as_str());
+        let mut kids = Vec::new();
+        emit_text_fragments(content, &text, &il.layout, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
+        Fragment {
+            rect: Rect::new(x, y, width, il.height),
+            node: None,
+            style: marker.style.clone(),
+            content: FragmentContent::Marker,
+            children: kids,
+            padding: Default::default(),
+            margin: Default::default(),
         }
     }
 
@@ -569,6 +617,13 @@ impl LayoutEngine {
         match &node.kind {
             BoxKind::Inline(content) => {
                 let mut children = Vec::new();
+                // A hanging marker (the item's one line) sits left of the
+                // content edge by its width.
+                let shift = match content.cache.first() {
+                    Some(il) if node.hangs => il.layout.full_width(),
+                    _ => 0.0,
+                };
+                let x = x - shift;
                 if let Some(il) = content.cache.first() {
                     let text: Arc<str> = Arc::from(content.text.as_str());
                     let overflow = content.ellipsis.as_ref().map(|e| (rect.width, e));
@@ -585,10 +640,10 @@ impl LayoutEngine {
                     );
                 }
                 Fragment {
-                    rect,
+                    rect: Rect::new(x, y, rect.width, rect.height),
                     node: None,
                     style: node.style.clone(),
-                    content: FragmentContent::Anonymous,
+                    content: if node.hangs { FragmentContent::Marker } else { FragmentContent::Anonymous },
                     children,
                     padding,
                     margin,
@@ -607,11 +662,15 @@ impl LayoutEngine {
                 margin,
             },
             BoxKind::Block | BoxKind::Flex => {
-                let children = node
+                let mut children: Vec<Fragment> = node
                     .children
                     .iter()
                     .map(|c| self.fragments(c, tree, x, y))
                     .collect();
+                if let Some(marker) = &node.marker {
+                    let fragment = self.marker_fragment(marker, rect, &layout, &children);
+                    children.insert(0, fragment);
+                }
                 Fragment {
                     rect,
                     node: node.node,
@@ -859,14 +918,6 @@ fn build_parley_layout(
         });
     }
     let mut layout = builder.build(&content.text);
-    // An outside list marker hangs left of the content edge: the first
-    // line is indented back by the marker's width, measured on the text
-    // laid out unbroken.
-    if content.marker_outside && content.marker_len > 0 {
-        layout.break_all_lines(None);
-        let width = marker_width(&layout, content);
-        layout.set_text_indent(-width, IndentOptions::default());
-    }
     // Spans that may not wrap carry `TextWrapMode::NoWrap` (`push_style`),
     // so the width goes to parley in every case.
     let wrap = container.white_space.allows_wrap();
@@ -891,30 +942,29 @@ fn build_parley_layout(
     (layout, height)
 }
 
-/// The advance of the list marker at the start of `content`'s text: the
-/// right edge of its glyphs and of its image box on the first line.
-fn marker_width(layout: &parley::Layout<Brush>, content: &InlineContent) -> f32 {
-    let Some(line) = layout.lines().next() else { return 0.0 };
-    let mut right = 0.0f32;
-    for item in line.items() {
-        match item {
-            PositionedLayoutItem::GlyphRun(run) => {
-                let mut x = run.offset();
-                for cluster in run.run().visual_clusters() {
-                    if cluster.text_range().start < content.marker_len {
-                        right = right.max(x + cluster.advance());
-                    }
-                    x += cluster.advance();
-                }
-            }
-            PositionedLayoutItem::InlineBox(b) => {
-                if content.atomics.get(b.id as usize).is_some_and(|a| a.index < content.marker_len) {
-                    right = right.max(b.x + b.width);
+/// The baseline (page y) of the first line among `fragments` in tree
+/// order, where a list item's outside marker goes: the first in-flow
+/// text's baseline, or the bottom margin edge of the first in-flow image
+/// (which sits on its line's baseline). Floats and out-of-flow boxes make
+/// no line of the item's.
+fn first_baseline_of(fragments: &[Fragment]) -> Option<f32> {
+    for f in fragments {
+        if f.node.is_some()
+            && (f.style.float != Float::None || matches!(f.style.position, Position::Absolute | Position::Fixed))
+        {
+            continue;
+        }
+        match &f.content {
+            FragmentContent::Text(t) => return Some(f.rect.y + t.baseline),
+            FragmentContent::Image(_) if f.node.is_some() => return Some(f.rect.bottom() + f.margin.bottom),
+            _ => {
+                if let Some(b) = first_baseline_of(&f.children) {
+                    return Some(b);
                 }
             }
         }
     }
-    right
+    None
 }
 
 /// Whether the font (at `index` in a collection file) lists the OpenType
@@ -1842,6 +1892,71 @@ mod tests {
         assert!((marker.0 - 40.0).abs() < 0.5 && text.0 > marker.0, "{two:?}");
         // No image known: the type's text stands in.
         assert!(texts(items[2]).iter().any(|t| t.2));
+    }
+
+    #[test]
+    fn outside_markers_are_boxes_outside_the_line() {
+        // The marker is not part of the line: centred and right-aligned
+        // text aligns on its own, the marker's end stays at the content
+        // edge and its baseline on the first line's; an item starting with
+        // a block gets no extra line and the marker sits on the block's
+        // first line; an empty item is one line tall with the marker
+        // hanging; an item with only a float keeps its zero height.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px;line-height:20px'><ul style='margin:0;padding-left:40px;width:200px'>\
+             <li style='text-align:center'>one</li><li style='text-align:right'>two</li>\
+             <li><p style='margin:0'>three</p></li><li></li>\
+             <li><i style='float:left;width:10px;height:10px'></i></li></ul></body>",
+            "",
+        );
+        let items: Vec<(Rect, Vec<(Rect, f32, bool)>)> = {
+            let ids: Vec<browser_dom::NodeId> = doc
+                .descendants(doc.root())
+                .filter(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "li"))
+                .collect();
+            ids.iter()
+                .map(|&li| {
+                    let mut rect = Rect::default();
+                    let mut texts = Vec::new();
+                    tree.root.walk(&mut |f| {
+                        if f.node == Some(li) {
+                            rect = f.rect;
+                            f.walk(&mut |g| {
+                                if let FragmentContent::Text(t) = &g.content {
+                                    texts.push((g.rect, g.rect.y + t.baseline, g.node.is_none()));
+                                }
+                            });
+                        }
+                    });
+                    (rect, texts)
+                })
+                .collect()
+        };
+        let marker = |t: &[(Rect, f32, bool)]| t.iter().find(|x| x.2).copied().expect("marker");
+        let text = |t: &[(Rect, f32, bool)]| t.iter().find(|x| !x.2).copied().expect("text");
+        // Centred in the 200px content box: the text's middle at 140.
+        let (m, t) = (marker(&items[0].1), text(&items[0].1));
+        let mid = (t.0.x + t.0.right()) / 2.0;
+        assert!((mid - 140.0).abs() < 1.0, "centred without the marker: {t:?}");
+        assert!((m.0.right() - 40.0).abs() < 0.5 && (m.1 - t.1).abs() < 0.01, "{m:?} vs {t:?}");
+        // Right-aligned: the text ends at the content edge, 240.
+        let (m, t) = (marker(&items[1].1), text(&items[1].1));
+        assert!((t.0.right() - 240.0).abs() < 1.0, "{t:?}");
+        assert!((m.0.right() - 40.0).abs() < 0.5 && (m.1 - t.1).abs() < 0.01);
+        // A block first child: the item is one line tall, the marker on
+        // that line.
+        let (m, t) = (marker(&items[2].1), text(&items[2].1));
+        assert!((items[2].0.height - 20.0).abs() < 0.5, "{:?}", items[2].0);
+        assert!((m.1 - t.1).abs() < 0.01 && (m.0.right() - 40.0).abs() < 0.5);
+        // Empty: the marker's line, hanging left of the content edge.
+        let m = marker(&items[3].1);
+        assert!((items[3].0.height - 20.0).abs() < 0.5, "{:?}", items[3].0);
+        assert!((m.0.right() - 40.0).abs() < 0.5, "{m:?}");
+        assert!(items[3].1.iter().all(|x| x.2), "nothing but the marker");
+        // Only a float: no line, so no height; the marker at the top.
+        let m = marker(&items[4].1);
+        assert!(items[4].0.height.abs() < 0.5, "{:?}", items[4].0);
+        assert!((m.0.y - items[4].0.y).abs() < 0.5 && (m.0.right() - 40.0).abs() < 0.5, "{m:?}");
     }
 
     #[test]
