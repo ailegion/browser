@@ -1739,7 +1739,7 @@ mod tests {
         let (doc, plain) = layout(&html("normal"), "");
         let (doc2, spaced) = layout(&html("4px"), "");
         // A `calc()` of one unit sums; mixed units wait for roadmap item
-        // 4a block 8 (layout `calc()`).
+        // 4a block 9 (layout `calc()`).
         let (doc3, calc) = layout(&html("calc(1px + 3px)"), "");
         let width = |doc: &Document, tree: &LayoutTree| texts_of(doc, tree, "p").0.iter().map(|(r, _)| r.width).sum::<f32>();
         let (w0, w1, w2) = (width(&doc, &plain), width(&doc2, &spaced), width(&doc3, &calc));

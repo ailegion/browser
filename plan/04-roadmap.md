@@ -1196,15 +1196,22 @@ Work:
       owner, with its `word-wrap` alias), `text-overflow`; (2) font,
       decoration and list paint: `font-variant: small-caps`,
       `font-stretch`, `text-decoration-style`/`-thickness`,
-      `list-style-position`/`-image`; (3) backgrounds: every layer with
-      its position, size, repeat, attachment, origin and clip; (4)
+      `list-style-position`/`-image`; (3) `vertical-align` at layout
+      (placed here 2026-10-11: the property is in the table and the
+      computed style but every inline sits on the line baseline today):
+      `baseline`, `sub`, `super`, `text-top`, `text-bottom`, `middle`,
+      `top`, `bottom`, lengths and percentages on inline text, inline
+      boxes, images and controls, with line box height following the
+      shifted boxes (CSS 2 §10.8) and decoration lines following their
+      decorating box's shifted baseline; (4) backgrounds: every layer with
+      its position, size, repeat, attachment, origin and clip; (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
-      `user-select`; (5) `z-index` and `transform`/`transform-origin`
+      `user-select`; (6) `z-index` and `transform`/`transform-origin`
       with stacking contexts, paint order and hit testing through
-      transforms; (6) `grid-*` through taffy grid; (7) `transition-*`,
+      transforms; (7) `grid-*` through taffy grid; (8) `transition-*`,
       `animation-*`, `@keyframes` with the tab's animation clock and
-      events; (8) `calc()` with mixed units at layout (added by the
+      events; (9) `calc()` with mixed units at layout (added by the
       owner; `values.rs` folds a mixed sum to its first operand today).
       **Block 1 done 2026-10-11: `letter-spacing`, `word-break`,
       `overflow-wrap`, `text-overflow`.** Table (`crates/style`):
