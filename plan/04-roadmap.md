@@ -1203,7 +1203,16 @@ Work:
       `top`, `bottom`, lengths and percentages on inline text, inline
       boxes, images and controls, with line box height following the
       shifted boxes (CSS 2 §10.8) and decoration lines following their
-      decorating box's shifted baseline; (4) backgrounds: every layer with
+      decorating box's shifted baseline; and `direction` (placed here
+      2026-10-11: the engine has no such property, so every block is
+      left-to-right): `ltr`/`rtl`, inherited, the `dir` attribute through
+      the UA sheet, as the base direction of each inline root's bidi
+      resolution (parley's), `text-align: start`/`end` and the default
+      alignment resolved against it, the outside list marker on the end
+      side, flex `row` running from the end, the `text-overflow` marker
+      at the end edge, and `unicode-bidi` (`normal`, `embed`, `isolate`,
+      `bidi-override`, `isolate-override`, `plaintext`) as the embedding
+      and override controls around inline elements; (4) backgrounds: every layer with
       its position, size, repeat, attachment, origin and clip; (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
