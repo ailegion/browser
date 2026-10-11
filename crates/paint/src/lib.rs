@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use browser_dom::NodeId;
-use browser_layout::{Control, Decoration, Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment};
+use browser_layout::{
+    Control, Decoration, DecorationLine, Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment,
+};
 use browser_style::{BorderStyle, ComputedStyle, Rgba, TextDecorationStyle, Visibility};
 use url::Url;
 use vello::kurbo::{
@@ -534,6 +536,11 @@ impl Painter<'_> {
 
     fn text(&mut self, rect: &Rect, t: &TextFragment, node: Option<NodeId>) {
         self.selection_highlight(rect, t, node);
+        // Underlines and overlines go under the glyphs, line-throughs over
+        // them (CSS Text Decoration 4 §5.1).
+        for deco in t.decorations.iter().filter(|d| d.line != DecorationLine::LineThrough) {
+            self.decoration_line(rect, deco);
+        }
         let origin = self.transform * Affine::translate((rect.x as f64, rect.y as f64));
         let brush = color(t.color);
         let glyph_transform = t.skew.map(|deg| Affine::skew((-deg as f64).to_radians().tan(), 0.0));
@@ -553,20 +560,43 @@ impl Painter<'_> {
                     y: g.y,
                 }),
             );
-        for deco in [t.underline, t.strikethrough].into_iter().flatten() {
-            self.decoration_line(rect, &deco);
+        for deco in t.decorations.iter().filter(|d| d.line == DecorationLine::LineThrough) {
+            self.decoration_line(rect, deco);
         }
         self.composition_underline(rect, t, node);
     }
 
     /// One decoration line across the fragment, in its
-    /// `text-decoration-style`. Dots, dashes and waves are phased from
-    /// the page's x axis, so a line continues unbroken from one fragment
-    /// of a run into the next.
+    /// `text-decoration-style`, left out where it skips ink. The skipped
+    /// ranges are snapped outward to whole pixels, as Blink clips them.
     fn decoration_line(&mut self, rect: &Rect, deco: &Decoration) {
+        let (left, right) = (rect.x as f64, rect.right() as f64);
+        let mut x = left;
+        for &(g0, g1) in &deco.gaps {
+            let (g0, g1) = ((rect.x + g0).floor() as f64, (rect.x + g1).ceil() as f64);
+            if g1 <= x {
+                continue;
+            }
+            if g0 > x {
+                self.decoration_segment(x, g0.min(right), rect.y, deco);
+            }
+            x = x.max(g1);
+            if x >= right {
+                return;
+            }
+        }
+        if x < right {
+            self.decoration_segment(x, right, rect.y, deco);
+        }
+    }
+
+    /// A decoration line from `x0` to `x1` on a fragment whose top is
+    /// `top`. Dots, dashes and waves are phased from the page's x axis, so
+    /// a line continues unbroken from one segment or fragment of a run
+    /// into the next.
+    fn decoration_segment(&mut self, x0: f64, x1: f64, top: f32, deco: &Decoration) {
         let t = deco.thickness.max(1.0) as f64;
-        let (x0, x1) = (rect.x as f64, rect.right() as f64);
-        let y = (rect.y + deco.y) as f64;
+        let y = (top + deco.y) as f64;
         let c = color(deco.color);
         let band = |top: f64| KRect::new(x0, top, x1, top + t);
         match deco.style {
@@ -574,9 +604,14 @@ impl Painter<'_> {
                 self.scene.fill(Fill::NonZero, self.transform, c, None, &band(y));
             }
             TextDecorationStyle::Double => {
-                // Two lines with a gap of one thickness between them.
+                // Two lines with a gap of one thickness between them; the
+                // second goes away from the text (up for an overline).
+                let second = match deco.line {
+                    DecorationLine::Overline => y - 2.0 * t,
+                    _ => y + 2.0 * t,
+                };
                 self.scene.fill(Fill::NonZero, self.transform, c, None, &band(y));
-                self.scene.fill(Fill::NonZero, self.transform, c, None, &band(y + 2.0 * t));
+                self.scene.fill(Fill::NonZero, self.transform, c, None, &band(second));
             }
             TextDecorationStyle::Dotted | TextDecorationStyle::Dashed => {
                 let (dash, gap) = if deco.style == TextDecorationStyle::Dotted { (t, t) } else { (3.0 * t, 3.0 * t) };
@@ -879,9 +914,9 @@ mod tests {
         let mut lines = Vec::new();
         tree.root.walk(&mut |f| {
             if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
-                && let Some(u) = t.underline
+                && let Some(u) = t.decorations.iter().find(|d| d.line == DecorationLine::Underline)
             {
-                lines.push((f.rect, u));
+                lines.push((f.rect, u.clone()));
             }
         });
         assert_eq!(lines.len(), 2, "{lines:?}");
@@ -902,18 +937,101 @@ mod tests {
             [pixels[i], pixels[i + 1], pixels[i + 2]]
         };
         let red = [255, 0, 0];
-        let (r, u) = lines[0];
+        let (r, u) = &lines[0];
         assert_eq!(u.thickness, 2.0);
         let x = r.x + 2.0;
         assert_eq!(px(x, r.y + u.y + 1.0), red, "double: first line");
         assert_eq!(px(x, r.y + u.y + 3.0), [255, 255, 255], "double: the gap");
         assert_eq!(px(x, r.y + u.y + 5.0), red, "double: second line");
-        let (r, u) = lines[1];
+        let (r, u) = &lines[1];
         let y = r.y + u.y + 1.0;
         // Dashes of one thickness from the fragment's left edge (x = 0).
         assert_eq!(px(r.x + 0.5, y), red, "dotted: ink");
         assert_eq!(px(r.x + 2.5, y), [255, 255, 255], "dotted: gap");
         assert_eq!(px(r.x + 4.5, y), red, "dotted: ink again");
+    }
+
+    /// The line-through is painted over the glyphs, the underline under
+    /// them, and the underline is left out where the g's descender
+    /// crosses it unless `text-decoration-skip-ink: none`.
+    #[test]
+    fn line_through_over_glyphs_and_underline_skips_ink() {
+        let render = |css: &str| {
+            let html = format!(
+                "<body style='margin:0;font-size:40px;line-height:50px;color:#000'>\
+                 <p style='margin:0;text-decoration:underline line-through red 2px;{css}'>Hg</p></body>"
+            );
+            let doc = browser_dom::parse_html(html.as_bytes());
+            let mut stylist = browser_style::Stylist::new();
+            stylist.add_sheet(browser_style::ua::ua_stylesheet());
+            let vp = browser_style::Viewport {
+                width: 200.0,
+                height: 100.0,
+                scale_factor: 1.0,
+                prefers_dark: false,
+            };
+            let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+            let mut engine = browser_layout::LayoutEngine::new();
+            let images = ImageStore::new();
+            let tree = engine.layout(&doc, &styles, 200.0, 100.0, &images);
+            let mut found = None;
+            tree.root.walk(&mut |f| {
+                if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
+                    && found.is_none()
+                {
+                    found = Some((f.rect, t.clone()));
+                }
+            });
+            let (rect, text) = found.expect("text");
+            let options = PaintOptions {
+                viewport_width: 200.0,
+                viewport_height: 100.0,
+                scale: 1.0,
+                ..PaintOptions::default()
+            };
+            let mut scene = Scene::new();
+            paint(&tree, &images, &options, &mut scene);
+            (rect, text, render_offscreen(&scene, 200, 100, Color::WHITE))
+        };
+        let (rect, text, pixels) = render("");
+        let Some(pixels) = pixels else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let px = |pixels: &[u8], x: f32, y: f32| {
+            let i = (y as usize * 200 + x as usize) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        let is_red = |p: [u8; 3]| p[0] > 200 && p[1] < 80 && p[2] < 80;
+        let is_dark = |p: [u8; 3]| p.iter().all(|&c| c < 100);
+        let under = text.decorations.iter().find(|d| d.line == DecorationLine::Underline).expect("underline");
+        let through = text.decorations.iter().find(|d| d.line == DecorationLine::LineThrough).expect("line-through");
+        let (h, g) = (text.clusters[0], text.clusters[1]);
+        // The line-through row is red all across the H, stems included.
+        let y = (rect.y + through.y + 1.0).floor();
+        for x in (h.x as i32 + 1)..((h.x + h.advance) as i32 - 1) {
+            assert!(is_red(px(&pixels, rect.x + x as f32, y)), "line-through over the H at x={x}");
+        }
+        // The underline row: red under the H, nothing red in the g's gap.
+        let y = (rect.y + under.y + 1.0).floor();
+        assert!(is_red(px(&pixels, rect.x + h.x + h.advance / 2.0, y)), "underline under the H");
+        let (g0, g1) = under.gaps[0];
+        for x in (g0.ceil() as i32)..(g1.floor() as i32) {
+            assert!(!is_red(px(&pixels, rect.x + x as f32, y)), "the gap at x={x} has no line");
+        }
+        let _ = g;
+        // Without ink skipping the line runs through, under the descender.
+        let (rect2, text2, pixels2) = render("text-decoration-skip-ink: none");
+        let pixels2 = pixels2.expect("gpu");
+        assert_eq!(rect2, rect);
+        let under2 = text2.decorations.iter().find(|d| d.line == DecorationLine::Underline).expect("underline");
+        assert!(under2.gaps.is_empty());
+        let y = (rect.y + under2.y + 1.0).floor();
+        let row: Vec<[u8; 3]> = ((g0.ceil() as i32)..(g1.floor() as i32))
+            .map(|x| px(&pixels2, rect.x + x as f32, y))
+            .collect();
+        assert!(row.iter().any(|&p| is_red(p)), "the line shows in the g's range: {row:?}");
+        assert!(row.iter().any(|&p| is_dark(p)), "the descender's ink over the line: {row:?}");
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 use crate::computed::{
     ComputedBackgroundSize, ComputedStyle, DecorationThickness, LetterSpacing, LineHeight, PositionOffset,
+    UnderlineOffset,
 };
 use crate::properties::*;
 use crate::values::*;
@@ -72,6 +73,12 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
             TextDecorationThickness::FromFont => "from-font".to_owned(),
             TextDecorationThickness::Length(l) => l.to_css(),
         },
+        P::TextUnderlinePosition(p) => p.to_css(),
+        P::TextUnderlineOffset(o) => match o {
+            TextUnderlineOffsetValue::Auto => "auto".to_owned(),
+            TextUnderlineOffsetValue::Length(l) => l.to_css(),
+        },
+        P::TextDecorationSkipInk(s) => s.keyword().to_owned(),
         P::TextTransform(t) => t.keyword().to_owned(),
         P::WhiteSpace(w) => w.keyword().to_owned(),
         P::LetterSpacing(l) => l.to_css(),
@@ -703,6 +710,12 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
             DecorationThickness::FromFont => "from-font".to_owned(),
             DecorationThickness::Length(l) => lp_css(l),
         },
+        Id::TextUnderlinePosition => style.text_underline_position.to_css(),
+        Id::TextUnderlineOffset => match style.text_underline_offset {
+            UnderlineOffset::Auto => "auto".to_owned(),
+            UnderlineOffset::Px(p) => px(p),
+        },
+        Id::TextDecorationSkipInk => style.text_decoration_skip_ink.keyword().to_owned(),
         Id::TextTransform => style.text_transform.keyword().to_owned(),
         Id::WhiteSpace => style.white_space.keyword().to_owned(),
         Id::LetterSpacing => match style.letter_spacing {

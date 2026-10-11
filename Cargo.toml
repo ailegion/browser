@@ -48,6 +48,8 @@ parley = "0.11.1"
 fontique = { version = "0.11.1", features = ["fontconfig-dlopen"] }
 # Font table parsing (Fontations); pinned to the version skrifa 0.44 pulls.
 read-fonts = "0.41"
+# Font metrics and glyph outlines; the version parley and vello use.
+skrifa = "0.44"
 pollster = "0.4"
 
 # content (Servo parsing group)

@@ -913,31 +913,67 @@ mod tests {
     }
 
     #[test]
-    fn decoration_look_comes_from_the_decorating_box() {
-        // `em` declares no lines: the lines it gets from `u` keep `u`'s
-        // wavy red 2px look, while its own `text-decoration-*` stay
-        // initial for `getComputedStyle`. `b` declares its own line, so
-        // its lines take its own look (currentcolor, solid), even though
-        // `s` around it sets a colour.
+    fn decorations_are_the_list_of_decorating_boxes() {
+        // `em` declares no lines: it carries `u`'s entry (wavy red 2px, in
+        // `u`'s 20px font) and shares the list, while its own
+        // `text-decoration-*` stay initial for `getComputedStyle`. `b`
+        // declares its own line: `s`'s blue line-through stays first and
+        // `b`'s underline (its own currentcolor, solid) is added after it.
+        // An inline-block, a float and an absolute box start afresh: `s`'s
+        // line does not reach them, their own lines do.
         let (doc, styles) = styles_for(
-            "<u style='text-decoration: underline wavy red 2px'><em>x</em></u>\
-             <s style='text-decoration-color: blue'><b style='text-decoration: underline; color: green'>y</b></s>",
+            "<u style='text-decoration: underline wavy red 2px; font-size: 20px'><em style='font-size: 30px'>x</em></u>\
+             <s style='text-decoration-color: blue'><b style='text-decoration: underline; color: green'>y</b>\
+             <span style='display:inline-block'>z</span><i style='float:left'>f</i>\
+             <q style='position:absolute; text-decoration: overline'>a</q></s>",
             "",
         );
         use crate::properties::TextDecorationStyle;
-        let em = find(&doc, "em");
-        assert_eq!(styles[em].decoration_style, TextDecorationStyle::Wavy);
-        assert_eq!(styles[em].decoration_color.to_rgba8(), [255, 0, 0, 255]);
-        assert_eq!(styles[em].decoration_thickness, crate::computed::DecorationThickness::Length(crate::values::ComputedLp::Px(2.0)));
-        assert!(styles[em].text_decoration.underline, "the line propagates");
+        let (u, em) = (find(&doc, "u"), find(&doc, "em"));
+        assert_eq!(styles[em].decorations.len(), 1);
+        let d = &styles[em].decorations[0];
+        assert!(d.lines.underline && !d.lines.line_through);
+        assert_eq!(d.style, TextDecorationStyle::Wavy);
+        assert_eq!(d.color.to_rgba8(), [255, 0, 0, 255]);
+        assert_eq!(d.thickness, crate::computed::DecorationThickness::Length(crate::values::ComputedLp::Px(2.0)));
+        assert_eq!(d.font.size, 20.0, "the decorating box's font, not the text's");
+        assert!(Arc::ptr_eq(&styles[em].decorations, &styles[u].decorations), "shared when nothing is added");
+        assert!(styles[em].decoration_lines().underline);
         assert_eq!(styles[em].text_decoration_style, TextDecorationStyle::Solid, "own value for the CSSOM");
         assert_eq!(styles[em].text_decoration_color.to_rgba8(), [0, 0, 0, 255]);
         let b = find(&doc, "b");
-        assert!(styles[b].text_decoration.underline && styles[b].text_decoration.line_through);
-        assert_eq!(styles[b].decoration_color.to_rgba8(), [0, 128, 0, 255], "its own currentcolor");
-        assert_eq!(styles[b].decoration_style, TextDecorationStyle::Solid);
-        let s = find(&doc, "s");
-        assert_eq!(styles[s].decoration_color.to_rgba8(), [0, 0, 255, 255]);
+        assert_eq!(styles[b].decorations.len(), 2);
+        assert!(styles[b].decorations[0].lines.line_through);
+        assert_eq!(styles[b].decorations[0].color.to_rgba8(), [0, 0, 255, 255]);
+        assert!(styles[b].decorations[1].lines.underline);
+        assert_eq!(styles[b].decorations[1].color.to_rgba8(), [0, 128, 0, 255], "its own currentcolor");
+        assert_eq!(styles[b].decorations[1].style, TextDecorationStyle::Solid);
+        assert!(styles[find(&doc, "span")].decorations.is_empty(), "inline-block");
+        assert!(styles[find(&doc, "i")].decorations.is_empty(), "float");
+        let q = &styles[find(&doc, "q")].decorations;
+        assert_eq!(q.len(), 1, "absolute: its own line only");
+        assert!(q[0].lines.overline && !q[0].lines.line_through);
+    }
+
+    #[test]
+    fn underline_position_offset_and_skip_ink_compute_and_inherit() {
+        let (doc, styles) = styles_for(
+            "<p style='font-size: 20px; text-underline-position: under left; text-underline-offset: 50%; text-decoration-skip-ink: none; text-decoration: underline'>\
+             <em style='text-underline-offset: 3px'>x</em></p>",
+            "",
+        );
+        use crate::computed::UnderlineOffset;
+        let (p, em) = (find(&doc, "p"), find(&doc, "em"));
+        assert_eq!(styles[p].text_underline_position.to_css(), "under left");
+        assert_eq!(styles[p].text_underline_offset, UnderlineOffset::Px(10.0), "a percentage of 1em");
+        assert_eq!(styles[p].text_decoration_skip_ink, crate::properties::TextDecorationSkipInk::None);
+        assert_eq!(styles[em].text_underline_position.to_css(), "under left", "inherited");
+        assert_eq!(styles[em].text_underline_offset, UnderlineOffset::Px(3.0));
+        assert_eq!(styles[em].text_decoration_skip_ink, crate::properties::TextDecorationSkipInk::None);
+        // The decorating box's offset and position go with its entry.
+        let d = &styles[em].decorations[0];
+        assert_eq!(d.underline_offset, UnderlineOffset::Px(10.0));
+        assert!(d.underline_position.under);
     }
 
     #[test]

@@ -1871,8 +1871,8 @@ impl TabState {
         } else if result.repaint {
             // Paint-only (colours, backgrounds, decorations): the boxes
             // stay where they are and take the new styles.
-            if let Some(layout) = &mut self.layout {
-                layout.refresh_styles(doc, &self.styles);
+            if let (Some(layout), Some(engine)) = (&mut self.layout, &mut self.engine) {
+                engine.refresh_styles(layout, doc, &self.styles);
             }
             self.needs_paint = true;
         }
@@ -5656,7 +5656,8 @@ mod tests {
                     && doc.parent(f.node.expect("node")) == Some(a)
                     && found.is_none()
                 {
-                    found = Some((f.rect, t.color.to_rgba8(), t.underline.is_some(), f.style.background_color.to_rgba8()));
+                    let underline = t.decorations.iter().any(|d| d.line == browser_layout::DecorationLine::Underline);
+                    found = Some((f.rect, t.color.to_rgba8(), underline, f.style.background_color.to_rgba8()));
                 }
             });
             found.expect("the link's text fragment")

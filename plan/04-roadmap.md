@@ -1252,24 +1252,56 @@ Work:
       script (`wordWrap`/`overflowWrap` both ways, the four as written,
       a percentage refused), tab harness (resolved values, inheritance
       into a child, a `letter-spacing` write widening the box at once).
-      **Block 2 done 2026-10-11: `font-variant: small-caps`,
-      `font-stretch`, `text-decoration-style`/`-thickness` paint,
-      `list-style-position`/`-image`.** Decorations: the lines on an
-      element's text are drawn as the decorating box says (CSS Text
-      Decoration 3): `ComputedStyle` carries `decoration_style`/
-      `_color`/`_thickness` in effect beside the element's own
-      `text_decoration_*` (which `getComputedStyle` reports), taken from
-      the element when it declares lines and from the ancestor whose
-      lines propagate otherwise, so `<u style="... wavy red"><em>` draws
-      `em`'s underline wavy and red (before, its own solid currentcolor;
-      the colour path changed with the owner's go). A layout
-      `Decoration` carries style and thickness; the thickness is the
-      font's for `auto` and `from-font`, else the length, a percentage
-      being of the font size; `refresh_styles` updates them paint-only.
-      The painter draws `solid`, `double` (two lines a thickness apart),
-      `dotted` and `dashed` (dash patterns phased from the page x axis
-      so a line runs unbroken across fragments), `wavy` (a stroked quad
-      wave, clipped to the fragment). `font-stretch` goes to parley as
+      **Block 2, 2026-10-11: `font-variant: small-caps`, `font-stretch`,
+      `text-decoration-style`/`-thickness` paint, `list-style-position`/
+      `-image`. Not done: two parts are SKIPPED, listed at the end of
+      this entry; the block is done when they are built.** The first
+      report of this block called it done with three parts built simpler
+      than browsers and named as "limits"; it was rejected. Decorations
+      were then redone (2026-10-11) as browsers draw them (CSS Text
+      Decoration 3 §2.1, Blink's applied-decoration list): `ComputedStyle::
+      decorations` is the list of decorating boxes whose lines reach the
+      element's text, outermost first: each ancestor with lines of its own
+      up to the nearest atomic inline (inline-block, inline-flex), float
+      or absolute/fixed box, whose contents start afresh, then the element
+      itself when it declares lines; each entry carries its own box's
+      lines, style, colour, thickness, `text-underline-offset`,
+      `text-underline-position` and font. The element's own
+      `text_decoration_*` stay for `getComputedStyle`. Layout
+      (`crates/layout/src/decor.rs`) gives a text fragment one
+      `Decoration` per line of every entry: the position and `auto`/
+      `from-font` thickness come from the decorating box's first
+      available font (fontique's first match for its family list, weight,
+      style and stretch; skrifa's metrics, new direct dependency in
+      `03-crates.md`), not the text's, so a bigger child under an
+      underlined parent keeps the parent's line; a length thickness is as
+      given, a percentage of the decorating box's font size; the
+      underline sits at the font's underline position (as Firefox; Chrome
+      leaves a gap under the baseline instead), `text-underline-position:
+      under` below the decorating font's descent, `left`/`right` as
+      `auto` in horizontal text, `from-font` at the font's position;
+      `text-underline-offset` (`auto`, a length, a percentage of `1em`,
+      negative inward) moves it; the overline sits at the decorating
+      font's ascent with the underline's thickness; the line-through at
+      the font's strikeout position and thickness (as Firefox; both
+      properties inherited and in the table, so the CSSOM has them).
+      `text-decoration-skip-ink` (`auto`, the default, and `all` skip;
+      `none` runs through): the underline's and overline's band is
+      tested against the glyph outlines (skrifa, flattened, cached per
+      glyph and size, synthetic italic skew applied); each crossing is
+      widened by the line's thickness (at most 13px, Blink's dilation),
+      merged and kept on the `Decoration` as gaps the painter leaves out,
+      snapped outward to whole pixels; line-throughs never skip. The
+      painter draws underlines and overlines under the glyphs and
+      line-throughs over them (CSS Text Decoration 4 §5.1), `solid`,
+      `double` (two lines a thickness apart, the second away from the
+      text), `dotted` and `dashed` (dash patterns phased from the page x
+      axis so a line runs unbroken across gaps and fragments), `wavy` (a
+      stroked quad wave, clipped to the segment). A paint-only restyle
+      (`LayoutEngine::refresh_styles`, moved from `LayoutTree` because it
+      needs the font system) rebuilds every text fragment's lines from
+      its element's new style, generated markers from their element's.
+      `font-stretch` goes to parley as
       `FontWidth`. Small caps: `LayoutEngine::font_has_small_caps`
       resolves the `font-family` list's first font through fontique and
       reads its GSUB feature list with `read-fonts` (new direct
@@ -1295,15 +1327,33 @@ Work:
       classification, `<br>` and atomic handling to helpers and the case
       passes with a 1 MiB stack. Snapshot `01-text-and-boxes.png` was
       regenerated for the moved markers (nothing else in it changed).
-      Tests: style (the decorating box's look propagates, own values
-      stay for the CSSOM), layout (synthesized small caps runs and spans,
-      the `smcp` probe cached and false for an unknown family, markers
-      outside/inside/image at the box and fragment level with the text
-      at the content edge, decoration style/thickness/colour on
-      fragments including propagation, percentages and `from-font`,
-      `font-stretch` laid out), paint (double and dotted lines by pixel),
-      tab harness (a `data:` `list-style-image` fetched and laid out
-      outside the item).
+      Tests: style (the list of decorating boxes: shared when nothing is
+      added, own entry appended after the ancestors', inline-block,
+      float and absolute start afresh, own values stay for the CSSOM;
+      the three underline properties parsed, computed, inherited and
+      carried on the entry), layout (synthesized small caps runs and
+      spans, the `smcp` probe cached and false for an unknown family,
+      markers outside/inside/image at the box and fragment level with
+      the text at the content edge, decoration style/thickness/colour on
+      fragments including propagation, percentages and `from-font`, a
+      parent underline and a child line-through each with its own look,
+      the overline, a 40px child keeping its 10px parent's line, no
+      lines into atomic/float/absolute descendants, `text-underline-
+      position`/`-offset` moving the line, skip-ink gaps under a g and
+      not under an H and off with `none`; `decor.rs` unit tests for
+      segment spans, merging and flattening; `font-stretch` laid out),
+      paint (double and dotted lines by pixel; the line-through painted
+      over the glyphs, the underline left out in the g's gap and running
+      under the descender with `skip-ink: none`), tab harness (a `data:`
+      `list-style-image` fetched and laid out outside the item; a
+      paint-only hover rebuilding the underline).
+      SKIPPED, to be built before anything else in this block is called
+      done: (1) `list-style-position: outside` is a negative first-line
+      indent, so centred or right-aligned text aligns including the
+      marker's width; browsers put the marker in its own box outside the
+      line and align the text alone. (2) The `smcp` probe reads only the
+      family list's first installed font; browsers decide per the font
+      each run actually shapes with, fallback fonts included.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.

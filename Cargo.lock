@@ -596,6 +596,7 @@ dependencies = [
  "html5ever",
  "parley",
  "read-fonts",
+ "skrifa",
  "taffy",
  "tracing",
  "url",

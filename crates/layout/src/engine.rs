@@ -10,11 +10,10 @@ use browser_style::{
     ComputedStyle, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position, StyleMap, TextAlign,
     WordBreak,
 };
-use fontique::{GenericFamily, QueryFamily, QueryStatus};
+use fontique::QueryStatus;
 use parley::layout::YieldData;
 use parley::style::{
-    FontFamily, FontFamilyName, FontFeatures, FontStyle as PFontStyle, FontWeight, FontWidth, LineHeight as PLineHeight,
-    StyleProperty,
+    FontFamily, FontFeatures, FontStyle as PFontStyle, FontWeight, FontWidth, LineHeight as PLineHeight, StyleProperty,
 };
 use parley::{
     Alignment, AlignmentOptions, FontContext, IndentOptions, InlineBox, InlineBoxKind, LayoutContext,
@@ -27,10 +26,8 @@ use crate::boxes::{
     Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineContent, InlineLayout, TaffyId,
 };
 use crate::convert::to_taffy;
-use crate::{
-    Brush, Cluster, Decoration, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment,
-    decoration_thickness,
-};
+use crate::decor::{Decorator, Family};
+use crate::{Brush, Cluster, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
 
 /// Owns the font system and parley's scratch state. One per tab thread.
 pub struct LayoutEngine {
@@ -39,6 +36,9 @@ pub struct LayoutEngine {
     /// Whether the first font of a `font-family` list has the `smcp`
     /// feature (real small caps), by list text; probed once each.
     small_caps: HashMap<Arc<str>, bool>,
+    /// Decoration geometry: decorating boxes' font metrics and glyph
+    /// outlines for ink skipping, cached.
+    decor: Decorator,
 }
 
 impl std::fmt::Debug for LayoutEngine {
@@ -106,7 +106,59 @@ impl LayoutEngine {
             fonts: FontContext::new(),
             lcx: LayoutContext::new(),
             small_caps: HashMap::new(),
+            decor: Decorator::default(),
         }
+    }
+
+    /// After a restyle that changed no layout-affecting value: every
+    /// fragment takes its element's current style (a text fragment its
+    /// parent element's, generated text such as a list or `text-overflow`
+    /// marker its element's), so the painter sees the new colours,
+    /// backgrounds and decorations without a layout. Text colour and the
+    /// decoration lines are refreshed in place, as they were baked in at
+    /// layout.
+    pub fn refresh_styles(&mut self, tree: &mut LayoutTree, doc: &Document, styles: &StyleMap) {
+        fn refresh(
+            f: &mut Fragment,
+            doc: &Document,
+            styles: &StyleMap,
+            inherited: Option<&Arc<ComputedStyle>>,
+            decor: &mut Decorator,
+            fonts: &mut FontContext,
+        ) {
+            let mut element_style: Option<Arc<ComputedStyle>> = None;
+            let new_style = match f.node {
+                Some(n) if doc.contains(n) => {
+                    if doc.get(n).is_element() {
+                        element_style = styles.get(n).cloned();
+                        element_style.clone()
+                    } else {
+                        doc.parent(n).and_then(|p| styles.get(p)).cloned()
+                    }
+                }
+                Some(_) => None,
+                // Generated text is styled as an anonymous box of the
+                // nearest element above it (as it was built).
+                None => match &f.content {
+                    FragmentContent::Text(_) => inherited.map(|s| Arc::new(ComputedStyle::anonymous_from(s))),
+                    _ => None,
+                },
+            };
+            if let Some(s) = new_style
+                && !Arc::ptr_eq(&s, &f.style)
+            {
+                f.style = s;
+                if let FragmentContent::Text(t) = &mut f.content {
+                    t.color = f.style.color;
+                    t.decorations = decor.decorations(fonts, &f.style, t);
+                }
+            }
+            let next = element_style.as_ref().or(inherited);
+            for c in &mut f.children {
+                refresh(c, doc, styles, next, decor, fonts);
+            }
+        }
+        refresh(&mut tree.root, doc, styles, None, &mut self.decor, &mut self.fonts);
     }
 
     /// Whether the first font of the `font-family` list `family` (the
@@ -118,24 +170,11 @@ impl LayoutEngine {
         if let Some(&has) = self.small_caps.get(family) {
             return has;
         }
-        enum Family {
-            Named(String),
-            Generic(GenericFamily),
-        }
-        let families: Vec<Family> = FontFamilyName::parse_css_list(family)
-            .map_while(Result::ok)
-            .map(|f| match f {
-                FontFamilyName::Named(name) => Family::Named(name.to_string()),
-                FontFamilyName::Generic(generic) => Family::Generic(generic),
-            })
-            .collect();
+        let families = Family::parse_list(family);
         let mut has = false;
         {
             let mut query = self.fonts.collection.query(&mut self.fonts.source_cache);
-            query.set_families(families.iter().map(|f| match f {
-                Family::Named(name) => QueryFamily::Named(name.as_str()),
-                Family::Generic(generic) => QueryFamily::Generic(*generic),
-            }));
+            query.set_families(families.iter().map(Family::query));
             query.matches_with(|font| {
                 has = font_has_feature(font.blob.as_ref(), font.index, b"smcp");
                 QueryStatus::Stop
@@ -510,7 +549,7 @@ impl LayoutEngine {
     }
 
     /// Produce fragments for a laid-out box subtree.
-    fn fragments(&self, node: &BoxNode, tree: &TaffyTree<Leaf>, ox: f32, oy: f32) -> Fragment {
+    fn fragments(&mut self, node: &BoxNode, tree: &TaffyTree<Leaf>, ox: f32, oy: f32) -> Fragment {
         let layout = node
             .taffy
             .and_then(|id| tree.layout(id).ok().cloned())
@@ -533,7 +572,17 @@ impl LayoutEngine {
                 if let Some(il) = content.cache.first() {
                     let text: Arc<str> = Arc::from(content.text.as_str());
                     let overflow = content.ellipsis.as_ref().map(|e| (rect.width, e));
-                    emit_text_fragments(content, &text, &il.layout, x, y, overflow, &mut children);
+                    emit_text_fragments(
+                        content,
+                        &text,
+                        &il.layout,
+                        x,
+                        y,
+                        overflow,
+                        &mut children,
+                        &mut self.decor,
+                        &mut self.fonts,
+                    );
                 }
                 Fragment {
                     rect,
@@ -1021,9 +1070,6 @@ fn push_style(
     range: Option<std::ops::Range<usize>>,
 ) {
     let color = Brush(style.color.to_rgba8());
-    // The decoration lines take the decorating box's colour (its text
-    // colour unless set).
-    let decoration = Brush(style.decoration_color.to_rgba8());
     // `word-break: break-word` lays out as `normal` with `overflow-wrap:
     // anywhere`, whatever `overflow-wrap` says (CSS Text 3).
     let (word_break, overflow_wrap) = match style.word_break {
@@ -1046,7 +1092,9 @@ fn push_style(
     } else {
         TextWrapMode::NoWrap
     };
-    let props: [StyleProperty<'_, Brush>; 15] = [
+    // Decoration lines are not parley's: the engine places them per
+    // decorating box (`crate::decor`).
+    let props: [StyleProperty<'_, Brush>; 11] = [
         StyleProperty::FontFamily(FontFamily::Source(Cow::Borrowed(&style.font_family))),
         StyleProperty::FontSize(style.font_size.max(0.0)),
         StyleProperty::FontWeight(FontWeight::new(style.font_weight as f32)),
@@ -1062,10 +1110,6 @@ fn push_style(
             LineHeight::Number(n) => PLineHeight::FontSizeRelative(n),
             LineHeight::Px(px) => PLineHeight::Absolute(px),
         }),
-        StyleProperty::Underline(style.text_decoration.underline),
-        StyleProperty::Strikethrough(style.text_decoration.line_through),
-        StyleProperty::UnderlineBrush(Some(decoration)),
-        StyleProperty::StrikethroughBrush(Some(decoration)),
         StyleProperty::LetterSpacing(style.letter_spacing.to_px()),
         StyleProperty::WordBreak(word_break),
         StyleProperty::OverflowWrap(overflow_wrap),
@@ -1141,6 +1185,13 @@ impl Truncation {
     }
 }
 
+/// Give a text fragment its decoration lines from its style.
+fn decorate(fragment: &mut Fragment, decor: &mut Decorator, fonts: &mut FontContext) {
+    if let FragmentContent::Text(t) = &mut fragment.content {
+        t.decorations = decor.decorations(fonts, &fragment.style, t);
+    }
+}
+
 /// The `text-overflow` marker as text fragments at `x` (root
 /// coordinates) on a line of `line_height` whose baseline is `baseline`
 /// below its top. It has no node: nothing selects, finds or hits it.
@@ -1154,12 +1205,13 @@ fn emit_marker(
     baseline: f32,
     line_height: f32,
     out: &mut Vec<Fragment>,
+    decor: &mut Decorator,
+    fonts: &mut FontContext,
 ) {
     let Some(line) = marker.layout.lines().next() else { return };
     for item in line.items() {
         let PositionedLayoutItem::GlyphRun(run) = item else { continue };
         let r = run.run();
-        let rm = r.metrics();
         let synthesis = r.synthesis();
         let x0 = x + run.offset();
         let mut gx = run.offset();
@@ -1186,14 +1238,6 @@ fn emit_marker(
                 rtl: r.is_rtl(),
             });
         }
-        let line = |on: bool, offset: f32, size: f32| {
-            on.then_some(Decoration {
-                y: baseline - offset,
-                thickness: decoration_thickness(style, r.font_size(), size),
-                color: style.decoration_color,
-                style: style.decoration_style,
-            })
-        };
         let text = TextFragment {
             font: r.font().clone(),
             font_size: r.font_size(),
@@ -1205,13 +1249,10 @@ fn emit_marker(
             color: style.color,
             embolden: synthesis.embolden(),
             skew: synthesis.skew(),
-            underline: line(style.text_decoration.underline, rm.underline_offset, rm.underline_size),
-            strikethrough: line(style.text_decoration.line_through, rm.strikethrough_offset, rm.strikethrough_size),
-            underline_metrics: (baseline - rm.underline_offset, rm.underline_size),
-            strikethrough_metrics: (baseline - rm.strikethrough_offset, rm.strikethrough_size),
+            decorations: Vec::new(),
             baseline,
         };
-        out.push(Fragment {
+        let mut fragment = Fragment {
             rect: Rect::new(ox + x0, oy, run.advance(), line_height),
             node: None,
             style: style.clone(),
@@ -1219,7 +1260,9 @@ fn emit_marker(
             children: Vec::new(),
             padding: Default::default(),
             margin: Default::default(),
-        });
+        };
+        decorate(&mut fragment, decor, fonts);
+        out.push(fragment);
     }
 }
 
@@ -1236,6 +1279,8 @@ fn emit_text_fragments(
     oy: f32,
     overflow: Option<(f32, &Ellipsis)>,
     out: &mut Vec<Fragment>,
+    decor: &mut Decorator,
+    fonts: &mut FontContext,
 ) {
     let styles = layout.styles();
     let rtl = layout.is_rtl();
@@ -1263,7 +1308,6 @@ fn emit_text_fragments(
                         continue;
                     }
                     last_run = Some(r.text_range());
-                    let rm = r.metrics();
                     let synthesis = r.synthesis();
                     let baseline = run.baseline();
                     let run_rtl = r.is_rtl();
@@ -1278,27 +1322,7 @@ fn emit_text_fragments(
                             .and_then(|i| content.spans.get(i))
                             .map(|s| (s.style.clone(), s.node))
                             .unwrap_or((content.container.clone(), None));
-                        let style = &styles[style_idx];
-                        let color = style.brush.0;
-                        let deco = |d: &Option<parley::layout::Decoration<Brush>>, default_offset: f32, default_size: f32| {
-                            d.as_ref().map(|d| {
-                                let c = d.brush.0;
-                                Decoration {
-                                    y: baseline - line_top - d.offset.unwrap_or(default_offset),
-                                    thickness: decoration_thickness(&span_style, r.font_size(), d.size.unwrap_or(default_size)),
-                                    color: browser_style::Rgba {
-                                        r: c[0] as f32 / 255.0,
-                                        g: c[1] as f32 / 255.0,
-                                        b: c[2] as f32 / 255.0,
-                                        a: c[3] as f32 / 255.0,
-                                    },
-                                    style: span_style.decoration_style,
-                                }
-                            })
-                        };
-                        // The same geometry for a line turned on later.
-                        let underline_metrics = (baseline - line_top - rm.underline_offset, rm.underline_size);
-                        let strikethrough_metrics = (baseline - line_top - rm.strikethrough_offset, rm.strikethrough_size);
+                        let color = styles[style_idx].brush.0;
                         let range = clusters.iter().map(|c| c.start).min().unwrap_or(0)
                             ..clusters.iter().map(|c| c.end).max().unwrap_or(0);
                         let text = TextFragment {
@@ -1317,10 +1341,7 @@ fn emit_text_fragments(
                             },
                             embolden: synthesis.embolden(),
                             skew: synthesis.skew(),
-                            underline: deco(&style.underline, rm.underline_offset, rm.underline_size),
-                            strikethrough: deco(&style.strikethrough, rm.strikethrough_offset, rm.strikethrough_size),
-                            underline_metrics,
-                            strikethrough_metrics,
+                            decorations: Vec::new(),
                             baseline: baseline - line_top,
                         };
                         Fragment {
@@ -1365,14 +1386,16 @@ fn emit_text_fragments(
                         let key = (span, style_idx);
                         if current.is_some_and(|c| c != key) && !glyphs.is_empty() {
                             let (prev_span, prev_style) = current.unwrap_or(key);
-                            out.push(make(
+                            let mut fragment = make(
                                 frag_x0,
                                 x,
                                 std::mem::take(&mut glyphs),
                                 std::mem::take(&mut clusters),
                                 prev_span,
                                 prev_style,
-                            ));
+                            );
+                            decorate(&mut fragment, decor, fonts);
+                            out.push(fragment);
                             frag_x0 = x;
                         }
                         current = Some(key);
@@ -1405,7 +1428,9 @@ fn emit_text_fragments(
                     if !glyphs.is_empty()
                         && let Some((span, style_idx)) = current
                     {
-                        out.push(make(frag_x0, x, glyphs, clusters, span, style_idx));
+                        let mut fragment = make(frag_x0, x, glyphs, clusters, span, style_idx);
+                        decorate(&mut fragment, decor, fonts);
+                        out.push(fragment);
                     }
                     // Left to right, everything after the cut is dropped.
                     if truncated && !rtl {
@@ -1465,6 +1490,8 @@ fn emit_text_fragments(
                 metrics.baseline - line_top,
                 line_height,
                 out,
+                decor,
+                fonts,
             );
         }
     }
@@ -1484,9 +1511,15 @@ pub fn layout_document(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Decoration, DecorationLine};
     use browser_style::{Origin, Stylesheet, Stylist, Viewport, compute_styles, ua::ua_stylesheet};
 
     fn layout(html: &str, css: &str) -> (Document, LayoutTree) {
+        let (doc, tree, _) = layout_with_engine(html, css);
+        (doc, tree)
+    }
+
+    fn layout_with_engine(html: &str, css: &str) -> (Document, LayoutTree, LayoutEngine) {
         let doc = browser_dom::parse_html(html.as_bytes());
         let mut stylist = Stylist::new();
         stylist.add_sheet(ua_stylesheet());
@@ -1494,7 +1527,26 @@ mod tests {
         let styles = compute_styles(&doc, &stylist, &Viewport::default());
         let mut engine = LayoutEngine::new();
         let tree = engine.layout(&doc, &styles, 800.0, 600.0, &());
-        (doc, tree)
+        (doc, tree, engine)
+    }
+
+    /// The decoration lines of the first text fragment whose text is `s`,
+    /// with the fragment's baseline.
+    fn lines_of(tree: &LayoutTree, s: &str) -> (Vec<Decoration>, f32) {
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
+                && found.is_none()
+                && &t.text[t.range.clone()] == s
+            {
+                found = Some((t.decorations.clone(), t.baseline));
+            }
+        });
+        found.unwrap_or_else(|| panic!("fragment {s}"))
+    }
+
+    fn line(lines: &[Decoration], kind: DecorationLine) -> &Decoration {
+        lines.iter().find(|d| d.line == kind).unwrap_or_else(|| panic!("{kind:?} in {lines:?}"))
     }
 
     fn find_by_tag(doc: &Document, tree: &LayoutTree, tag: &str) -> Rect {
@@ -1592,7 +1644,7 @@ mod tests {
         // the new styles keeps every box where it is and gives the text
         // its new colour and underline from the metrics kept at layout.
         let html = "<body style='margin:0'><p style='margin:0'><a href=x>link</a> and <b>bold</b></p></body>";
-        let (doc, mut tree) = layout(html, "a { color: red; text-decoration: none }");
+        let (doc, mut tree, mut engine) = layout_with_engine(html, "a { color: red; text-decoration: none }");
         let a = doc
             .descendants(doc.root())
             .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "a"))
@@ -1604,7 +1656,8 @@ mod tests {
                     && doc.parent(f.node.expect("node")) == Some(a)
                     && found.is_none()
                 {
-                    found = Some((f.rect, t.color.to_rgba8(), t.underline, f.style.background_color.to_rgba8()));
+                    let underline = t.decorations.iter().find(|d| d.line == DecorationLine::Underline).cloned();
+                    found = Some((f.rect, t.color.to_rgba8(), underline, f.style.background_color.to_rgba8()));
                 }
             });
             found.expect("the link's text")
@@ -1621,7 +1674,7 @@ mod tests {
             Origin::Author,
         )));
         let styles = compute_styles(&doc, &stylist, &Viewport::default());
-        tree.refresh_styles(&doc, &styles);
+        engine.refresh_styles(&mut tree, &doc, &styles);
         let (rect, color, underline, bg) = text_of(&tree);
         assert_eq!(rect, rect_before, "no box moved");
         assert_eq!(color, [255, 255, 255, 255]);
@@ -1819,33 +1872,151 @@ mod tests {
 
     #[test]
     fn decoration_lines_carry_their_style_thickness_and_decorating_colour() {
-        let (doc, tree) = layout(
+        let (_doc, tree) = layout(
             "<body style='margin:0;font-size:20px'><p style='margin:0'>\
              <u style='text-decoration: underline wavy red 3px'>a<em>b</em></u> \
              <s style='text-decoration-thickness: 10%'>c</s> <i style='text-decoration: underline from-font'>d</i></p></body>",
             "",
         );
-        let (texts, _) = texts_of(&doc, &tree, "p");
-        let _ = texts;
-        let mut by_text: Vec<(String, Option<Decoration>, Option<Decoration>)> = Vec::new();
-        tree.root.walk(&mut |f| {
-            if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node) {
-                by_text.push((t.text[t.range.clone()].to_owned(), t.underline, t.strikethrough));
-            }
-        });
-        let find = |s: &str| by_text.iter().find(|(t, _, _)| t == s).unwrap_or_else(|| panic!("fragment {s}: {by_text:?}"));
+        use DecorationLine as L;
         use browser_style::TextDecorationStyle as S;
-        let a = find("a").1.expect("underline");
+        let (a, _) = lines_of(&tree, "a");
+        let a = line(&a, L::Underline);
         assert_eq!((a.style, a.thickness, a.color.to_rgba8()), (S::Wavy, 3.0, [255, 0, 0, 255]));
         // `em` declares no lines: the look of `u` comes with the line.
-        let b = find("b").1.expect("propagated underline");
+        let (b, _) = lines_of(&tree, "b");
+        let b = line(&b, L::Underline);
         assert_eq!((b.style, b.thickness, b.color.to_rgba8()), (S::Wavy, 3.0, [255, 0, 0, 255]));
         // A percentage is of the font size; `from-font` is the font's.
-        let c = find("c").2.expect("line-through");
+        let (c, _) = lines_of(&tree, "c");
+        let c = line(&c, L::LineThrough);
         assert_eq!((c.style, c.thickness), (S::Solid, 2.0));
-        let d = find("d").1.expect("underline");
+        let (d, _) = lines_of(&tree, "d");
+        let d = line(&d, L::Underline);
         assert!(d.thickness > 0.0 && d.thickness < 5.0, "{d:?}");
         assert_eq!(d.style, S::Solid);
+    }
+
+    #[test]
+    fn each_decorating_box_draws_its_own_lines() {
+        // `s` inside `u`: the text carries `u`'s wavy red underline and
+        // `s`'s solid blue line-through, each with its own box's look, in
+        // that order; `u`'s text has the underline alone. The overline is
+        // laid out too, above the ascent.
+        let (_doc, tree) = layout(
+            "<body style='margin:0;font-size:20px'><p style='margin:0'>\
+             <u style='text-decoration: underline wavy red 3px'>a<s style='text-decoration-color: blue'>b</s></u>\
+             <o style='text-decoration: overline green'>c</o></p></body>",
+            "",
+        );
+        use DecorationLine as L;
+        use browser_style::TextDecorationStyle as S;
+        let (a, _) = lines_of(&tree, "a");
+        assert_eq!(a.len(), 1);
+        let (b, baseline) = lines_of(&tree, "b");
+        assert_eq!(b.iter().map(|d| d.line).collect::<Vec<_>>(), vec![L::Underline, L::LineThrough]);
+        assert_eq!((b[0].style, b[0].thickness, b[0].color.to_rgba8()), (S::Wavy, 3.0, [255, 0, 0, 255]));
+        assert_eq!((b[1].style, b[1].color.to_rgba8()), (S::Solid, [0, 0, 255, 255]));
+        assert!(b[1].thickness > 0.0 && b[1].thickness < 3.0, "the font's strikeout thickness: {:?}", b[1]);
+        assert!(b[0].y > baseline && b[1].y < baseline, "under and over the baseline: {b:?} {baseline}");
+        let (c, baseline) = lines_of(&tree, "c");
+        let c = line(&c, L::Overline);
+        assert_eq!(c.color.to_rgba8(), [0, 128, 0, 255]);
+        assert!(c.y < baseline - 10.0, "at the ascent: {c:?} {baseline}");
+    }
+
+    #[test]
+    fn propagated_lines_take_the_decorating_box_font() {
+        // A 40px child under a 10px underlined parent: the child's
+        // underline sits where the parent's 10px font puts it, as thick as
+        // the parent's; the child's own underline would be lower and
+        // thicker.
+        let (_doc, tree) = layout(
+            "<body style='margin:0'><p style='margin:0;font-size:10px'>\
+             <u>a<big style='font-size:40px'>b</big></u><big style='font-size:40px;text-decoration:underline'>c</big></p></body>",
+            "",
+        );
+        use DecorationLine as L;
+        let (a, a_base) = lines_of(&tree, "a");
+        let (b, b_base) = lines_of(&tree, "b");
+        let (c, c_base) = lines_of(&tree, "c");
+        let (a, b, c) = (line(&a, L::Underline), line(&b, L::Underline), line(&c, L::Underline));
+        assert!((a.y - a_base - (b.y - b_base)).abs() < 0.01, "same distance below the baseline: {a:?} {b:?}");
+        assert!((a.thickness - b.thickness).abs() < 0.01);
+        assert!(c.y - c_base > b.y - b_base && c.thickness > b.thickness, "own 40px font: {c:?} vs {b:?}");
+    }
+
+    #[test]
+    fn decorations_stop_at_atomic_inlines_floats_and_out_of_flow_boxes() {
+        let (_doc, tree) = layout(
+            "<body style='margin:0'><p style='margin:0'><u>a<span style='display:inline-block'>b</span>\
+             <i style='float:left'>c</i><q style='position:absolute;left:0;top:100px'>d</q></u></p></body>",
+            "",
+        );
+        assert_eq!(lines_of(&tree, "a").0.len(), 1);
+        for s in ["b", "c", "d"] {
+            assert!(lines_of(&tree, s).0.is_empty(), "{s} is not decorated");
+        }
+    }
+
+    #[test]
+    fn underline_position_and_offset_move_the_line() {
+        let page = |css: &str| {
+            layout(
+                &format!("<body style='margin:0;font-size:20px'><p style='margin:0;text-decoration:underline;{css}'>Hg</p></body>"),
+                "",
+            )
+        };
+        use DecorationLine as L;
+        let under = |css: &str| {
+            let (_, tree) = page(css);
+            let (lines, baseline) = lines_of(&tree, "Hg");
+            line(&lines, L::Underline).y - baseline
+        };
+        let auto = under("");
+        assert!(auto >= 0.0, "never above the baseline: {auto}");
+        assert!((under("text-underline-offset: 4px") - auto - 4.0).abs() < 0.01);
+        assert!((under("text-underline-offset: 50%") - auto - 10.0).abs() < 0.01, "a percentage of 1em");
+        assert!((under("text-underline-offset: -2px") - auto + 2.0).abs() < 0.01, "inward");
+        let below = under("text-underline-position: under");
+        assert!(below > auto && below >= 20.0 * 0.15, "under the descent: {below} vs {auto}");
+        assert!((under("text-underline-position: under; text-underline-offset: 3px") - below - 3.0).abs() < 0.01);
+        assert_eq!(under("text-underline-position: from-font"), auto, "the font's position, as auto");
+        assert_eq!(under("text-underline-position: left"), auto, "horizontal text: as auto");
+    }
+
+    #[test]
+    fn skip_ink_interrupts_the_underline_at_descenders_only() {
+        // "Hg": the underline has a gap at the g's descender and none under
+        // the H; `none` keeps the line whole; the line-through never skips.
+        let page = |css: &str| {
+            layout(
+                &format!("<body style='margin:0;font-size:40px'><p style='margin:0;text-decoration:underline line-through;{css}'>Hg</p></body>"),
+                "",
+            )
+        };
+        use DecorationLine as L;
+        let (_, tree) = page("");
+        let (lines, _) = lines_of(&tree, "Hg");
+        let under = line(&lines, L::Underline);
+        let mut clusters = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
+                && clusters.is_empty()
+            {
+                clusters = t.clusters.clone();
+            }
+        });
+        let (h, g) = (clusters[0], clusters[1]);
+        assert!(!under.gaps.is_empty(), "{under:?}");
+        assert!(under.gaps.iter().all(|&(x0, x1)| x1 > g.x && x0 < g.x + g.advance), "gaps lie under the g: {:?}", under.gaps);
+        assert!(under.gaps.iter().all(|&(_, x1)| x1 > h.x + h.advance * 0.9), "none under the H: {:?}", under.gaps);
+        assert!(under.gaps.iter().all(|&(x0, _)| x0 > h.x + h.advance * 0.5), "the H's half is clear: {:?}", under.gaps);
+        assert!(line(&lines, L::LineThrough).gaps.is_empty());
+        let (_, tree) = page("text-decoration-skip-ink: none");
+        assert!(line(&lines_of(&tree, "Hg").0, L::Underline).gaps.is_empty());
+        let (_, tree) = page("text-decoration-skip-ink: all");
+        assert!(!line(&lines_of(&tree, "Hg").0, L::Underline).gaps.is_empty());
     }
 
     #[test]

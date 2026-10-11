@@ -653,6 +653,75 @@ pub enum TextDecorationThickness {
     Length(LengthPercentage),
 }
 
+/// `text-underline-position`: `auto | [ from-font | under ] || [ left |
+/// right ]`. All false is `auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextUnderlinePosition {
+    pub from_font: bool,
+    pub under: bool,
+    pub side: Option<UnderlineSide>,
+}
+
+/// The `left` / `right` part of `text-underline-position` (which edge the
+/// underline takes in vertical writing; horizontal text treats both as
+/// `auto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnderlineSide {
+    Left,
+    Right,
+}
+
+impl TextUnderlinePosition {
+    pub fn is_auto(self) -> bool {
+        !self.from_font && !self.under && self.side.is_none()
+    }
+
+    pub fn to_css(self) -> String {
+        if self.is_auto() {
+            return "auto".to_owned();
+        }
+        let mut parts = Vec::new();
+        if self.from_font {
+            parts.push("from-font");
+        }
+        if self.under {
+            parts.push("under");
+        }
+        match self.side {
+            Some(UnderlineSide::Left) => parts.push("left"),
+            Some(UnderlineSide::Right) => parts.push("right"),
+            None => {}
+        }
+        parts.join(" ")
+    }
+}
+
+/// `text-underline-offset`: `auto | <length-percentage>`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextUnderlineOffsetValue {
+    Auto,
+    Length(LengthPercentage),
+}
+
+/// `text-decoration-skip-ink`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextDecorationSkipInk {
+    #[default]
+    Auto,
+    None,
+    All,
+}
+
+impl TextDecorationSkipInk {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            TextDecorationSkipInk::Auto => "auto",
+            TextDecorationSkipInk::None => "none",
+            TextDecorationSkipInk::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WhiteSpace {
     #[default]
@@ -1457,6 +1526,9 @@ longhands! {
     TextDecorationStyle: "text-decoration-style" => TextDecorationStyle, false;
     TextDecorationColor: "text-decoration-color" => Color, false;
     TextDecorationThickness: "text-decoration-thickness" => TextDecorationThickness, false;
+    TextUnderlinePosition: "text-underline-position" => TextUnderlinePosition, true;
+    TextUnderlineOffset: "text-underline-offset" => TextUnderlineOffsetValue, true;
+    TextDecorationSkipInk: "text-decoration-skip-ink" => TextDecorationSkipInk, true;
     TextTransform: "text-transform" => TextTransform, true;
     WhiteSpace: "white-space" => WhiteSpace, true;
     LetterSpacing: "letter-spacing" => LetterSpacingValue, true;
@@ -1718,6 +1790,11 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
         PropertyId::TextDecorationStyle => P::TextDecorationStyle(parse_text_decoration_style(input)?),
         PropertyId::TextDecorationColor => P::TextDecorationColor(parse_color(input)?),
         PropertyId::TextDecorationThickness => P::TextDecorationThickness(parse_text_decoration_thickness(input)?),
+        PropertyId::TextUnderlinePosition => P::TextUnderlinePosition(parse_text_underline_position(input)?),
+        PropertyId::TextUnderlineOffset => P::TextUnderlineOffset(parse_text_underline_offset(input)?),
+        PropertyId::TextDecorationSkipInk => P::TextDecorationSkipInk(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "auto" => TextDecorationSkipInk::Auto, "none" => TextDecorationSkipInk::None,
+            "all" => TextDecorationSkipInk::All, _ => return None }))?),
         PropertyId::TextTransform => P::TextTransform(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "none" => TextTransform::None, "uppercase" => TextTransform::Uppercase,
             "lowercase" => TextTransform::Lowercase, "capitalize" => TextTransform::Capitalize,
@@ -2186,6 +2263,40 @@ fn parse_text_decoration_thickness<'i>(
         return Ok(kw);
     }
     Ok(TextDecorationThickness::Length(parse_length_percentage(input)?))
+}
+
+/// `auto | [ from-font | under ] || [ left | right ]`: at most one of
+/// each group, in any order, `auto` alone.
+fn parse_text_underline_position<'i>(input: &mut Parser<'i, '_>) -> Result<TextUnderlinePosition, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        return Ok(TextUnderlinePosition::default());
+    }
+    let mut out = TextUnderlinePosition::default();
+    let mut any = false;
+    while let Ok(kw) = input.try_parse(|i| i.expect_ident().map(|s| s.to_string())) {
+        let taken = match_ignore_ascii_case! { &kw,
+            "from-font" => std::mem::replace(&mut out.from_font, true) || out.under,
+            "under" => std::mem::replace(&mut out.under, true) || out.from_font,
+            "left" => out.side.replace(UnderlineSide::Left).is_some(),
+            "right" => out.side.replace(UnderlineSide::Right).is_some(),
+            _ => return Err(input.new_custom_error(())),
+        };
+        if taken {
+            return Err(input.new_custom_error(()));
+        }
+        any = true;
+    }
+    if !any {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(out)
+}
+
+fn parse_text_underline_offset<'i>(input: &mut Parser<'i, '_>) -> Result<TextUnderlineOffsetValue, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        return Ok(TextUnderlineOffsetValue::Auto);
+    }
+    Ok(TextUnderlineOffsetValue::Length(parse_length_percentage(input)?))
 }
 
 fn parse_letter_spacing<'i>(input: &mut Parser<'i, '_>) -> Result<LetterSpacingValue, ParseErr<'i>> {
@@ -3033,5 +3144,41 @@ mod tests {
         assert!(parse("text-decoration", "underline underline").is_empty());
         assert!(parse("text-decoration", "none underline").is_empty());
         assert!(parse("text-decoration", "red blue").is_empty());
+    }
+
+    #[test]
+    fn underline_position_offset_and_skip_ink() {
+        let one = |name: &str, s: &str| parse(name, s).pop();
+        use DeclaredValue as D;
+        use PropertyDeclaration as P;
+        let pos = |s: &str| match one("text-underline-position", s) {
+            Some(D::Value(P::TextUnderlinePosition(p))) => p.to_css(),
+            _ => "invalid".to_owned(),
+        };
+        assert_eq!(pos("auto"), "auto");
+        assert_eq!(pos("under"), "under");
+        assert_eq!(pos("from-font"), "from-font");
+        assert_eq!(pos("left under"), "under left", "canonical order");
+        assert_eq!(pos("right"), "right");
+        assert_eq!(pos("under from-font"), "invalid", "one of each group");
+        assert_eq!(pos("left right"), "invalid");
+        assert_eq!(pos("auto under"), "invalid");
+        assert_eq!(pos("below"), "invalid");
+        assert_eq!(one("text-underline-offset", "auto"), Some(D::Value(P::TextUnderlineOffset(TextUnderlineOffsetValue::Auto))));
+        assert_eq!(
+            one("text-underline-offset", "-2px"),
+            Some(D::Value(P::TextUnderlineOffset(TextUnderlineOffsetValue::Length(LengthPercentage::Length(Length::Px(-2.0))))))
+        );
+        assert_eq!(
+            one("text-underline-offset", "10%"),
+            Some(D::Value(P::TextUnderlineOffset(TextUnderlineOffsetValue::Length(LengthPercentage::Percent(10.0)))))
+        );
+        assert_eq!(one("text-underline-offset", "thick"), None);
+        assert_eq!(one("text-decoration-skip-ink", "none"), Some(D::Value(P::TextDecorationSkipInk(TextDecorationSkipInk::None))));
+        assert_eq!(one("text-decoration-skip-ink", "all"), Some(D::Value(P::TextDecorationSkipInk(TextDecorationSkipInk::All))));
+        assert_eq!(one("text-decoration-skip-ink", "auto"), Some(D::Value(P::TextDecorationSkipInk(TextDecorationSkipInk::Auto))));
+        assert_eq!(one("text-decoration-skip-ink", "skip"), None);
+        assert!(PropertyId::TextUnderlinePosition.is_inherited() && PropertyId::TextUnderlineOffset.is_inherited());
+        assert!(PropertyId::TextDecorationSkipInk.is_inherited() && !PropertyId::TextDecorationLine.is_inherited());
     }
 }

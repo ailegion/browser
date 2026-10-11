@@ -18,6 +18,9 @@ fontique.workspace = true
 # To read a font's GSUB feature list (`smcp` for small caps); the same
 # version parley's skrifa uses.
 read-fonts.workspace = true
+# A decorating box's font metrics (where its lines go) and glyph outlines
+# (where an underline skips ink); the same version parley uses.
+skrifa.workspace = true
 url.workspace = true
 html5ever.workspace = true
 tracing.workspace = true

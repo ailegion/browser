@@ -23,7 +23,10 @@ pub mod values;
 
 pub use cascade::{Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
 pub use state::{ElementStates, InteractionDeps, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
-pub use computed::{ComputedStyle, DecorationThickness, LetterSpacing, LineHeight, Viewport};
+pub use computed::{
+    AppliedDecoration, ComputedStyle, DecorationFont, DecorationThickness, LetterSpacing, LineHeight, UnderlineOffset,
+    Viewport,
+};
 pub use properties::*;
 pub use media::MediaQueryList;
 pub use serialize::{UsedValues, resolved_value, serialize_block, serialize_declared, serialize_shorthand};

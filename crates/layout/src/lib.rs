@@ -12,13 +12,14 @@
 
 mod boxes;
 mod convert;
+mod decor;
 mod engine;
 pub mod selection;
 
 use std::sync::Arc;
 
 use browser_dom::NodeId;
-use browser_style::{ComputedStyle, DecorationThickness, Rgba, TextDecorationStyle};
+use browser_style::{ComputedStyle, Rgba, TextDecorationStyle};
 use url::Url;
 
 pub use engine::{LayoutEngine, layout_document};
@@ -64,12 +65,23 @@ pub struct PositionedGlyph {
     pub y: f32,
 }
 
-/// Underline or strikethrough geometry relative to the fragment origin.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Which line a `Decoration` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecorationLine {
+    Underline,
+    Overline,
+    LineThrough,
+}
+
+/// One decoration line across a text fragment, with the look and position
+/// its decorating box gives it. Underlines and overlines are painted under
+/// the glyphs, line-throughs over them (CSS Text Decoration 4 §5.1).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Decoration {
+    pub line: DecorationLine,
     /// Top of the line, relative to the fragment's top.
     pub y: f32,
-    /// The line's thickness: the font's, or the declared
+    /// The line's thickness: the decorating box's font's, or its declared
     /// `text-decoration-thickness`.
     pub thickness: f32,
     /// The decorating box's `text-decoration-color`, resolved (its text
@@ -77,17 +89,11 @@ pub struct Decoration {
     pub color: browser_style::Rgba,
     /// The decorating box's `text-decoration-style`.
     pub style: TextDecorationStyle,
-}
-
-/// The thickness of a decoration line on text of `font_size`: the font's
-/// own (`from_font`) for `auto` and `from-font`, else the declared
-/// length, a percentage being of the font size (CSS Text Decoration 4).
-pub fn decoration_thickness(style: &ComputedStyle, font_size: f32, from_font: f32) -> f32 {
-    match style.decoration_thickness {
-        DecorationThickness::Auto | DecorationThickness::FromFont => from_font,
-        DecorationThickness::Length(lp) => lp.resolve(font_size),
-    }
-    .max(0.0)
+    /// Where the line is interrupted for glyph ink
+    /// (`text-decoration-skip-ink`), as x ranges relative to the
+    /// fragment's left, sorted and disjoint; empty when the line runs
+    /// through (always for a line-through).
+    pub gaps: Vec<(f32, f32)>,
 }
 
 /// One grapheme cluster of a text fragment: the bytes of the inline root's
@@ -123,13 +129,9 @@ pub struct TextFragment {
     pub embolden: bool,
     /// Synthetic italic skew in degrees, if the font has no italic face.
     pub skew: Option<f32>,
-    pub underline: Option<Decoration>,
-    pub strikethrough: Option<Decoration>,
-    /// Where the decoration lines go when they are on: (top relative to
-    /// the fragment's top, thickness), from the font's metrics. Kept so a
-    /// paint-only restyle can toggle them (`LayoutTree::refresh_styles`).
-    pub underline_metrics: (f32, f32),
-    pub strikethrough_metrics: (f32, f32),
+    /// The decoration lines on this text, one per line of every
+    /// decorating box around it, outermost box first.
+    pub decorations: Vec<Decoration>,
     /// Baseline y relative to the fragment's top.
     pub baseline: f32,
 }
@@ -206,49 +208,6 @@ pub struct LayoutTree {
 }
 
 impl LayoutTree {
-    /// After a restyle that changed no layout-affecting value: every
-    /// fragment takes its element's current style (a text fragment its
-    /// parent element's), so the painter sees the new colours,
-    /// backgrounds and decorations without a layout. Text colour and the
-    /// decoration lines are refreshed in place, as they were baked in at
-    /// layout.
-    pub fn refresh_styles(&mut self, doc: &browser_dom::Document, styles: &browser_style::StyleMap) {
-        fn refresh(f: &mut Fragment, doc: &browser_dom::Document, styles: &browser_style::StyleMap) {
-            if let Some(n) = f.node
-                && doc.contains(n)
-            {
-                let style = if doc.get(n).is_element() {
-                    styles.get(n)
-                } else {
-                    doc.parent(n).and_then(|p| styles.get(p))
-                };
-                if let Some(s) = style
-                    && !Arc::ptr_eq(s, &f.style)
-                {
-                    f.style = s.clone();
-                    if let FragmentContent::Text(t) = &mut f.content {
-                        t.color = s.color;
-                        let font_size = t.font_size;
-                        let line = |on: bool, (y, from_font): (f32, f32)| {
-                            on.then_some(Decoration {
-                                y,
-                                thickness: decoration_thickness(s, font_size, from_font),
-                                color: s.decoration_color,
-                                style: s.decoration_style,
-                            })
-                        };
-                        t.underline = line(s.text_decoration.underline, t.underline_metrics);
-                        t.strikethrough = line(s.text_decoration.line_through, t.strikethrough_metrics);
-                    }
-                }
-            }
-            for c in &mut f.children {
-                refresh(c, doc, styles);
-            }
-        }
-        refresh(&mut self.root, doc, styles);
-    }
-
     /// The rectangle of the first fragment (in tree order) whose node
     /// satisfies `matches`. Inline elements have no box of their own, so
     /// callers accept their text nodes too.

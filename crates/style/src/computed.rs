@@ -54,6 +54,43 @@ pub enum DecorationThickness {
     Length(ComputedLp),
 }
 
+/// Computed `text-underline-offset`: `auto`, or an absolute length (a
+/// percentage is of the element's `1em`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum UnderlineOffset {
+    #[default]
+    Auto,
+    Px(f32),
+}
+
+/// The font of a decorating box: what layout needs to find the box's
+/// first available font, whose metrics place the box's lines (CSS Text
+/// Decoration 3 §2.1: a propagated line sits where the decorating box's
+/// font and baseline put it, not the text's).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecorationFont {
+    pub family: Arc<str>,
+    pub size: f32,
+    pub weight: u16,
+    pub style: FontStyle,
+    pub stretch: f32,
+}
+
+/// The lines one decorating box draws on the text inside it, with that
+/// box's look (what Blink keeps as its applied-decoration list).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedDecoration {
+    pub lines: TextDecorationLine,
+    pub style: TextDecorationStyle,
+    pub color: Rgba,
+    pub thickness: DecorationThickness,
+    /// The decorating box's `text-underline-offset` and
+    /// `text-underline-position`.
+    pub underline_offset: UnderlineOffset,
+    pub underline_position: TextUnderlinePosition,
+    pub font: DecorationFont,
+}
+
 /// One axis of a computed `background-position`: a percentage of the
 /// box plus a pixel offset (`right 10px` is 100% and -10px).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -130,23 +167,22 @@ pub struct ComputedStyle {
     pub font_stretch: f32,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
-    /// The decoration lines in effect on this element's text: its own
-    /// and those propagated from its ancestors.
-    pub text_decoration: TextDecorationLine,
-    /// The element's own `text-decoration-line` (what `getComputedStyle`
+    /// The element's own `text-decoration-*` (what `getComputedStyle`
     /// reports).
     pub text_decoration_line: TextDecorationLine,
     pub text_decoration_style: TextDecorationStyle,
     pub text_decoration_color: Rgba,
     pub text_decoration_thickness: DecorationThickness,
-    /// How the lines on this element's text are drawn: the decorating
-    /// box's style, colour and thickness (this element's own when it
-    /// declares lines, else the nearest ancestor's that does), as CSS
-    /// Text Decoration paints propagated lines. `text_decoration_*` above
-    /// stay the element's own values for `getComputedStyle`.
-    pub decoration_style: TextDecorationStyle,
-    pub decoration_color: Rgba,
-    pub decoration_thickness: DecorationThickness,
+    pub text_underline_position: TextUnderlinePosition,
+    pub text_underline_offset: UnderlineOffset,
+    pub text_decoration_skip_ink: TextDecorationSkipInk,
+    /// The decorating boxes whose lines are drawn on this element's text,
+    /// outermost first: every ancestor with lines of its own, up to the
+    /// nearest atomic inline, float or out-of-flow box (which start
+    /// afresh), then this element when it declares lines. Each entry is
+    /// drawn with its own box's look and font (CSS Text Decoration 3
+    /// §2.1). Shared with the parent when this element adds nothing.
+    pub decorations: Arc<[AppliedDecoration]>,
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
     pub letter_spacing: LetterSpacing,
@@ -240,14 +276,14 @@ impl ComputedStyle {
             font_stretch: 100.0,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Start,
-            text_decoration: TextDecorationLine::default(),
             text_decoration_line: TextDecorationLine::default(),
             text_decoration_style: TextDecorationStyle::Solid,
             text_decoration_color: Rgba::BLACK,
             text_decoration_thickness: DecorationThickness::Auto,
-            decoration_style: TextDecorationStyle::Solid,
-            decoration_color: Rgba::BLACK,
-            decoration_thickness: DecorationThickness::Auto,
+            text_underline_position: TextUnderlinePosition::default(),
+            text_underline_offset: UnderlineOffset::Auto,
+            text_decoration_skip_ink: TextDecorationSkipInk::Auto,
+            decorations: Arc::from(Vec::new()),
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             letter_spacing: LetterSpacing::Normal,
@@ -301,14 +337,26 @@ impl ComputedStyle {
         self.list_style_type = p.list_style_type;
         self.list_style_position = p.list_style_position;
         self.list_style_image = p.list_style_image.clone();
+        self.text_underline_position = p.text_underline_position;
+        self.text_underline_offset = p.text_underline_offset;
+        self.text_decoration_skip_ink = p.text_decoration_skip_ink;
         self.custom = p.custom.clone();
-        // Not inherited by spec, but the decoration propagates to all
-        // descendant text, which is what this achieves for now; its look
-        // comes along with it.
-        self.text_decoration = p.text_decoration;
-        self.decoration_style = p.decoration_style;
-        self.decoration_color = p.decoration_color;
-        self.decoration_thickness = p.decoration_thickness;
+        // Not inherited by spec, but the decorating boxes' lines reach
+        // every in-flow descendant's text, anonymous boxes included.
+        self.decorations = p.decorations.clone();
+    }
+
+    /// The decoration lines in effect on this element's text: the union
+    /// of every decorating box's.
+    pub fn decoration_lines(&self) -> TextDecorationLine {
+        let mut out = TextDecorationLine::default();
+        for d in self.decorations.iter() {
+            out.underline |= d.lines.underline;
+            out.overline |= d.lines.overline;
+            out.line_through |= d.lines.line_through;
+            out.blink |= d.lines.blink;
+        }
+        out
     }
 
     pub fn is_block_container(&self) -> bool {
@@ -722,12 +770,7 @@ pub fn compute(
     };
 
     pick!(text_align, TextAlign, TextAlign, |v| v.computed());
-    pick!(text_decoration, TextDecorationLine, TextDecorationLine, |v| *v);
-    out.text_decoration_line = out.text_decoration;
-    // Decoration propagates: union with the parent's.
-    out.text_decoration.underline |= parent.text_decoration.underline;
-    out.text_decoration.overline |= parent.text_decoration.overline;
-    out.text_decoration.line_through |= parent.text_decoration.line_through;
+    pick!(text_decoration_line, TextDecorationLine, TextDecorationLine, |v| *v);
     pick!(text_decoration_style, TextDecorationStyle, TextDecorationStyle, |v| *v);
     pick!(text_decoration_color, TextDecorationColor, TextDecorationColor, |v| v.resolve(current));
     if matches!(resolve(decls, PropertyId::TextDecorationColor), Resolved::Initial) {
@@ -738,19 +781,43 @@ pub fn compute(
         TextDecorationThickness::FromFont => DecorationThickness::FromFont,
         TextDecorationThickness::Length(l) => DecorationThickness::Length(lp(l)),
     });
-    // The lines are drawn as the decorating box says: this element when
-    // it declares lines of its own, else the ancestor whose lines
-    // propagate to it (CSS Text Decoration 3, "painting text
-    // decorations").
-    if out.text_decoration_line.is_none() {
-        out.decoration_style = parent.decoration_style;
-        out.decoration_color = parent.decoration_color;
-        out.decoration_thickness = parent.decoration_thickness;
-    } else {
-        out.decoration_style = out.text_decoration_style;
-        out.decoration_color = out.text_decoration_color;
-        out.decoration_thickness = out.text_decoration_thickness;
-    }
+    pick!(text_underline_position, TextUnderlinePosition, TextUnderlinePosition, |v| *v);
+    pick!(text_underline_offset, TextUnderlineOffset, TextUnderlineOffset, |v| match v {
+        TextUnderlineOffsetValue::Auto => UnderlineOffset::Auto,
+        TextUnderlineOffsetValue::Length(l) => UnderlineOffset::Px(l.to_computed(&ctx).resolve(out.font_size)),
+    });
+    pick!(text_decoration_skip_ink, TextDecorationSkipInk, TextDecorationSkipInk, |v| *v);
+    // The decorating boxes above reach this element's text (CSS Text
+    // Decoration 3 §2.1), except across an atomic inline, a float or an
+    // out-of-flow box, whose contents start afresh (what Blink's
+    // `StopPropagateTextDecorations` lists). An element with lines of its
+    // own is a decorating box too and adds its entry after theirs.
+    let stops = matches!(out.display, Display::InlineBlock | Display::InlineFlex)
+        || out.float != Float::None
+        || matches!(out.position, Position::Absolute | Position::Fixed);
+    out.decorations = match (stops, out.text_decoration_line.is_none()) {
+        (false, true) => parent.decorations.clone(),
+        (true, true) => Arc::from(Vec::new()),
+        (stops, false) => {
+            let mut list = if stops { Vec::new() } else { parent.decorations.to_vec() };
+            list.push(AppliedDecoration {
+                lines: out.text_decoration_line,
+                style: out.text_decoration_style,
+                color: out.text_decoration_color,
+                thickness: out.text_decoration_thickness,
+                underline_offset: out.text_underline_offset,
+                underline_position: out.text_underline_position,
+                font: DecorationFont {
+                    family: out.font_family.clone(),
+                    size: out.font_size,
+                    weight: out.font_weight,
+                    style: out.font_style,
+                    stretch: out.font_stretch,
+                },
+            });
+            Arc::from(list)
+        }
+    };
     pick!(text_transform, TextTransform, TextTransform, |v| *v);
     pick!(white_space, WhiteSpace, WhiteSpace, |v| *v);
     pick!(letter_spacing, LetterSpacing, LetterSpacing, |v| match v {
