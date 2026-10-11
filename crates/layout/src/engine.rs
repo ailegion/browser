@@ -2,7 +2,7 @@
 //! inline roots, then produces fragments.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use browser_dom::Document;
@@ -10,7 +10,6 @@ use browser_style::{
     ComputedStyle, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position, StyleMap, TextAlign,
     WordBreak,
 };
-use fontique::QueryStatus;
 use parley::layout::YieldData;
 use parley::style::{
     FontFamily, FontFeatures, FontStyle as PFontStyle, FontWeight, FontWidth, LineHeight as PLineHeight, StyleProperty,
@@ -26,16 +25,16 @@ use crate::boxes::{
     Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineContent, InlineLayout, TaffyId,
 };
 use crate::convert::to_taffy;
-use crate::decor::{Decorator, Family};
+use crate::decor::Decorator;
 use crate::{Brush, Cluster, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
 
 /// Owns the font system and parley's scratch state. One per tab thread.
 pub struct LayoutEngine {
     fonts: FontContext,
     lcx: LayoutContext<Brush>,
-    /// Whether the first font of a `font-family` list has the `smcp`
-    /// feature (real small caps), by list text; probed once each.
-    small_caps: HashMap<Arc<str>, bool>,
+    /// Whether a font (by blob id and collection index) has the `smcp`
+    /// feature (real small caps); read once per font.
+    smcp: HashMap<(u64, u32), bool>,
     /// Decoration geometry: decorating boxes' font metrics and glyph
     /// outlines for ink skipping, cached.
     decor: Decorator,
@@ -105,7 +104,7 @@ impl LayoutEngine {
         Self {
             fonts: FontContext::new(),
             lcx: LayoutContext::new(),
-            small_caps: HashMap::new(),
+            smcp: HashMap::new(),
             decor: Decorator::default(),
         }
     }
@@ -161,43 +160,6 @@ impl LayoutEngine {
         refresh(&mut tree.root, doc, styles, None, &mut self.decor, &mut self.fonts);
     }
 
-    /// Whether the first font of the `font-family` list `family` (the
-    /// list text as the style keeps it) has an OpenType `smcp` feature,
-    /// so `font-variant: small-caps` can use the font's own small
-    /// capitals rather than synthesized ones. Unknown families count as
-    /// lacking it: whatever font stands in for them gets the synthesis.
-    pub fn font_has_small_caps(&mut self, family: &Arc<str>) -> bool {
-        if let Some(&has) = self.small_caps.get(family) {
-            return has;
-        }
-        let families = Family::parse_list(family);
-        let mut has = false;
-        {
-            let mut query = self.fonts.collection.query(&mut self.fonts.source_cache);
-            query.set_families(families.iter().map(Family::query));
-            query.matches_with(|font| {
-                has = font_has_feature(font.blob.as_ref(), font.index, b"smcp");
-                QueryStatus::Stop
-            });
-        }
-        self.small_caps.insert(family.clone(), has);
-        has
-    }
-
-    /// The family lists in `styles` whose small caps must be synthesized.
-    fn small_caps_synth(&mut self, styles: &StyleMap) -> HashSet<Arc<str>> {
-        let mut out = HashSet::new();
-        for (_, style) in styles.iter() {
-            if style.font_variant == FontVariant::SmallCaps
-                && !out.contains(&style.font_family)
-                && !self.font_has_small_caps(&style.font_family)
-            {
-                out.insert(style.font_family.clone());
-            }
-        }
-        out
-    }
-
     /// Lay out a whole document in a viewport of the given size.
     pub fn layout(
         &mut self,
@@ -207,13 +169,7 @@ impl LayoutEngine {
         viewport_height: f32,
         images: &dyn ImageSizes,
     ) -> LayoutTree {
-        let small_caps_synth = self.small_caps_synth(styles);
-        let builder = BoxBuilder {
-            doc,
-            styles,
-            images,
-            small_caps_synth: &small_caps_synth,
-        };
+        let builder = BoxBuilder { doc, styles, images };
         let root_style = Arc::new(ComputedStyle::initial());
         let Some(mut html) = builder.build_root() else {
             return LayoutTree {
@@ -299,7 +255,7 @@ impl LayoutEngine {
         if let Some(marker) = &mut node.marker {
             self.prepare_atomics(marker, available_width);
             if let BoxKind::Inline(content) = &mut marker.kind {
-                ensure_layout(content, &mut self.fonts, &mut self.lcx, None);
+                ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, None);
             }
         }
         if let BoxKind::Inline(content) = &mut node.kind {
@@ -546,12 +502,13 @@ impl LayoutEngine {
     ) {
         let fonts = &mut self.fonts;
         let lcx = &mut self.lcx;
+        let smcp = &mut self.smcp;
         let result = tree.compute_layout_with_measure(root, available, |inputs, _id, ctx, style| {
             match ctx {
                 Some(Leaf::Inline(idx)) => {
                     let content = &mut *inlines[*idx];
                     taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
-                        measure_inline(content, fonts, lcx, known, avail)
+                        measure_inline(content, fonts, lcx, smcp, known, avail)
                     })
                 }
                 Some(Leaf::Image { intrinsic }) => {
@@ -577,7 +534,7 @@ impl LayoutEngine {
     ) {
         for (content, id) in inlines.iter_mut().zip(inline_ids) {
             let width = tree.layout(*id).map(|l| l.size.width).unwrap_or(0.0);
-            ensure_layout(content, &mut self.fonts, &mut self.lcx, Some(width));
+            ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, Some(width));
             // Keep only the final layout.
             content.cache.retain(|l| l.max_width == Some(width));
             // The `text-overflow` marker, in the container's font.
@@ -846,6 +803,7 @@ fn measure_inline(
     content: &mut InlineContent,
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
+    smcp: &mut HashMap<(u64, u32), bool>,
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
 ) -> Size<f32> {
@@ -857,24 +815,33 @@ fn measure_inline(
             AvailableSpace::MaxContent => None,
         },
     };
-    let il = ensure_layout(content, fonts, lcx, max_width);
+    let il = ensure_layout(content, fonts, lcx, smcp, max_width);
     let width = known.width.unwrap_or_else(|| il.layout.width().max(0.0));
     let height = known.height.unwrap_or_else(|| il.height.max(0.0));
     Size { width, height }
 }
 
-/// Get or build the parley layout for a width constraint.
+/// Get or build the parley layout for a width constraint. Small caps are
+/// decided here per shaped run, as browsers do: text of a `font-variant:
+/// small-caps` span whose run was shaped with a font that has the `smcp`
+/// feature keeps the feature; text whose font lacks it is synthesized
+/// (`InlineContent::synthesize_small_caps`) and shaped again.
 fn ensure_layout<'a>(
     content: &'a mut InlineContent,
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
+    smcp: &mut HashMap<(u64, u32), bool>,
     max_width: Option<f32>,
 ) -> &'a InlineLayout {
     let key = max_width.map(|w| (w * 4.0).round() / 4.0);
     if let Some(pos) = content.cache.iter().position(|l| l.max_width == key) {
         return &content.cache[pos];
     }
-    let (layout, height) = build_parley_layout(content, fonts, lcx, key);
+    let (mut layout, mut height) = build_parley_layout(content, fonts, lcx, key);
+    let ranges = small_caps_to_synthesize(&layout, content, smcp);
+    if !ranges.is_empty() && content.synthesize_small_caps(&ranges) {
+        (layout, height) = build_parley_layout(content, fonts, lcx, key);
+    }
     if content.cache.len() >= 4 {
         content.cache.remove(0);
     }
@@ -965,6 +932,53 @@ fn first_baseline_of(fragments: &[Fragment]) -> Option<f32> {
         }
     }
     None
+}
+
+/// The byte ranges of `content`'s text, sorted and merged, that lie in a
+/// `font-variant: small-caps` span, were shaped with a font that has no
+/// `smcp` feature, and hold a lowercase letter, so small caps must be
+/// synthesized for them. `smcp` caches the per-font answer.
+fn small_caps_to_synthesize(
+    layout: &parley::Layout<Brush>,
+    content: &InlineContent,
+    smcp: &mut HashMap<(u64, u32), bool>,
+) -> Vec<std::ops::Range<usize>> {
+    if !content.spans.iter().any(|s| s.style.font_variant == FontVariant::SmallCaps) {
+        return Vec::new();
+    }
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for line in layout.lines() {
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(run) = item else { continue };
+            let r = run.run();
+            let font = r.font();
+            let has = *smcp
+                .entry((font.data.id(), font.index))
+                .or_insert_with(|| font_has_feature(font.data.as_ref(), font.index, b"smcp"));
+            if has {
+                continue;
+            }
+            let range = r.text_range();
+            for span in &content.spans {
+                if span.style.font_variant != FontVariant::SmallCaps {
+                    continue;
+                }
+                let (start, end) = (range.start.max(span.start), range.end.min(span.end));
+                if start < end && content.text[start..end].chars().any(char::is_lowercase) {
+                    ranges.push(start..end);
+                }
+            }
+        }
+    }
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 /// Whether the font (at `index` in a collection file) lists the OpenType
@@ -1171,8 +1185,8 @@ fn push_style(
             None => builder.push_default(p),
         }
     }
-    // Small caps from the font's own `smcp` feature; a font without it
-    // ignores the feature and the box builder synthesized them.
+    // Small caps from the font's own `smcp` feature; text whose run's
+    // font lacks it is synthesized after shaping (`ensure_layout`).
     if style.font_variant == FontVariant::SmallCaps {
         let feature = StyleProperty::FontFeatures(FontFeatures::Source(Cow::Borrowed("\"smcp\"")));
         match &range {
@@ -1909,7 +1923,10 @@ mod tests {
              <li><i style='float:left;width:10px;height:10px'></i></li></ul></body>",
             "",
         );
-        let items: Vec<(Rect, Vec<(Rect, f32, bool)>)> = {
+        // Per item: its rect and its text fragments (rect, baseline y,
+        // is marker).
+        type ItemTexts = Vec<(Rect, Vec<(Rect, f32, bool)>)>;
+        let items: ItemTexts = {
             let ids: Vec<browser_dom::NodeId> = doc
                 .descendants(doc.root())
                 .filter(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "li"))
@@ -2135,20 +2152,46 @@ mod tests {
     }
 
     #[test]
-    fn font_stretch_and_small_caps_reach_the_font_system() {
-        // Both lay out; the probe answers once per family and is cached.
-        let (doc, tree) = layout(
-            "<body style='margin:0'><p style='font-stretch: condensed'>narrow</p><p style='font-variant: small-caps'>Small Caps</p></body>",
-            "",
-        );
+    fn font_stretch_reaches_the_font_system() {
+        let (doc, tree) = layout("<body style='margin:0'><p style='font-stretch: condensed'>narrow</p></body>", "");
         let (texts, _) = texts_of(&doc, &tree, "p");
         assert!(!texts.is_empty());
-        let mut engine = LayoutEngine::new();
-        let family: Arc<str> = Arc::from("serif");
-        let first = engine.font_has_small_caps(&family);
-        assert_eq!(engine.font_has_small_caps(&family), first);
-        assert_eq!(engine.small_caps.len(), 1);
-        assert!(!engine.font_has_small_caps(&Arc::from("\"No Such Font Family Here\"")), "unknown: synthesized");
+    }
+
+    #[test]
+    fn small_caps_follow_the_font_of_each_run() {
+        // Latin and Armenian lowercase in one small-caps span, shaped by
+        // whatever fonts the system has: every run is synthesized
+        // (capitals at 0.7 times the size) exactly when the font parley
+        // shaped it with has no `smcp`, and left to the font (lowercase
+        // text, full size, the feature on) when it has. A span that is
+        // not small-caps is never touched.
+        let (doc, tree, engine) = layout_with_engine(
+            "<body style='margin:0;font-size:20px'><p style='margin:0'><span style='font-variant:small-caps'>abc \u{561}\u{562}\u{563}</span> def</p></body>",
+            "",
+        );
+        let (texts, _) = texts_of(&doc, &tree, "span");
+        assert!(texts.len() >= 2, "{}", texts.len());
+        let mut fonts_seen = std::collections::HashSet::new();
+        for (_, t) in &texts {
+            fonts_seen.insert((t.font.data.id(), t.font.index));
+            let has = font_has_feature(t.font.data.as_ref(), t.font.index, b"smcp");
+            let shown = &t.text[t.range.clone()];
+            let letters: Vec<char> = shown.chars().filter(|c| c.is_alphabetic()).collect();
+            if letters.is_empty() {
+                continue;
+            }
+            if has {
+                assert!((t.font_size - 20.0).abs() < 0.01 && letters.iter().all(|c| c.is_lowercase()), "left to the font: {shown:?} at {}", t.font_size);
+            } else {
+                assert!((t.font_size - 14.0).abs() < 0.01 && letters.iter().all(|c| c.is_uppercase()), "synthesized: {shown:?} at {}", t.font_size);
+            }
+        }
+        // The answer was read once per font that shaped the span.
+        assert!(fonts_seen.iter().all(|k| engine.smcp.contains_key(k)));
+        let (texts, _) = texts_of(&doc, &tree, "p");
+        let def = texts.iter().find(|(_, t)| t.text[t.range.clone()].contains("def")).expect("def");
+        assert!((def.1.font_size - 20.0).abs() < 0.01);
     }
 
     #[test]

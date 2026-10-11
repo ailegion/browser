@@ -31,7 +31,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `skrifa` | 0.44.0 | Font parsing, glyph outlines | Direct dep of `layout` since 2026-10-11 (D14): a decorating box's font metrics place its decoration lines on any text under it, and glyph outlines give the ranges where an underline skips ink (`text-decoration-skip-ink`). Already in the tree under vello and parley; same version |
 | `harfrust` | 0.12.0 | Shaping (pure-Rust HarfBuzz port) | via parley; parley 0.11 no longer uses `swash` |
 | `parlance` | 0.1.0 | Font family list parsing (`FontFamily::Source` takes the CSS list text) | via parley |
-| `read-fonts` | 0.41.0 | Font table parsing (Fontations) | Direct dep of `layout` since 2026-10-11 (D14) to read a font's GSUB feature list: `font-variant: small-caps` uses the font's `smcp` feature when it has one and is synthesized otherwise. Already in the tree under `skrifa`; pinned to the same version so no second copy is compiled |
+| `read-fonts` | 0.41.0 | Font table parsing (Fontations) | Direct dep of `layout` since 2026-10-11 (D14) to read a font's GSUB feature list: `font-variant: small-caps` uses the `smcp` feature of the font each run was shaped with when it has one and is synthesized for that run otherwise. Already in the tree under `skrifa`; pinned to the same version so no second copy is compiled |
 
 ### Content
 

@@ -1268,13 +1268,16 @@ Work:
       script (`wordWrap`/`overflowWrap` both ways, the four as written,
       a percentage refused), tab harness (resolved values, inheritance
       into a child, a `letter-spacing` write widening the box at once).
-      **Block 2, 2026-10-11: `font-variant: small-caps`, `font-stretch`,
-      `text-decoration-style`/`-thickness` paint, `list-style-position`/
-      `-image`. Not done: two parts are SKIPPED, listed at the end of
-      this entry; the block is done when they are built.** The first
-      report of this block called it done with three parts built simpler
-      than browsers and named as "limits"; it was rejected. Decorations
-      were then redone (2026-10-11) as browsers draw them (CSS Text
+      **Block 2 done 2026-10-11: `font-variant: small-caps`,
+      `font-stretch`, `text-decoration-style`/`-thickness` paint,
+      `list-style-position`/`-image`, plus `text-underline-position`,
+      `text-underline-offset` and `text-decoration-skip-ink` (added by
+      the owner, since every underline differs from browsers without
+      them).** The first report of this block called it done with three
+      parts built simpler than browsers and named as "limits"; it was
+      rejected and the three were redone the same day: decorations, the
+      outside marker and the small-caps decision. Decorations
+      are drawn as browsers draw them (CSS Text
       Decoration 3 §2.1, Blink's applied-decoration list): `ComputedStyle::
       decorations` is the list of decorating boxes whose lines reach the
       element's text, outermost first: each ancestor with lines of its own
@@ -1318,14 +1321,18 @@ Work:
       needs the font system) rebuilds every text fragment's lines from
       its element's new style, generated markers from their element's.
       `font-stretch` goes to parley as
-      `FontWidth`. Small caps: `LayoutEngine::font_has_small_caps`
-      resolves the `font-family` list's first font through fontique and
-      reads its GSUB feature list with `read-fonts` (new direct
-      dependency, `03-crates.md`), cached per list; a font with `smcp`
-      gets the feature, one without (or an unknown family) gets Blink's
-      synthesis in the box builder: lowercase letters become capitals in
-      runs 0.7 times the size, each run its own span of the text node,
-      after `text-transform`. Markers: `list-style-image` (fetched by
+      `FontWidth`. Small caps are decided per shaped run, as browsers
+      decide them (redone 2026-10-11; the first build probed only the
+      family list's first installed font): the text is shaped as written
+      with the `smcp` feature on for `small-caps` spans; then every run's
+      font (the one parley shaped it with, fallback fonts included) is
+      read for `smcp` in its GSUB feature list (`read-fonts`, cached per
+      font), and the lowercase letters of `small-caps` spans in runs
+      whose font lacks it are synthesized (`InlineContent::
+      synthesize_small_caps`: capitals in runs 0.7 times the size, each
+      run its own span of the text node, offsets of later spans, atomics
+      and the marker following) and the root is shaped once more; runs
+      whose font has the feature keep it. Markers: `list-style-image` (fetched by
       the tab beside background images) replaces the type's text with an
       inline image box at its intrinsic size followed by a space, the
       image winning over `list-style-type: none`; until the image is
@@ -1358,9 +1365,10 @@ Work:
       added, own entry appended after the ancestors', inline-block,
       float and absolute start afresh, own values stay for the CSSOM;
       the three underline properties parsed, computed, inherited and
-      carried on the entry), layout (synthesized small caps runs and
-      spans, the `smcp` probe cached and false for an unknown family,
-      markers outside/inside/image at the box and fragment level with
+      carried on the entry), layout (small caps synthesized over given
+      ranges with spans, a growing `ß` and an atomic's offset following;
+      Latin and Armenian in one span each synthesized exactly when the
+      run's own font lacks `smcp`, the answer cached per font; markers outside/inside/image at the box and fragment level with
       the text at the content edge, decoration style/thickness/colour on
       fragments including propagation, percentages and `from-font`, a
       parent underline and a child line-through each with its own look,
@@ -1381,10 +1389,6 @@ Work:
       content edge and on the text's baseline, a block first child, an
       empty item one line tall, a float-only item zero height with the
       marker at its top).
-      SKIPPED, to be built before anything else in this block is called
-      done: the `smcp` probe reads only the family list's first installed
-      font; browsers decide per the font each run actually shapes with,
-      fallback fonts included.
    5. `fetch`, `Response`, `Request`, `Headers`, `XMLHttpRequest`, `URL`,
       `URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`.
    6. `localStorage`, `sessionStorage`, `history.pushState`/`popstate`.

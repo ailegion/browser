@@ -1,7 +1,7 @@
 //! Box tree construction: DOM + computed styles -> boxes that taffy lays
 //! out, with inline content gathered into inline roots.
 
-use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use browser_dom::{Document, NodeId, NodeKind};
@@ -194,6 +194,103 @@ impl InlineContent {
         }
     }
 
+    /// Synthesize small caps over `ranges` of the text (sorted, disjoint
+    /// byte ranges): every lowercase letter of a `font-variant:
+    /// small-caps` span inside them becomes its capital in a run of its
+    /// own at 0.7 times the size (Blink's ratio), the run a span of the
+    /// same node. Called by the engine after shaping for the ranges whose
+    /// font has no `smcp` feature, as browsers synthesize per shaped run.
+    /// Span, atomic and marker offsets follow the text; the layout cache
+    /// is dropped. Returns whether anything changed.
+    pub(crate) fn synthesize_small_caps(&mut self, ranges: &[Range<usize>]) -> bool {
+        let old = std::mem::take(&mut self.text);
+        let old_spans = std::mem::take(&mut self.spans);
+        // New offset of every old char boundary.
+        let mut map = vec![0usize; old.len() + 1];
+        let mut new = String::with_capacity(old.len() + 16);
+        let mut spans = Vec::with_capacity(old_spans.len());
+        let mut changed = false;
+        let mut next_range = 0;
+        let mut in_range = |pos: usize| {
+            while next_range < ranges.len() && ranges[next_range].end <= pos {
+                next_range += 1;
+            }
+            next_range < ranges.len() && ranges[next_range].start <= pos
+        };
+        let copy = |from: usize, to: usize, new: &mut String, map: &mut Vec<usize>| {
+            for (i, ch) in old[from..to].char_indices() {
+                map[from + i] = new.len();
+                new.push(ch);
+            }
+        };
+        let mut cursor = 0;
+        for span in old_spans {
+            copy(cursor, span.start, &mut new, &mut map);
+            let synth = span.style.font_variant == FontVariant::SmallCaps;
+            let mut small_style: Option<Arc<ComputedStyle>> = None;
+            let mut run_start = new.len();
+            let mut run_small = false;
+            for (i, ch) in old[span.start..span.end].char_indices() {
+                let o = span.start + i;
+                let small = synth && ch.is_lowercase() && in_range(o);
+                if small != run_small && new.len() > run_start {
+                    let style = if run_small {
+                        small_style.clone().unwrap_or_else(|| span.style.clone())
+                    } else {
+                        span.style.clone()
+                    };
+                    spans.push(TextSpan {
+                        start: run_start,
+                        end: new.len(),
+                        style,
+                        node: span.node,
+                    });
+                    run_start = new.len();
+                }
+                run_small = small;
+                map[o] = new.len();
+                if small {
+                    if small_style.is_none() {
+                        let mut s = (*span.style).clone();
+                        s.font_size *= 0.7;
+                        s.font_variant = FontVariant::Normal;
+                        small_style = Some(Arc::new(s));
+                    }
+                    new.extend(ch.to_uppercase());
+                    changed = true;
+                } else {
+                    new.push(ch);
+                }
+            }
+            if new.len() > run_start {
+                let style = if run_small {
+                    small_style.clone().unwrap_or_else(|| span.style.clone())
+                } else {
+                    span.style.clone()
+                };
+                spans.push(TextSpan {
+                    start: run_start,
+                    end: new.len(),
+                    style,
+                    node: span.node,
+                });
+            }
+            cursor = span.end;
+        }
+        copy(cursor, old.len(), &mut new, &mut map);
+        map[old.len()] = new.len();
+        for a in &mut self.atomics {
+            a.index = map[a.index];
+        }
+        self.marker_len = map[self.marker_len];
+        self.text = new;
+        self.spans = spans;
+        if changed {
+            self.cache.clear();
+        }
+        changed
+    }
+
     fn prepend(&mut self, text: &str, style: Arc<ComputedStyle>) {
         let n = text.len();
         for s in &mut self.spans {
@@ -247,10 +344,6 @@ pub(crate) struct BoxBuilder<'a> {
     pub doc: &'a Document,
     pub styles: &'a StyleMap,
     pub images: &'a dyn ImageSizes,
-    /// Font family lists whose first font has no `smcp` feature:
-    /// `font-variant: small-caps` text in them is synthesized (lowercase
-    /// letters as smaller capitals). Probed by the engine.
-    pub small_caps_synth: &'a HashSet<Arc<str>>,
 }
 
 /// Element nesting deeper than this is flattened: a stack overflow aborts
@@ -271,11 +364,6 @@ impl BoxBuilder<'_> {
 
     fn style_of(&self, id: NodeId) -> Option<Arc<ComputedStyle>> {
         self.styles.get(id).cloned()
-    }
-
-    /// Whether small caps in this style are synthesized.
-    fn synth_small_caps(&self, style: &ComputedStyle) -> bool {
-        style.font_variant == FontVariant::SmallCaps && self.small_caps_synth.contains(&style.font_family)
     }
 
     fn is_image(&self, id: NodeId) -> bool {
@@ -397,8 +485,7 @@ impl BoxBuilder<'_> {
             last_was_space: false,
             at_line_start: true,
         };
-        let synth = self.synth_small_caps(&text_style);
-        append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws, synth);
+        append_text(&mut content, text, Arc::new(text_style), Some(id), &mut ws);
         let mut inline = BoxNode::new(BoxKind::Inline(content), None, container);
         inline.anonymous = true;
         b.children.push(inline);
@@ -434,8 +521,7 @@ impl BoxBuilder<'_> {
                 last_was_space: false,
                 at_line_start: true,
             };
-            let synth = self.synth_small_caps(&style);
-            append_text(&mut content, &self.doc.text_content(id), style.clone(), None, &mut ws, synth);
+            append_text(&mut content, &self.doc.text_content(id), style.clone(), None, &mut ws);
             let mut inline = BoxNode::new(BoxKind::Inline(content), None, Arc::new(ComputedStyle::anonymous_from(&style)));
             inline.anonymous = true;
             vec![inline]
@@ -479,8 +565,7 @@ impl BoxBuilder<'_> {
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
                     let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
-                    let synth = self.synth_small_caps(container);
-                    append_text(content, text, container.clone(), Some(child), &mut ws, synth);
+                    append_text(content, text, container.clone(), Some(child), &mut ws);
                 }
                 NodeKind::Element(_) => {
                     let Some(style) = self.style_of(child) else { continue };
@@ -569,8 +654,7 @@ impl BoxBuilder<'_> {
         depth: usize,
     ) {
         if depth >= MAX_DEPTH {
-            let synth = self.synth_small_caps(&style);
-            append_text(content, &self.doc.text_content(id), style, Some(id), ws, synth);
+            append_text(content, &self.doc.text_content(id), style, Some(id), ws);
             return;
         }
         match self.inline_kind(id, &style) {
@@ -579,11 +663,10 @@ impl BoxBuilder<'_> {
             InlineKind::Plain => {}
         }
         // A plain inline element: its text joins the run with its own style.
-        let synth = self.synth_small_caps(&style);
         for child in self.doc.children(id) {
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
-                    append_text(content, text, style.clone(), Some(child), ws, synth);
+                    append_text(content, text, style.clone(), Some(child), ws);
                 }
                 NodeKind::Element(_) => {
                     let Some(cs) = self.style_of(child) else { continue };
@@ -727,94 +810,26 @@ fn is_inline_level(style: &ComputedStyle) -> bool {
     )
 }
 
-/// The style spans one text node's characters go into: the node's style,
-/// and for synthesized small caps a second one for the runs of lowercase
-/// letters shown as capitals at 0.7 times the size (Blink's ratio).
-struct SpanRuns {
-    style: Arc<ComputedStyle>,
-    small: Option<Arc<ComputedStyle>>,
-    node: Option<NodeId>,
-    /// Where the current run began, and whether it is the small one.
-    run_start: usize,
-    run_small: bool,
-}
-
-impl SpanRuns {
-    fn new(style: Arc<ComputedStyle>, node: Option<NodeId>, synth: bool, start: usize) -> Self {
-        let small = synth.then(|| {
-            let mut s = (*style).clone();
-            s.font_size *= 0.7;
-            Arc::new(s)
-        });
-        Self {
-            style,
-            small,
-            node,
-            run_start: start,
-            run_small: false,
-        }
-    }
-
-    fn close(&mut self, content: &mut InlineContent) {
-        let end = content.text.len();
-        if end > self.run_start {
-            let style = match (&self.small, self.run_small) {
-                (Some(small), true) => small.clone(),
-                _ => self.style.clone(),
-            };
-            content.spans.push(TextSpan {
-                start: self.run_start,
-                end,
-                style,
-                node: self.node,
-            });
-        }
-        self.run_start = end;
-    }
-
-    /// Push one character of the node's text; a lowercase letter under
-    /// synthesized small caps becomes its capital in the small run.
-    fn push(&mut self, content: &mut InlineContent, ch: char) {
-        let small = self.small.is_some() && ch.is_lowercase();
-        if small != self.run_small {
-            self.close(content);
-            self.run_small = small;
-        }
-        if small {
-            content.text.extend(ch.to_uppercase());
-        } else {
-            content.text.push(ch);
-        }
-    }
-}
-
 /// Append a text node's content with CSS white-space processing and
-/// text-transform applied, recording a style span for it (two kinds of
-/// span when small caps are synthesized, see `SpanRuns`).
-fn append_text(
-    content: &mut InlineContent,
-    text: &str,
-    style: Arc<ComputedStyle>,
-    node: Option<NodeId>,
-    ws: &mut WsState,
-    synth: bool,
-) {
+/// text-transform applied, recording a style span for it. Small caps are
+/// not synthesized here: the engine does that per shaped run
+/// (`InlineContent::synthesize_small_caps`).
+fn append_text(content: &mut InlineContent, text: &str, style: Arc<ComputedStyle>, node: Option<NodeId>, ws: &mut WsState) {
     let start = content.text.len();
     let mode = style.white_space;
     let transform = style.text_transform;
     let mut capitalize_next = true;
-    let mut runs = SpanRuns::new(style, node, synth, start);
 
     let mut push_char = |content: &mut InlineContent, ch: char| {
         match transform {
-            TextTransform::None => runs.push(content, ch),
-            TextTransform::Uppercase => ch.to_uppercase().for_each(|c| runs.push(content, c)),
-            TextTransform::Lowercase => ch.to_lowercase().for_each(|c| runs.push(content, c)),
+            TextTransform::None => content.text.push(ch),
+            TextTransform::Uppercase => content.text.extend(ch.to_uppercase()),
+            TextTransform::Lowercase => content.text.extend(ch.to_lowercase()),
             TextTransform::Capitalize => {
                 if capitalize_next && ch.is_alphanumeric() {
-                    ch.to_uppercase().for_each(|c| runs.push(content, c));
+                    content.text.extend(ch.to_uppercase());
                 } else {
-                    runs.push(content, ch);
+                    content.text.push(ch);
                 }
                 capitalize_next = !ch.is_alphanumeric();
             }
@@ -880,7 +895,10 @@ fn append_text(
             }
         }
     }
-    runs.close(content);
+    let end = content.text.len();
+    if end > start {
+        content.spans.push(TextSpan { start, end, style, node });
+    }
 }
 
 fn alpha(n: i64, upper: bool) -> String {
@@ -935,28 +953,49 @@ mod tests {
     }
 
     #[test]
-    fn small_caps_are_synthesized_for_fonts_without_the_feature() {
-        let (doc, styles) = build("<p style='font-variant: small-caps; font-size: 20px'>Hello <b>ab</b>!</p>");
-        let family = styles[doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "p")).expect("p")]
-            .font_family
-            .clone();
-        // The family lacks `smcp`: lowercase letters become capitals in
-        // runs 0.7 times the size, each run a span of its node.
-        let synth: HashSet<Arc<str>> = [family].into_iter().collect();
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &synth };
+    fn small_caps_are_synthesized_over_the_given_ranges() {
+        // Built as written; the engine asks for synthesis per shaped run.
+        let (doc, styles) = build("<p style='font-variant: small-caps; font-size: 20px'>Hello <b>ab</b>!<img src=x.png> stra\u{df}e</p>");
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares };
         let root = builder.build_root().expect("root");
         let p = &root.children[0].children[0];
         let BoxKind::Inline(c) = &p.children[0].kind else { panic!("inline root") };
-        assert_eq!(c.text, "HELLO AB!");
+        assert_eq!(c.text, "Hello ab! stra\u{df}e");
+        assert_eq!(c.spans.len(), 4);
+        assert_eq!(c.atomics[0].index, 9);
+        let mut c = InlineContent {
+            text: c.text.clone(),
+            spans: c.spans.iter().map(|s| TextSpan { start: s.start, end: s.end, style: s.style.clone(), node: s.node }).collect(),
+            atomics: Vec::new(),
+            container: c.container.clone(),
+            cache: Vec::new(),
+            floats: Vec::new(),
+            ellipsis: None,
+            marker_len: 0,
+        };
+        let img_index = 9;
+        c.atomics.push(Atomic {
+            index: img_index,
+            node: BoxNode::new(BoxKind::Image { url: None, intrinsic: None }, None, c.container.clone()),
+            result: None,
+        });
+        // Only "Hello " and "straße" need synthesis (their runs' font has
+        // no `smcp`); "ab" is left to its font. Lowercase letters become
+        // capitals in runs 0.7 times the size, each a span of its node;
+        // `ß` grows to "SS" and the image after it moves along.
+        assert!(c.synthesize_small_caps(&[0..6, 9..17]));
+        assert_eq!(c.text, "HELLO ab! STRASSE");
         let runs: Vec<(usize, usize, f32)> = c.spans.iter().map(|s| (s.start, s.end, s.style.font_size)).collect();
-        assert_eq!(runs, vec![(0, 1, 20.0), (1, 5, 14.0), (5, 6, 20.0), (6, 8, 14.0), (8, 9, 20.0)]);
+        assert_eq!(
+            runs,
+            vec![(0, 1, 20.0), (1, 5, 14.0), (5, 6, 20.0), (6, 8, 20.0), (8, 9, 20.0), (9, 10, 20.0), (10, 17, 14.0)]
+        );
         assert_eq!(c.spans[1].node, c.spans[0].node, "both runs belong to the text node");
-        // The family has `smcp`: the text is left to the font.
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
-        let root = builder.build_root().expect("root");
-        let BoxKind::Inline(c) = &root.children[0].children[0].children[0].kind else { panic!("inline root") };
-        assert_eq!(c.text, "Hello ab!");
-        assert_eq!(c.spans.len(), 3);
+        assert_eq!(c.spans[1].style.font_variant, FontVariant::Normal, "a synthesized run is not small caps again");
+        assert_eq!(c.atomics[0].index, img_index);
+        assert!(c.cache.is_empty());
+        // Nothing lowercase in the ranges: no change.
+        assert!(!c.synthesize_small_caps(std::slice::from_ref(&(0..1))));
     }
 
     #[test]
@@ -967,7 +1006,7 @@ mod tests {
              <li style='list-style-type: none; list-style-image: url(http://x/m.png)'>four</li>\
              <li style='list-style-type: none'>five</li></ul>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares, small_caps_synth: &HashSet::new() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares };
         let root = builder.build_root().expect("root");
         let ul = &root.children[0].children[0];
         let inline = |b: &BoxNode| match &b.kind {
@@ -1004,7 +1043,7 @@ mod tests {
     #[test]
     fn an_empty_item_gets_its_marker_as_its_one_line() {
         let (doc, styles) = build("<ul><li></li><li><div></div></li></ul>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
         let root = builder.build_root().expect("root");
         let ul = &root.children[0].children[0];
         // Nothing else to make a line: the marker root is in flow, hanging.
@@ -1036,7 +1075,7 @@ mod tests {
     #[test]
     fn collapses_whitespace_and_splits_blocks() {
         let (doc, styles) = build("<body>  Hello   <b>big</b>\n world <div>block</div> tail  </body>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["Hello big world", "block", "tail"]);
@@ -1045,7 +1084,7 @@ mod tests {
     #[test]
     fn pre_keeps_newlines_and_br_breaks() {
         let (doc, styles) = build("<pre>a\n  b</pre><p>x<br>y</p>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["a\n  b", "x\ny"]);
@@ -1054,7 +1093,7 @@ mod tests {
     #[test]
     fn list_markers() {
         let (doc, styles) = build("<ol start=3><li>a<li value=7>b<li>c</ol><ul><li>d</ul>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["3. ", "a", "7. ", "b", "8. ", "c", "\u{2022} ", "d"]);
@@ -1067,7 +1106,7 @@ mod tests {
              <input type=checkbox checked><input type=radio><select><option>One<option selected>Two</select>\
              <input type=submit><input type=button value='Go'><textarea>text\nhere</textarea><button>Push</button></body>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), small_caps_synth: &HashSet::new() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
         let root = builder.build_root().expect("root");
         // Controls are inline-level, so they sit in the body's inline
         // root as atomics; visit those too.
