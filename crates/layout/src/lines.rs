@@ -9,7 +9,7 @@ use browser_style::{ComputedLp, ComputedStyle, ComputedVerticalAlign, LineHeight
 use parley::{FontContext, PositionedLayoutItem};
 
 use crate::Brush;
-use crate::boxes::InlineContent;
+use crate::boxes::{InlineContent, LineItemId};
 use crate::decor::{Decorator, font_of};
 
 /// Where one line box and everything in it sits, in the inline root's
@@ -254,17 +254,26 @@ fn place_line(
                     }
                 }
             }
-            PositionedLayoutItem::InlineBox(b) => {
-                let index = b.id as usize;
-                let Some(atomic) = content.atomics.get(index) else { continue };
-                state.open(atomic.inline_box, content, metrics, decor, fonts);
-                let node = node_of_atomic(content, index);
-                state.present[node] = true;
-                state.parent[node] = node_of_box(atomic.inline_box);
-                let (height, baseline) = atomic.result.as_ref().map(|r| (r.height, r.baseline)).unwrap_or((0.0, 0.0));
-                state.above[node] = baseline;
-                state.below[node] = height - baseline;
-            }
+            PositionedLayoutItem::InlineBox(b) => match LineItemId::decode(b.id, content.atomics.len()) {
+                LineItemId::Atomic(index) => {
+                    let Some(atomic) = content.atomics.get(index) else { continue };
+                    state.open(atomic.inline_box, content, metrics, decor, fonts);
+                    let node = node_of_atomic(content, index);
+                    state.present[node] = true;
+                    state.parent[node] = node_of_box(atomic.inline_box);
+                    let (height, baseline) =
+                        atomic.result.as_ref().map(|r| (r.height, r.baseline)).unwrap_or((0.0, 0.0));
+                    state.above[node] = baseline;
+                    state.below[node] = height - baseline;
+                }
+                // An inline element's edge: the element is on the line with
+                // its line-height box, even when it has no content (CSS
+                // 2.1 §10.8: empty inline boxes with margins, padding or
+                // borders influence the line box).
+                LineItemId::Edge { inline_box, .. } => {
+                    state.open(Some(inline_box), content, metrics, decor, fonts);
+                }
+            },
         }
     }
 

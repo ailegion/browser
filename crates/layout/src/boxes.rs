@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use browser_dom::{Directionality, Document, NodeId, NodeKind, strong_direction};
 use browser_style::{
-    ComputedStyle, Direction, Display, Float, FontVariant, LetterSpacing, ListStylePosition, ListStyleType, Rgba,
-    StyleMap, TextTransform, UnicodeBidi, WhiteSpace,
+    BoxDecorationBreak, ComputedLp, ComputedLpAuto, ComputedStyle, Direction, Display, Float, FontVariant,
+    LetterSpacing, ListStylePosition, ListStyleType, Rgba, Sides, StyleMap, TextTransform, UnicodeBidi, WhiteSpace,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -85,9 +85,22 @@ pub(crate) struct TextSpan {
 /// An inline element (`display: inline`) inside an inline root: the chain
 /// of these, up to the root, is what `vertical-align` shifts a run or
 /// atomic against, and what contributes line-height boxes to the line.
+/// Its padding, border, margin and background are laid out and painted
+/// per line fragment (CSS 2.1 §9.4.2, §10.8; the inline box model).
 pub(crate) struct InlineBoxInfo {
     pub parent: Option<usize>,
     pub style: Arc<ComputedStyle>,
+    /// The element.
+    pub node: NodeId,
+    /// Byte range of the root's text the element's content occupies
+    /// (controls included; empty for an element with no text). Kept in
+    /// step with the text by every function that moves offsets.
+    pub start: usize,
+    pub end: usize,
+    /// Where the element's start and end fall in document order among the
+    /// atomics and inline boxes at the same text offset (`Atomic::seq`).
+    pub seq_start: u32,
+    pub seq_end: u32,
 }
 
 /// An inline-level box that is laid out on its own and placed in the line
@@ -100,6 +113,131 @@ pub(crate) struct Atomic {
     pub result: Option<AtomicResult>,
     /// The innermost inline element around the box, as for a `TextSpan`.
     pub inline_box: Option<usize>,
+    /// Document-order position among the atomics and inline box edges at
+    /// the same offset (an atomic sits before the character at its index).
+    pub seq: u32,
+}
+
+/// The edges of an inline box resolved for one layout width: percentages
+/// against the containing block's width (zero while the root's
+/// max-content or min-content size is measured, CSS Sizing 3 §5.2.1),
+/// `auto` margins zero (CSS 2.1 §10.3.1). Vertical margins are kept for
+/// the used values the CSSOM reports; they take no space (§10.6.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct ResolvedEdges {
+    pub margin: Sides<f32>,
+    pub border: Sides<f32>,
+    pub padding: Sides<f32>,
+    /// `box-decoration-break: clone`: every line fragment gets every edge.
+    pub clone: bool,
+    /// The box has something to lay out or paint: a non-zero margin,
+    /// border or padding on any side, or a background. Such a box gets
+    /// edge items in the line (so its edges take inline space and its
+    /// line-height box counts even when it is empty, CSS 2.1 §9.4.2,
+    /// §10.8), and shaping breaks at its boundaries as it does in browsers
+    /// at a box with decorations.
+    pub decorated: bool,
+}
+
+/// Whether an inline element has decorations: a margin, border or padding
+/// that is not zero on some side (a percentage counts, whatever it later
+/// resolves to), or a background. Such an element has fragments to lay out
+/// and paint even without content, and shaping breaks at its edges.
+pub(crate) fn has_decorations(style: &ComputedStyle) -> bool {
+    let lp = |v: ComputedLp| !matches!(v, ComputedLp::Px(0.0));
+    let lpa = |v: ComputedLpAuto| !matches!(v, ComputedLpAuto::Px(0.0) | ComputedLpAuto::Auto);
+    let (m, p, b) = (&style.margin, &style.padding, &style.border_width);
+    lpa(m.top)
+        || lpa(m.right)
+        || lpa(m.bottom)
+        || lpa(m.left)
+        || lp(p.top)
+        || lp(p.right)
+        || lp(p.bottom)
+        || lp(p.left)
+        || b.top > 0.0
+        || b.right > 0.0
+        || b.bottom > 0.0
+        || b.left > 0.0
+        || !style.background_color.is_transparent()
+        || style.background_image.is_some()
+}
+
+impl ResolvedEdges {
+    pub fn resolve(style: &ComputedStyle, basis: f32) -> Self {
+        let lp = |v: ComputedLp| v.resolve(basis);
+        let lpa = |v: ComputedLpAuto| v.resolve(basis).unwrap_or(0.0);
+        let margin = Sides {
+            top: lpa(style.margin.top),
+            right: lpa(style.margin.right),
+            bottom: lpa(style.margin.bottom),
+            left: lpa(style.margin.left),
+        };
+        let padding = Sides {
+            top: lp(style.padding.top),
+            right: lp(style.padding.right),
+            bottom: lp(style.padding.bottom),
+            left: lp(style.padding.left),
+        };
+        Self {
+            margin,
+            border: style.border_width,
+            padding,
+            clone: style.box_decoration_break == BoxDecorationBreak::Clone,
+            decorated: has_decorations(style),
+        }
+    }
+
+    /// The inline space the left edge takes: margin, border and padding.
+    pub fn left(&self) -> f32 {
+        self.margin.left + self.border.left + self.padding.left
+    }
+
+    pub fn right(&self) -> f32 {
+        self.margin.right + self.border.right + self.padding.right
+    }
+
+    /// The box's inline-start edge: left for a left-to-right box, right
+    /// for a right-to-left one (CSS Writing Modes 3 §6).
+    pub fn start(&self, rtl: bool) -> f32 {
+        if rtl { self.right() } else { self.left() }
+    }
+
+    pub fn end(&self, rtl: bool) -> f32 {
+        if rtl { self.left() } else { self.right() }
+    }
+}
+
+/// What a parley inline box in a paragraph stands for: an atomic of the
+/// root, or the start or end edge of an inline element (an `AttachedToNext`
+/// or `AttachedToPrevious` box reserving the edge's width).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineItemId {
+    Atomic(usize),
+    Edge { inline_box: usize, end: bool },
+}
+
+impl LineItemId {
+    /// Atomics are numbered first, then the edges two per inline box.
+    pub fn encode(self, atomics: usize) -> u64 {
+        match self {
+            LineItemId::Atomic(i) => i as u64,
+            LineItemId::Edge { inline_box, end } => (atomics + 2 * inline_box + usize::from(end)) as u64,
+        }
+    }
+
+    pub fn decode(id: u64, atomics: usize) -> Self {
+        let id = id as usize;
+        if id < atomics {
+            LineItemId::Atomic(id)
+        } else {
+            let v = id - atomics;
+            LineItemId::Edge {
+                inline_box: v / 2,
+                end: v % 2 == 1,
+            }
+        }
+    }
 }
 
 pub(crate) struct AtomicResult {
@@ -134,6 +272,10 @@ pub(crate) struct InlineLayout {
     /// Height of all the lines, including gaps left when a line was
     /// pushed below a float.
     pub height: f32,
+    /// Each inline box's edges as this layout resolved them (one entry
+    /// per `InlineContent::boxes`), so the fragments carry what the lines
+    /// were broken with.
+    pub edges: Vec<ResolvedEdges>,
 }
 
 impl InlineLayout {
@@ -234,6 +376,8 @@ pub(crate) struct InlineContent {
     /// `inside` marker this root is the item's first line; for an
     /// `outside` one the root is the marker's own (`BoxNode::marker`).
     pub marker_len: usize,
+    /// The next document-order number for an atomic or inline box edge.
+    next_seq: u32,
 }
 
 /// The laid-out `text-overflow` marker of an inline root.
@@ -255,6 +399,7 @@ impl InlineContent {
             floats: Vec::new(),
             ellipsis: None,
             marker_len: 0,
+            next_seq: 0,
         };
         // A block container's override applies to all of its inline
         // content: the paragraph is wrapped in it (`finish` closes it).
@@ -267,6 +412,14 @@ impl InlineContent {
             });
         }
         content
+    }
+
+    /// The next document-order number (`Atomic::seq`, `InlineBoxInfo::
+    /// seq_start`/`seq_end`).
+    fn seq(&mut self) -> u32 {
+        let s = self.next_seq;
+        self.next_seq += 1;
+        s
     }
 
     /// Append bidi control characters: a nodeless span the engine shapes
@@ -391,6 +544,16 @@ impl InlineContent {
                 a.index += n;
             }
         }
+        // A box starting at the position follows the controls (as its
+        // spans do); one spanning it grows.
+        for b in &mut self.boxes {
+            if b.start >= pos {
+                b.start += n;
+                b.end += n;
+            } else if b.end > pos {
+                b.end += n;
+            }
+        }
         if self.marker_len > pos {
             self.marker_len += n;
         }
@@ -406,10 +569,13 @@ impl InlineContent {
         self.container.text_overflow.marker()
     }
 
-    /// Whether the root shows nothing: no atomics and no text beyond
-    /// white space and bidi controls.
+    /// Whether the root shows nothing: no atomics, no inline element with
+    /// decorations (which makes a line even empty, CSS 2.1 §9.4.2) and no
+    /// text beyond white space and bidi controls.
     fn is_empty(&self) -> bool {
-        self.atomics.is_empty() && self.text.chars().all(|c| c.is_whitespace() || is_bidi_control(c))
+        self.atomics.is_empty()
+            && !self.boxes.iter().any(|b| has_decorations(&b.style))
+            && self.text.chars().all(|c| c.is_whitespace() || is_bidi_control(c))
     }
 
     /// Remove a collapsible space at the end of the run (CSS Text 3, step
@@ -438,6 +604,14 @@ impl InlineContent {
         for a in &mut self.atomics {
             if a.index > pos {
                 a.index -= 1;
+            }
+        }
+        for b in &mut self.boxes {
+            if b.start > pos {
+                b.start -= 1;
+            }
+            if b.end > pos {
+                b.end -= 1;
             }
         }
     }
@@ -532,6 +706,10 @@ impl InlineContent {
         for a in &mut self.atomics {
             a.index = map[a.index];
         }
+        for b in &mut self.boxes {
+            b.start = map[b.start];
+            b.end = map[b.end];
+        }
         self.marker_len = map[self.marker_len];
         self.text = new;
         self.spans = spans;
@@ -549,6 +727,10 @@ impl InlineContent {
         }
         for a in &mut self.atomics {
             a.index += n;
+        }
+        for b in &mut self.boxes {
+            b.start += n;
+            b.end += n;
         }
         self.text.insert_str(0, text);
         self.spans.insert(
@@ -895,11 +1077,13 @@ impl BoxBuilder<'_> {
         inline_box: Option<usize>,
     ) {
         let node = self.build_element(id, style, depth + 1);
+        let seq = content.seq();
         content.atomics.push(Atomic {
             index: content.text.len(),
             node,
             result: None,
             inline_box,
+            seq,
         });
         ws.last_was_space = false;
         ws.at_line_start = false;
@@ -930,11 +1114,19 @@ impl BoxBuilder<'_> {
         // A plain inline element: an inline box of the root; its text
         // joins the run with its own style, inside the bidi controls its
         // `unicode-bidi` asks for.
+        let start = content.text.len();
+        let seq_start = content.seq();
         content.boxes.push(InlineBoxInfo {
             parent,
             style: style.clone(),
+            node: id,
+            start,
+            end: start,
+            seq_start,
+            seq_end: seq_start,
         });
-        let me = Some(content.boxes.len() - 1);
+        let me_index = content.boxes.len() - 1;
+        let me = Some(me_index);
         let controls = bidi_controls(&style);
         if let Some((open, close)) = controls {
             content.enter_bidi(BidiContext {
@@ -965,6 +1157,8 @@ impl BoxBuilder<'_> {
         if controls.is_some() {
             content.exit_bidi();
         }
+        content.boxes[me_index].end = content.text.len();
+        content.boxes[me_index].seq_end = content.seq();
     }
 
     /// The list item's marker: the `list-style-image` when the image is
@@ -1017,6 +1211,7 @@ impl BoxBuilder<'_> {
                     node,
                     result: None,
                     inline_box: None,
+                    seq: 0,
                 }
             })
         };
@@ -1295,6 +1490,7 @@ mod tests {
             floats: Vec::new(),
             ellipsis: None,
             marker_len: 0,
+            next_seq: 0,
         };
         let img_index = 9;
         c.atomics.push(Atomic {
@@ -1302,6 +1498,7 @@ mod tests {
             node: BoxNode::new(BoxKind::Image { url: None, intrinsic: None }, None, c.container.clone()),
             result: None,
             inline_box: None,
+            seq: 0,
         });
         // Only "Hello " and "straße" need synthesis (their runs' font has
         // no `smcp`); "ab" is left to its font. Lowercase letters become

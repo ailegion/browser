@@ -15,18 +15,18 @@ use parley::style::{
     FontFamily, FontFeatures, FontStyle as PFontStyle, FontWeight, FontWidth, LineHeight as PLineHeight, StyleProperty,
 };
 use parley::{
-    Alignment, AlignmentOptions, FontContext, InlineBox, InlineBoxKind, LayoutContext, OverflowWrap as POverflowWrap,
-    PositionedLayoutItem, TextWrapMode, WordBreak as PWordBreak,
+    Alignment, AlignmentOptions, ClonedDecoration, FontContext, InlineBox, InlineBoxKind, LayoutContext,
+    OverflowWrap as POverflowWrap, PositionedLayoutItem, TextWrapMode, WordBreak as PWordBreak,
 };
 use read_fonts::TableProvider;
 use taffy::prelude::*;
 
 use crate::boxes::{
-    Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineContent, InlineLayout, Paragraph,
-    TaffyId,
+    Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineBoxInfo, InlineContent,
+    InlineLayout, LineItemId, Paragraph, ResolvedEdges, TaffyId, is_bidi_control,
 };
 use crate::convert::to_taffy;
-use crate::decor::Decorator;
+use crate::decor::{Decorator, font_of};
 use crate::lines::{LinePlacement, node_of_atomic, node_of_box, place_lines};
 use crate::{Brush, Cluster, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
 
@@ -302,7 +302,7 @@ impl LayoutEngine {
         let text: Arc<str> = Arc::from(content.text.as_str());
         let mut kids = Vec::new();
         for p in &il.paragraphs {
-            emit_text_fragments(content, &text, p, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
+            emit_text_fragments(content, &text, p, &il.edges, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
         }
         Fragment {
             rect: Rect::new(x, y, width, il.height),
@@ -615,6 +615,7 @@ impl LayoutEngine {
                             content,
                             &text,
                             p,
+                            &il.edges,
                             x,
                             y,
                             overflow,
@@ -867,13 +868,21 @@ fn ensure_layout<'a>(
     if let Some(pos) = content.cache.iter().position(|l| l.max_width == key) {
         return &content.cache[pos];
     }
-    let (mut paragraphs, mut height) = build_paragraphs(content, fonts, lcx, decor, key);
+    // The inline boxes' edges for this width: percentages against the
+    // containing block's width, zero while an intrinsic size is measured
+    // (CSS Sizing 3 §5.2.1).
+    let edges: Vec<ResolvedEdges> = content
+        .boxes
+        .iter()
+        .map(|b| ResolvedEdges::resolve(&b.style, key.unwrap_or(0.0)))
+        .collect();
+    let (mut paragraphs, mut height) = build_paragraphs(content, fonts, lcx, decor, key, &edges);
     let ranges: Vec<std::ops::Range<usize>> = paragraphs
         .iter()
         .flat_map(|p| small_caps_to_synthesize(&p.layout, content, smcp, p.range.start))
         .collect();
     if !ranges.is_empty() && content.synthesize_small_caps(&ranges) {
-        (paragraphs, height) = build_paragraphs(content, fonts, lcx, decor, key);
+        (paragraphs, height) = build_paragraphs(content, fonts, lcx, decor, key, &edges);
     }
     if content.cache.len() >= 4 {
         content.cache.remove(0);
@@ -882,8 +891,30 @@ fn ensure_layout<'a>(
         max_width: key,
         paragraphs,
         height,
+        edges,
     });
     content.cache.last().expect("just pushed")
+}
+
+/// Where an inline box's end edge goes: after its last content, before the
+/// bidi controls that close it and before a forced break that ends it
+/// (`<span>a<br></span>`: the edge stays on the line before the break, as
+/// Blink places close tags that follow a forced break).
+fn edge_end(text: &str, b: &InlineBoxInfo) -> usize {
+    let strip_controls = |mut e: usize| {
+        while e > b.start {
+            match text[..e].chars().next_back() {
+                Some(c) if is_bidi_control(c) => e -= c.len_utf8(),
+                _ => break,
+            }
+        }
+        e
+    };
+    let mut e = strip_controls(b.end);
+    if e > b.start && text[..e].ends_with('\n') {
+        e = strip_controls(e - 1);
+    }
+    e.max(b.start)
 }
 
 /// The byte ranges of a text's bidi paragraphs: each forced break ends
@@ -906,13 +937,18 @@ fn paragraph_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
 /// Shape, line-break and place the inline content paragraph by paragraph,
 /// each stacked under the one before; returns the paragraphs and the
 /// height of all their lines (which includes any gap left by lines pushed
-/// below floats).
+/// below floats). `edges` are the inline boxes' resolved edges: a
+/// decorated box's start and end edges go into the paragraph as inline
+/// boxes glued to its content (so they take inline space and break with
+/// the text), and a `box-decoration-break: clone` box's edges are reserved
+/// on every line it is broken over.
 fn build_paragraphs(
     content: &InlineContent,
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
     decor: &mut Decorator,
     max_width: Option<f32>,
+    edges: &[ResolvedEdges],
 ) -> (Vec<Paragraph>, f32) {
     let container = &content.container;
     let ranges = paragraph_ranges(&content.text);
@@ -922,6 +958,7 @@ fn build_paragraphs(
     // Spans are in text order: each paragraph takes the ones overlapping
     // it from where the previous one stopped.
     let mut first_span = 0;
+    let n_atomics = content.atomics.len();
     for (pi, range) in ranges.into_iter().enumerate() {
         let base = range.start;
         let slice = &content.text[range.clone()];
@@ -939,22 +976,75 @@ fn build_paragraphs(
                 push_style(&mut builder, &span.style, Some(start - base..end - base));
             }
         }
+        // The paragraph's inline-level items in document order: atomics
+        // and the edges of decorated inline boxes at their offsets (an
+        // offset at the paragraph's end belongs to the next paragraph,
+        // except in the last one).
+        let inside = |index: usize| index >= base && (index < range.end || (pi == last && index == range.end));
+        let mut items: Vec<(usize, u32, LineItemId)> = Vec::new();
         for (i, atomic) in content.atomics.iter().enumerate() {
-            let inside = atomic.index >= base && (atomic.index < range.end || (pi == last && atomic.index == range.end));
-            if !inside {
+            if inside(atomic.index) {
+                items.push((atomic.index, atomic.seq, LineItemId::Atomic(i)));
+            }
+        }
+        for (bi, b) in content.boxes.iter().enumerate() {
+            if !edges[bi].decorated {
                 continue;
             }
-            let (w, h) = atomic
-                .result
-                .as_ref()
-                .map(|r| (r.width, r.height))
-                .unwrap_or((0.0, 0.0));
+            if inside(b.start) {
+                items.push((b.start, b.seq_start, LineItemId::Edge { inline_box: bi, end: false }));
+            }
+            let end = edge_end(&content.text, b);
+            if inside(end) {
+                items.push((end, b.seq_end, LineItemId::Edge { inline_box: bi, end: true }));
+            }
+        }
+        items.sort_by_key(|&(index, seq, _)| (index, seq));
+        for (index, _, id) in items {
+            let (kind, width, height) = match id {
+                LineItemId::Atomic(i) => {
+                    let (w, h) = content.atomics[i]
+                        .result
+                        .as_ref()
+                        .map(|r| (r.width, r.height))
+                        .unwrap_or((0.0, 0.0));
+                    (InlineBoxKind::InFlow, w, h)
+                }
+                LineItemId::Edge { inline_box, end } => {
+                    let rtl = content.boxes[inline_box].style.direction == Direction::Rtl;
+                    let e = &edges[inline_box];
+                    if end {
+                        (InlineBoxKind::AttachedToPrevious, e.end(rtl), 0.0)
+                    } else {
+                        (InlineBoxKind::AttachedToNext, e.start(rtl), 0.0)
+                    }
+                }
+            };
             builder.push_inline_box(InlineBox {
-                id: i as u64,
-                kind: InlineBoxKind::InFlow,
-                index: atomic.index - base,
-                width: w,
-                height: h,
+                id: id.encode(n_atomics),
+                kind,
+                index: index - base,
+                width,
+                height,
+            });
+        }
+        // `box-decoration-break: clone`: a line that starts or ends inside
+        // the box carries the edge there too.
+        for (bi, b) in content.boxes.iter().enumerate() {
+            let e = &edges[bi];
+            if !e.clone || !e.decorated {
+                continue;
+            }
+            let end = edge_end(&content.text, b);
+            if b.start >= range.end || end <= base || b.start >= end {
+                continue;
+            }
+            let rtl = b.style.direction == Direction::Rtl;
+            builder.push_cloned_decoration(ClonedDecoration {
+                begins: (b.start >= base).then(|| b.start - base),
+                ends: (end < range.end).then(|| end - base),
+                start: e.start(rtl),
+                end: e.end(rtl),
             });
         }
         let mut layout = builder.build(slice);
@@ -1492,15 +1582,79 @@ fn emit_marker(
     }
 }
 
-/// Turn one paragraph of an inline root into text and atomic fragments
-/// positioned at (`ox`, `oy`), the root's top-left. With `overflow` (the
-/// root's width and its `text-overflow` marker), a line that overflows
-/// the root is cut where the marker still fits and ends with the marker.
+/// One thing on a line, in visual order, at the position parley gave it
+/// before the inline boxes' edges are placed (`place_line_items`).
+struct LineItem {
+    kind: LineItemKind,
+    /// Parley's extent in the root's coordinates.
+    x0: f32,
+    x1: f32,
+    /// The innermost inline element around it (`None`: the root).
+    inline_box: Option<usize>,
+}
+
+enum LineItemKind {
+    /// A text fragment, its rect at x 0 until it is placed;
+    /// `glyphs_per_cluster[i]` glyphs belong to `clusters[i]`.
+    Text {
+        fragment: Fragment,
+        glyphs_per_cluster: Vec<usize>,
+    },
+    /// The `index`th atomic's fragment, its border box at the origin.
+    Atomic {
+        index: usize,
+        fragment: Fragment,
+        baseline: f32,
+    },
+    /// The start or end edge of the inline element `inline_box` (no
+    /// extent here: the edge's width is placed with the element's
+    /// fragment).
+    Edge { end: bool },
+    /// An empty inline element with no edges: where it sits.
+    Empty,
+}
+
+/// Whether the inline element `inline_box` or one of its ancestors is `b`.
+fn chain_contains(content: &InlineContent, mut inline_box: Option<usize>, b: usize) -> bool {
+    while let Some(i) = inline_box {
+        if i == b {
+            return true;
+        }
+        inline_box = content.boxes[i].parent;
+    }
+    false
+}
+
+/// The inline elements around `inline_box`, outermost first.
+fn chain_of(content: &InlineContent, mut inline_box: Option<usize>) -> Vec<usize> {
+    let mut chain = Vec::new();
+    while let Some(i) = inline_box {
+        chain.push(i);
+        inline_box = content.boxes[i].parent;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Whether a space in text of this `white-space` collapses (and so is
+/// removed at the end of a line; CSS Text 3 §4.1.3).
+fn collapses_spaces(ws: browser_style::WhiteSpace) -> bool {
+    use browser_style::WhiteSpace;
+    matches!(ws, WhiteSpace::Normal | WhiteSpace::Nowrap | WhiteSpace::PreLine)
+}
+
+/// Turn one paragraph of an inline root into fragments positioned at
+/// (`ox`, `oy`), the root's top-left: per line, the text and atomic
+/// fragments, each inline element's line fragment holding its content
+/// with its edges placed (`place_line_items`). With `overflow` (the root's
+/// width and its `text-overflow` marker), a line that overflows the root
+/// is cut where the marker still fits and ends with the marker.
 #[allow(clippy::too_many_arguments)]
 fn emit_text_fragments(
     content: &InlineContent,
     text: &Arc<str>,
     paragraph: &Paragraph,
+    edges: &[ResolvedEdges],
     ox: f32,
     oy: f32,
     overflow: Option<(f32, &Ellipsis)>,
@@ -1513,15 +1667,21 @@ fn emit_text_fragments(
     let base = paragraph.range.start;
     let styles = layout.styles();
     let rtl = layout.is_rtl();
-    for (line, placement) in layout.lines().zip(&paragraph.lines) {
+    let n_atomics = content.atomics.len();
+    let last_paragraph = paragraph.range.end == content.text.len();
+    let line_count = layout.len();
+    for (li, (line, placement)) in layout.lines().zip(&paragraph.lines).enumerate() {
         let line_top = placement.top;
         let line_height = placement.height;
-        let trunc = overflow.and_then(|(width, marker)| Truncation::for_line(&line, width, marker, rtl));
-        // The edge of the kept content nearest the marker, and whether
-        // anything was dropped.
-        let mut kept_edge: Option<f32> = None;
-        let mut truncated = false;
-        let line_first = out.len();
+        // The line's text, in the root's offsets (a line of boxes alone has
+        // no text: parley reports an inverted range).
+        let raw = line.text_range();
+        let lr = if raw.start <= raw.end {
+            raw.start + base..raw.end + base
+        } else {
+            raw.end + base..raw.end + base
+        };
+        let mut items: Vec<LineItem> = Vec::new();
         // A run is one font over any number of DOM spans and parley styles;
         // parley yields one GlyphRun per style range, and identical styles
         // merge across spans. Each run is walked once, cluster by cluster,
@@ -1543,6 +1703,7 @@ fn emit_text_fragments(
                                 x1: f32,
                                 mut glyphs: Vec<PositionedGlyph>,
                                 clusters: Vec<Cluster>,
+                                glyphs_per_cluster: Vec<usize>,
                                 span: Option<usize>,
                                 style_idx: usize| {
                         let (span_style, node, inline_box) = span
@@ -1576,14 +1737,23 @@ fn emit_text_fragments(
                             decorations: Vec::new(),
                             baseline,
                         };
-                        Fragment {
-                            rect: Rect::new(ox + x0, oy + line_top, x1 - x0, line_height),
+                        let fragment = Fragment {
+                            rect: Rect::new(0.0, oy + line_top, x1 - x0, line_height),
                             node,
                             style: span_style,
                             content: FragmentContent::Text(text),
                             children: Vec::new(),
                             padding: Default::default(),
                             margin: Default::default(),
+                        };
+                        LineItem {
+                            kind: LineItemKind::Text {
+                                fragment,
+                                glyphs_per_cluster,
+                            },
+                            x0,
+                            x1,
+                            inline_box,
                         }
                     };
 
@@ -1591,24 +1761,12 @@ fn emit_text_fragments(
                     let mut frag_x0 = x;
                     let mut glyphs: Vec<PositionedGlyph> = Vec::new();
                     let mut clusters: Vec<Cluster> = Vec::new();
+                    let mut per_cluster: Vec<usize> = Vec::new();
                     let mut current: Option<(Option<usize>, usize)> = None;
                     for cluster in r.visual_clusters() {
                         let text_range = cluster.text_range();
                         let text_range = text_range.start + base..text_range.end + base;
                         let start = text_range.start;
-                        if let Some(t) = &trunc
-                            && !t.keeps(x, x + cluster.advance())
-                        {
-                            truncated = true;
-                            if t.rtl {
-                                // Dropped from the left; the kept content
-                                // starts where the first kept cluster does.
-                                x += cluster.advance();
-                                frag_x0 = x;
-                                continue;
-                            }
-                            break;
-                        }
                         let span = content.spans.iter().position(|s| s.start <= start && start < s.end);
                         let style_idx = cluster
                             .glyphs()
@@ -1619,24 +1777,24 @@ fn emit_text_fragments(
                         let key = (span, style_idx);
                         if current.is_some_and(|c| c != key) && !glyphs.is_empty() {
                             let (prev_span, prev_style) = current.unwrap_or(key);
-                            let mut fragment = make(
+                            let item = make(
                                 frag_x0,
                                 x,
                                 std::mem::take(&mut glyphs),
                                 std::mem::take(&mut clusters),
+                                std::mem::take(&mut per_cluster),
                                 prev_span,
                                 prev_style,
                             );
-                            if !controls_only(&fragment) {
-                                decorate(&mut fragment, decor, fonts);
-                                out.push(fragment);
+                            if !matches!(&item.kind, LineItemKind::Text { fragment, .. } if controls_only(fragment)) {
+                                items.push(item);
                             }
                             frag_x0 = x;
                         }
                         current = Some(key);
                         let cluster_x = x - frag_x0;
-                        let cluster_left = x;
                         let mut advance = 0.0;
+                        let mut count = 0;
                         for g in cluster.glyphs() {
                             // Relative to the run's baseline; `make` adds
                             // the placed baseline.
@@ -1647,6 +1805,7 @@ fn emit_text_fragments(
                             });
                             x += g.advance;
                             advance += g.advance;
+                            count += 1;
                         }
                         clusters.push(Cluster {
                             start: text_range.start,
@@ -1655,58 +1814,63 @@ fn emit_text_fragments(
                             advance,
                             rtl: run_rtl,
                         });
-                        kept_edge = Some(match kept_edge {
-                            Some(k) if rtl => k.min(cluster_left),
-                            Some(k) => k.max(x),
-                            None if rtl => cluster_left,
-                            None => x,
-                        });
+                        per_cluster.push(count);
                     }
                     if !glyphs.is_empty()
                         && let Some((span, style_idx)) = current
                     {
-                        let mut fragment = make(frag_x0, x, glyphs, clusters, span, style_idx);
-                        if !controls_only(&fragment) {
-                            decorate(&mut fragment, decor, fonts);
-                            out.push(fragment);
+                        let item = make(frag_x0, x, glyphs, clusters, per_cluster, span, style_idx);
+                        if !matches!(&item.kind, LineItemKind::Text { fragment, .. } if controls_only(fragment)) {
+                            items.push(item);
                         }
                     }
-                    // Left to right, everything after the cut is dropped.
-                    if truncated && !rtl {
-                        break;
-                    }
                 }
-                PositionedLayoutItem::InlineBox(b) => {
-                    if let Some(t) = &trunc
-                        && !t.keeps(b.x, b.x + b.width)
-                    {
-                        truncated = true;
-                        if t.rtl {
-                            continue;
+                PositionedLayoutItem::InlineBox(b) => match LineItemId::decode(b.id, n_atomics) {
+                    LineItemId::Atomic(index) => {
+                        if let Some(atomic) = content.atomics.get(index)
+                            && let Some(result) = &atomic.result
+                        {
+                            items.push(LineItem {
+                                kind: LineItemKind::Atomic {
+                                    index,
+                                    fragment: result.fragment.clone(),
+                                    baseline: result.baseline,
+                                },
+                                x0: b.x,
+                                x1: b.x + b.width,
+                                inline_box: atomic.inline_box,
+                            });
                         }
-                        break;
                     }
-                    if let Some(atomic) = content.atomics.get(b.id as usize)
-                        && let Some(result) = &atomic.result
-                    {
-                        // The margin box's top is its baseline up by the
-                        // box's own baseline; the border box sits inside
-                        // the margins.
-                        let mut fragment = result.fragment.clone();
-                        let baseline = placement.node_baseline(node_of_atomic(content, b.id as usize));
-                        let margin = fragment.margin;
-                        fragment.translate(ox + b.x + margin.left, oy + line_top + baseline - result.baseline + margin.top);
-                        out.push(fragment);
-                        kept_edge = Some(match kept_edge {
-                            Some(k) if rtl => k.min(b.x),
-                            Some(k) => k.max(b.x + b.width),
-                            None if rtl => b.x,
-                            None => b.x + b.width,
-                        });
-                    }
-                }
+                    LineItemId::Edge { inline_box, end } => items.push(LineItem {
+                        kind: LineItemKind::Edge { end },
+                        x0: b.x,
+                        x1: b.x,
+                        inline_box: Some(inline_box),
+                    }),
+                },
             }
         }
+        insert_empty_boxes(&mut items, content, edges, &lr, li + 1 == line_count && last_paragraph);
+
+        let trunc = overflow.and_then(|(width, marker)| Truncation::for_line(&line, width, marker, rtl));
+        let m = line.metrics();
+        let ctx = LineCtx {
+            content,
+            edges,
+            text,
+            placement,
+            ox,
+            oy,
+            line_top,
+            rtl,
+            lr: lr.clone(),
+            line_left: m.inline_min_coord + m.offset,
+            hanging: m.trailing_whitespace,
+            soft_wrapped: matches!(line.break_reason(), parley::BreakReason::Regular | parley::BreakReason::Emergency),
+        };
+        let line_first = out.len();
+        let (truncated, kept_edge) = place_line_items(&ctx, items, trunc.as_ref(), out, decor, fonts);
         if truncated
             && let (Some(t), Some((_, marker))) = (&trunc, overflow)
         {
@@ -1714,16 +1878,8 @@ fn emit_text_fragments(
             // text is still there, as in browsers: select-all and a
             // triple click take it, so the last kept fragment's range
             // runs to the line's end while its clusters stay what shows.
-            let line_end = line.text_range().end + base;
-            let last = out[line_first..]
-                .iter_mut()
-                .filter_map(|f| match &mut f.content {
-                    FragmentContent::Text(t) if f.node.is_some() && Arc::ptr_eq(&t.text, text) => Some(t),
-                    _ => None,
-                })
-                .max_by_key(|t| t.range.end);
-            if let Some(t) = last {
-                t.range.end = t.range.end.max(line_end);
+            if let Some(t) = last_text_fragment(&mut out[line_first..], text) {
+                t.range.end = t.range.end.max(lr.end);
             }
             emit_marker(
                 marker,
@@ -1739,6 +1895,538 @@ fn emit_text_fragments(
             );
         }
     }
+}
+
+/// The text fragment with a node and the largest text range end among
+/// `frags` and their descendants, for the text of one root.
+fn last_text_fragment<'a>(frags: &'a mut [Fragment], text: &Arc<str>) -> Option<&'a mut TextFragment> {
+    let mut best: Option<&'a mut TextFragment> = None;
+    for f in frags {
+        let own = f.node.is_some() && matches!(&f.content, FragmentContent::Text(t) if Arc::ptr_eq(&t.text, text));
+        let candidate = if own {
+            match &mut f.content {
+                FragmentContent::Text(t) => Some(t),
+                _ => None,
+            }
+        } else {
+            last_text_fragment(&mut f.children, text)
+        };
+        if let Some(c) = candidate
+            && best.as_ref().is_none_or(|b| c.range.end >= b.range.end)
+        {
+            best = Some(c);
+        }
+    }
+    best
+}
+
+/// Put the empty, undecorated inline elements that sit on this line among
+/// `items`: an element with no text, no atomic and no edge has no item of
+/// its own, but still a (zero-width) fragment where it stands, so its
+/// rectangles can be asked for. It is on the line that holds the text
+/// around its offset, or the atomic at its offset, or, at the end of the
+/// root's text, the last line.
+fn insert_empty_boxes(
+    items: &mut Vec<LineItem>,
+    content: &InlineContent,
+    edges: &[ResolvedEdges],
+    lr: &std::ops::Range<usize>,
+    last_line: bool,
+) {
+    for (b, info) in content.boxes.iter().enumerate() {
+        if edges[b].decorated || info.start != edge_end(&content.text, info) {
+            continue;
+        }
+        if content.atomics.iter().any(|a| chain_contains(content, a.inline_box, b)) {
+            continue;
+        }
+        let o = info.start;
+        let item = |inline_box| LineItem {
+            kind: LineItemKind::Empty,
+            x0: 0.0,
+            x1: 0.0,
+            inline_box: Some(inline_box),
+        };
+        // Beside the atomic at its offset, in document order.
+        let at_atomic = items.iter().position(|it| {
+            matches!(&it.kind, LineItemKind::Atomic { index, .. } if content.atomics[*index].index == o)
+        });
+        if let Some(i) = at_atomic {
+            let index = match &items[i].kind {
+                LineItemKind::Atomic { index, .. } => *index,
+                _ => continue,
+            };
+            let before = info.seq_start < content.atomics[index].seq;
+            items.insert(if before { i } else { i + 1 }, item(b));
+            continue;
+        }
+        // Between the text before and after it: before the fragment that
+        // starts at the offset (after it when it reads right to left),
+        // else after the fragment that ends there.
+        let text_at = |it: &LineItem, f: &dyn Fn(&Cluster) -> bool| match &it.kind {
+            LineItemKind::Text { fragment, .. } => match &fragment.content {
+                FragmentContent::Text(t) => t.clusters.iter().any(f).then_some(t.clusters[0].rtl),
+                _ => None,
+            },
+            _ => None,
+        };
+        if lr.start <= o
+            && o < lr.end
+            && let Some((i, cluster_rtl)) =
+                items.iter().enumerate().find_map(|(i, it)| text_at(it, &|c| c.start == o).map(|r| (i, r)))
+        {
+            items.insert(if cluster_rtl { i + 1 } else { i }, item(b));
+            continue;
+        }
+        if o == lr.end && (last_line || lr.start < lr.end) {
+            if let Some((i, cluster_rtl)) = items.iter().enumerate().find_map(|(i, it)| text_at(it, &|c| c.end == o).map(|r| (i, r))) {
+                items.insert(if cluster_rtl { i } else { i + 1 }, item(b));
+            } else if last_line {
+                items.push(item(b));
+            }
+        }
+    }
+}
+
+/// What `place_line_items` works with for one line.
+struct LineCtx<'a> {
+    content: &'a InlineContent,
+    edges: &'a [ResolvedEdges],
+    text: &'a Arc<str>,
+    placement: &'a LinePlacement,
+    ox: f32,
+    oy: f32,
+    line_top: f32,
+    /// The paragraph reads right to left.
+    rtl: bool,
+    /// The line's text, in the root's offsets.
+    lr: std::ops::Range<usize>,
+    /// Where the line's content starts (parley's alignment included).
+    line_left: f32,
+    /// The trailing white space parley hung outside the line.
+    hanging: f32,
+    /// The line ends at a soft wrap (not a forced break or the text's
+    /// end), where a trailing collapsible space is removed.
+    soft_wrapped: bool,
+}
+
+/// Widen the kept content's extent with something kept at `x0..x1`: the
+/// `text-overflow` marker goes against its end (the right edge of a
+/// left-to-right line, the left edge of a right-to-left one).
+fn note_kept(kept: &mut Option<f32>, rtl: bool, x0: f32, x1: f32) {
+    *kept = Some(match *kept {
+        Some(k) if rtl => k.min(x0),
+        Some(k) => k.max(x1),
+        None if rtl => x0,
+        None => x1,
+    });
+}
+
+/// The line fragment of the inline element `b` whose border box runs from
+/// `border_x0` to `border_x1` (root coordinates) on the line, carrying its
+/// `left` and `right` edges and holding `children`. Vertically it is the
+/// element's font content area (the rounded ascent and descent of its
+/// first available font, as Blink sizes it) plus its vertical padding and
+/// borders, around the baseline the element was placed on; the line box is
+/// not affected (CSS 2.1 §10.6.1).
+#[allow(clippy::too_many_arguments)]
+fn piece_fragment(
+    ctx: &LineCtx<'_>,
+    b: usize,
+    border_x0: f32,
+    border_x1: f32,
+    left: bool,
+    right: bool,
+    children: Vec<Fragment>,
+    decor: &mut Decorator,
+    fonts: &mut FontContext,
+) -> Fragment {
+    let info = &ctx.content.boxes[b];
+    let e = &ctx.edges[b];
+    let fm = decor.font_metrics(fonts, &font_of(&info.style));
+    let (ascent, descent) = (fm.ascent.round(), fm.descent.round());
+    let baseline = ctx.oy + ctx.line_top + ctx.placement.node_baseline(node_of_box(Some(b)));
+    let top = baseline - ascent - e.padding.top - e.border.top;
+    let height = ascent + descent + e.padding.top + e.padding.bottom + e.border.top + e.border.bottom;
+    Fragment {
+        rect: Rect::new(ctx.ox + border_x0, top, border_x1 - border_x0, height),
+        node: Some(info.node),
+        style: info.style.clone(),
+        content: FragmentContent::Inline { left, right },
+        children,
+        padding: e.padding,
+        margin: e.margin,
+    }
+}
+
+/// An inline element's fragment being gathered while a line is walked.
+struct OpenPiece {
+    inline_box: usize,
+    /// The fragment's border box left, in the root's coordinates.
+    border_x0: f32,
+    /// It carries the element's left edge.
+    left: bool,
+    children: Vec<Fragment>,
+    /// Something of it was kept (not cut by `text-overflow`).
+    kept: bool,
+}
+
+/// Place a line's items and build its fragments into `out` (CSS 2.1
+/// §9.4.2, §10.6.1; the inline box model). The items come in visual order
+/// at parley's positions, which reserved each decorated inline element's
+/// edges as zero-height boxes where the element starts and ends; here the
+/// line is walked again from its left: the edges' widths are dropped and
+/// put back where the edges are drawn, around the element's content. Each
+/// element's content on the line, split wherever bidi reordering puts
+/// other content between its parts, becomes one `FragmentContent::Inline`
+/// fragment per part holding the text, atomics and nested fragments in
+/// it; the leftmost part gets the element's left edge and the rightmost
+/// its right edge when the element has them on this line (its start edge
+/// where it begins, its end edge where it ends, mapped to left and right
+/// by its `direction`; both on every line with `box-decoration-break:
+/// clone`). A collapsible space that ends the line is removed (CSS Text 3
+/// §4.1.3), so an end edge follows the last letter. Returns whether
+/// `text-overflow` cut the line, and the edge of the kept content the
+/// marker goes against.
+fn place_line_items(
+    ctx: &LineCtx<'_>,
+    mut items: Vec<LineItem>,
+    trunc: Option<&Truncation>,
+    out: &mut Vec<Fragment>,
+    decor: &mut Decorator,
+    fonts: &mut FontContext,
+) -> (bool, Option<f32>) {
+    let content = ctx.content;
+    let edges = ctx.edges;
+    let nb = content.boxes.len();
+
+    // The trailing collapsible space at a soft wrap: the line's last
+    // cluster, when it is a space that collapses and no atomic follows it
+    // on the line (the builder already removed one at the root's end, and
+    // a list marker's trailing space is the gap before the item). Its
+    // advance goes to zero and what sits after it moves up.
+    let mut removed = 0.0f32;
+    if ctx.soft_wrapped
+        && ctx.lr.start < ctx.lr.end
+        && !items
+            .iter()
+            .any(|it| matches!(&it.kind, LineItemKind::Atomic { index, .. } if content.atomics[*index].index >= ctx.lr.end))
+    {
+        for it in &mut items {
+            let LineItemKind::Text { fragment, .. } = &mut it.kind else { continue };
+            if !collapses_spaces(fragment.style.white_space) {
+                continue;
+            }
+            let FragmentContent::Text(t) = &mut fragment.content else { continue };
+            let Some(ci) = t.clusters.iter().position(|c| c.end == ctx.lr.end) else { continue };
+            let c = t.clusters[ci];
+            if &ctx.text[c.start..c.end] != " " || c.advance <= 0.0 {
+                break;
+            }
+            let adv = c.advance;
+            t.clusters[ci].advance = 0.0;
+            for k in &mut t.clusters {
+                if k.x > c.x + 0.001 {
+                    k.x -= adv;
+                }
+            }
+            for g in &mut t.glyphs {
+                if g.x > c.x + 0.001 {
+                    g.x -= adv;
+                }
+            }
+            it.x1 -= adv;
+            fragment.rect.width -= adv;
+            removed = adv;
+            break;
+        }
+    }
+
+    // Each element's first and last item on the line, and which of its
+    // edges are here.
+    let mut first = vec![usize::MAX; nb];
+    let mut last = vec![usize::MAX; nb];
+    let mut start_edge = vec![false; nb];
+    let mut end_edge = vec![false; nb];
+    let mut atomics_here: Vec<usize> = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        let mut cur = it.inline_box;
+        while let Some(b) = cur {
+            if first[b] == usize::MAX {
+                first[b] = i;
+            }
+            last[b] = i;
+            cur = content.boxes[b].parent;
+        }
+        match &it.kind {
+            LineItemKind::Edge { end } => {
+                if let Some(b) = it.inline_box {
+                    if *end {
+                        end_edge[b] = true;
+                    } else {
+                        start_edge[b] = true;
+                    }
+                }
+            }
+            LineItemKind::Atomic { index, .. } => atomics_here.push(*index),
+            _ => {}
+        }
+    }
+    // An element without edge items begins or ends on this line when its
+    // first or last content does: the atomic there, else the text.
+    for b in 0..nb {
+        if edges[b].decorated || first[b] == usize::MAX {
+            continue;
+        }
+        let info = &content.boxes[b];
+        let e = edge_end(&content.text, info);
+        let own: Vec<(usize, &Atomic)> = content
+            .atomics
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| chain_contains(content, a.inline_box, b))
+            .collect();
+        let first_atomic = own.iter().min_by_key(|(_, a)| (a.index, a.seq)).copied();
+        let last_atomic = own.iter().max_by_key(|(_, a)| (a.index, a.seq)).copied();
+        start_edge[b] = match first_atomic {
+            Some((ai, a)) if a.index == info.start => atomics_here.contains(&ai),
+            _ if info.start < e => ctx.lr.start <= info.start && info.start < ctx.lr.end,
+            _ => true,
+        };
+        end_edge[b] = match last_atomic {
+            Some((ai, a)) if a.index == e => atomics_here.contains(&ai),
+            _ if info.start < e => ctx.lr.start < e && e <= ctx.lr.end,
+            _ => true,
+        };
+    }
+    let has_left = |b: usize| {
+        let e = &edges[b];
+        e.clone || if content.boxes[b].style.direction == Direction::Rtl { end_edge[b] } else { start_edge[b] }
+    };
+    let has_right = |b: usize| {
+        let e = &edges[b];
+        e.clone || if content.boxes[b].style.direction == Direction::Rtl { start_edge[b] } else { end_edge[b] }
+    };
+
+    // The walk. A right-to-left line hung its trailing space at the left;
+    // with the space gone the content starts where the space did.
+    let mut x = ctx.line_left + if ctx.rtl { removed.min(ctx.hanging) } else { 0.0 };
+    let keeps = |x0: f32, x1: f32| trunc.is_none_or(|t| t.keeps(x0, x1));
+    let mut kept_edge: Option<f32> = None;
+    let mut truncated = false;
+    let mut stack: Vec<OpenPiece> = Vec::new();
+    let emit = |stack: &mut Vec<OpenPiece>, out: &mut Vec<Fragment>, f: Fragment| match stack.last_mut() {
+        Some(open) => open.children.push(f),
+        None => out.push(f),
+    };
+    // Close the innermost open element after its item `last_index`.
+    let close = |stack: &mut Vec<OpenPiece>,
+                 out: &mut Vec<Fragment>,
+                 x: &mut f32,
+                 last_index: usize,
+                 kept_edge: &mut Option<f32>,
+                 truncated: &mut bool,
+                 decor: &mut Decorator,
+                 fonts: &mut FontContext| {
+        let Some(mut open) = stack.pop() else { return };
+        let b = open.inline_box;
+        let e = &edges[b];
+        let mut right = last_index == last[b] && has_right(b);
+        let content_end = *x;
+        if right {
+            let (x0, x1) = (*x, *x + e.right());
+            if keeps(x0, x1) {
+                note_kept(kept_edge, ctx.rtl, x0, x1);
+                open.kept = true;
+            } else {
+                *truncated = true;
+                right = false;
+            }
+            *x += e.right();
+        }
+        if !open.kept {
+            // Everything of it was cut away.
+            return;
+        }
+        let border_x1 = if right { content_end + e.padding.right + e.border.right } else { content_end };
+        let children = std::mem::take(&mut open.children);
+        let fragment = piece_fragment(ctx, b, open.border_x0, border_x1, open.left, right, children, decor, fonts);
+        match stack.last_mut() {
+            Some(parent) => {
+                parent.kept = true;
+                parent.children.push(fragment);
+            }
+            None => out.push(fragment),
+        }
+    };
+
+    let count = items.len();
+    for (i, item) in items.into_iter().enumerate() {
+        let chain = chain_of(content, item.inline_box);
+        let common = stack.iter().zip(&chain).take_while(|(o, c)| o.inline_box == **c).count();
+        while stack.len() > common {
+            close(&mut stack, out, &mut x, i - 1, &mut kept_edge, &mut truncated, decor, fonts);
+        }
+        if truncated && !ctx.rtl {
+            break;
+        }
+        for &b in &chain[common..] {
+            let e = &edges[b];
+            let mut left = i == first[b] && has_left(b);
+            let mut border_x0 = x;
+            if left {
+                let (x0, x1) = (x, x + e.left());
+                if keeps(x0, x1) {
+                    note_kept(&mut kept_edge, ctx.rtl, x0, x1);
+                } else {
+                    truncated = true;
+                    left = false;
+                }
+                border_x0 = x + e.margin.left;
+                x += e.left();
+            }
+            stack.push(OpenPiece {
+                inline_box: b,
+                border_x0,
+                left,
+                children: Vec::new(),
+                kept: left,
+            });
+        }
+        if truncated && !ctx.rtl {
+            break;
+        }
+        let width = item.x1 - item.x0;
+        match item.kind {
+            LineItemKind::Text {
+                mut fragment,
+                glyphs_per_cluster,
+            } => {
+                let FragmentContent::Text(t) = &mut fragment.content else { unreachable!() };
+                // The clusters past the cut, from the right of a left-to-
+                // right line or the left of a right-to-left one.
+                let mut cut_at: Option<usize> = None;
+                for (ci, c) in t.clusters.iter().enumerate() {
+                    if !keeps(x + c.x, x + c.x + c.advance) {
+                        truncated = true;
+                        if ctx.rtl {
+                            cut_at = Some(ci + 1);
+                        } else {
+                            cut_at = Some(ci);
+                            break;
+                        }
+                    }
+                }
+                let mut shown_x0 = x;
+                let mut shown_x1 = x + width;
+                if let Some(ci) = cut_at {
+                    if ctx.rtl {
+                        // Dropped from the left: the kept clusters start
+                        // the fragment.
+                        if ci >= t.clusters.len() {
+                            x += width;
+                            continue;
+                        }
+                        let dropped_glyphs: usize = glyphs_per_cluster[..ci].iter().sum();
+                        let dx = t.clusters[ci].x;
+                        t.clusters.drain(..ci);
+                        t.glyphs.drain(..dropped_glyphs);
+                        for c in &mut t.clusters {
+                            c.x -= dx;
+                        }
+                        for g in &mut t.glyphs {
+                            g.x -= dx;
+                        }
+                        shown_x0 = x + dx;
+                        fragment.rect.width = width - dx;
+                    } else {
+                        if ci == 0 {
+                            break;
+                        }
+                        let kept_glyphs: usize = glyphs_per_cluster[..ci].iter().sum();
+                        let end = t.clusters[ci].x;
+                        t.clusters.truncate(ci);
+                        t.glyphs.truncate(kept_glyphs);
+                        shown_x1 = x + end;
+                        fragment.rect.width = end;
+                    }
+                    t.range = t.clusters.iter().map(|c| c.start).min().unwrap_or(0)
+                        ..t.clusters.iter().map(|c| c.end).max().unwrap_or(0);
+                }
+                note_kept(&mut kept_edge, ctx.rtl, shown_x0, shown_x1);
+                fragment.rect.x = ctx.ox + shown_x0;
+                decorate(&mut fragment, decor, fonts);
+                if let Some(open) = stack.last_mut() {
+                    open.kept = true;
+                }
+                emit(&mut stack, out, fragment);
+                if cut_at.is_some() && !ctx.rtl {
+                    // The line ends at the cut: the open elements' fragments
+                    // end there too.
+                    x = shown_x1;
+                    break;
+                }
+                x += width;
+            }
+            LineItemKind::Atomic {
+                index,
+                mut fragment,
+                baseline,
+            } => {
+                if !keeps(x, x + width) {
+                    truncated = true;
+                    if ctx.rtl {
+                        x += width;
+                        continue;
+                    }
+                    break;
+                }
+                // The margin box's top is its baseline up by the box's own
+                // baseline; the border box sits inside the margins.
+                let margin = fragment.margin;
+                let placed = ctx.placement.node_baseline(node_of_atomic(content, index));
+                fragment.translate(ctx.ox + x + margin.left, ctx.oy + ctx.line_top + placed - baseline + margin.top);
+                note_kept(&mut kept_edge, ctx.rtl, x, x + width);
+                if let Some(open) = stack.last_mut() {
+                    open.kept = true;
+                }
+                emit(&mut stack, out, fragment);
+                x += width;
+            }
+            // Edges were dropped above and are put back around the
+            // element's fragment.
+            LineItemKind::Edge { .. } => {}
+            // An empty element's fragment is nothing but a place.
+            LineItemKind::Empty => {
+                if let Some(open) = stack.last_mut() {
+                    open.kept = true;
+                }
+            }
+        }
+    }
+    let last_index = count.saturating_sub(1);
+    while !stack.is_empty() {
+        if truncated && !ctx.rtl {
+            // Past the cut: the open elements' right edges are dropped
+            // with the rest of the line.
+            let Some(mut open) = stack.pop() else { break };
+            if !open.kept {
+                continue;
+            }
+            let children = std::mem::take(&mut open.children);
+            let fragment = piece_fragment(ctx, open.inline_box, open.border_x0, x, open.left, false, children, decor, fonts);
+            match stack.last_mut() {
+                Some(parent) => {
+                    parent.kept = true;
+                    parent.children.push(fragment);
+                }
+                None => out.push(fragment),
+            }
+            continue;
+        }
+        close(&mut stack, out, &mut x, last_index, &mut kept_edge, &mut truncated, decor, fonts);
+    }
+    (truncated, kept_edge)
 }
 
 /// Convenience for tests and tools: style + layout in one call.
@@ -2771,6 +3459,265 @@ mod tests {
         let text_left = texts.iter().map(|(r, _)| r.x).fold(f32::MAX, f32::min);
         assert!((text_left - mr.right()).abs() < 0.01, "kept text starts at the marker's right: {text_left} vs {mr:?}");
         assert!(texts.iter().all(|(r, _)| r.right() <= 120.5));
+    }
+
+    /// The line fragments of the first element with the tag: rect and
+    /// whether it carries the element's left and right edges, in tree
+    /// order.
+    fn pieces_of(doc: &Document, tree: &LayoutTree, tag: &str) -> Vec<(Rect, bool, bool)> {
+        let id = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == tag))
+            .expect("element");
+        let mut out = Vec::new();
+        tree.root.walk(&mut |f| {
+            if f.node == Some(id)
+                && let FragmentContent::Inline { left, right } = f.content
+            {
+                out.push((f.rect, left, right));
+            }
+        });
+        out
+    }
+
+    fn rect_by_id(doc: &Document, tree: &LayoutTree, id: &str) -> Rect {
+        let n = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+            .expect(id);
+        tree.first_rect(|x| x == n).expect("fragment")
+    }
+
+    /// A paragraph `w` pixels wide (800 by default) holding `html`.
+    fn para(w: Option<f32>, html: &str) -> (Document, LayoutTree) {
+        let w = w.unwrap_or(800.0);
+        layout(
+            &format!("<body style='margin:0;font-size:16px;line-height:20px'><p style='margin:0;width:{w}px'>{html}</p></body>"),
+            "",
+        )
+    }
+
+    #[test]
+    fn inline_edges_take_inline_space_around_the_content() {
+        // Margin, border and padding on each side move the text after them
+        // and wrap the element's fragment, whose border box excludes the
+        // margin; vertical edges and margins change nothing of the line.
+        let (doc, tree, mut engine) = layout_with_engine(
+            "<body style='margin:0;font-size:16px;line-height:20px'><p style='margin:0'>\
+             a<span style='padding:0 10px;border:2px solid;margin:0 5px'>b</span>c\
+             <i style='padding:30px 0;border-top:5px solid;margin-top:40px'>d</i></p></body>",
+            "",
+        );
+        let (a, b, c, d) = (text_at(&tree, "a").0, text_at(&tree, "b").0, text_at(&tree, "c").0, text_at(&tree, "d").0);
+        assert!((b.x - a.right() - 17.0).abs() < 0.01, "margin 5 + border 2 + padding 10 before b: {a:?} {b:?}");
+        assert!((c.x - b.right() - 17.0).abs() < 0.01, "and after it: {b:?} {c:?}");
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 1, "{pieces:?}");
+        let (r, left, right) = pieces[0];
+        assert!(left && right);
+        assert!((r.x - (b.x - 12.0)).abs() < 0.01 && (r.right() - (b.right() + 12.0)).abs() < 0.01, "border box: {r:?} around {b:?}");
+        // Vertically the fragment is the font's content area (rounded
+        // ascent and descent) plus the borders, around the baseline; the
+        // line box stays 20px.
+        let baseline = text_at(&tree, "b").1;
+        let span_style = {
+            let mut s = None;
+            tree.root.walk(&mut |f| {
+                if matches!(f.content, FragmentContent::Inline { .. }) && s.is_none() {
+                    s = Some(f.style.clone());
+                }
+            });
+            s.expect("span style")
+        };
+        let fm = engine.decor.font_metrics(&mut engine.fonts, &crate::decor::font_of(&span_style));
+        let (ascent, descent) = (fm.ascent.round(), fm.descent.round());
+        assert!((r.y - (baseline - ascent - 2.0)).abs() < 0.01, "{r:?} around baseline {baseline}, ascent {ascent}");
+        assert!((r.height - (ascent + descent + 4.0)).abs() < 0.01, "{r:?}");
+        let p = find_by_tag(&doc, &tree, "p");
+        assert!((p.height - 20.0).abs() < 0.01, "vertical edges leave the line box alone: {p:?}");
+        let i = pieces_of(&doc, &tree, "i")[0].0;
+        assert!((i.height - (ascent + descent + 65.0)).abs() < 0.01, "content area + 60px padding + 5px border: {i:?}");
+        assert!((i.y - (text_at(&tree, "d").1 - ascent - 35.0)).abs() < 0.01, "{i:?}");
+        assert!((d.x - c.right()).abs() < 0.01, "no horizontal edge on i");
+        // The element is hit on its padding, found by its own rect, and
+        // its text fragment is its child.
+        let span = doc
+            .descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "span"))
+            .expect("span");
+        assert_eq!(tree.hit_test(r.x + 4.0, r.y + r.height / 2.0), Some(span));
+        assert_eq!(tree.first_rect(|n| n == span), Some(r));
+        let mut nested = false;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(span) {
+                nested = f.children.iter().any(|c| matches!(&c.content, FragmentContent::Text(t) if &t.text[t.range.clone()] == "b"));
+            }
+        });
+        assert!(nested, "the text is inside the element's fragment");
+    }
+
+    #[test]
+    fn inline_edges_break_with_their_content() {
+        // A start edge goes to the next line with the word after it; a
+        // word and its end edge move together; no edge makes a break
+        // opportunity inside a word.
+        let (_, t) = para(None, "abc <span>def</span>");
+        let fits = text_at(&t, "def").0.right();
+        let (doc, tree) = para(Some(fits + 10.0), "abc <span style='padding-left:20px'>def</span>");
+        let (abc, def) = (text_at(&tree, "abc ").0, text_at(&tree, "def").0);
+        assert!(def.y > abc.y, "def wrapped: {abc:?} {def:?}");
+        assert!((def.x - 20.0).abs() < 0.01, "the padding starts the line: {def:?}");
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 1);
+        assert!(pieces[0].0.x.abs() < 0.01 && pieces[0].1 && pieces[0].2, "{pieces:?}");
+
+        let (_, tree) = para(Some(40.0), "foo<span style='padding-left:20px'>bar</span>");
+        assert_eq!(text_at(&tree, "foo").0.y, text_at(&tree, "bar").0.y, "no break inside foobar");
+
+        let (_, t) = para(None, "xxxx <span>foo</span> bar");
+        let fits = text_at(&t, "foo").0.right();
+        let (doc, tree) = para(Some(fits + 10.0), "xxxx <span style='padding-right:20px'>foo</span> bar");
+        let (xxxx, foo) = (text_at(&tree, "xxxx ").0, text_at(&tree, "foo").0);
+        assert!(foo.y > xxxx.y && foo.x.abs() < 0.01, "foo and its edge wrapped: {xxxx:?} {foo:?}");
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert!((pieces[0].0.right() - foo.right() - 20.0).abs() < 0.01, "{pieces:?} {foo:?}");
+
+        // A collapsible space that ends the line before an end edge is
+        // removed: the edge follows the last letter.
+        let (_, t) = para(None, "aaa <b>bbb</b> ccc");
+        let fits = text_at(&t, "bbb").0.right();
+        let (doc, tree) = para(Some(fits + 15.0), "aaa <b style='padding-right:10px'>bbb </b>ccc");
+        let (texts, _) = texts_of(&doc, &tree, "b");
+        let (bbb, bt) = &texts[0];
+        assert_eq!(&bt.text[bt.range.clone()], "bbb ");
+        assert!(text_at(&tree, "ccc").0.y > bbb.y, "ccc wrapped");
+        let space = bt.clusters.iter().find(|c| &bt.text[c.start..c.end] == " ").expect("space");
+        assert_eq!(space.advance, 0.0, "the trailing space has no width");
+        let letters_right = bbb.x + bt.clusters.iter().map(|c| c.x + c.advance).fold(0.0f32, f32::max);
+        let pieces = pieces_of(&doc, &tree, "b");
+        assert!((pieces[0].0.right() - letters_right - 10.0).abs() < 0.01, "{pieces:?} vs {letters_right}");
+    }
+
+    #[test]
+    fn empty_inline_boxes_with_edges_make_a_line_in_their_font() {
+        // CSS 2.1 §9.4.2, §10.8: an empty inline element with padding or
+        // a border is on a line and brings its line-height box; one with
+        // nothing is not.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:10px;line-height:normal'>\
+             <p id=a style='margin:0'><span style='padding:0 5px'></span></p>\
+             <p id=b style='margin:0'><span></span></p>\
+             <p id=c style='margin:0'>x<span style='font-size:40px;border-top:1px solid'></span></p>\
+             <p id=d style='margin:0'>x<span style='font-size:40px'></span></p></body>",
+            "",
+        );
+        let a = rect_by_id(&doc, &tree, "a");
+        assert!(a.height > 8.0 && a.height < 16.0, "one 10px line: {a:?}");
+        assert_eq!(rect_by_id(&doc, &tree, "b").height, 0.0);
+        assert!(rect_by_id(&doc, &tree, "c").height > 35.0, "the 40px box widens the line");
+        assert!(rect_by_id(&doc, &tree, "d").height < 16.0, "an empty box without edges does not");
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 1);
+        assert!((pieces[0].0.width - 10.0).abs() < 0.01 && pieces[0].1 && pieces[0].2, "{pieces:?}");
+    }
+
+    #[test]
+    fn inline_edges_nest_resolve_percentages_and_map_by_direction() {
+        let (doc, tree) = para(
+            Some(400.0),
+            "<a style='padding:0 5px'><b style='padding:0 5px'>x</b></a> <span style='padding-left:10%;margin-left:auto;margin-right:-5px'>y</span>z",
+        );
+        let x = text_at(&tree, "x").0;
+        let a = pieces_of(&doc, &tree, "a")[0].0;
+        let b = pieces_of(&doc, &tree, "b")[0].0;
+        assert!(a.x.abs() < 0.01 && (b.x - 5.0).abs() < 0.01 && (x.x - 10.0).abs() < 0.01, "{a:?} {b:?} {x:?}");
+        assert!((b.right() - x.right() - 5.0).abs() < 0.01 && (a.right() - x.right() - 10.0).abs() < 0.01);
+        let a_id = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "a")).expect("a");
+        let b_id = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "b")).expect("b");
+        let mut nested = false;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(a_id) {
+                nested = f.children.iter().any(|c| c.node == Some(b_id));
+            }
+        });
+        assert!(nested, "b's fragment is inside a's");
+        // 10% of the 400px containing block; `auto` is zero; a negative
+        // margin pulls the next text back.
+        let (y, z) = (text_at(&tree, "y").0, text_at(&tree, "z").0);
+        let space = text_at(&tree, " ").0;
+        assert!((y.x - space.right() - 40.0).abs() < 0.01, "{space:?} {y:?}");
+        assert!((z.x - (y.right() - 5.0)).abs() < 0.01, "{y:?} {z:?}");
+
+        // A right-to-left element broken over two lines keeps its start
+        // edge (the right one) on the first line and its end edge (the
+        // left one) on the last.
+        let (_, t) = para(None, "aaaa bbbb");
+        let fits = text_at(&t, "aaaa bbbb").0.right();
+        let (doc, tree) = para(
+            Some(fits + 32.0),
+            "aaaa <span style='direction:rtl;padding-left:10px;padding-right:30px'>bbbb cccc</span>",
+        );
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        let bbbb = text_at(&tree, "bbbb ").0;
+        let cccc = text_at(&tree, "cccc").0;
+        assert!(cccc.y > bbbb.y);
+        assert!(!pieces[0].1 && pieces[0].2 && (pieces[0].0.right() - bbbb.right() - 30.0).abs() < 0.01, "{pieces:?} {bbbb:?}");
+        assert!((pieces[0].0.x - bbbb.x).abs() < 0.01, "no left edge on the first line");
+        assert!(pieces[1].1 && !pieces[1].2 && pieces[1].0.x.abs() < 0.01 && (cccc.x - 10.0).abs() < 0.01, "{pieces:?} {cccc:?}");
+    }
+
+    #[test]
+    fn box_decoration_break_clone_gives_every_fragment_every_edge() {
+        let (_, t) = para(None, "aaa bbb");
+        let fits = text_at(&t, "aaa bbb").0.right();
+        let (doc, tree) = para(
+            Some(fits + 25.0),
+            "aaa <span style='box-decoration-break:clone;padding:0 10px;border:1px solid'>bbb ccc</span>",
+        );
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        let (bbb, ccc) = (text_at(&tree, "bbb ").0, text_at(&tree, "ccc").0);
+        assert!(ccc.y > bbb.y);
+        assert!(pieces.iter().all(|p| p.1 && p.2), "{pieces:?}");
+        assert!((pieces[0].0.x - (bbb.x - 11.0)).abs() < 0.01 && (pieces[0].0.right() - bbb.right() - 11.0).abs() < 0.01, "{pieces:?} {bbb:?}");
+        assert!(pieces[1].0.x.abs() < 0.01 && (ccc.x - 11.0).abs() < 0.01 && (pieces[1].0.right() - ccc.right() - 11.0).abs() < 0.01, "{pieces:?} {ccc:?}");
+        // Slice: the second fragment has no left edge.
+        let (doc, tree) = para(Some(fits + 25.0), "aaa <span style='padding:0 10px;border:1px solid'>bbb ccc</span>");
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 2);
+        assert!(pieces[0].1 && !pieces[0].2 && !pieces[1].1 && pieces[1].2, "{pieces:?}");
+        assert!(text_at(&tree, "ccc").0.x.abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_edges_count_in_intrinsic_sizes_and_truncation_and_empty_boxes_have_a_place() {
+        let (doc, tree) = para(None, "<span style='display:inline-block'><b style='padding:0 10px'>x</b></span>");
+        let block = find_by_tag(&doc, &tree, "span");
+        let x = text_at(&tree, "x").0;
+        assert!((block.width - x.width - 20.0).abs() < 0.01, "shrink-to-fit holds the edges: {block:?} {x:?}");
+
+        // An empty element without edges still has a zero-width fragment
+        // where it sits.
+        let (doc, tree) = para(None, "ab<span></span>cd");
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 1);
+        assert!(pieces[0].0.width == 0.0 && (pieces[0].0.x - text_at(&tree, "ab").0.right()).abs() < 0.01, "{pieces:?}");
+
+        // `text-overflow` cuts an element's fragment with its text: the
+        // edge past the cut is gone and the marker follows what is kept.
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:16px'><p style='margin:0;width:100px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>\
+             aaa <span style='padding:0 10px;border:1px solid'>bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</span></p></body>",
+            "",
+        );
+        let pieces = pieces_of(&doc, &tree, "span");
+        assert_eq!(pieces.len(), 1);
+        assert!(pieces[0].1 && !pieces[0].2, "{pieces:?}");
+        let (texts, markers) = texts_of(&doc, &tree, "p");
+        assert_eq!(markers.len(), 1);
+        let kept_right = texts.iter().map(|(r, _)| r.right()).fold(0.0f32, f32::max).max(pieces[0].0.right());
+        assert!((markers[0].0.x - kept_right).abs() < 0.01 && markers[0].0.right() <= 100.01, "{markers:?} after {kept_right}");
     }
 
     #[test]

@@ -5632,6 +5632,16 @@ mod tests {
                             c = cs(a); [c.letterSpacing, c.wordWrap, c.overflowWrap, c.wordBreak, c.textOverflow, cs(em).letterSpacing, cs(em).overflowWrap, cs(em).textOverflow, w2 - w1 >= 20, c.getPropertyValue('word-wrap')].join('|')"),
             "\"10px|break-word|break-word|keep-all|ellipsis|10px|break-word|clip|true|break-word\""
         );
+        // Roadmap 4a block 3, the inline box model: an inline element has
+        // line fragments of its own, so its rects grow with its padding
+        // and its used padding is reported; `box-decoration-break`
+        // resolves, the `-webkit-` alias through both IDL attributes.
+        assert_eq!(
+            run_js(&mut h, "var w1 = inl.getBoundingClientRect().width; inl.style.padding = '0 10px'; var r = inl.getClientRects(); var w0 = inl.getBoundingClientRect().width; var pl = cs(inl).paddingLeft; \
+                            inl.style.padding = ''; inl.style.webkitBoxDecorationBreak = 'clone'; var c = cs(inl); \
+                            [r.length, w0 - w1, pl, c.boxDecorationBreak, c.webkitBoxDecorationBreak, c.WebkitBoxDecorationBreak, inl.style.getPropertyValue('-webkit-box-decoration-break'), inl.style.cssText, cs(inl).paddingLeft].join('|')"),
+            "\"1|20|10px|clone|clone|clone|clone|box-decoration-break: clone;|0px\""
+        );
     }
 
     #[test]

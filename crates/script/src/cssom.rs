@@ -163,6 +163,12 @@ impl Class for StyleDeclarationClass {
             if css.contains('-') {
                 forms.push(css);
             }
+            // A `-webkit-` property has the `webkitFoo` attribute as well
+            // as the dashed-prefixed `WebkitFoo` (CSSOM §6.7.1).
+            let webkit = idl.strip_prefix("Webkit").map(|rest| format!("webkit{rest}"));
+            if let Some(w) = &webkit {
+                forms.push(w.as_str());
+            }
             if Some(i as u16) == float {
                 forms.push("cssFloat");
             }

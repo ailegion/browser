@@ -205,6 +205,7 @@ pub struct ComputedStyle {
     pub word_break: WordBreak,
     pub overflow_wrap: OverflowWrap,
     pub text_overflow: TextOverflow,
+    pub box_decoration_break: BoxDecorationBreak,
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
     pub list_style_image: Option<Arc<str>>,
@@ -308,6 +309,7 @@ impl ComputedStyle {
             word_break: WordBreak::Normal,
             overflow_wrap: OverflowWrap::Normal,
             text_overflow: TextOverflow::Clip,
+            box_decoration_break: BoxDecorationBreak::Slice,
             list_style_type: ListStyleType::Disc,
             list_style_position: ListStylePosition::Outside,
             list_style_image: None,
@@ -435,6 +437,7 @@ impl ComputedStyle {
             || self.word_break != other.word_break
             || self.overflow_wrap != other.overflow_wrap
             || self.text_overflow != other.text_overflow
+            || self.box_decoration_break != other.box_decoration_break
             || self.list_style_type != other.list_style_type
             || self.list_style_position != other.list_style_position
             || self.list_style_image != other.list_style_image
@@ -855,6 +858,7 @@ pub fn compute(
     pick!(word_break, WordBreak, WordBreak, |v| *v);
     pick!(overflow_wrap, OverflowWrap, OverflowWrap, |v| *v);
     pick!(text_overflow, TextOverflow, TextOverflow, |v| v.clone());
+    pick!(box_decoration_break, BoxDecorationBreak, BoxDecorationBreak, |v| *v);
     pick!(list_style_type, ListStyleType, ListStyleType, |v| v.computed());
     pick!(list_style_position, ListStylePosition, ListStylePosition, |v| *v);
     pick!(list_style_image, ListStyleImage, ListStyleImage, |v| v.url());

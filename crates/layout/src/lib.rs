@@ -159,6 +159,20 @@ pub enum FragmentContent {
     Image(Url),
     /// A list marker or other generated text.
     Marker,
+    /// One line fragment of a non-replaced `display: inline` element: its
+    /// background and borders paint from `style` on `rect`, the fragment's
+    /// border box (the element's font content area plus its vertical
+    /// padding and borders; CSS 2.1 §10.6.1). `left` and `right` say
+    /// whether the fragment carries the element's left and right edges:
+    /// with `box-decoration-break: slice` only the fragment where the
+    /// element starts and the one where it ends have them (the start edge
+    /// is the left one for a left-to-right element, the right one for a
+    /// right-to-left element; §9.4.2), with `clone` every fragment does.
+    /// The top and bottom edges are on every fragment. The children are
+    /// the text, atomic boxes and nested inline fragments it holds on that
+    /// line, in visual order. `padding` and `margin` are the element's
+    /// used values on every side.
+    Inline { left: bool, right: bool },
 }
 
 /// A positioned box. `rect` is the border box in page coordinates.
@@ -177,10 +191,12 @@ pub struct Fragment {
 
 impl Fragment {
     /// Whether children must be clipped to this box (overflow not visible).
+    /// `overflow` does not apply to inline fragments (CSS 2.1 §11.1.1).
     pub fn clips_children(&self) -> bool {
         use browser_style::Overflow;
-        !matches!(self.style.overflow_x, Overflow::Visible)
-            || !matches!(self.style.overflow_y, Overflow::Visible)
+        !matches!(self.content, FragmentContent::Inline { .. })
+            && (!matches!(self.style.overflow_x, Overflow::Visible)
+                || !matches!(self.style.overflow_y, Overflow::Visible))
     }
 
     fn translate(&mut self, dx: f32, dy: f32) {
@@ -210,8 +226,9 @@ pub struct LayoutTree {
 
 impl LayoutTree {
     /// The rectangle of the first fragment (in tree order) whose node
-    /// satisfies `matches`. Inline elements have no box of their own, so
-    /// callers accept their text nodes too.
+    /// satisfies `matches`. An inline element's fragments are its line
+    /// fragments (`FragmentContent::Inline`); its text nodes have their
+    /// own.
     pub fn first_rect(&self, matches: impl Fn(NodeId) -> bool) -> Option<Rect> {
         let mut found = None;
         self.root.walk(&mut |f| {

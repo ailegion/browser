@@ -87,6 +87,7 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::WordBreak(w) => w.keyword().to_owned(),
         P::OverflowWrap(w) => w.keyword().to_owned(),
         P::TextOverflow(t) => t.to_css(),
+        P::BoxDecorationBreak(b) => b.keyword().to_owned(),
         P::ListStyleType(t) => t.to_css(),
         P::ListStylePosition(p) => p.keyword().to_owned(),
         P::VerticalAlign(v) => match v {
@@ -405,7 +406,7 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             }
             parts.join(" ")
         }
-        "place-items" | "word-wrap" => v(0).to_owned(),
+        "place-items" | "word-wrap" | "-webkit-box-decoration-break" => v(0).to_owned(),
         _ => return None,
     })
 }
@@ -729,6 +730,7 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::WordBreak => style.word_break.keyword().to_owned(),
         Id::OverflowWrap => style.overflow_wrap.keyword().to_owned(),
         Id::TextOverflow => style.text_overflow.to_css(),
+        Id::BoxDecorationBreak => style.box_decoration_break.keyword().to_owned(),
         Id::ListStyleType => style.list_style_type.keyword().to_owned(),
         Id::ListStylePosition => style.list_style_position.keyword().to_owned(),
         Id::ListStyleImage => style.list_style_image.as_deref().map_or("none".to_owned(), css_url),
@@ -905,6 +907,8 @@ mod tests {
         assert_eq!(resolved_value(&style, PropertyId::WordBreak, None), "normal");
         assert_eq!(resolved_value(&style, PropertyId::OverflowWrap, None), "normal");
         assert_eq!(resolved_value(&style, PropertyId::TextOverflow, None), "\"~\"");
+        assert_eq!(resolved_value(&style, PropertyId::BoxDecorationBreak, None), "slice");
+        assert_eq!(serialize_shorthand("-webkit-box-decoration-break", &["clone".to_owned()]), Some("clone".to_owned()));
         assert_eq!(resolved_value(&style, PropertyId::Width, None), "50%");
         assert_eq!(resolved_value(&style, PropertyId::PaddingLeft, None), "10%");
         assert_eq!(resolved_value(&style, PropertyId::MarginLeft, None), "auto");

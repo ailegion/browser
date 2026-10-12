@@ -866,6 +866,27 @@ impl OverflowWrap {
     }
 }
 
+/// `box-decoration-break` (CSS Fragmentation 3 §5; `-webkit-box-
+/// decoration-break` is its prefixed alias): how an inline box broken over
+/// several lines gets its padding, border, margin and background: `slice`,
+/// the edges at the first and last fragment only, as if the box were drawn
+/// whole and cut; `clone`, every fragment wrapped in all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoxDecorationBreak {
+    #[default]
+    Slice,
+    Clone,
+}
+
+impl BoxDecorationBreak {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            BoxDecorationBreak::Slice => "slice",
+            BoxDecorationBreak::Clone => "clone",
+        }
+    }
+}
+
 /// `text-overflow`: what a line that overflows a block with `overflow`
 /// other than `visible` ends with.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1534,6 +1555,7 @@ longhands! {
     BorderTopRightRadius: "border-top-right-radius" => CornerRadius, false;
     BorderBottomRightRadius: "border-bottom-right-radius" => CornerRadius, false;
     BorderBottomLeftRadius: "border-bottom-left-radius" => CornerRadius, false;
+    BoxDecorationBreak: "box-decoration-break" => BoxDecorationBreak, false;
     Width: "width" => SizeValue, false;
     Height: "height" => SizeValue, false;
     MinWidth: "min-width" => SizeValue, false;
@@ -1670,10 +1692,10 @@ pub fn is_shorthand(name: &str) -> bool {
 }
 
 /// Every shorthand name, in the order the CSSOM tries them when it
-/// serializes a declaration block (the widest first; `grid-gap` and
-/// `word-wrap` are the legacy aliases of `gap` and `overflow-wrap`,
-/// never written).
-pub const SHORTHANDS: [&str; 24] = [
+/// serializes a declaration block (the widest first; `grid-gap`,
+/// `word-wrap` and `-webkit-box-decoration-break` are the legacy aliases
+/// of `gap`, `overflow-wrap` and `box-decoration-break`, never written).
+pub const SHORTHANDS: [&str; 25] = [
     "border",
     "border-width",
     "border-style",
@@ -1698,6 +1720,7 @@ pub const SHORTHANDS: [&str; 24] = [
     "place-items",
     "grid-gap",
     "word-wrap",
+    "-webkit-box-decoration-break",
 ];
 
 /// One declaration in a block, with its `!important` flag.
@@ -1855,6 +1878,7 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "break-word" => WordBreak::BreakWord, _ => return None }))?),
         PropertyId::OverflowWrap => P::OverflowWrap(parse_overflow_wrap(input)?),
         PropertyId::TextOverflow => P::TextOverflow(parse_text_overflow(input)?),
+        PropertyId::BoxDecorationBreak => P::BoxDecorationBreak(parse_box_decoration_break(input)?),
         PropertyId::ListStyleType => P::ListStyleType(parse_list_style_type(input)?),
         PropertyId::ListStylePosition => P::ListStylePosition(parse_list_style_position(input)?),
         PropertyId::ListStyleImage => P::ListStyleImage(parse_image(input)?),
@@ -2364,6 +2388,11 @@ fn parse_overflow_wrap<'i>(input: &mut Parser<'i, '_>) -> Result<OverflowWrap, P
 
 /// `clip | ellipsis | <string>`: one value, as Chrome and Safari take it
 /// (the two-value form is Firefox only).
+fn parse_box_decoration_break<'i>(input: &mut Parser<'i, '_>) -> Result<BoxDecorationBreak, ParseErr<'i>> {
+    keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "slice" => BoxDecorationBreak::Slice, "clone" => BoxDecorationBreak::Clone, _ => return None }))
+}
+
 fn parse_text_overflow<'i>(input: &mut Parser<'i, '_>) -> Result<TextOverflow, ParseErr<'i>> {
     if let Ok(s) = input.try_parse(|i| i.expect_string().map(|s| s.to_string())) {
         return Ok(TextOverflow::String(Arc::from(s.as_str())));
@@ -2474,6 +2503,7 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "flex-flow" => &[FlexDirection, FlexWrap],
         "gap" | "grid-gap" => &[RowGap, ColumnGap],
         "word-wrap" => &[OverflowWrap],
+        "-webkit-box-decoration-break" => &[BoxDecorationBreak],
         "text-decoration" => &[TextDecorationLine, TextDecorationThickness, TextDecorationStyle, TextDecorationColor],
         "list-style" => &[ListStyleType, ListStylePosition, ListStyleImage],
         "place-items" => &[AlignItems],
@@ -2564,8 +2594,9 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
             let c = input.try_parse(parse_gap_value).unwrap_or_else(|_| r.clone());
             vec![P::RowGap(r), P::ColumnGap(c)]
         },
-        // The legacy alias: parsed and stored as `overflow-wrap`.
+        // The legacy aliases: parsed and stored as the unprefixed longhand.
         "word-wrap" => vec![P::OverflowWrap(parse_overflow_wrap(input)?)],
+        "-webkit-box-decoration-break" => vec![P::BoxDecorationBreak(parse_box_decoration_break(input)?)],
         "text-decoration" => {
             // <line> || <thickness> || <style> || <color>, in any order,
             // each at most once; the line keywords may come one at a
@@ -3125,6 +3156,20 @@ mod tests {
         assert_eq!(parse("margin", "revert-layer").len(), 4);
         assert_eq!(parse("gap", "inherit").len(), 2);
         assert_eq!(parse("grid-gap", "inherit").len(), 2);
+    }
+
+    #[test]
+    fn box_decoration_break_parses_with_its_prefixed_alias() {
+        let one = |name: &str, s: &str| parse(name, s).pop();
+        use DeclaredValue as D;
+        use PropertyDeclaration as P;
+        assert_eq!(one("box-decoration-break", "clone"), Some(D::Value(P::BoxDecorationBreak(BoxDecorationBreak::Clone))));
+        assert_eq!(one("box-decoration-break", "slice"), Some(D::Value(P::BoxDecorationBreak(BoxDecorationBreak::Slice))));
+        assert!(one("box-decoration-break", "both").is_none());
+        assert_eq!(parse("-webkit-box-decoration-break", "clone"), vec![D::Value(P::BoxDecorationBreak(BoxDecorationBreak::Clone))]);
+        assert_eq!(parse("-webkit-box-decoration-break", "inherit"), vec![D::Inherit(PropertyId::BoxDecorationBreak)]);
+        assert_eq!(longhands_of("-webkit-box-decoration-break"), Some(vec![PropertyId::BoxDecorationBreak]));
+        assert!(!PropertyId::BoxDecorationBreak.is_inherited());
     }
 
     #[test]

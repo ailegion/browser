@@ -15,10 +15,13 @@ use browser_dom::NodeId;
 use browser_layout::{
     Control, Decoration, DecorationLine, Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment,
 };
-use browser_style::{BorderStyle, ComputedStyle, Rgba, TextDecorationStyle, Visibility};
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+
+use browser_style::{BackgroundBox, BorderStyle, ComputedStyle, Rgba, Sides, TextDecorationStyle, Visibility};
 use url::Url;
 use vello::kurbo::{
-    Affine, BezPath, Cap, Circle, Line, Point, Rect as KRect, RoundedRect, RoundedRectRadii, Shape as _, Stroke,
+    Affine, Arc as KArc, BezPath, Cap, Circle, Line, ParamCurve, ParamCurveArclen, PathSeg, Point, Rect as KRect,
+    RoundedRect, Shape as _, Stroke,
 };
 use vello::peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat, Mix};
 use vello::{Glyph, Scene};
@@ -310,14 +313,14 @@ impl Painter<'_> {
         match &f.content {
             FragmentContent::Box => {
                 if !offscreen && !f.node.is_some_and(|n| self.skip_background_of.contains(&n)) {
-                    self.background_and_border(&f.rect, &f.style);
+                    self.background_and_border(&f.rect, &f.style, &f.padding, ALL_SIDES);
                 } else if !offscreen {
-                    self.border(&f.rect, &f.style);
+                    self.border(&f.rect, &f.style, ALL_SIDES);
                 }
             }
             FragmentContent::Control(c) => {
                 if !offscreen {
-                    self.background_and_border(&f.rect, &f.style);
+                    self.background_and_border(&f.rect, &f.style, &f.padding, ALL_SIDES);
                     self.control(&f.rect, *c);
                 }
             }
@@ -329,8 +332,18 @@ impl Painter<'_> {
             }
             FragmentContent::Image(url) => {
                 if !offscreen {
-                    self.background_and_border(&f.rect, &f.style);
+                    self.background_and_border(&f.rect, &f.style, &f.padding, ALL_SIDES);
                     self.image(&f.rect, &f.style, url);
+                }
+            }
+            // A line fragment of an inline element: its background and the
+            // edges it carries (the top and bottom on every fragment, the
+            // left and right where the element starts and ends; CSS 2.1
+            // §9.4.2). Corners at a missing side have no radius.
+            FragmentContent::Inline { left, right } => {
+                if !offscreen {
+                    let sides = [true, *right, true, *left];
+                    self.background_and_border(&f.rect, &f.style, &f.padding, sides);
                 }
             }
         }
@@ -354,13 +367,31 @@ impl Painter<'_> {
         }
     }
 
-    fn background_and_border(&mut self, rect: &Rect, style: &ComputedStyle) {
-        let radii = radii(rect, style);
+    /// A box's background colour, background image and border. `padding`
+    /// is the box's used padding (for `background-clip: content-box`);
+    /// `sides` says which of its top, right, bottom and left edges the
+    /// box has here (an inline element's line fragment lacks the ones
+    /// not on that line).
+    fn background_and_border(&mut self, rect: &Rect, style: &ComputedStyle, padding: &Sides<f32>, sides: [bool; 4]) {
+        let geometry = BoxGeometry::new(rect, style, sides);
         let bg = style.background_color;
         if !bg.is_transparent() {
-            let shape = RoundedRect::from_rect(krect(rect), radii);
-            self.scene
-                .fill(Fill::NonZero, self.transform, color(bg), None, &shape);
+            // The colour is clipped by the last layer's `background-clip`
+            // (CSS Backgrounds 3 §3.3); `text` clips to the glyphs and is
+            // roadmap item 4a block 4's, painted as `border-box` until
+            // then.
+            let clip = style.background_clip.last().copied().unwrap_or(BackgroundBox::BorderBox);
+            let path = match clip {
+                BackgroundBox::BorderBox | BackgroundBox::Text => geometry.outer_path(),
+                BackgroundBox::PaddingBox => geometry.inset_path(geometry.width),
+                BackgroundBox::ContentBox => geometry.inset_path([
+                    geometry.width[0] + padding.top as f64,
+                    geometry.width[1] + padding.right as f64,
+                    geometry.width[2] + padding.bottom as f64,
+                    geometry.width[3] + padding.left as f64,
+                ]),
+            };
+            self.scene.fill(Fill::NonZero, self.transform, color(bg), None, &path);
         }
         if let Some(url) = &style.background_image
             && let Ok(resolved) = Url::parse(url)
@@ -375,67 +406,116 @@ impl Painter<'_> {
             self.scene.draw_image(&ImageBrush::new(img.clone()), t);
             self.scene.pop_layer();
         }
-        self.border(rect, style);
+        self.border_with(&geometry, style);
     }
 
-    fn border(&mut self, rect: &Rect, style: &ComputedStyle) {
+    fn border(&mut self, rect: &Rect, style: &ComputedStyle, sides: [bool; 4]) {
         if !style.has_visible_border() {
             return;
         }
-        let bw = &style.border_width;
-        let radii = radii(rect, style);
-        let uniform = bw.top == bw.right
-            && bw.top == bw.bottom
-            && bw.top == bw.left
-            && style.border_color.top == style.border_color.right
-            && style.border_color.top == style.border_color.bottom
-            && style.border_color.top == style.border_color.left;
-        if uniform && (radii.top_left > 0.0 || radii.top_right > 0.0 || radii.bottom_left > 0.0 || radii.bottom_right > 0.0) {
-            // Rounded border: outer rounded rect minus inner rounded rect.
-            let outer = RoundedRect::from_rect(krect(rect), radii);
-            let w = bw.top as f64;
-            let inner_rect = KRect::new(
-                rect.x as f64 + w,
-                rect.y as f64 + w,
-                rect.right() as f64 - w,
-                rect.bottom() as f64 - w,
-            );
-            let inner = RoundedRect::from_rect(
-                inner_rect,
-                RoundedRectRadii::new(
-                    (radii.top_left - w).max(0.0),
-                    (radii.top_right - w).max(0.0),
-                    (radii.bottom_right - w).max(0.0),
-                    (radii.bottom_left - w).max(0.0),
-                ),
-            );
-            let mut path = outer.to_path(0.1);
-            path.extend(inner.to_path(0.1));
-            self.scene.fill(
-                Fill::EvenOdd,
-                self.transform,
-                color(style.border_color.top),
-                None,
-                &path,
-            );
+        self.border_with(&BoxGeometry::new(rect, style, sides), style);
+    }
+
+    /// The border of a box (CSS Backgrounds 3 §4): each side present is
+    /// drawn in its own style and colour inside the ring between the
+    /// outer and inner edges, confined to its wedge (the region between
+    /// the lines from each outer corner to the matching inner corner), so
+    /// sides of different colours meet along the corner diagonal.
+    fn border_with(&mut self, g: &BoxGeometry, style: &ComputedStyle) {
+        if g.width.iter().all(|w| *w <= 0.0) {
             return;
         }
-        let sides = [
-            (bw.top, style.border_style.top, style.border_color.top, KRect::new(rect.x as f64, rect.y as f64, rect.right() as f64, (rect.y + bw.top) as f64)),
-            (bw.bottom, style.border_style.bottom, style.border_color.bottom, KRect::new(rect.x as f64, (rect.bottom() - bw.bottom) as f64, rect.right() as f64, rect.bottom() as f64)),
-            (bw.left, style.border_style.left, style.border_color.left, KRect::new(rect.x as f64, rect.y as f64, (rect.x + bw.left) as f64, rect.bottom() as f64)),
-            (bw.right, style.border_style.right, style.border_color.right, KRect::new((rect.right() - bw.right) as f64, rect.y as f64, rect.right() as f64, rect.bottom() as f64)),
-        ];
-        for (width, border_style, c, r) in sides {
-            if width <= 0.0 || !border_style.is_visible() || c.is_transparent() {
+        let styles = [style.border_style.top, style.border_style.right, style.border_style.bottom, style.border_style.left];
+        let colors = [style.border_color.top, style.border_color.right, style.border_color.bottom, style.border_color.left];
+        let outer = g.outer_path();
+        let inner = g.inset_path(g.width);
+        let drawn = |i: usize| g.width[i] > 0.0 && styles[i].is_visible() && !colors[i].is_transparent();
+        // One solid colour all round: the ring in one fill.
+        if (0..4).all(|i| drawn(i) && styles[i] == BorderStyle::Solid && colors[i] == colors[0] && g.width[i] == g.width[0])
+        {
+            let mut ring = outer.clone();
+            ring.extend(inner.iter());
+            self.scene.fill(Fill::EvenOdd, self.transform, color(colors[0]), None, &ring);
+            return;
+        }
+        let mut ring = outer.clone();
+        ring.extend(inner.iter());
+        self.scene.push_clip_layer(Fill::EvenOdd, self.transform, &ring);
+        for side in 0..4 {
+            if !drawn(side) {
                 continue;
             }
-            let c = match border_style {
-                // Inset/outset/groove/ridge: darken as a hint of 3D.
-                BorderStyle::Inset | BorderStyle::Groove => Rgba { r: c.r * 0.6, g: c.g * 0.6, b: c.b * 0.6, a: c.a },
-                _ => c,
-            };
-            self.scene.fill(Fill::NonZero, self.transform, color(c), None, &r);
+            let wedge = g.wedge(side);
+            self.scene.push_clip_layer(Fill::NonZero, self.transform, &wedge);
+            self.border_side(g, side, styles[side], colors[side], &outer, &inner);
+            self.scene.pop_layer();
+        }
+        self.scene.pop_layer();
+    }
+
+    /// One side of a border, in its style (CSS Backgrounds 3 §4.2),
+    /// clipped to its wedge of the border ring by the caller.
+    fn border_side(&mut self, g: &BoxGeometry, side: usize, style: BorderStyle, c: Rgba, outer: &BezPath, inner: &BezPath) {
+        let w = g.width[side];
+        let t = self.transform;
+        let fill_ring = |scene: &mut Scene, a: &BezPath, b: &BezPath, c: Rgba| {
+            let mut ring = a.clone();
+            ring.extend(b.iter());
+            scene.fill(Fill::EvenOdd, t, color(c), None, &ring);
+        };
+        match style {
+            BorderStyle::None | BorderStyle::Hidden => {}
+            BorderStyle::Solid => self.scene.fill(Fill::NonZero, t, color(c), None, outer),
+            // Two lines each a third of the width, the middle third clear.
+            BorderStyle::Double => {
+                let third: [f64; 4] = std::array::from_fn(|i| g.width[i] / 3.0);
+                let two_thirds: [f64; 4] = std::array::from_fn(|i| g.width[i] * 2.0 / 3.0);
+                fill_ring(self.scene, outer, &g.inset_path(third), c);
+                fill_ring(self.scene, &g.inset_path(two_thirds), inner, c);
+            }
+            // Lit from the top left: `inset` darkens the top and left,
+            // `outset` the bottom and right (Blink's shading).
+            BorderStyle::Inset => self.scene.fill(Fill::NonZero, t, color(if side == 0 || side == 3 { dark(c) } else { c }), None, outer),
+            BorderStyle::Outset => self.scene.fill(Fill::NonZero, t, color(if side == 1 || side == 2 { dark(c) } else { c }), None, outer),
+            // Carved in or raised: an inset outer half over an outset
+            // inner half, or the reverse.
+            BorderStyle::Groove | BorderStyle::Ridge => {
+                let half: [f64; 4] = std::array::from_fn(|i| g.width[i] / 2.0);
+                let mid = g.inset_path(half);
+                let top_left = side == 0 || side == 3;
+                let (outer_dark, inner_dark) = if style == BorderStyle::Groove { (top_left, !top_left) } else { (!top_left, top_left) };
+                fill_ring(self.scene, outer, &mid, if outer_dark { dark(c) } else { c });
+                fill_ring(self.scene, &mid, inner, if inner_dark { dark(c) } else { c });
+            }
+            // Round dots a width apart, and dashes three widths long with
+            // gaps about as long, fitted to the side so it starts and ends
+            // with ink; they follow the corners' curves.
+            BorderStyle::Dotted | BorderStyle::Dashed => {
+                let center = g.side_center_path(side);
+                let length: f64 = center.segments().map(|s| s.arclen(0.05)).sum();
+                if length <= 0.0 {
+                    return;
+                }
+                if style == BorderStyle::Dotted {
+                    let n = if length <= w { 1 } else { (((length - w) / (2.0 * w)).round() as usize).max(1) + 1 };
+                    let step = if n > 1 { (length - w) / (n - 1) as f64 } else { 0.0 };
+                    let first = if n > 1 { w / 2.0 } else { length / 2.0 };
+                    for k in 0..n {
+                        let p = point_along(&center, first + step * k as f64);
+                        self.scene.fill(Fill::NonZero, t, color(c), None, &Circle::new(p, w / 2.0));
+                    }
+                } else {
+                    let dash = (3.0 * w).min(length);
+                    let n = if length <= dash { 1 } else { (((length - dash) / (6.0 * w)).round() as usize).max(1) + 1 };
+                    let step = if n > 1 { (length - dash) / (n - 1) as f64 } else { 0.0 };
+                    let stroke = Stroke::new(w).with_caps(Cap::Butt);
+                    for k in 0..n {
+                        let from = step * k as f64;
+                        let piece = sub_path(&center, from, from + dash);
+                        self.scene.stroke(&stroke, t, color(c), None, &piece);
+                    }
+                }
+            }
         }
     }
 
@@ -666,15 +746,276 @@ impl Painter<'_> {
     }
 }
 
-fn radii(rect: &Rect, style: &ComputedStyle) -> RoundedRectRadii {
-    let r = |v: browser_style::ComputedLp| v.resolve(rect.width.min(rect.height)) as f64;
-    let max = (rect.width.min(rect.height) / 2.0) as f64;
-    RoundedRectRadii::new(
-        r(style.border_radius.top).clamp(0.0, max),
-        r(style.border_radius.right).clamp(0.0, max),
-        r(style.border_radius.bottom).clamp(0.0, max),
-        r(style.border_radius.left).clamp(0.0, max),
-    )
+/// Every edge present: a block, replaced or control box.
+const ALL_SIDES: [bool; 4] = [true, true, true, true];
+
+/// Blink's darkening of a border colour for the shaded sides of `inset`,
+/// `outset`, `groove` and `ridge`: the brightest channel comes down by a
+/// third and the others in proportion.
+fn dark(c: Rgba) -> Rgba {
+    let v = c.r.max(c.g).max(c.b);
+    if v <= 0.0 {
+        return c;
+    }
+    let m = ((v - 0.33) / v).max(0.0);
+    Rgba {
+        r: c.r * m,
+        g: c.g * m,
+        b: c.b * m,
+        a: c.a,
+    }
+}
+
+/// The geometry a box's background and border are drawn with: its border
+/// box, the widths of the sides it has (zero for one it has not) and the
+/// outer corner radii, elliptical for percentages and reduced together so
+/// adjacent corners fit their side (CSS Backgrounds 3 §5.1, §5.5); a
+/// corner at a missing side has no radius (the box continues there).
+/// Sides are top, right, bottom, left; corners top-left, top-right,
+/// bottom-right, bottom-left.
+struct BoxGeometry {
+    rect: KRect,
+    width: [f64; 4],
+    radii: [(f64, f64); 4],
+}
+
+impl BoxGeometry {
+    fn new(rect: &Rect, style: &ComputedStyle, sides: [bool; 4]) -> Self {
+        let bw = &style.border_width;
+        let width = [
+            if sides[0] { bw.top as f64 } else { 0.0 },
+            if sides[1] { bw.right as f64 } else { 0.0 },
+            if sides[2] { bw.bottom as f64 } else { 0.0 },
+            if sides[3] { bw.left as f64 } else { 0.0 },
+        ];
+        let (w, h) = (rect.width.max(0.0) as f64, rect.height.max(0.0) as f64);
+        let radius = |v: browser_style::ComputedLp, has: bool| -> (f64, f64) {
+            if !has {
+                return (0.0, 0.0);
+            }
+            match v {
+                browser_style::ComputedLp::Px(px) => (px.max(0.0) as f64, px.max(0.0) as f64),
+                browser_style::ComputedLp::Percent(p) => {
+                    let p = (p.max(0.0) / 100.0) as f64;
+                    (p * w, p * h)
+                }
+            }
+        };
+        let mut radii = [
+            radius(style.border_radius.top, sides[0] && sides[3]),
+            radius(style.border_radius.right, sides[0] && sides[1]),
+            radius(style.border_radius.bottom, sides[2] && sides[1]),
+            radius(style.border_radius.left, sides[2] && sides[3]),
+        ];
+        // §5.5: scale every radius by the same factor so no side's two
+        // corners overlap.
+        let mut f = 1.0f64;
+        let fit = |len: f64, sum: f64| if sum > len && sum > 0.0 { len / sum } else { 1.0 };
+        f = f.min(fit(w, radii[0].0 + radii[1].0));
+        f = f.min(fit(w, radii[3].0 + radii[2].0));
+        f = f.min(fit(h, radii[0].1 + radii[3].1));
+        f = f.min(fit(h, radii[1].1 + radii[2].1));
+        if f < 1.0 {
+            for r in &mut radii {
+                r.0 *= f;
+                r.1 *= f;
+            }
+        }
+        Self {
+            rect: krect(rect),
+            width,
+            radii,
+        }
+    }
+
+    /// The outer edge of the border box.
+    fn outer_path(&self) -> BezPath {
+        rounded_rect_path(self.rect, self.radii)
+    }
+
+    /// The edge `inset` (top, right, bottom, left) inside the outer one,
+    /// its radii reduced by the insets (§5.3: the padding edge's radii
+    /// are the outer ones less the border widths).
+    fn inset_path(&self, inset: [f64; 4]) -> BezPath {
+        let r = &self.rect;
+        let rect = KRect::new(
+            r.x0 + inset[3],
+            r.y0 + inset[0],
+            (r.x1 - inset[1]).max(r.x0 + inset[3]),
+            (r.y1 - inset[2]).max(r.y0 + inset[0]),
+        );
+        let shrink = |(rx, ry): (f64, f64), dx: f64, dy: f64| ((rx - dx).max(0.0), (ry - dy).max(0.0));
+        let radii = [
+            shrink(self.radii[0], inset[3], inset[0]),
+            shrink(self.radii[1], inset[1], inset[0]),
+            shrink(self.radii[2], inset[1], inset[2]),
+            shrink(self.radii[3], inset[3], inset[2]),
+        ];
+        rounded_rect_path(rect, radii)
+    }
+
+    /// The region one side's border lies in: between its outer edge and
+    /// the lines from its two outer corners to the matching inner
+    /// corners, where neighbouring sides meet.
+    fn wedge(&self, side: usize) -> BezPath {
+        let r = &self.rect;
+        let [t, rt, b, l] = self.width;
+        let outer = [
+            Point::new(r.x0, r.y0),
+            Point::new(r.x1, r.y0),
+            Point::new(r.x1, r.y1),
+            Point::new(r.x0, r.y1),
+        ];
+        let inner = [
+            Point::new(r.x0 + l, r.y0 + t),
+            Point::new(r.x1 - rt, r.y0 + t),
+            Point::new(r.x1 - rt, r.y1 - b),
+            Point::new(r.x0 + l, r.y1 - b),
+        ];
+        // Side `i` runs from corner `i` to corner `i + 1`.
+        let (a, c) = (side, (side + 1) % 4);
+        let mut path = BezPath::new();
+        path.move_to(outer[a]);
+        path.line_to(outer[c]);
+        path.line_to(inner[c]);
+        path.line_to(inner[a]);
+        path.close_path();
+        path
+    }
+
+    /// The line a dotted or dashed side is drawn along: the middle of the
+    /// border, from the middle of one corner's curve to the middle of the
+    /// next (each corner is shared by its two sides).
+    fn side_center_path(&self, side: usize) -> BezPath {
+        let half: [f64; 4] = std::array::from_fn(|i| self.width[i] / 2.0);
+        let full = self.inset_path(half);
+        // The full centre path is four corner arcs joined by lines, each
+        // corner's arc starting at the corner before the side; take the
+        // half of each bounding arc nearest the side.
+        let r = &self.rect;
+        let rect = KRect::new(r.x0 + half[3], r.y0 + half[0], r.x1 - half[1], r.y1 - half[2]);
+        let shrink = |(rx, ry): (f64, f64), dx: f64, dy: f64| ((rx - dx).max(0.0), (ry - dy).max(0.0));
+        let radii = [
+            shrink(self.radii[0], half[3], half[0]),
+            shrink(self.radii[1], half[1], half[0]),
+            shrink(self.radii[2], half[1], half[2]),
+            shrink(self.radii[3], half[3], half[2]),
+        ];
+        let _ = full;
+        side_path(rect, radii, side)
+    }
+}
+
+/// A rectangle with elliptical corners (radii top-left, top-right,
+/// bottom-right, bottom-left as (rx, ry)), clockwise from the top-left
+/// corner's end.
+fn rounded_rect_path(r: KRect, radii: [(f64, f64); 4]) -> BezPath {
+    let mut path = BezPath::new();
+    let [tl, tr, br, bl] = radii;
+    path.move_to((r.x0 + tl.0, r.y0));
+    path.line_to((r.x1 - tr.0, r.y0));
+    corner_arc(&mut path, Point::new(r.x1 - tr.0, r.y0 + tr.1), tr, -FRAC_PI_2);
+    path.line_to((r.x1, r.y1 - br.1));
+    corner_arc(&mut path, Point::new(r.x1 - br.0, r.y1 - br.1), br, 0.0);
+    path.line_to((r.x0 + bl.0, r.y1));
+    corner_arc(&mut path, Point::new(r.x0 + bl.0, r.y1 - bl.1), bl, FRAC_PI_2);
+    path.line_to((r.x0, r.y0 + tl.1));
+    corner_arc(&mut path, Point::new(r.x0 + tl.0, r.y0 + tl.1), tl, PI);
+    path.close_path();
+    path
+}
+
+/// A quarter of an ellipse of `radii` around `center`, clockwise (y down)
+/// from `start` (an angle with 0 at +x, measured towards +y). A corner
+/// without a radius is the point itself: nothing is added (the next line
+/// reaches it), so the path has no zero-length segments.
+fn corner_arc(path: &mut BezPath, center: Point, radii: (f64, f64), start: f64) {
+    if radii.0 <= 0.0 || radii.1 <= 0.0 {
+        let end = start + FRAC_PI_2;
+        let p = Point::new(center.x + radii.0 * end.cos(), center.y + radii.1 * end.sin());
+        if path.elements().last().and_then(|e| e.end_point()) != Some(p) {
+            path.line_to(p);
+        }
+        return;
+    }
+    let arc = KArc::new(center, (radii.0, radii.1), start, FRAC_PI_2, 0.0);
+    path.extend(arc.append_iter(0.1));
+}
+
+/// The centre line of side `side` (top, right, bottom, left) of a rounded
+/// rectangle: from the middle of the corner arc before it, along the
+/// side, to the middle of the arc after it.
+fn side_path(r: KRect, radii: [(f64, f64); 4], side: usize) -> BezPath {
+    let [tl, tr, br, bl] = radii;
+    let mut path = BezPath::new();
+    // Each corner's arc as (center, radii, start angle of the quarter).
+    let corners = [
+        (Point::new(r.x0 + tl.0, r.y0 + tl.1), tl, PI),
+        (Point::new(r.x1 - tr.0, r.y0 + tr.1), tr, -FRAC_PI_2),
+        (Point::new(r.x1 - br.0, r.y1 - br.1), br, 0.0),
+        (Point::new(r.x0 + bl.0, r.y1 - bl.1), bl, FRAC_PI_2),
+    ];
+    let (c0, c1) = (corners[side], corners[(side + 1) % 4]);
+    let at = |(center, radii, _): (Point, (f64, f64), f64), angle: f64| {
+        Point::new(center.x + radii.0 * angle.cos(), center.y + radii.1 * angle.sin())
+    };
+    // Second half of the corner before the side (a corner without a
+    // radius is a point: the side starts there).
+    let mid0 = c0.2 + FRAC_PI_4;
+    path.move_to(at(c0, mid0));
+    if c0.1.0 > 0.0 && c0.1.1 > 0.0 {
+        path.extend(KArc::new(c0.0, c0.1, mid0, FRAC_PI_4, 0.0).append_iter(0.1));
+    }
+    // The straight part, then the first half of the corner after it.
+    let end_of_straight = at(c1, c1.2);
+    if path.elements().last().and_then(|e| e.end_point()) != Some(end_of_straight) {
+        path.line_to(end_of_straight);
+    }
+    if c1.1.0 > 0.0 && c1.1.1 > 0.0 {
+        path.extend(KArc::new(c1.0, c1.1, c1.2, FRAC_PI_4, 0.0).append_iter(0.1));
+    }
+    path
+}
+
+/// The part of `path` between `from` and `to` along its length.
+fn sub_path(path: &BezPath, from: f64, to: f64) -> BezPath {
+    let mut out = BezPath::new();
+    let mut start = 0.0;
+    for seg in path.segments() {
+        let len = seg.arclen(0.05);
+        let end = start + len;
+        if end > from && start < to && len > 0.0 {
+            let t0 = if from > start { seg.inv_arclen(from - start, 0.05) } else { 0.0 };
+            let t1 = if to < end { seg.inv_arclen(to - start, 0.05) } else { 1.0 };
+            let piece = seg.subsegment(t0..t1);
+            if out.elements().is_empty() {
+                out.move_to(piece.start());
+            }
+            match piece {
+                PathSeg::Line(l) => out.line_to(l.p1),
+                PathSeg::Quad(q) => out.quad_to(q.p1, q.p2),
+                PathSeg::Cubic(c) => out.curve_to(c.p1, c.p2, c.p3),
+            }
+        }
+        start = end;
+    }
+    out
+}
+
+/// The point `distance` along `path` (clamped to its ends).
+fn point_along(path: &BezPath, distance: f64) -> Point {
+    let mut remaining = distance.max(0.0);
+    let mut last = Point::ZERO;
+    for seg in path.segments() {
+        let len = seg.arclen(0.05);
+        if remaining <= len {
+            let t = seg.inv_arclen(remaining, 0.05);
+            return seg.eval(t);
+        }
+        remaining -= len;
+        last = seg.eval(1.0);
+    }
+    last
 }
 
 fn padding_box(rect: &Rect, style: &ComputedStyle) -> Rect {
@@ -1032,6 +1373,149 @@ mod tests {
             .collect();
         assert!(row.iter().any(|&p| is_red(p)), "the line shows in the g's range: {row:?}");
         assert!(row.iter().any(|&p| is_dark(p)), "the descender's ink over the line: {row:?}");
+    }
+
+    /// Lay out and paint `html` in a 300×150 viewport; the tree, the
+    /// pixels (`None` without a GPU) and a probe.
+    fn render(html: &str) -> (browser_layout::LayoutTree, Option<Vec<u8>>) {
+        let doc = browser_dom::parse_html(html.as_bytes());
+        let mut stylist = browser_style::Stylist::new();
+        stylist.add_sheet(browser_style::ua::ua_stylesheet());
+        let vp = browser_style::Viewport {
+            width: 300.0,
+            height: 150.0,
+            scale_factor: 1.0,
+            prefers_dark: false,
+        };
+        let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+        let mut engine = browser_layout::LayoutEngine::new();
+        let images = ImageStore::new();
+        let tree = engine.layout(&doc, &styles, 300.0, 150.0, &images);
+        let options = PaintOptions {
+            viewport_width: 300.0,
+            viewport_height: 150.0,
+            scale: 1.0,
+            ..PaintOptions::default()
+        };
+        let mut scene = Scene::new();
+        paint(&tree, &images, &options, &mut scene);
+        (tree, render_offscreen(&scene, 300, 150, Color::WHITE))
+    }
+
+    fn px(pixels: &[u8], x: f32, y: f32) -> [u8; 3] {
+        let i = (y.floor() as usize * 300 + x.floor() as usize) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2]]
+    }
+
+    /// The `Inline` fragments of the first element with the tag.
+    fn inline_fragments(tree: &browser_layout::LayoutTree, tag: &str) -> Vec<(Rect, bool, bool)> {
+        let mut out = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let FragmentContent::Inline { left, right } = f.content
+                && f.style.font_size > 0.0
+                && f.node.is_some()
+            {
+                let _ = tag;
+                out.push((f.rect, left, right));
+            }
+        });
+        out
+    }
+
+    /// An inline element's background covers its font's content area and
+    /// its padding, not the whole line box; borders, radii and the edges
+    /// of a sliced two-line element paint where the fragment has them.
+    #[test]
+    fn inline_fragments_paint_background_edges_and_corners() {
+        let (tree, pixels) = render(
+            "<body style='margin:0;font-size:20px;line-height:40px'><p style='margin:0'>a<mark>bb</mark>c</p></body>",
+        );
+        let Some(pixels) = pixels else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let marks = inline_fragments(&tree, "mark");
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        let r = marks[0].0;
+        assert!(r.height < 30.0 && r.y > 2.0, "the content area, not the 40px line: {r:?}");
+        let yellow = [255, 255, 0];
+        assert_eq!(px(&pixels, r.x + r.width / 2.0, r.y + 1.0), yellow, "inside the content area's top");
+        assert_eq!(px(&pixels, r.x + 1.0, r.bottom() - 1.0), yellow);
+        assert_eq!(px(&pixels, r.x + r.width / 2.0, 1.0), [255, 255, 255], "the line box above it is bare");
+        assert_eq!(px(&pixels, r.x + r.width / 2.0, 38.0), [255, 255, 255]);
+
+        // Two lines (60px apart, so the 43px-tall fragments do not overlap
+        // the next line): the first fragment has the left edge and a
+        // rounded top-left corner but no right edge; the last the reverse.
+        let (tree, pixels) = render(
+            "<body style='margin:0;font-size:20px;line-height:60px'><p style='margin:0;width:170px'>\
+             aaaa <span style='padding:6px 10px;border:4px solid red;border-radius:10px;background:#0f0'>bbbb cccc dddd eeee ffff</span></p></body>",
+        );
+        let pixels = pixels.expect("gpu");
+        let pieces = inline_fragments(&tree, "span");
+        assert!(pieces.len() >= 2, "{pieces:?}");
+        let (first, last) = (pieces[0], pieces[pieces.len() - 1]);
+        assert!(first.1 && !first.2 && !last.1 && last.2, "{pieces:?}");
+        let red = |p: [u8; 3]| p[0] > 200 && p[1] < 80 && p[2] < 80;
+        let green = |p: [u8; 3]| p[1] > 200 && p[0] < 80 && p[2] < 80;
+        let white = |p: [u8; 3]| p == [255, 255, 255];
+        let (f, l) = (first.0, last.0);
+        assert!(red(px(&pixels, f.x + 2.0, f.y + f.height / 2.0)), "left border on the first fragment");
+        assert!(green(px(&pixels, f.right() - 2.0, f.y + 7.0)), "no right border on it: the padding shows");
+        assert!(white(px(&pixels, f.x + 1.0, f.y + 1.0)), "its top-left corner is rounded off");
+        assert!(red(px(&pixels, f.right() - 1.0, f.y + 1.0)), "its top-right corner is square: the top border runs to the end");
+        assert!(red(px(&pixels, l.right() - 2.0, l.y + l.height / 2.0)), "right border on the last fragment");
+        assert!(green(px(&pixels, l.x + 2.0, l.y + 7.0)), "no left border on it");
+        assert!(red(px(&pixels, l.x + 1.0, l.y + 1.0)), "its top-left corner is square");
+        let corner = px(&pixels, l.right() - 1.0, l.y + 1.0);
+        assert!(
+            white(corner),
+            "its top-right corner is rounded off: {corner:?} at {:?}; row: {:?}",
+            l,
+            (0..12).map(|d| px(&pixels, l.right() - 12.0 + d as f32, l.y + 1.0)).collect::<Vec<_>>()
+        );
+    }
+
+    /// Border styles on a block: double is two lines and a gap, dotted and
+    /// dashed alternate ink and gaps, inset shades the top and left, and
+    /// two colours meet along the corner diagonal.
+    #[test]
+    fn border_styles_paint() {
+        let (_, pixels) = render(
+            "<body style='margin:0'>\
+             <div style='width:100px;height:40px;border:6px double red'></div>\
+             <div style='width:100px;height:40px;border:6px dotted red;margin-top:4px'></div>\
+             <div style='width:100px;height:40px;border:6px dashed red;margin-top:4px'></div></body>",
+        );
+        let Some(pixels) = pixels else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let red = |p: [u8; 3]| p[0] > 200 && p[1] < 80 && p[2] < 80;
+        let white = |p: [u8; 3]| p == [255, 255, 255];
+        assert!(red(px(&pixels, 50.0, 1.0)) && white(px(&pixels, 50.0, 3.0)) && red(px(&pixels, 50.0, 5.0)), "double: line, gap, line");
+        assert!(red(px(&pixels, 1.0, 20.0)) && white(px(&pixels, 3.0, 20.0)) && red(px(&pixels, 5.0, 20.0)), "double on the left too");
+        // The boxes are 52px tall (40 + two 6px borders), 4px apart.
+        for (top, name) in [(56.0, "dotted"), (112.0, "dashed")] {
+            let row: Vec<[u8; 3]> = (10..90).map(|x| px(&pixels, x as f32 + 0.5, top + 3.0)).collect();
+            assert!(row.iter().any(|p| red(*p)) && row.iter().any(|p| white(*p)), "{name}: ink and gaps along the top: {row:?}");
+            assert!(red(px(&pixels, 3.0, top + 20.0)) || white(px(&pixels, 3.0, top + 20.0)), "{name}: the left side is drawn");
+        }
+        let (_, pixels) = render(
+            "<body style='margin:0'><div style='width:100px;height:40px;border:8px inset rgb(200,200,200)'></div>\
+             <div style='width:100px;height:40px;border-top:8px solid red;border-left:8px solid blue;margin-top:4px'></div></body>",
+        );
+        let pixels = pixels.expect("gpu");
+        let top = px(&pixels, 50.0, 3.0);
+        let bottom = px(&pixels, 50.0, 37.0);
+        assert!(top[0] < bottom[0] && bottom == [200, 200, 200], "inset: the top is shaded, the bottom plain: {top:?} {bottom:?}");
+        assert_eq!(px(&pixels, 3.0, 20.0), top, "and the left like the top");
+        // The inset box is 56px tall (40 + two 8px borders); the next
+        // starts 4px below it.
+        let blue = |p: [u8; 3]| p[2] > 200 && p[0] < 80 && p[1] < 80;
+        assert!(red(px(&pixels, 6.0, 60.0 + 1.0)), "above the corner diagonal: the top's red");
+        assert!(blue(px(&pixels, 1.0, 60.0 + 6.0)), "below it: the left's blue");
+        assert!(red(px(&pixels, 50.0, 60.0 + 4.0)) && blue(px(&pixels, 4.0, 60.0 + 30.0)));
     }
 
     #[test]
