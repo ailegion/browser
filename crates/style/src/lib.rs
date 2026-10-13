@@ -12,6 +12,7 @@
 pub mod cascade;
 pub mod computed;
 pub mod custom;
+pub mod image;
 pub mod media;
 pub mod properties;
 pub mod selector_impl;
@@ -24,8 +25,14 @@ pub mod values;
 pub use cascade::{Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
 pub use state::{ElementStates, InteractionDeps, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 pub use computed::{
-    AppliedDecoration, ComputedStyle, ComputedVerticalAlign, DecorationFont, DecorationThickness, LetterSpacing,
-    LineHeight, UnderlineOffset, Viewport,
+    AppliedDecoration, ComputedBackgroundSize, ComputedPosition, ComputedStyle, ComputedVerticalAlign, DecorationFont,
+    DecorationThickness, LetterSpacing, LineHeight, PositionOffset, UnderlineOffset, Viewport,
+};
+pub use image::{
+    ColorInterpolation, ComputedCandidate, ComputedGradient, ComputedGradientItem, ComputedGradientPos,
+    ComputedGradientPosition, ComputedGradientShape, ComputedImage, ComputedPositionComponent, ComputedRadialSize,
+    Gradient, GradientItem, GradientPos, GradientShape, HueMethod, ImageSetCandidate, InterpolationSpace,
+    LinearDirection, RadialShape, RadialSize,
 };
 pub use properties::*;
 pub use media::MediaQueryList;

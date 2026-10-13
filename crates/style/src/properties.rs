@@ -10,6 +10,7 @@ use std::sync::Arc;
 use cssparser::{Parser, Token, match_ignore_ascii_case};
 
 use crate::ParseErr;
+use crate::image::{Gradient, ImageSetCandidate, parse_angle, parse_image};
 use crate::values::*;
 
 // ----- keyword value types -----
@@ -1009,17 +1010,21 @@ impl ListStylePosition {
     }
 }
 
-/// An image value: `none`, a `url()`, or an image function (gradients
-/// and `image-set()`, kept as written; nothing paints them yet).
+/// An image value as written: `none`, a `url()`, a gradient, an
+/// `image-set()`, or another image function kept as text (`crate::image`
+/// parses, computes and paints the first four; `cross-fade()`,
+/// `element()` and `paint()` are only given back by the CSSOM).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImageValue {
     None,
     Url(Arc<str>),
+    Gradient(Arc<Gradient>),
+    ImageSet(Arc<Vec<ImageSetCandidate>>),
     Function(Arc<str>),
 }
 
 impl ImageValue {
-    /// The URL the engine paints, if any.
+    /// The URL, when the value is a plain `url()`.
     pub fn url(&self) -> Option<Arc<str>> {
         match self {
             ImageValue::Url(u) => Some(u.clone()),
@@ -1031,7 +1036,61 @@ impl ImageValue {
         match self {
             ImageValue::None => "none".to_owned(),
             ImageValue::Url(u) => css_url(u),
+            ImageValue::Gradient(g) => g.to_css(),
+            ImageValue::ImageSet(c) => format!(
+                "image-set({})",
+                c.iter()
+                    .map(|c| format!("{} {}x", c.image.to_css(), css_number(c.resolution)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             ImageValue::Function(f) => f.to_string(),
+        }
+    }
+}
+
+/// `background-blend-mode` (Compositing 1 §9): how a background layer
+/// blends with the layers and colour beneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendMode {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "normal",
+            BlendMode::Multiply => "multiply",
+            BlendMode::Screen => "screen",
+            BlendMode::Overlay => "overlay",
+            BlendMode::Darken => "darken",
+            BlendMode::Lighten => "lighten",
+            BlendMode::ColorDodge => "color-dodge",
+            BlendMode::ColorBurn => "color-burn",
+            BlendMode::HardLight => "hard-light",
+            BlendMode::SoftLight => "soft-light",
+            BlendMode::Difference => "difference",
+            BlendMode::Exclusion => "exclusion",
+            BlendMode::Hue => "hue",
+            BlendMode::Saturation => "saturation",
+            BlendMode::Color => "color",
+            BlendMode::Luminosity => "luminosity",
         }
     }
 }
@@ -1291,6 +1350,30 @@ pub enum PositionEdge {
     End,
 }
 
+impl PositionComponent {
+    pub const INITIAL: PositionComponent = PositionComponent::Length(LengthPercentage::Percent(0.0));
+
+    /// As written, on the horizontal or vertical axis.
+    pub fn to_css(&self, horizontal: bool) -> String {
+        match self {
+            PositionComponent::Length(lp) => lp.to_css(),
+            PositionComponent::Keyword(edge, offset) => {
+                let kw = match (edge, horizontal) {
+                    (PositionEdge::Start, true) => "left",
+                    (PositionEdge::Start, false) => "top",
+                    (PositionEdge::Center, _) => "center",
+                    (PositionEdge::End, true) => "right",
+                    (PositionEdge::End, false) => "bottom",
+                };
+                match offset {
+                    Some(o) => format!("{kw} {}", o.to_css()),
+                    None => kw.to_owned(),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackgroundPosition {
     pub x: PositionComponent,
@@ -1299,26 +1382,12 @@ pub struct BackgroundPosition {
 
 impl BackgroundPosition {
     pub const INITIAL: BackgroundPosition = BackgroundPosition {
-        x: PositionComponent::Length(LengthPercentage::Percent(0.0)),
-        y: PositionComponent::Length(LengthPercentage::Percent(0.0)),
+        x: PositionComponent::INITIAL,
+        y: PositionComponent::INITIAL,
     };
 
     pub fn to_css(&self) -> String {
-        let axis = |c: &PositionComponent, start: &str, end: &str| match c {
-            PositionComponent::Length(lp) => lp.to_css(),
-            PositionComponent::Keyword(edge, offset) => {
-                let kw = match edge {
-                    PositionEdge::Start => start,
-                    PositionEdge::Center => "center",
-                    PositionEdge::End => end,
-                };
-                match offset {
-                    Some(o) => format!("{kw} {}", o.to_css()),
-                    None => kw.to_owned(),
-                }
-            }
-        };
-        format!("{} {}", axis(&self.x, "left", "right"), axis(&self.y, "top", "bottom"))
+        format!("{} {}", self.x.to_css(true), self.y.to_css(false))
     }
 }
 
@@ -1568,12 +1637,14 @@ longhands! {
     Color: "color" => Color, true;
     BackgroundColor: "background-color" => Color, false;
     BackgroundImage: "background-image" => Vec<ImageValue>, false;
-    BackgroundPosition: "background-position" => Vec<BackgroundPosition>, false;
+    BackgroundPositionX: "background-position-x" => Vec<PositionComponent>, false;
+    BackgroundPositionY: "background-position-y" => Vec<PositionComponent>, false;
     BackgroundSize: "background-size" => Vec<BackgroundSize>, false;
     BackgroundRepeat: "background-repeat" => Vec<BackgroundRepeat>, false;
     BackgroundAttachment: "background-attachment" => Vec<BackgroundAttachment>, false;
     BackgroundOrigin: "background-origin" => Vec<BackgroundBox>, false;
     BackgroundClip: "background-clip" => Vec<BackgroundBox>, false;
+    BackgroundBlendMode: "background-blend-mode" => Vec<BlendMode>, false;
     FontFamily: "font-family" => Vec<FamilyName>, true;
     FontSize: "font-size" => FontSize, true;
     FontWeight: "font-weight" => FontWeight, true;
@@ -1693,9 +1764,11 @@ pub fn is_shorthand(name: &str) -> bool {
 
 /// Every shorthand name, in the order the CSSOM tries them when it
 /// serializes a declaration block (the widest first; `grid-gap`,
-/// `word-wrap` and `-webkit-box-decoration-break` are the legacy aliases
-/// of `gap`, `overflow-wrap` and `box-decoration-break`, never written).
-pub const SHORTHANDS: [&str; 25] = [
+/// `word-wrap`, `-webkit-box-decoration-break` and the three
+/// `-webkit-background-*` names are the legacy aliases of `gap`,
+/// `overflow-wrap`, `box-decoration-break`, `background-clip`,
+/// `background-origin` and `background-size`, never written).
+pub const SHORTHANDS: [&str; 29] = [
     "border",
     "border-width",
     "border-style",
@@ -1709,6 +1782,7 @@ pub const SHORTHANDS: [&str; 25] = [
     "padding",
     "inset",
     "background",
+    "background-position",
     "font",
     "overflow",
     "flex-flow",
@@ -1721,6 +1795,9 @@ pub const SHORTHANDS: [&str; 25] = [
     "grid-gap",
     "word-wrap",
     "-webkit-box-decoration-break",
+    "-webkit-background-clip",
+    "-webkit-background-origin",
+    "-webkit-background-size",
 ];
 
 /// One declaration in a block, with its `!important` flag.
@@ -1829,7 +1906,9 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
         PropertyId::Color => P::Color(parse_color(input)?),
         PropertyId::BackgroundColor => P::BackgroundColor(parse_color(input)?),
         PropertyId::BackgroundImage => P::BackgroundImage(input.parse_comma_separated(parse_image)?),
-        PropertyId::BackgroundPosition => P::BackgroundPosition(input.parse_comma_separated(parse_background_position)?),
+        PropertyId::BackgroundPositionX => P::BackgroundPositionX(input.parse_comma_separated(|i| parse_position_axis(i, true))?),
+        PropertyId::BackgroundPositionY => P::BackgroundPositionY(input.parse_comma_separated(|i| parse_position_axis(i, false))?),
+        PropertyId::BackgroundBlendMode => P::BackgroundBlendMode(input.parse_comma_separated(parse_blend_mode)?),
         PropertyId::BackgroundSize => P::BackgroundSize(input.parse_comma_separated(parse_background_size)?),
         PropertyId::BackgroundRepeat => P::BackgroundRepeat(input.parse_comma_separated(parse_background_repeat)?),
         PropertyId::BackgroundAttachment => {
@@ -1984,35 +2063,43 @@ fn parse_overflow<'i>(input: &mut Parser<'i, '_>) -> Result<OverflowValue, Parse
         _ => return None }))
 }
 
-/// `none`, a `url()`, or an image function kept as its source text.
-fn parse_image<'i>(input: &mut Parser<'i, '_>) -> Result<ImageValue, ParseErr<'i>> {
-    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
-        return Ok(ImageValue::None);
-    }
-    let location = input.current_source_location();
-    let start = input.position();
-    match input.next()?.clone() {
-        Token::UnquotedUrl(u) => Ok(ImageValue::Url(Arc::from(&*u))),
-        Token::Function(name) => {
-            if name.eq_ignore_ascii_case("url") {
-                let url = input.parse_nested_block(|i| Ok(i.expect_string()?.to_string()))?;
-                Ok(ImageValue::Url(Arc::from(url.as_str())))
+/// One axis of a position (`background-position-x`/`-y`): `[ left |
+/// right | center ]` (`top`/`bottom` for the vertical axis), a
+/// `<length-percentage>`, or a side keyword with an offset from it.
+fn parse_position_axis<'i>(input: &mut Parser<'i, '_>, horizontal: bool) -> Result<PositionComponent, ParseErr<'i>> {
+    let (start, end) = if horizontal { ("left", "right") } else { ("top", "bottom") };
+    if let Ok(edge) = input.try_parse(|i| {
+        keyword(i, |k| {
+            if k.eq_ignore_ascii_case(start) {
+                Some(PositionEdge::Start)
+            } else if k.eq_ignore_ascii_case(end) {
+                Some(PositionEdge::End)
+            } else if k.eq_ignore_ascii_case("center") {
+                Some(PositionEdge::Center)
             } else {
-                // Gradients and image-set are not painted yet; kept as
-                // written so the CSSOM can give them back.
-                input.parse_nested_block(|i| {
-                    while i.next().is_ok() {}
-                    Ok(())
-                })?;
-                Ok(ImageValue::Function(Arc::from(input.slice_from(start).trim())))
+                None
             }
-        }
-        t => Err(location.new_unexpected_token_error(t)),
+        })
+    }) {
+        let offset = if edge == PositionEdge::Center { None } else { input.try_parse(parse_length_percentage).ok() };
+        return Ok(PositionComponent::Keyword(edge, offset));
     }
+    parse_length_percentage(input).map(PositionComponent::Length)
+}
+
+fn parse_blend_mode<'i>(input: &mut Parser<'i, '_>) -> Result<BlendMode, ParseErr<'i>> {
+    keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "normal" => BlendMode::Normal, "multiply" => BlendMode::Multiply, "screen" => BlendMode::Screen,
+        "overlay" => BlendMode::Overlay, "darken" => BlendMode::Darken, "lighten" => BlendMode::Lighten,
+        "color-dodge" => BlendMode::ColorDodge, "color-burn" => BlendMode::ColorBurn,
+        "hard-light" => BlendMode::HardLight, "soft-light" => BlendMode::SoftLight,
+        "difference" => BlendMode::Difference, "exclusion" => BlendMode::Exclusion,
+        "hue" => BlendMode::Hue, "saturation" => BlendMode::Saturation, "color" => BlendMode::Color,
+        "luminosity" => BlendMode::Luminosity, _ => return None }))
 }
 
 /// `<bg-position>`: one to four values.
-fn parse_background_position<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundPosition, ParseErr<'i>> {
+pub(crate) fn parse_background_position<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundPosition, ParseErr<'i>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Kw {
         Left,
@@ -2244,21 +2331,6 @@ fn parse_font_style<'i>(input: &mut Parser<'i, '_>) -> Result<FontStyleValue, Pa
         return Ok(FontStyleValue::Oblique(angle));
     }
     Ok(s)
-}
-
-/// An `<angle>` in degrees.
-fn parse_angle<'i>(input: &mut Parser<'i, '_>) -> Result<f32, ParseErr<'i>> {
-    let location = input.current_source_location();
-    match input.next()?.clone() {
-        Token::Dimension { value, unit, .. } => Ok(match_ignore_ascii_case! { &unit,
-            "deg" => value,
-            "grad" => value * 0.9,
-            "rad" => value.to_degrees(),
-            "turn" => value * 360.0,
-            _ => return Err(location.new_unexpected_token_error(Token::Ident(unit))),
-        }),
-        t => Err(location.new_unexpected_token_error(t)),
-    }
 }
 
 fn parse_font_stretch<'i>(input: &mut Parser<'i, '_>) -> Result<FontStretch, ParseErr<'i>> {
@@ -2495,8 +2567,12 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "border-bottom" => &[BorderBottomWidth, BorderBottomStyle, BorderBottomColor],
         "border-left" => &[BorderLeftWidth, BorderLeftStyle, BorderLeftColor],
         "border-radius" => &[BorderTopLeftRadius, BorderTopRightRadius, BorderBottomRightRadius, BorderBottomLeftRadius],
-        "background" => &[BackgroundColor, BackgroundImage, BackgroundPosition, BackgroundSize, BackgroundRepeat,
-                          BackgroundAttachment, BackgroundOrigin, BackgroundClip],
+        "background" => &[BackgroundColor, BackgroundImage, BackgroundPositionX, BackgroundPositionY, BackgroundSize,
+                          BackgroundRepeat, BackgroundAttachment, BackgroundOrigin, BackgroundClip],
+        "background-position" => &[BackgroundPositionX, BackgroundPositionY],
+        "-webkit-background-clip" => &[BackgroundClip],
+        "-webkit-background-origin" => &[BackgroundOrigin],
+        "-webkit-background-size" => &[BackgroundSize],
         "font" => &[FontStyle, FontVariant, FontWeight, FontStretch, FontSize, LineHeight, FontFamily],
         "overflow" => &[OverflowX, OverflowY],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
@@ -2597,6 +2673,16 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
         // The legacy aliases: parsed and stored as the unprefixed longhand.
         "word-wrap" => vec![P::OverflowWrap(parse_overflow_wrap(input)?)],
         "-webkit-box-decoration-break" => vec![P::BoxDecorationBreak(parse_box_decoration_break(input)?)],
+        "-webkit-background-clip" => vec![P::BackgroundClip(input.parse_comma_separated(|i| parse_background_box(i, true))?)],
+        "-webkit-background-origin" => vec![P::BackgroundOrigin(input.parse_comma_separated(|i| parse_background_box(i, false))?)],
+        "-webkit-background-size" => vec![P::BackgroundSize(input.parse_comma_separated(parse_background_size)?)],
+        "background-position" => {
+            let positions = input.parse_comma_separated(parse_background_position)?;
+            vec![
+                P::BackgroundPositionX(positions.iter().map(|p| p.x.clone()).collect()),
+                P::BackgroundPositionY(positions.iter().map(|p| p.y.clone()).collect()),
+            ]
+        },
         "text-decoration" => {
             // <line> || <thickness> || <style> || <color>, in any order,
             // each at most once; the line keywords may come one at a
@@ -2846,7 +2932,8 @@ fn parse_background<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclar
         Ok(layers) => {
             let color = layers.last().and_then(|l| l.color).unwrap_or(Color::Transparent);
             let mut images = Vec::with_capacity(layers.len());
-            let mut positions = Vec::with_capacity(layers.len());
+            let mut xs = Vec::with_capacity(layers.len());
+            let mut ys = Vec::with_capacity(layers.len());
             let mut sizes = Vec::with_capacity(layers.len());
             let mut repeats = Vec::with_capacity(layers.len());
             let mut attachments = Vec::with_capacity(layers.len());
@@ -2854,7 +2941,9 @@ fn parse_background<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclar
             let mut clips = Vec::with_capacity(layers.len());
             for layer in layers {
                 images.push(layer.image.unwrap_or(ImageValue::None));
-                positions.push(layer.position.unwrap_or(BackgroundPosition::INITIAL));
+                let position = layer.position.unwrap_or(BackgroundPosition::INITIAL);
+                xs.push(position.x);
+                ys.push(position.y);
                 sizes.push(layer.size.unwrap_or(BackgroundSize::Explicit(None, None)));
                 repeats.push(layer.repeat.unwrap_or_default());
                 attachments.push(layer.attachment.unwrap_or_default());
@@ -2870,7 +2959,8 @@ fn parse_background<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclar
             Ok(vec![
                 P::BackgroundColor(color),
                 P::BackgroundImage(images),
-                P::BackgroundPosition(positions),
+                P::BackgroundPositionX(xs),
+                P::BackgroundPositionY(ys),
                 P::BackgroundSize(sizes),
                 P::BackgroundRepeat(repeats),
                 P::BackgroundAttachment(attachments),
@@ -2919,7 +3009,8 @@ fn parse_background<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclar
             Ok(vec![
                 P::BackgroundColor(color),
                 P::BackgroundImage(vec![image]),
-                P::BackgroundPosition(vec![BackgroundPosition::INITIAL]),
+                P::BackgroundPositionX(vec![PositionComponent::INITIAL]),
+                P::BackgroundPositionY(vec![PositionComponent::INITIAL]),
                 P::BackgroundSize(vec![BackgroundSize::Explicit(None, None)]),
                 P::BackgroundRepeat(vec![BackgroundRepeat::default()]),
                 P::BackgroundAttachment(vec![BackgroundAttachment::default()]),
@@ -3105,23 +3196,27 @@ mod tests {
     #[test]
     fn background_layers_and_lenient_fallback() {
         let v = parse("background", "url(a.png) no-repeat right 10px top / cover fixed content-box, red");
-        assert_eq!(v.len(), 8);
+        // Colour, image, position-x, position-y, size, repeat, attachment,
+        // origin, clip.
+        assert_eq!(v.len(), 9);
         let DeclaredValue::Value(PropertyDeclaration::BackgroundImage(images)) = &v[1] else { panic!("{v:?}") };
         assert!(matches!(&images[..], [ImageValue::Url(u), ImageValue::None] if &**u == "a.png"));
         assert!(matches!(&v[0], DeclaredValue::Value(PropertyDeclaration::BackgroundColor(Color::Named(_)))));
-        let DeclaredValue::Value(PropertyDeclaration::BackgroundSize(sizes)) = &v[3] else { panic!("{v:?}") };
+        let DeclaredValue::Value(PropertyDeclaration::BackgroundPositionX(xs)) = &v[2] else { panic!("{v:?}") };
+        assert_eq!(xs[0].to_css(true), "right 10px");
+        let DeclaredValue::Value(PropertyDeclaration::BackgroundSize(sizes)) = &v[4] else { panic!("{v:?}") };
         assert_eq!(sizes, &[BackgroundSize::Cover, BackgroundSize::Explicit(None, None)]);
-        let DeclaredValue::Value(PropertyDeclaration::BackgroundClip(clips)) = &v[7] else { panic!("{v:?}") };
+        let DeclaredValue::Value(PropertyDeclaration::BackgroundClip(clips)) = &v[8] else { panic!("{v:?}") };
         assert_eq!(clips, &[BackgroundBox::ContentBox, BackgroundBox::BorderBox]);
         // Junk the grammar refuses is still read leniently: the color
         // and image survive, the rest is initial.
         let v = parse("background", "foo bar red 10px url(b.png)");
-        assert_eq!(v.len(), 8);
+        assert_eq!(v.len(), 9);
         assert!(matches!(&v[1], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(i)) if matches!(&i[..], [ImageValue::Url(u)] if &**u == "b.png")));
         assert!(matches!(&v[0], DeclaredValue::Value(PropertyDeclaration::BackgroundColor(Color::Named(_)))));
         assert!(parse("background", "").is_empty());
         let v = parse("background", "linear-gradient(red, blue)");
-        assert!(matches!(&v[1], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(i)) if matches!(&i[..], [ImageValue::Function(f)] if &**f == "linear-gradient(red, blue)")));
+        assert!(matches!(&v[1], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(i)) if matches!(&i[..], [ImageValue::Gradient(_)])));
         // The longhands take layer lists too.
         let v = parse("background-image", "url(a.png), none, url(b.png)");
         assert!(matches!(&v[0], DeclaredValue::Value(PropertyDeclaration::BackgroundImage(i)) if i.len() == 3));
@@ -3199,10 +3294,26 @@ mod tests {
 
     #[test]
     fn background_position_forms() {
-        let pos = |s: &str| match parse("background-position", s).pop() {
-            Some(DeclaredValue::Value(PropertyDeclaration::BackgroundPosition(p))) => p[0].to_css(),
+        // The shorthand gives the two axis longhands.
+        let pos = |s: &str| match &parse("background-position", s)[..] {
+            [DeclaredValue::Value(PropertyDeclaration::BackgroundPositionX(x)), DeclaredValue::Value(PropertyDeclaration::BackgroundPositionY(y))] => {
+                format!("{} {}", x[0].to_css(true), y[0].to_css(false))
+            }
             _ => "invalid".to_owned(),
         };
+        let axis = |name: &str, s: &str| match parse(name, s).pop() {
+            Some(DeclaredValue::Value(PropertyDeclaration::BackgroundPositionX(x))) => x[0].to_css(true),
+            Some(DeclaredValue::Value(PropertyDeclaration::BackgroundPositionY(y))) => y[0].to_css(false),
+            _ => "invalid".to_owned(),
+        };
+        assert_eq!(axis("background-position-x", "right 10px"), "right 10px");
+        assert_eq!(axis("background-position-x", "center"), "center");
+        assert_eq!(axis("background-position-x", "top"), "invalid");
+        assert_eq!(axis("background-position-y", "bottom 5%"), "bottom 5%");
+        assert_eq!(axis("background-position-y", "20px"), "20px");
+        assert_eq!(longhands_of("background-position"), Some(vec![PropertyId::BackgroundPositionX, PropertyId::BackgroundPositionY]));
+        assert_eq!(longhands_of("-webkit-background-size"), Some(vec![PropertyId::BackgroundSize]));
+        assert!(matches!(parse("background-blend-mode", "multiply, normal").pop(), Some(DeclaredValue::Value(PropertyDeclaration::BackgroundBlendMode(m))) if m == vec![BlendMode::Multiply, BlendMode::Normal]));
         assert_eq!(pos("center"), "center center");
         assert_eq!(pos("10px"), "10px center");
         assert_eq!(pos("top"), "center top");

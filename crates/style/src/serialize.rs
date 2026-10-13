@@ -9,8 +9,9 @@
 
 use crate::computed::{
     ComputedBackgroundSize, ComputedStyle, ComputedVerticalAlign, DecorationThickness, LetterSpacing, LineHeight,
-    PositionOffset, UnderlineOffset,
+    UnderlineOffset,
 };
+use crate::image::{ComputedImage, position_offset_css};
 use crate::properties::*;
 use crate::values::*;
 
@@ -44,7 +45,9 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::Color(c) | P::BackgroundColor(c) | P::TextDecorationColor(c) => c.to_css(),
         P::ListStyleImage(i) => i.to_css(),
         P::BackgroundImage(list) => layers(list.iter().map(ImageValue::to_css)),
-        P::BackgroundPosition(list) => layers(list.iter().map(BackgroundPosition::to_css)),
+        P::BackgroundPositionX(list) => layers(list.iter().map(|p| p.to_css(true))),
+        P::BackgroundPositionY(list) => layers(list.iter().map(|p| p.to_css(false))),
+        P::BackgroundBlendMode(list) => layers(list.iter().map(|m| m.keyword().to_owned())),
         P::BackgroundSize(list) => layers(list.iter().map(BackgroundSize::to_css)),
         P::BackgroundRepeat(list) => layers(list.iter().map(|r| r.to_css())),
         P::BackgroundAttachment(list) => layers(list.iter().map(|a| a.keyword().to_owned())),
@@ -290,25 +293,36 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
         "overflow" | "gap" | "grid-gap" | "place-content" => {
             if v(0) == v(1) { v(0).to_owned() } else { format!("{} {}", v(0), v(1)) }
         }
+        "background-position" => {
+            // One `x y` per layer; the two lists must agree in length.
+            let (xs, ys) = (split_layers(v(0)), split_layers(v(1)));
+            if xs.len() != ys.len() || xs.is_empty() {
+                return None;
+            }
+            xs.iter().zip(&ys).map(|(x, y)| format!("{x} {y}")).collect::<Vec<_>>().join(", ")
+        }
+        "-webkit-background-clip" | "-webkit-background-origin" | "-webkit-background-size" => v(0).to_owned(),
         "background" => {
             // One layer per entry of the lists, which must agree in
             // length; the color goes with the last layer.
             let color = v(0);
-            let lists: Vec<Vec<&str>> = (1..8).map(|i| split_layers(v(i))).collect();
+            let lists: Vec<Vec<&str>> = (1..9).map(|i| split_layers(v(i))).collect();
             let count = lists[0].len();
             if lists.iter().any(|l| l.len() != count) || count == 0 {
                 return None;
             }
             let mut out: Vec<String> = Vec::with_capacity(count);
             for (layer, &image) in lists[0].iter().enumerate() {
-                let (position, size, repeat, attachment, origin, clip) = (
+                let (x, y, size, repeat, attachment, origin, clip) = (
                     lists[1][layer],
                     lists[2][layer],
                     lists[3][layer],
                     lists[4][layer],
                     lists[5][layer],
                     lists[6][layer],
+                    lists[7][layer],
                 );
+                let position = format!("{x} {y}");
                 let mut parts: Vec<String> = Vec::new();
                 if layer == count - 1 && color != "transparent" {
                     parts.push(color.to_owned());
@@ -318,7 +332,7 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
                 }
                 let size_set = size != "auto";
                 if position != "0% 0%" || size_set {
-                    parts.push(if size_set { format!("{position} / {size}") } else { position.to_owned() });
+                    parts.push(if size_set { format!("{position} / {size}") } else { position });
                 }
                 if repeat != "repeat" {
                     parts.push(repeat.to_owned());
@@ -587,17 +601,6 @@ fn size_css(v: ComputedSize) -> String {
     }
 }
 
-fn position_offset_css(o: PositionOffset) -> String {
-    if o.px == 0.0 {
-        format!("{}%", css_number(o.percent))
-    } else if o.percent == 0.0 {
-        px(o.px)
-    } else if o.px < 0.0 {
-        format!("calc({}% - {})", css_number(o.percent), px(-o.px))
-    } else {
-        format!("calc({}% + {})", css_number(o.percent), px(o.px))
-    }
-}
 
 /// The resolved value of longhand `id` per CSSOM §resolved values: the
 /// used value (from `used`) for the sizes, margins, paddings and insets
@@ -675,13 +678,10 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::Visibility => style.visibility.keyword().to_owned(),
         Id::Color => style.color.to_css(),
         Id::BackgroundColor => style.background_color.to_css(),
-        Id::BackgroundImage => layers(style.background_images.iter().map(ImageValue::to_css)),
-        Id::BackgroundPosition => layers(
-            style
-                .background_position
-                .iter()
-                .map(|p| format!("{} {}", position_offset_css(p.x), position_offset_css(p.y))),
-        ),
+        Id::BackgroundImage => layers(style.background_images.iter().map(ComputedImage::to_css)),
+        Id::BackgroundPositionX => layers(style.background_position_x.iter().copied().map(position_offset_css)),
+        Id::BackgroundPositionY => layers(style.background_position_y.iter().copied().map(position_offset_css)),
+        Id::BackgroundBlendMode => layers(style.background_blend_mode.iter().map(|m| m.keyword().to_owned())),
         Id::BackgroundSize => layers(style.background_size.iter().map(|s| match *s {
             ComputedBackgroundSize::Cover => "cover".to_owned(),
             ComputedBackgroundSize::Contain => "contain".to_owned(),
@@ -919,7 +919,13 @@ mod tests {
         assert_eq!(resolved_value(&style, PropertyId::FontSize, None), "20px");
         assert_eq!(resolved_value(&style, PropertyId::BorderTopWidth, None), "2px");
         assert_eq!(resolved_value(&style, PropertyId::Top, None), "5px");
-        assert_eq!(resolved_value(&style, PropertyId::BackgroundPosition, None), "0% 0%");
+        assert_eq!(resolved_value(&style, PropertyId::BackgroundPositionX, None), "0%");
+        assert_eq!(resolved_value(&style, PropertyId::BackgroundPositionY, None), "0%");
+        assert_eq!(
+            serialize_shorthand("background-position", &["0%, 10px".to_owned(), "0%, calc(100% - 4px)".to_owned()]),
+            Some("0% 0%, 10px calc(100% - 4px)".to_owned())
+        );
+        assert_eq!(resolved_value(&style, PropertyId::BackgroundBlendMode, None), "normal");
         // Rendered: used values.
         let used = UsedValues {
             width: 200.0,

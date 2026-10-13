@@ -2949,9 +2949,13 @@ impl TabState {
     /// Background and list marker images only become known after the
     /// cascade.
     fn fetch_background_images(&mut self) {
+        let scale = self.viewport.scale_factor;
         let mut urls = Vec::new();
         for (_, style) in self.styles.iter() {
-            for u in [&style.background_image, &style.list_style_image].into_iter().flatten() {
+            // Every layer's image; an `image-set()` the candidate this
+            // device's scale chooses.
+            let layers = style.background_images.iter().filter_map(|i| i.url_to_fetch(scale));
+            for u in layers.chain(style.list_style_image.iter()) {
                 if let Ok(url) = Url::parse(u) {
                     urls.push(url);
                 }
@@ -5642,6 +5646,32 @@ mod tests {
                             [r.length, w0 - w1, pl, c.boxDecorationBreak, c.webkitBoxDecorationBreak, c.WebkitBoxDecorationBreak, inl.style.getPropertyValue('-webkit-box-decoration-break'), inl.style.cssText, cs(inl).paddingLeft].join('|')"),
             "\"1|20|10px|clone|clone|clone|clone|box-decoration-break: clone;|0px\""
         );
+        // Roadmap 4a block 4: the position axes, gradients computed to
+        // `rgb()` and pixels, the `-webkit-background-clip` alias and the
+        // blend mode resolve.
+        assert_eq!(
+            run_js(&mut h, "a.style.backgroundPosition = 'right 10px center'; a.style.backgroundImage = 'linear-gradient(to right, red 1em, blue)'; \
+                            a.style.webkitBackgroundClip = 'text'; a.style.backgroundBlendMode = 'multiply, screen'; var c = cs(a); \
+                            [c.backgroundPositionX, c.backgroundPositionY, c.backgroundPosition, c.backgroundImage, c.backgroundClip, c.webkitBackgroundClip, c.backgroundBlendMode, a.style.backgroundPosition].join('|')"),
+            "\"calc(100% - 10px)|50%|calc(100% - 10px) 50%|linear-gradient(to right, rgb(255, 0, 0) 20px, rgb(0, 0, 255))|text|text|multiply, screen|right 10px center\""
+        );
+    }
+
+    #[test]
+    fn every_background_layer_image_is_fetched() {
+        // Two `url()` layers, an `image-set()` (the 1x candidate for this
+        // 1x device) and a `list-style-image`: four distinct data URLs of
+        // the same 1×1 GIF, all decoded into the image store.
+        const GIF: &str = "R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw";
+        let html = format!(
+            "<!DOCTYPE html><style>div {{ background-image: url(data:image/gif;base64,{GIF}==), url(\"data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAO%77==\"), \
+             image-set(url(data:image/gif;base64,{GIF}) 1x, url(data:image/gif;base64,{GIF}%3D) 2x) }} \
+             li {{ list-style-image: url(data:image/gif;base64,{GIF}%3D%3D) }}</style><div>x</div><ul><li>y</li></ul>"
+        );
+        let h = Harness::load(&html);
+        let mut urls: Vec<String> = h.state.images.sizes().keys().map(|u| u.to_string()).collect();
+        urls.sort();
+        assert_eq!(h.state.images.len(), 4, "the 2x candidate is not fetched: {urls:?}");
     }
 
     #[test]

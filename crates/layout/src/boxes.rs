@@ -160,7 +160,7 @@ pub(crate) fn has_decorations(style: &ComputedStyle) -> bool {
         || b.bottom > 0.0
         || b.left > 0.0
         || !style.background_color.is_transparent()
-        || style.background_image.is_some()
+        || style.background_images.iter().any(|i| !i.is_none())
 }
 
 impl ResolvedEdges {

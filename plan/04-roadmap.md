@@ -1405,7 +1405,86 @@ Work:
       `overflow: hidden`, margins around it, lines stacking on placed
       heights beside a float; `lines.rs` unit test for the leading split).
       (4) backgrounds: every layer with
-      its position, size, repeat, attachment, origin and clip; (5)
+      its position, size, repeat, attachment, origin and clip; placed in it
+      by the owner 2026-10-13: gradient images (`linear-`, `radial-`,
+      `conic-gradient` and the `repeating-` forms), `image-set()`,
+      `background-position-x`/`-y` and `background-blend-mode`, and the
+      root/body layers on the canvas; `background-attachment: local` is
+      `scroll` until (4s) exists, since nothing but the page scrolls.
+      **Block 4 done 2026-10-13.** Style (`crates/style/src/image.rs`):
+      `ImageValue::Gradient` (`linear-`, `radial-`, `conic-gradient` and
+      the `repeating-` forms per CSS Images 3 §3 and Images 4 §3: angles
+      and `to <side-or-corner>`, shapes, size keywords and radii, `at`
+      positions, `from` angles, colour stops with one or two positions,
+      colour hints; the `<color-interpolation-method>` of CSS Color 4
+      §12.1, `in <space>` with the hue method for polar spaces, painted by
+      tracing each segment in that space with the `color` crate since
+      vello's ramp interpolates in sRGB only; the `-webkit-`/`-moz-`
+      legacy forms with their start side and polar angles, serialized back
+      in their own syntax; a gradient's `at` position keeps its keywords
+      in the computed value with lengths in pixels, as the computed value
+      of a gradient does),
+      `ImageValue::ImageSet` (`image-set()` and `-webkit-image-set()`:
+      `x`/`dppx`/`dpi`/`dpcm` resolutions, `type()` with candidates of
+      undecodable types dropped), computed to `ComputedImage` with colours
+      resolved and lengths in pixels and serialized the way Chrome does
+      (`to bottom` and `from 0deg` left out, `rgb()` colours); other image
+      functions (`cross-fade()`, `element()`, `paint()`) stay text the
+      CSSOM gives back and nothing paints. `background-position-x`/`-y`
+      are the longhands, `background-position` their shorthand (the
+      `background` shorthand expands to nine), `background-blend-mode` is
+      in the table, `-webkit-background-clip`/`-origin`/`-size` are
+      aliases; `getComputedStyle` reports the axes (`calc(100% - 10px)`),
+      the shorthand, gradients and blend modes. The tab fetches every
+      layer's `url()`, an `image-set()`'s candidate chosen for the device
+      scale (the smallest resolution not below it, else the largest, as
+      Chrome chooses). Paint (`crates/paint`, `background_layers`): the
+      colour clipped by the last layer's `background-clip`, then each
+      layer from the last to the first: positioning area per
+      `background-origin` (the viewport for `attachment: fixed`, in page
+      coordinates), tile size per `background-size` (§3.9, `auto` by the
+      image's ratio, gradients filling the area, `cover`/`contain`,
+      `round` resizing to whole tiles with the `auto` axis following),
+      position as `(area − tile) × percentage + offset` (§3.6), tiles per
+      `background-repeat` axis (`repeat`, `no-repeat`, `space` with equal
+      gaps and the position for a lone tile, `round`), only the tiles
+      meeting the visible part of the clip; raster tiles drawn with
+      bilinear scaling (as browsers scale by default), gradient tiles as
+      vello brushes (linear: the line through the centre at the angle with
+      the corner rule; radial: circle or ellipse by side/corner keywords
+      or radii, a zero radius the last colour; conic: stops laid over the
+      whole turn rotated by `from`, since vello's sweep takes 0..2π
+      without wrapping; stops fixed up per §3.4.3 with hints traced by
+      nine stops; `repeating-` by the period, a zero period the average
+      colour; interpolation premultiplied in sRGB; vello's ramp takes its
+      first and last stop as the ends, so stops at 0 and 1 are added);
+      `background-clip: text` clips to the glyph outlines of the box's
+      text (skrifa, a new direct dependency of `paint`, `03-crates.md`);
+      `background-blend-mode` blends each layer over the layers and colour
+      below in an isolated group; a sliced inline element's fragments
+      position the background over the unbroken box
+      (`FragmentContent::Inline::offset`/`total`, set after a root's lines
+      are emitted), `clone` per fragment; the root's (or body's) layers go
+      to the canvas, positioned against the root element's box and cut to
+      the viewport (CSS Backgrounds 3 §2.11.2); `local` is `scroll` until
+      (4s). Tests: style (gradient and image-set parsing, validity,
+      serialization, computation, the axis longhands and shorthands, the
+      blend mode), paint (position, size, every repeat mode, origin and
+      clip boxes, `fixed` under a scroll, the body's layers on the canvas,
+      `image-set()` at scale 1 and 2, slice against clone on a two-line
+      inline, linear directions and legacy `left`, repeating, the
+      monotonic fix-up, radial circle and `closest-side at` ellipse,
+      conic `from`, `multiply`, `background-clip: text` with transparent
+      text), tab (every layer's image decoded, the CSSOM readbacks). (4s)
+      scroll containers (added by the owner 2026-10-13, right after 4):
+      elements with `overflow: auto`/`scroll` keep their own scroll
+      offsets, wheel, keyboard and drag scroll the innermost one under the
+      pointer before the page, their scrollbars are drawn (`auto` only
+      when the content overflows) and layout reserves their width, their
+      children paint and hit-test shifted, `scrollTop`/`scrollLeft`/
+      `scrollWidth`/`scrollHeight`/`scrollTo`/`scrollBy`/`scrollIntoView`
+      and `scroll` events work on them, and `background-attachment:
+      local` follows their offset; (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
       `user-select`; (6) `z-index` and `transform`/`transform-origin`

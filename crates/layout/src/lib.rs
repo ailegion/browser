@@ -171,8 +171,18 @@ pub enum FragmentContent {
     /// The top and bottom edges are on every fragment. The children are
     /// the text, atomic boxes and nested inline fragments it holds on that
     /// line, in visual order. `padding` and `margin` are the element's
-    /// used values on every side.
-    Inline { left: bool, right: bool },
+    /// used values on every side. `offset` is how far this fragment's
+    /// border box starts into the element's unbroken box (the sum of the
+    /// widths of its fragments before this one) and `total` that box's
+    /// width: with `box-decoration-break: slice` the background is
+    /// positioned over the unbroken box and this fragment shows its part
+    /// (CSS Fragmentation 3 §5.1).
+    Inline {
+        left: bool,
+        right: bool,
+        offset: f32,
+        total: f32,
+    },
 }
 
 /// A positioned box. `rect` is the border box in page coordinates.

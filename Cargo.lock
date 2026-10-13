@@ -639,6 +639,7 @@ dependencies = [
  "browser-style",
  "image",
  "pollster",
+ "skrifa",
  "tracing",
  "url",
  "vello",

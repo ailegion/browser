@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use browser_dom::Document;
+use browser_dom::{Document, NodeId};
 use browser_style::{
     ComputedStyle, Direction, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position, StyleMap,
     TextAlign, WordBreak,
@@ -624,6 +624,7 @@ impl LayoutEngine {
                             &mut self.fonts,
                         );
                     }
+                    place_inline_offsets(&mut children);
                 }
                 Fragment {
                     rect: Rect::new(x, y, rect.width, rect.height),
@@ -2052,10 +2053,50 @@ fn piece_fragment(
         rect: Rect::new(ctx.ox + border_x0, top, border_x1 - border_x0, height),
         node: Some(info.node),
         style: info.style.clone(),
-        content: FragmentContent::Inline { left, right },
+        // The offsets into the unbroken box are set once every line of
+        // the root is emitted (`place_inline_offsets`).
+        content: FragmentContent::Inline {
+            left,
+            right,
+            offset: 0.0,
+            total: border_x1 - border_x0,
+        },
         children,
         padding: e.padding,
         margin: e.margin,
+    }
+}
+
+/// Give every inline element's fragments among `frags` (and inside them)
+/// their offset into the element's unbroken box and that box's width:
+/// the fragments in tree order, each starting where the previous ended.
+fn place_inline_offsets(frags: &mut [Fragment]) {
+    fn collect<'a>(frags: &'a mut [Fragment], out: &mut Vec<(NodeId, &'a mut Fragment)>) {
+        for f in frags {
+            if let (Some(node), FragmentContent::Inline { .. }) = (f.node, &f.content) {
+                // The children are visited through the collected fragment
+                // afterwards, so the borrow stays whole.
+                out.push((node, f));
+            } else {
+                collect(&mut f.children, out);
+            }
+        }
+    }
+    let mut pieces: Vec<(NodeId, &mut Fragment)> = Vec::new();
+    collect(frags, &mut pieces);
+    let mut totals: HashMap<NodeId, f32> = HashMap::new();
+    for (node, f) in &pieces {
+        *totals.entry(*node).or_default() += f.rect.width;
+    }
+    let mut running: HashMap<NodeId, f32> = HashMap::new();
+    for (node, f) in pieces {
+        let start = running.entry(node).or_default();
+        if let FragmentContent::Inline { offset, total, .. } = &mut f.content {
+            *offset = *start;
+            *total = totals[&node];
+        }
+        *start += f.rect.width;
+        place_inline_offsets(&mut f.children);
     }
 }
 
@@ -3472,7 +3513,7 @@ mod tests {
         let mut out = Vec::new();
         tree.root.walk(&mut |f| {
             if f.node == Some(id)
-                && let FragmentContent::Inline { left, right } = f.content
+                && let FragmentContent::Inline { left, right, .. } = f.content
             {
                 out.push((f.rect, left, right));
             }

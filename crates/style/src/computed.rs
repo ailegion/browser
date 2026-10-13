@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::custom::CustomMap;
+use crate::image::ComputedImage;
 use crate::properties::*;
 use crate::values::*;
 
@@ -160,18 +161,18 @@ pub struct ComputedStyle {
     pub visibility: Visibility,
     pub color: Rgba,
     pub background_color: Rgba,
-    /// The image the painter draws: the last layer with a `url()` (one
-    /// layer is painted until roadmap item 4a paints them all).
-    pub background_image: Option<Arc<str>>,
-    /// The background layers, one entry per layer for each longhand
-    /// (`getComputedStyle` reports them all).
-    pub background_images: Vec<ImageValue>,
-    pub background_position: Vec<ComputedPosition>,
+    /// The background layers, one entry per layer for each longhand; the
+    /// lists repeat to the image list's length when painted (CSS
+    /// Backgrounds 3 §2.3).
+    pub background_images: Vec<ComputedImage>,
+    pub background_position_x: Vec<PositionOffset>,
+    pub background_position_y: Vec<PositionOffset>,
     pub background_size: Vec<ComputedBackgroundSize>,
     pub background_repeat: Vec<BackgroundRepeat>,
     pub background_attachment: Vec<BackgroundAttachment>,
     pub background_origin: Vec<BackgroundBox>,
     pub background_clip: Vec<BackgroundBox>,
+    pub background_blend_mode: Vec<BlendMode>,
     pub font_family: Arc<str>,
     pub font_size: f32,
     pub font_weight: u16,
@@ -277,14 +278,15 @@ impl ComputedStyle {
             visibility: Visibility::Visible,
             color: Rgba::BLACK,
             background_color: Rgba::TRANSPARENT,
-            background_image: None,
-            background_images: vec![ImageValue::None],
-            background_position: vec![ComputedPosition::default()],
+            background_images: vec![ComputedImage::None],
+            background_position_x: vec![PositionOffset::default()],
+            background_position_y: vec![PositionOffset::default()],
             background_size: vec![ComputedBackgroundSize::default()],
             background_repeat: vec![BackgroundRepeat::default()],
             background_attachment: vec![BackgroundAttachment::Scroll],
             background_origin: vec![BackgroundBox::PaddingBox],
             background_clip: vec![BackgroundBox::BorderBox],
+            background_blend_mode: vec![BlendMode::Normal],
             font_family: Arc::from(DEFAULT_FONT_FAMILY),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -534,7 +536,7 @@ fn resolve<'a>(decls: &DeclaredValues<'a>, id: PropertyId) -> Resolved<'a> {
 
 /// A `background-position` axis as computed: keywords become
 /// percentages, an offset from the end edge is subtracted.
-fn position_offset(c: &PositionComponent, ctx: &LengthContext) -> PositionOffset {
+pub(crate) fn position_offset(c: &PositionComponent, ctx: &LengthContext) -> PositionOffset {
     let lp = |v: &LengthPercentage| match v.to_computed(ctx) {
         ComputedLp::Px(px) => PositionOffset { percent: 0.0, px },
         ComputedLp::Percent(percent) => PositionOffset { percent, px: 0.0 },
@@ -727,16 +729,19 @@ pub fn compute(
     pick!(overflow_y, OverflowY, OverflowY, |v| v.computed());
     pick!(visibility, Visibility, Visibility, |v| *v);
     pick!(background_color, BackgroundColor, BackgroundColor, |v| v.resolve(current));
-    pick!(background_images, BackgroundImage, BackgroundImage, |v| v.clone());
-    // The painted image: the last layer with a URL.
-    out.background_image = out.background_images.iter().rev().find_map(ImageValue::url);
-    pick!(background_position, BackgroundPosition, BackgroundPosition, |v| v
+    pick!(background_images, BackgroundImage, BackgroundImage, |v| v
         .iter()
-        .map(|p| ComputedPosition {
-            x: position_offset(&p.x, &ctx),
-            y: position_offset(&p.y, &ctx),
-        })
+        .map(|i| crate::image::compute_image(i, &ctx, current))
         .collect());
+    pick!(background_position_x, BackgroundPositionX, BackgroundPositionX, |v| v
+        .iter()
+        .map(|p| position_offset(p, &ctx))
+        .collect());
+    pick!(background_position_y, BackgroundPositionY, BackgroundPositionY, |v| v
+        .iter()
+        .map(|p| position_offset(p, &ctx))
+        .collect());
+    pick!(background_blend_mode, BackgroundBlendMode, BackgroundBlendMode, |v| v.clone());
     pick!(background_size, BackgroundSize, BackgroundSize, |v| v
         .iter()
         .map(|s| match s {

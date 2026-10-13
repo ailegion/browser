@@ -17,13 +17,25 @@ use browser_layout::{
 };
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
-use browser_style::{BackgroundBox, BorderStyle, ComputedStyle, Rgba, Sides, TextDecorationStyle, Visibility};
+use browser_style::{
+    BackgroundAttachment, BackgroundBox, BlendMode, BorderStyle, BoxDecorationBreak, ColorInterpolation,
+    ComputedBackgroundSize, ComputedGradient, ComputedGradientItem, ComputedGradientPos, ComputedGradientShape,
+    ComputedImage, ComputedLp, ComputedLpAuto, ComputedRadialSize, ComputedStyle, HueMethod, InterpolationSpace,
+    LinearDirection, PositionEdge, PositionOffset, RadialShape, Rgba, TextDecorationStyle, Visibility,
+};
+use vello::peniko::color::{ColorSpaceTag, DynamicColor, HueDirection};
+use skrifa::instance::{LocationRef, NormalizedCoord, Size as FontSize};
+use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::{GlyphId, MetadataProvider};
 use url::Url;
 use vello::kurbo::{
     Affine, Arc as KArc, BezPath, Cap, Circle, Line, ParamCurve, ParamCurveArclen, PathSeg, Point, Rect as KRect,
     RoundedRect, Shape as _, Stroke,
 };
-use vello::peniko::{Blob, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat, Mix};
+use vello::peniko::{
+    Blob, Brush, Color, ColorStop, Extend, Fill, Gradient as PGradient, ImageAlphaType, ImageBrush, ImageData,
+    ImageFormat, InterpolationAlphaSpace, Mix,
+};
 use vello::{Glyph, Scene};
 
 pub use offscreen::render_offscreen;
@@ -183,25 +195,33 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
     let scale = options.scale.max(0.01) as f64;
     let base = Affine::scale(scale);
 
-    // Canvas background (CSS 2.1 section 14.2): the root element's background
-    // covers the whole canvas; if it has none, the body's is used instead.
-    // Whichever element supplied it does not paint its own background again.
+    // Canvas background (CSS 2.1 §14.2, CSS Backgrounds 3 §2.11.2): the
+    // root element's background (colour and image layers) covers the whole
+    // canvas; if it has none, the body's is used instead, positioned as if
+    // it were the root's. Whichever element supplied it does not paint its
+    // own background again.
     let html = tree.root.children.first();
     let body = html.and_then(|h| {
         h.children
             .iter()
             .find(|c| c.node.is_some() && matches!(c.content, FragmentContent::Box))
     });
+    let has_background = |f: &Fragment| {
+        !f.style.background_color.is_transparent() || f.style.background_images.iter().any(|i| !i.is_none())
+    };
     let mut skip_background_of = Vec::new();
     let mut canvas = Rgba::WHITE;
+    let mut canvas_layers: Option<Arc<ComputedStyle>> = None;
     if let Some(h) = html {
-        if !h.style.background_color.is_transparent() {
+        if has_background(h) {
             canvas = h.style.background_color;
+            canvas_layers = Some(h.style.clone());
             skip_background_of.extend(h.node);
         } else if let Some(b) = body {
             skip_background_of.extend(h.node);
-            if !b.style.background_color.is_transparent() {
+            if has_background(b) {
                 canvas = b.style.background_color;
+                canvas_layers = Some(b.style.clone());
                 skip_background_of.extend(b.node);
             }
         }
@@ -226,6 +246,7 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         images,
         visible,
         transform,
+        scale: options.scale.max(0.01),
         skip_background_of,
         highlights: [
             (&options.selection, SELECTION),
@@ -234,6 +255,9 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         ],
         composition: &options.composition,
     };
+    if let (Some(h), Some(style)) = (html, &canvas_layers) {
+        painter.canvas_layers(style, h);
+    }
     if let Some(html) = html {
         painter.fragment(html);
     }
@@ -252,6 +276,8 @@ struct Painter<'a> {
     images: &'a ImageStore,
     visible: Rect,
     transform: Affine,
+    /// Device pixels per CSS pixel: what `image-set()` chooses by.
+    scale: f32,
     /// Elements whose background the canvas already painted.
     skip_background_of: Vec<NodeId>,
     /// Text highlights in paint order: later ones cover earlier ones.
@@ -313,14 +339,14 @@ impl Painter<'_> {
         match &f.content {
             FragmentContent::Box => {
                 if !offscreen && !f.node.is_some_and(|n| self.skip_background_of.contains(&n)) {
-                    self.background_and_border(&f.rect, &f.style, &f.padding, ALL_SIDES);
+                    self.background_and_border(f, ALL_SIDES);
                 } else if !offscreen {
                     self.border(&f.rect, &f.style, ALL_SIDES);
                 }
             }
             FragmentContent::Control(c) => {
                 if !offscreen {
-                    self.background_and_border(&f.rect, &f.style, &f.padding, ALL_SIDES);
+                    self.background_and_border(f, ALL_SIDES);
                     self.control(&f.rect, *c);
                 }
             }
@@ -332,7 +358,7 @@ impl Painter<'_> {
             }
             FragmentContent::Image(url) => {
                 if !offscreen {
-                    self.background_and_border(&f.rect, &f.style, &f.padding, ALL_SIDES);
+                    self.background_and_border(f, ALL_SIDES);
                     self.image(&f.rect, &f.style, url);
                 }
             }
@@ -340,10 +366,10 @@ impl Painter<'_> {
             // edges it carries (the top and bottom on every fragment, the
             // left and right where the element starts and ends; CSS 2.1
             // §9.4.2). Corners at a missing side have no radius.
-            FragmentContent::Inline { left, right } => {
+            FragmentContent::Inline { left, right, .. } => {
                 if !offscreen {
                     let sides = [true, *right, true, *left];
-                    self.background_and_border(&f.rect, &f.style, &f.padding, sides);
+                    self.background_and_border(f, sides);
                 }
             }
         }
@@ -367,46 +393,183 @@ impl Painter<'_> {
         }
     }
 
-    /// A box's background colour, background image and border. `padding`
-    /// is the box's used padding (for `background-clip: content-box`);
-    /// `sides` says which of its top, right, bottom and left edges the
-    /// box has here (an inline element's line fragment lacks the ones
-    /// not on that line).
-    fn background_and_border(&mut self, rect: &Rect, style: &ComputedStyle, padding: &Sides<f32>, sides: [bool; 4]) {
-        let geometry = BoxGeometry::new(rect, style, sides);
-        let bg = style.background_color;
-        if !bg.is_transparent() {
-            // The colour is clipped by the last layer's `background-clip`
-            // (CSS Backgrounds 3 §3.3); `text` clips to the glyphs and is
-            // roadmap item 4a block 4's, painted as `border-box` until
-            // then.
-            let clip = style.background_clip.last().copied().unwrap_or(BackgroundBox::BorderBox);
-            let path = match clip {
-                BackgroundBox::BorderBox | BackgroundBox::Text => geometry.outer_path(),
-                BackgroundBox::PaddingBox => geometry.inset_path(geometry.width),
-                BackgroundBox::ContentBox => geometry.inset_path([
-                    geometry.width[0] + padding.top as f64,
-                    geometry.width[1] + padding.right as f64,
-                    geometry.width[2] + padding.bottom as f64,
-                    geometry.width[3] + padding.left as f64,
-                ]),
-            };
-            self.scene.fill(Fill::NonZero, self.transform, color(bg), None, &path);
+    /// A box's background (colour and image layers) and border. `sides`
+    /// says which of its top, right, bottom and left edges the box has here
+    /// (an inline element's line fragment lacks the ones not on that
+    /// line).
+    fn background_and_border(&mut self, f: &Fragment, sides: [bool; 4]) {
+        let style = &f.style;
+        let geometry = BoxGeometry::new(&f.rect, style, sides);
+        let padding = &f.padding;
+        // The element's own box: for a sliced inline fragment the unbroken
+        // box it is a part of (CSS Fragmentation 3 §5.1), else this one.
+        let (offset, total) = match f.content {
+            FragmentContent::Inline { offset, total, .. } if style.box_decoration_break == BoxDecorationBreak::Slice => {
+                (offset as f64, total as f64)
+            }
+            _ => (0.0, f.rect.width as f64),
+        };
+        let border_box = KRect::new(
+            f.rect.x as f64 - offset,
+            f.rect.y as f64,
+            f.rect.x as f64 - offset + total,
+            f.rect.bottom() as f64,
+        );
+        let bw = &style.border_width;
+        let padding_box = inset_rect(border_box, [bw.top as f64, bw.right as f64, bw.bottom as f64, bw.left as f64]);
+        let content_box = inset_rect(
+            padding_box,
+            [padding.top as f64, padding.right as f64, padding.bottom as f64, padding.left as f64],
+        );
+        let areas = Areas {
+            border: border_box,
+            padding: padding_box,
+            content: content_box,
+            fixed: krect(&self.visible),
+        };
+        let content_inset = [
+            geometry.width[0] + padding.top as f64,
+            geometry.width[1] + padding.right as f64,
+            geometry.width[2] + padding.bottom as f64,
+            geometry.width[3] + padding.left as f64,
+        ];
+        let text = style.background_clip.contains(&BackgroundBox::Text).then(|| text_clip_path(f));
+        let clip_for = |b: BackgroundBox| match b {
+            BackgroundBox::BorderBox => geometry.outer_path(),
+            BackgroundBox::PaddingBox => geometry.inset_path(geometry.width),
+            BackgroundBox::ContentBox => geometry.inset_path(content_inset),
+            BackgroundBox::Text => text.clone().unwrap_or_default(),
+        };
+        self.background_layers(style, &areas, &clip_for, &geometry.outer_path(), true);
+        self.border_with(&geometry, style);
+    }
+
+    /// The root (or body) background's image layers on the canvas: they
+    /// cover the whole canvas, positioned against the root element's box
+    /// (`root`), or the viewport when fixed (CSS Backgrounds 3 §2.11.2).
+    fn canvas_layers(&mut self, style: &ComputedStyle, root: &Fragment) {
+        let border_box = krect(&root.rect);
+        let bw = &root.style.border_width;
+        let padding_box = inset_rect(border_box, [bw.top as f64, bw.right as f64, bw.bottom as f64, bw.left as f64]);
+        let p = &root.padding;
+        let content_box = inset_rect(padding_box, [p.top as f64, p.right as f64, p.bottom as f64, p.left as f64]);
+        let areas = Areas {
+            border: border_box,
+            padding: padding_box,
+            content: content_box,
+            fixed: krect(&self.visible),
+        };
+        let canvas = BezPath::from_vec(krect(&self.visible).path_elements(0.1).collect());
+        let clip_for = |_: BackgroundBox| canvas.clone();
+        self.background_layers(style, &areas, &clip_for, &canvas, false);
+    }
+
+    /// Paint a background's colour (when `with_color`, clipped by the last
+    /// layer's `background-clip`, §3.3) and its image layers from the last
+    /// to the first (§2): each layer tiled over its positioning area
+    /// (`background-origin`, or the viewport when `fixed`), sized by
+    /// `background-size`, placed by `background-position`, repeated by
+    /// `background-repeat`, clipped by `clip_for(background-clip)` and
+    /// blended by `background-blend-mode` within the background alone.
+    fn background_layers(
+        &mut self,
+        style: &ComputedStyle,
+        areas: &Areas,
+        clip_for: &dyn Fn(BackgroundBox) -> BezPath,
+        isolate: &BezPath,
+        with_color: bool,
+    ) {
+        let n = style.background_images.len();
+        let cycle = |i: usize, len: usize| i % len.max(1);
+        let blend = |i: usize| style.background_blend_mode.get(cycle(i, style.background_blend_mode.len())).copied().unwrap_or_default();
+        // Blending happens among the layers and the colour only: the
+        // background is composited as one group over what is behind it
+        // (Compositing 1 §9.1).
+        let isolated = (0..n).any(|i| blend(i) != BlendMode::Normal);
+        if isolated {
+            self.scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, self.transform, isolate);
         }
-        if let Some(url) = &style.background_image
-            && let Ok(resolved) = Url::parse(url)
-            && let Some(img) = self.images.get(&resolved)
-        {
-            // Background images: natural size at the padding box origin,
-            // clipped to the box. Repeat and positioning come later.
-            let pb = padding_box(rect, style);
-            self.scene
-                .push_clip_layer(Fill::NonZero, self.transform, &krect(&pb));
-            let t = self.transform * Affine::translate((pb.x as f64, pb.y as f64));
-            self.scene.draw_image(&ImageBrush::new(img.clone()), t);
+        if with_color && !style.background_color.is_transparent() {
+            let clip = style.background_clip.last().copied().unwrap_or(BackgroundBox::BorderBox);
+            self.scene.fill(Fill::NonZero, self.transform, color(style.background_color), None, &clip_for(clip));
+        }
+        for i in (0..n).rev() {
+            let image = style.background_images[i].chosen(self.scale);
+            let clip_box = style.background_clip[cycle(i, style.background_clip.len())];
+            let origin = style.background_origin[cycle(i, style.background_origin.len())];
+            let attachment = style.background_attachment[cycle(i, style.background_attachment.len())];
+            let repeat = style.background_repeat[cycle(i, style.background_repeat.len())];
+            let size = style.background_size[cycle(i, style.background_size.len())];
+            let x = style.background_position_x[cycle(i, style.background_position_x.len())];
+            let y = style.background_position_y[cycle(i, style.background_position_y.len())];
+            let source = match image {
+                ComputedImage::Url(u) => match Url::parse(u).ok().and_then(|u| self.images.get(&u)) {
+                    Some(img) => LayerSource::Raster(img.clone()),
+                    None => continue,
+                },
+                ComputedImage::Gradient(g) => LayerSource::Gradient(g.clone()),
+                _ => continue,
+            };
+            let area = match attachment {
+                BackgroundAttachment::Fixed => areas.fixed,
+                // Nothing but the page scrolls, so `local` is `scroll`
+                // (roadmap 4a (4s) adds scroll containers).
+                BackgroundAttachment::Scroll | BackgroundAttachment::Local => match origin {
+                    BackgroundBox::BorderBox => areas.border,
+                    BackgroundBox::PaddingBox => areas.padding,
+                    BackgroundBox::ContentBox | BackgroundBox::Text => areas.content,
+                },
+            };
+            let intrinsic = match &source {
+                LayerSource::Raster(img) => Some((img.width as f64, img.height as f64)),
+                LayerSource::Gradient(_) => None,
+            };
+            let Some((tw, th)) = tile_size(size, intrinsic, (area.width(), area.height()), repeat) else { continue };
+            let clip = clip_for(clip_box);
+            if clip.elements().is_empty() {
+                continue;
+            }
+            // Only the tiles that reach the visible part of the clip.
+            let region = clip.bounding_box().intersect(krect(&self.visible));
+            if region.is_zero_area() {
+                continue;
+            }
+            let xs = tile_starts(repeat.x, area.x0, area.width(), position(x, area.width(), tw), tw, (region.x0, region.x1));
+            let ys = tile_starts(repeat.y, area.y0, area.height(), position(y, area.height(), th), th, (region.y0, region.y1));
+            let mode = blend(i);
+            if mode == BlendMode::Normal {
+                self.scene.push_clip_layer(Fill::NonZero, self.transform, &clip);
+            } else {
+                self.scene.push_layer(Fill::NonZero, mix(mode), 1.0, self.transform, &clip);
+            }
+            let paint = match &source {
+                LayerSource::Gradient(g) => gradient_paint(g, tw, th),
+                LayerSource::Raster(_) => None,
+            };
+            for &ty in &ys {
+                for &tx in &xs {
+                    match &source {
+                        LayerSource::Raster(img) => {
+                            let t = self.transform
+                                * Affine::translate((tx, ty))
+                                * Affine::scale_non_uniform(tw / img.width as f64, th / img.height as f64);
+                            self.scene.draw_image(&ImageBrush::new(img.clone()), t);
+                        }
+                        LayerSource::Gradient(_) => {
+                            if let Some((brush, brush_transform)) = &paint {
+                                let tile = KRect::new(tx, ty, tx + tw, ty + th);
+                                let bt = Affine::translate((tx, ty)) * *brush_transform;
+                                self.scene.fill(Fill::NonZero, self.transform, brush, Some(bt), &tile);
+                            }
+                        }
+                    }
+                }
+            }
             self.scene.pop_layer();
         }
-        self.border_with(&geometry, style);
+        if isolated {
+            self.scene.pop_layer();
+        }
     }
 
     fn border(&mut self, rect: &Rect, style: &ComputedStyle, sides: [bool; 4]) {
@@ -748,6 +911,743 @@ impl Painter<'_> {
 
 /// Every edge present: a block, replaced or control box.
 const ALL_SIDES: [bool; 4] = [true, true, true, true];
+
+/// A background's positioning areas (CSS Backgrounds 3 §3.7): the box's
+/// border, padding and content boxes, and the viewport for `fixed`.
+struct Areas {
+    border: KRect,
+    padding: KRect,
+    content: KRect,
+    fixed: KRect,
+}
+
+/// What a background layer draws.
+enum LayerSource {
+    Raster(ImageData),
+    Gradient(Arc<ComputedGradient>),
+}
+
+fn inset_rect(r: KRect, inset: [f64; 4]) -> KRect {
+    KRect::new(
+        r.x0 + inset[3],
+        r.y0 + inset[0],
+        (r.x1 - inset[1]).max(r.x0 + inset[3]),
+        (r.y1 - inset[2]).max(r.y0 + inset[0]),
+    )
+}
+
+fn mix(mode: BlendMode) -> Mix {
+    match mode {
+        BlendMode::Normal => Mix::Normal,
+        BlendMode::Multiply => Mix::Multiply,
+        BlendMode::Screen => Mix::Screen,
+        BlendMode::Overlay => Mix::Overlay,
+        BlendMode::Darken => Mix::Darken,
+        BlendMode::Lighten => Mix::Lighten,
+        BlendMode::ColorDodge => Mix::ColorDodge,
+        BlendMode::ColorBurn => Mix::ColorBurn,
+        BlendMode::HardLight => Mix::HardLight,
+        BlendMode::SoftLight => Mix::SoftLight,
+        BlendMode::Difference => Mix::Difference,
+        BlendMode::Exclusion => Mix::Exclusion,
+        BlendMode::Hue => Mix::Hue,
+        BlendMode::Saturation => Mix::Saturation,
+        BlendMode::Color => Mix::Color,
+        BlendMode::Luminosity => Mix::Luminosity,
+    }
+}
+
+/// A layer's tile size (§3.9): `auto` is the image's natural size (a
+/// gradient has none and fills the area), one `auto` follows the image's
+/// ratio, percentages are of the positioning area, `cover` and `contain`
+/// scale by the ratio; `round` on an axis then resizes so a whole number
+/// of tiles fits the area (§3.4), the other axis following when `auto`.
+/// `None` when nothing can be drawn.
+fn tile_size(
+    size: ComputedBackgroundSize,
+    intrinsic: Option<(f64, f64)>,
+    area: (f64, f64),
+    repeat: browser_style::BackgroundRepeat,
+) -> Option<(f64, f64)> {
+    use browser_style::RepeatStyle;
+    let (aw, ah) = area;
+    let ratio = intrinsic.filter(|(w, h)| *w > 0.0 && *h > 0.0).map(|(w, h)| w / h);
+    let (mut w, mut h, auto_w, auto_h) = match size {
+        ComputedBackgroundSize::Cover | ComputedBackgroundSize::Contain => match ratio {
+            Some(r) => {
+                let by_width = (aw, aw / r);
+                let by_height = (ah * r, ah);
+                let cover = size == ComputedBackgroundSize::Cover;
+                let (w, h) = if (by_width.1 >= ah) == cover { by_width } else { by_height };
+                (w, h, false, false)
+            }
+            None => (aw, ah, false, false),
+        },
+        ComputedBackgroundSize::Explicit(x, y) => {
+            let resolve = |v: ComputedLpAuto, basis: f64| match v {
+                ComputedLpAuto::Px(px) => Some(px as f64),
+                ComputedLpAuto::Percent(p) => Some(p as f64 / 100.0 * basis),
+                ComputedLpAuto::Auto => None,
+            };
+            let (x, y) = (resolve(x, aw), resolve(y, ah));
+            match (x, y, intrinsic, ratio) {
+                (Some(w), Some(h), _, _) => (w, h, false, false),
+                (Some(w), None, _, Some(r)) => (w, w / r, false, true),
+                (None, Some(h), _, Some(r)) => (h * r, h, true, false),
+                (Some(w), None, Some((_, ih)), None) => (w, ih, false, true),
+                (None, Some(h), Some((iw, _)), None) => (iw, h, true, false),
+                (Some(w), None, None, _) => (w, ah, false, true),
+                (None, Some(h), None, _) => (aw, h, true, false),
+                (None, None, Some((iw, ih)), _) => (iw, ih, true, true),
+                (None, None, None, _) => (aw, ah, true, true),
+            }
+        }
+    };
+    if repeat.x == RepeatStyle::Round && w > 0.0 {
+        let rounded = aw / (aw / w).round().max(1.0);
+        if auto_h && repeat.y != RepeatStyle::Round {
+            h *= rounded / w;
+        }
+        w = rounded;
+    }
+    if repeat.y == RepeatStyle::Round && h > 0.0 {
+        let rounded = ah / (ah / h).round().max(1.0);
+        if auto_w && repeat.x != RepeatStyle::Round {
+            w *= rounded / h;
+        }
+        h = rounded;
+    }
+    (w > 0.0 && h > 0.0 && w.is_finite() && h.is_finite()).then_some((w, h))
+}
+
+/// Where a layer's first tile starts within its positioning area (§3.6):
+/// the percentage of the area's leftover space plus the pixel offset.
+fn position(o: PositionOffset, area: f64, tile: f64) -> f64 {
+    (area - tile) * o.percent as f64 / 100.0 + o.px as f64
+}
+
+/// The tiles' start coordinates along one axis of a positioning area
+/// starting at `start`, `len` long, with the first tile `pos` into it,
+/// kept to those overlapping `region` (§3.4): `repeat` and `round` tile
+/// from the position both ways, `space` fits whole tiles with the first
+/// and last at the area's edges (and places the one tile that fits by the
+/// position), `no-repeat` places one.
+fn tile_starts(
+    mode: browser_style::RepeatStyle,
+    start: f64,
+    len: f64,
+    pos: f64,
+    tile: f64,
+    region: (f64, f64),
+) -> Vec<f64> {
+    use browser_style::RepeatStyle;
+    const MAX_TILES: usize = 4096;
+    let overlaps = |x: f64| x + tile > region.0 && x < region.1;
+    match mode {
+        RepeatStyle::NoRepeat => vec![start + pos].into_iter().filter(|x| overlaps(*x)).collect(),
+        RepeatStyle::Repeat | RepeatStyle::Round => {
+            let first = start + pos;
+            let k0 = ((region.0 - first) / tile).floor() as i64;
+            let k1 = ((region.1 - first) / tile).ceil() as i64;
+            (k0..=k1)
+                .take(MAX_TILES)
+                .map(|k| first + k as f64 * tile)
+                .filter(|x| overlaps(*x))
+                .collect()
+        }
+        RepeatStyle::Space => {
+            let n = (len / tile).floor();
+            if n < 2.0 {
+                return vec![start + pos].into_iter().filter(|x| overlaps(*x)).collect();
+            }
+            let gap = (len - n * tile) / (n - 1.0);
+            (0..(n as usize).min(MAX_TILES))
+                .map(|k| start + k as f64 * (tile + gap))
+                .filter(|x| overlaps(*x))
+                .collect()
+        }
+    }
+}
+
+/// The glyph outlines of every text fragment in `f`'s subtree, as one
+/// path in page coordinates: what `background-clip: text` clips to.
+fn text_clip_path(f: &Fragment) -> BezPath {
+    struct Pen<'a> {
+        path: &'a mut BezPath,
+        origin: Point,
+        skew: f64,
+    }
+    impl Pen<'_> {
+        fn map(&self, x: f32, y: f32) -> Point {
+            // Font units are y-up; the page is y-down. A synthetic italic
+            // leans the outline as the glyph painter does.
+            Point::new(self.origin.x + x as f64 + self.skew * y as f64, self.origin.y - y as f64)
+        }
+    }
+    impl OutlinePen for Pen<'_> {
+        fn move_to(&mut self, x: f32, y: f32) {
+            self.path.move_to(self.map(x, y));
+        }
+        fn line_to(&mut self, x: f32, y: f32) {
+            self.path.line_to(self.map(x, y));
+        }
+        fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+            self.path.quad_to(self.map(cx0, cy0), self.map(x, y));
+        }
+        fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+            self.path.curve_to(self.map(cx0, cy0), self.map(cx1, cy1), self.map(x, y));
+        }
+        fn close(&mut self) {
+            self.path.close_path();
+        }
+    }
+    fn collect(f: &Fragment, path: &mut BezPath) {
+        if let FragmentContent::Text(t) = &f.content
+            && let Ok(font) = skrifa::FontRef::from_index(t.font.data.as_ref(), t.font.index)
+        {
+            let outlines = font.outline_glyphs();
+            let coords: Vec<NormalizedCoord> = t.coords.iter().map(|&c| NormalizedCoord::from_bits(c)).collect();
+            let skew = t.skew.map(|deg| (deg as f64).to_radians().tan()).unwrap_or(0.0);
+            for g in &t.glyphs {
+                let Some(outline) = outlines.get(GlyphId::new(g.id)) else { continue };
+                let mut pen = Pen {
+                    path,
+                    origin: Point::new((f.rect.x + g.x) as f64, (f.rect.y + g.y) as f64),
+                    skew,
+                };
+                let settings = DrawSettings::unhinted(FontSize::new(t.font_size), LocationRef::new(&coords));
+                let _ = outline.draw(settings, &mut pen);
+            }
+        }
+        for c in &f.children {
+            collect(c, path);
+        }
+    }
+    let mut path = BezPath::new();
+    collect(f, &mut path);
+    path
+}
+
+// ----- gradients (CSS Images 3 §3, CSS Images 4 §3) -----
+
+/// A resolved colour stop: its fraction of the gradient line and colour.
+type Stop = (f64, Rgba);
+
+/// The brush a gradient paints a `w`×`h` tile with (tile coordinates),
+/// and the brush transform that makes a circular gradient the ellipse the
+/// gradient asks for. `None` paints nothing.
+fn gradient_paint(g: &ComputedGradient, w: f64, h: f64) -> Option<(Brush, Affine)> {
+    match &g.shape {
+        ComputedGradientShape::Linear(direction) => {
+            // The gradient line through the centre at `angle` (0deg up,
+            // clockwise), long enough for the corners' perpendiculars to
+            // reach its ends (§3.1.1).
+            let angle = match direction {
+                LinearDirection::Default => 180.0f64,
+                LinearDirection::Angle(a) => *a as f64,
+                LinearDirection::Corner {
+                    horizontal,
+                    vertical,
+                } => {
+                    let corner = (h.atan2(w)).to_degrees();
+                    match (horizontal, vertical) {
+                        (None, Some(PositionEdge::Start)) => 0.0,
+                        (None, _) => 180.0,
+                        (Some(PositionEdge::End), None) => 90.0,
+                        (Some(_), None) => 270.0,
+                        (Some(PositionEdge::End), Some(PositionEdge::Start)) => corner,
+                        (Some(PositionEdge::End), Some(_)) => 180.0 - corner,
+                        (Some(_), Some(PositionEdge::Start)) => 360.0 - corner,
+                        (Some(_), Some(_)) => 180.0 + corner,
+                    }
+                }
+            };
+            let rad = angle.to_radians();
+            let (sin, cos) = (rad.sin(), rad.cos());
+            let length = (w * sin).abs() + (h * cos).abs();
+            let center = Point::new(w / 2.0, h / 2.0);
+            let dir = (sin, -cos);
+            let at = |f: f64| Point::new(center.x + dir.0 * length * (f - 0.5), center.y + dir.1 * length * (f - 0.5));
+            let stops = expand_stops(resolve_stops(&g.items, length, g.interpolation), g.interpolation);
+            let (lo, hi, stops) = ramp(stops, g.repeating)?;
+            match stops {
+                Ramp::Solid(c) => Some((Brush::Solid(color(c)), Affine::IDENTITY)),
+                Ramp::Stops(stops) => {
+                    let gradient = PGradient::new_linear(at(lo), at(hi))
+                        .with_extend(if g.repeating { Extend::Repeat } else { Extend::Pad })
+                        .with_interpolation_alpha_space(InterpolationAlphaSpace::Premultiplied)
+                        .with_stops(&stops[..]);
+                    Some((Brush::Gradient(gradient), Affine::IDENTITY))
+                }
+            }
+        }
+        ComputedGradientShape::Radial {
+            shape,
+            size,
+            position,
+        } => {
+            let (cx, cy) = gradient_center(position, w, h);
+            let circle = match (shape, size) {
+                (Some(RadialShape::Circle), _) => true,
+                (Some(RadialShape::Ellipse), _) => false,
+                (None, Some(ComputedRadialSize::Circle(_))) => true,
+                (None, _) => false,
+            };
+            // Distances to the sides and corners (§3.2.1).
+            let (dl, dr, dt, db) = (cx, w - cx, cy, h - cy);
+            let side = |closest: bool| {
+                if closest { (dl.min(dr).abs(), dt.min(db).abs()) } else { (dl.max(dr).abs(), dt.max(db).abs()) }
+            };
+            let corner = |closest: bool| {
+                let corners = [(dl, dt), (dr, dt), (dl, db), (dr, db)];
+                let pick = corners
+                    .iter()
+                    .map(|(x, y)| (x.abs(), y.abs()))
+                    .min_by(|a, b| (a.0.hypot(a.1)).total_cmp(&b.0.hypot(b.1)))
+                    .unwrap_or((0.0, 0.0));
+                if closest {
+                    pick
+                } else {
+                    corners
+                        .iter()
+                        .map(|(x, y)| (x.abs(), y.abs()))
+                        .max_by(|a, b| (a.0.hypot(a.1)).total_cmp(&b.0.hypot(b.1)))
+                        .unwrap_or((0.0, 0.0))
+                }
+            };
+            let (rx, ry) = match size.unwrap_or(ComputedRadialSize::FarthestCorner) {
+                ComputedRadialSize::ClosestSide | ComputedRadialSize::FarthestSide => {
+                    let (sx, sy) = side(matches!(size, Some(ComputedRadialSize::ClosestSide)));
+                    if circle {
+                        let r = if matches!(size, Some(ComputedRadialSize::ClosestSide)) { sx.min(sy) } else { sx.max(sy) };
+                        (r, r)
+                    } else {
+                        (sx, sy)
+                    }
+                }
+                ComputedRadialSize::ClosestCorner | ComputedRadialSize::FarthestCorner => {
+                    let closest = matches!(size, Some(ComputedRadialSize::ClosestCorner));
+                    let (dx, dy) = corner(closest);
+                    if circle {
+                        let r = dx.hypot(dy);
+                        (r, r)
+                    } else {
+                        // The ellipse through the corner with the side
+                        // ellipse's aspect ratio.
+                        let (sx, sy) = side(closest);
+                        if sx <= 0.0 || sy <= 0.0 {
+                            (0.0, 0.0)
+                        } else {
+                            let rx = (dx * dx + (dy * sx / sy).powi(2)).sqrt();
+                            (rx, rx * sy / sx)
+                        }
+                    }
+                }
+                ComputedRadialSize::Circle(r) => {
+                    let r = lp_px(r, w);
+                    (r, r)
+                }
+                ComputedRadialSize::Ellipse(x, y) => (lp_px(x, w), lp_px(y, h)),
+            };
+            let stops = expand_stops(resolve_stops(&g.items, rx, g.interpolation), g.interpolation);
+            let (lo, hi, stops) = ramp(stops, g.repeating)?;
+            // A zero radius leaves nothing inside the last stop: the last
+            // colour everywhere, or the average for a repeating gradient
+            // (§3.2.3).
+            if rx <= 0.0 || ry <= 0.0 {
+                let c = match &stops {
+                    Ramp::Solid(c) => *c,
+                    Ramp::Stops(s) if g.repeating => average(s),
+                    Ramp::Stops(s) => s.last().map(|s| rgba_of(s.color)).unwrap_or(Rgba::TRANSPARENT),
+                };
+                return Some((Brush::Solid(color(c)), Affine::IDENTITY));
+            }
+            match stops {
+                Ramp::Solid(c) => Some((Brush::Solid(color(c)), Affine::IDENTITY)),
+                Ramp::Stops(stops) => {
+                    let center = Point::new(cx, cy);
+                    let gradient = PGradient::new_two_point_radial(center, (rx * lo) as f32, center, (rx * hi) as f32)
+                        .with_extend(if g.repeating { Extend::Repeat } else { Extend::Pad })
+                        .with_interpolation_alpha_space(InterpolationAlphaSpace::Premultiplied)
+                        .with_stops(&stops[..]);
+                    // The circle becomes the ellipse by scaling about the
+                    // centre.
+                    let squash = Affine::translate((cx, cy)) * Affine::scale_non_uniform(1.0, ry / rx) * Affine::translate((-cx, -cy));
+                    Some((Brush::Gradient(gradient), squash))
+                }
+            }
+        }
+        ComputedGradientShape::Conic { from, position } => {
+            let (cx, cy) = gradient_center(position, w, h);
+            let from = from.unwrap_or(0.0) as f64;
+            // Positions are fractions of the full turn (§3.3). vello's
+            // sweep measures from +x clockwise (y down) over 0..2π with no
+            // wrapping, so the turn's stops are laid out over the whole
+            // sweep, rotated by the `from` angle (CSS measures from up).
+            let stops = resolve_stops(&g.items, 360.0, g.interpolation);
+            if stops.is_empty() {
+                return None;
+            }
+            let turn = expand_stops(conic_turn(stops, g.repeating), g.interpolation);
+            let shift = ((from - 90.0) / 360.0).rem_euclid(1.0);
+            let rotated = rotate_stops(&turn, shift);
+            let stops = to_color_stops(&rotated, 0.0, 1.0);
+            let gradient = PGradient::new_sweep(Point::new(cx, cy), 0.0, std::f32::consts::TAU)
+                .with_extend(Extend::Pad)
+                .with_interpolation_alpha_space(InterpolationAlphaSpace::Premultiplied)
+                .with_stops(&stops[..]);
+            Some((Brush::Gradient(gradient), Affine::IDENTITY))
+        }
+    }
+}
+
+fn lp_px(v: ComputedLp, basis: f64) -> f64 {
+    match v {
+        ComputedLp::Px(p) => p as f64,
+        ComputedLp::Percent(p) => p as f64 / 100.0 * basis,
+    }
+}
+
+/// A radial or conic gradient's centre in a `w`×`h` tile: `at` position,
+/// else the middle.
+fn gradient_center(position: &Option<browser_style::ComputedGradientPosition>, w: f64, h: f64) -> (f64, f64) {
+    match position {
+        Some(p) => {
+            let p = p.to_offsets();
+            (w * p.x.percent as f64 / 100.0 + p.x.px as f64, h * p.y.percent as f64 / 100.0 + p.y.px as f64)
+        }
+        None => (w / 2.0, h / 2.0),
+    }
+}
+
+/// The `color` crate's view of a gradient's interpolation method.
+fn interpolation_of(i: ColorInterpolation) -> (ColorSpaceTag, HueDirection) {
+    let space = match i.space {
+        InterpolationSpace::Srgb => ColorSpaceTag::Srgb,
+        InterpolationSpace::SrgbLinear => ColorSpaceTag::LinearSrgb,
+        InterpolationSpace::DisplayP3 => ColorSpaceTag::DisplayP3,
+        InterpolationSpace::A98Rgb => ColorSpaceTag::A98Rgb,
+        InterpolationSpace::ProphotoRgb => ColorSpaceTag::ProphotoRgb,
+        InterpolationSpace::Rec2020 => ColorSpaceTag::Rec2020,
+        InterpolationSpace::Lab => ColorSpaceTag::Lab,
+        InterpolationSpace::Oklab => ColorSpaceTag::Oklab,
+        InterpolationSpace::Xyz | InterpolationSpace::XyzD65 => ColorSpaceTag::XyzD65,
+        InterpolationSpace::XyzD50 => ColorSpaceTag::XyzD50,
+        InterpolationSpace::Hsl => ColorSpaceTag::Hsl,
+        InterpolationSpace::Hwb => ColorSpaceTag::Hwb,
+        InterpolationSpace::Lch => ColorSpaceTag::Lch,
+        InterpolationSpace::Oklch => ColorSpaceTag::Oklch,
+    };
+    let hue = match i.hue {
+        HueMethod::Shorter => HueDirection::Shorter,
+        HueMethod::Longer => HueDirection::Longer,
+        HueMethod::Increasing => HueDirection::Increasing,
+        HueMethod::Decreasing => HueDirection::Decreasing,
+    };
+    (space, hue)
+}
+
+/// The colour `t` of the way from `a` to `b` in the gradient's
+/// interpolation space (premultiplied, CSS Color 4 §12): sRGB when none
+/// is given.
+fn mix_colors(a: Rgba, b: Rgba, t: f64, interpolation: Option<ColorInterpolation>) -> Rgba {
+    let Some(i) = interpolation else { return lerp_rgba(a, b, t) };
+    let (space, hue) = interpolation_of(i);
+    let dyn_color = |c: Rgba| DynamicColor::from_alpha_color(color(c));
+    let mixed = dyn_color(a).interpolate(dyn_color(b), space, hue).eval(t.clamp(0.0, 1.0) as f32);
+    rgba_of(mixed)
+}
+
+/// Stops with the segments between them traced in the gradient's
+/// interpolation space: vello's ramp interpolates in sRGB only, so a
+/// gradient in another space (or with a hue method) gets 24 sub-stops per
+/// segment, each the colour the space gives there.
+fn expand_stops(stops: Vec<Stop>, interpolation: Option<ColorInterpolation>) -> Vec<Stop> {
+    let Some(i) = interpolation else { return stops };
+    if i.space == InterpolationSpace::Srgb && !i.space.is_polar() {
+        return stops;
+    }
+    const STEPS: usize = 24;
+    let mut out: Vec<Stop> = Vec::with_capacity(stops.len() * STEPS);
+    for (k, &(p, c)) in stops.iter().enumerate() {
+        if k > 0 {
+            let (p0, c0) = stops[k - 1];
+            if p > p0 {
+                for s in 1..STEPS {
+                    let t = s as f64 / STEPS as f64;
+                    out.push((p0 + (p - p0) * t, mix_colors(c0, c, t, interpolation)));
+                }
+            }
+        }
+        out.push((p, c));
+    }
+    out
+}
+
+/// The colour stops as fractions of a gradient line `length` long (§3.4.3):
+/// two-position stops become two, the first and last missing positions
+/// are 0 and 1, positions never go backwards, missing ones spread evenly
+/// between their neighbours, and a colour hint becomes the stops of the
+/// curve it bends the transition into.
+fn resolve_stops(items: &[ComputedGradientItem], length: f64, interpolation: Option<ColorInterpolation>) -> Vec<Stop> {
+    let fraction = |p: &ComputedGradientPos| match p {
+        ComputedGradientPos::Lp(ComputedLp::Px(px)) => {
+            if length > 0.0 { *px as f64 / length } else { 0.0 }
+        }
+        ComputedGradientPos::Lp(ComputedLp::Percent(p)) => *p as f64 / 100.0,
+        ComputedGradientPos::Angle(a) => *a as f64 / 360.0,
+    };
+    // (position, colour; a hint has none)
+    let mut entries: Vec<(Option<f64>, Option<Rgba>)> = Vec::new();
+    for item in items {
+        match item {
+            ComputedGradientItem::Stop { color, positions } => {
+                if positions.is_empty() {
+                    entries.push((None, Some(*color)));
+                }
+                for p in positions {
+                    entries.push((Some(fraction(p)), Some(*color)));
+                }
+            }
+            ComputedGradientItem::Hint(p) => entries.push((Some(fraction(p)), None)),
+        }
+    }
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let last = entries.len() - 1;
+    if entries[0].0.is_none() {
+        entries[0].0 = Some(0.0);
+    }
+    if entries[last].0.is_none() {
+        entries[last].0 = Some(1.0);
+    }
+    // No position before a previous one.
+    let mut max = f64::NEG_INFINITY;
+    for e in &mut entries {
+        if let Some(p) = &mut e.0 {
+            if *p < max {
+                *p = max;
+            }
+            max = *p;
+        }
+    }
+    // Missing positions spread evenly.
+    let mut i = 0;
+    while i < entries.len() {
+        if entries[i].0.is_some() {
+            i += 1;
+            continue;
+        }
+        let prev = entries[..i].iter().rev().find_map(|e| e.0).unwrap_or(0.0);
+        let mut j = i;
+        while j < entries.len() && entries[j].0.is_none() {
+            j += 1;
+        }
+        let next = entries.get(j).and_then(|e| e.0).unwrap_or(1.0);
+        let count = (j - i + 1) as f64;
+        for (k, e) in entries[i..j].iter_mut().enumerate() {
+            e.0 = Some(prev + (next - prev) * (k + 1) as f64 / count);
+        }
+        i = j;
+    }
+    // Hints: the transition from the stop before to the stop after passes
+    // through the midpoint colour at the hint; nine stops trace the
+    // curve (`weight = fraction ^ (log 0.5 / log hint)`).
+    let mut out: Vec<Stop> = Vec::new();
+    for (k, e) in entries.iter().enumerate() {
+        let p = e.0.unwrap_or(0.0);
+        match e.1 {
+            Some(c) => out.push((p, c)),
+            None => {
+                let Some(&(pa, ca)) = out.last() else { continue };
+                let Some((pb, cb)) = entries[k + 1..].iter().find_map(|e| e.1.map(|c| (e.0.unwrap_or(1.0), c))) else {
+                    continue;
+                };
+                if pb <= pa {
+                    continue;
+                }
+                let hf = ((p - pa) / (pb - pa)).clamp(0.0, 1.0);
+                if (hf - 0.5).abs() < 1e-4 {
+                    continue;
+                }
+                if hf <= 0.0 {
+                    out.push((pa, cb));
+                    continue;
+                }
+                if hf >= 1.0 {
+                    out.push((pb, ca));
+                    continue;
+                }
+                let exponent = 0.5f64.ln() / hf.ln();
+                for n in 1..=9 {
+                    let f = if n <= 4 {
+                        hf * n as f64 / 5.0
+                    } else if n == 5 {
+                        hf
+                    } else {
+                        hf + (1.0 - hf) * (n - 5) as f64 / 5.0
+                    };
+                    out.push((pa + (pb - pa) * f, mix_colors(ca, cb, f.powf(exponent), interpolation)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Interpolate in premultiplied alpha (CSS Color 4 §12.3).
+fn lerp_rgba(a: Rgba, b: Rgba, t: f64) -> Rgba {
+    let t = t.clamp(0.0, 1.0) as f32;
+    let alpha = a.a + (b.a - a.a) * t;
+    let ch = |x: f32, y: f32| {
+        let p = x * a.a + (y * b.a - x * a.a) * t;
+        if alpha > 0.0 { p / alpha } else { 0.0 }
+    };
+    Rgba {
+        r: ch(a.r, b.r),
+        g: ch(a.g, b.g),
+        b: ch(a.b, b.b),
+        a: alpha,
+    }
+}
+
+/// The colour of a resolved stop list at `t` (padding beyond its ends).
+fn color_at(stops: &[Stop], t: f64) -> Rgba {
+    match stops.iter().position(|s| s.0 >= t) {
+        None => stops.last().map(|s| s.1).unwrap_or(Rgba::TRANSPARENT),
+        Some(0) => stops[0].1,
+        Some(i) => {
+            let (p0, c0) = stops[i - 1];
+            let (p1, c1) = stops[i];
+            if p1 <= p0 { c1 } else { lerp_rgba(c0, c1, (t - p0) / (p1 - p0)) }
+        }
+    }
+}
+
+/// A conic gradient's stops over its full turn, 0..1: what lies outside
+/// the turn is replaced by the colours at its ends; a repeating gradient's
+/// period (first to last stop) is laid end to end over the turn (a zero
+/// period is the average colour, §3.4.1).
+fn conic_turn(stops: Vec<Stop>, repeating: bool) -> Vec<Stop> {
+    let (first, last) = (stops[0].0, stops[stops.len() - 1].0);
+    if repeating {
+        let period = last - first;
+        if period < 1e-6 {
+            let c = average(&to_color_stops(&stops, 0.0, 1.0));
+            return vec![(0.0, c), (1.0, c)];
+        }
+        // Copies of the period from before 0 to past 1, then cut to the
+        // turn.
+        let mut tiled = Vec::new();
+        let k0 = ((0.0 - first) / period).floor() as i64 - 1;
+        let k1 = ((1.0 - first) / period).ceil() as i64 + 1;
+        for k in k0..=k1 {
+            let d = k as f64 * period;
+            for (p, c) in &stops {
+                tiled.push((p + d, *c));
+            }
+        }
+        return cut_to_turn(&tiled);
+    }
+    cut_to_turn(&stops)
+}
+
+/// The stops within 0..1 with the colours at 0 and 1 at the ends.
+fn cut_to_turn(stops: &[Stop]) -> Vec<Stop> {
+    let mut out = vec![(0.0, color_at(stops, 0.0))];
+    out.extend(stops.iter().copied().filter(|s| s.0 > 0.0 && s.0 < 1.0));
+    out.push((1.0, color_at(stops, 1.0)));
+    out
+}
+
+/// Stops over 0..1 moved round the turn by `shift` (0..1): what passes 1
+/// comes back in at 0, and the colour where the turn wraps is put at both
+/// ends so the ramp stays continuous there.
+fn rotate_stops(stops: &[Stop], shift: f64) -> Vec<Stop> {
+    if shift <= 0.0 {
+        return stops.to_vec();
+    }
+    let wrap = 1.0 - shift;
+    let at_wrap = color_at(stops, wrap);
+    let mut out = vec![(0.0, at_wrap)];
+    out.extend(stops.iter().filter(|s| s.0 > wrap && s.0 < 1.0).map(|(p, c)| (p + shift - 1.0, *c)));
+    out.extend(stops.iter().filter(|s| s.0 > 0.0 && s.0 < wrap).map(|(p, c)| (p + shift, *c)));
+    out.push((1.0, at_wrap));
+    out
+}
+
+enum Ramp {
+    Solid(Rgba),
+    Stops(Vec<ColorStop>),
+}
+
+/// The gradient line's span `lo..hi` (fractions of the nominal line) the
+/// brush runs over and the stops renormalized to it: a repeating gradient
+/// repeats its first-to-last stop period (a zero period is a solid of the
+/// average colour, §3.4.1), a plain one pads beyond 0..1 when stops lie
+/// outside.
+fn ramp(stops: Vec<Stop>, repeating: bool) -> Option<(f64, f64, Ramp)> {
+    let first = stops.first()?.0;
+    let last = stops.last()?.0;
+    let (lo, hi) = if repeating { (first, last) } else { (first.min(0.0), last.max(1.0)) };
+    if hi - lo < 1e-6 {
+        let c = if repeating { average(&to_color_stops(&stops, 0.0, 1.0)) } else { stops.last()?.1 };
+        return Some((0.0, 1.0, Ramp::Solid(c)));
+    }
+    Some((lo, hi, Ramp::Stops(to_color_stops(&stops, lo, hi))))
+}
+
+/// The stops renormalized to `lo..hi`. vello's ramp takes its first stop
+/// as the ramp's start and its last as its end whatever their offsets, so
+/// a ramp that does not begin at 0 or end at 1 gets the end colours
+/// there (the padding CSS asks for).
+fn to_color_stops(stops: &[Stop], lo: f64, hi: f64) -> Vec<ColorStop> {
+    let span = (hi - lo).max(1e-9);
+    let mut out: Vec<ColorStop> = stops
+        .iter()
+        .map(|(p, c)| ColorStop::from((((p - lo) / span).clamp(0.0, 1.0) as f32, color(*c))))
+        .collect();
+    if let Some(first) = out.first().copied()
+        && first.offset > 0.0
+    {
+        out.insert(0, ColorStop::from((0.0f32, rgba_to_color(first.color))));
+    }
+    if let Some(last) = out.last().copied()
+        && last.offset < 1.0
+    {
+        out.push(ColorStop::from((1.0f32, rgba_to_color(last.color))));
+    }
+    out
+}
+
+fn rgba_to_color(c: vello::peniko::color::DynamicColor) -> Color {
+    c.to_alpha_color::<vello::peniko::color::Srgb>()
+}
+
+fn rgba_of(c: vello::peniko::color::DynamicColor) -> Rgba {
+    let c = c.to_alpha_color::<vello::peniko::color::Srgb>();
+    let [r, g, b, a] = c.components;
+    Rgba { r, g, b, a }
+}
+
+/// The mean of the stops' colours (what a degenerate repeating gradient
+/// shows).
+fn average(stops: &[ColorStop]) -> Rgba {
+    if stops.is_empty() {
+        return Rgba::TRANSPARENT;
+    }
+    let n = stops.len() as f32;
+    let mut sum = Rgba::TRANSPARENT;
+    for s in stops {
+        let c = rgba_of(s.color);
+        sum.r += c.r / n;
+        sum.g += c.g / n;
+        sum.b += c.b / n;
+        sum.a += c.a / n;
+    }
+    sum
+}
 
 /// Blink's darkening of a border colour for the shaded sides of `inset`,
 /// `outset`, `groove` and `ridge`: the brightest channel comes down by a
@@ -1378,28 +2278,282 @@ mod tests {
     /// Lay out and paint `html` in a 300×150 viewport; the tree, the
     /// pixels (`None` without a GPU) and a probe.
     fn render(html: &str) -> (browser_layout::LayoutTree, Option<Vec<u8>>) {
+        render_with(html, &ImageStore::new(), 0.0, 1.0)
+    }
+
+    /// `render` with known images, a vertical scroll and a device scale
+    /// (the 300×150 device pixels are `300/scale` × `150/scale` CSS px).
+    fn render_with(html: &str, images: &ImageStore, scroll_y: f32, scale: f32) -> (browser_layout::LayoutTree, Option<Vec<u8>>) {
         let doc = browser_dom::parse_html(html.as_bytes());
         let mut stylist = browser_style::Stylist::new();
         stylist.add_sheet(browser_style::ua::ua_stylesheet());
+        let (w, h) = (300.0 / scale, 150.0 / scale);
         let vp = browser_style::Viewport {
-            width: 300.0,
-            height: 150.0,
-            scale_factor: 1.0,
+            width: w,
+            height: h,
+            scale_factor: scale,
             prefers_dark: false,
         };
         let styles = browser_style::compute_styles(&doc, &stylist, &vp);
         let mut engine = browser_layout::LayoutEngine::new();
-        let images = ImageStore::new();
-        let tree = engine.layout(&doc, &styles, 300.0, 150.0, &images);
+        let tree = engine.layout(&doc, &styles, w, h, images);
         let options = PaintOptions {
-            viewport_width: 300.0,
-            viewport_height: 150.0,
-            scale: 1.0,
+            scroll_y,
+            viewport_width: w,
+            viewport_height: h,
+            scale,
             ..PaintOptions::default()
         };
         let mut scene = Scene::new();
-        paint(&tree, &images, &options, &mut scene);
+        paint(&tree, images, &options, &mut scene);
         (tree, render_offscreen(&scene, 300, 150, Color::WHITE))
+    }
+
+    /// A store with `http://x/i.png`, a 2×2 image (red, green over blue,
+    /// white), and `http://x/j.png`, 2×2 green.
+    fn two_by_two() -> ImageStore {
+        let img = |pixels: [[u8; 4]; 4]| ImageData {
+            data: Blob::new(Arc::new(pixels.concat())),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: 2,
+            height: 2,
+        };
+        let mut store = ImageStore::new();
+        store.insert(
+            Url::parse("http://x/i.png").expect("url"),
+            img([[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 255]]),
+        );
+        store.insert(Url::parse("http://x/j.png").expect("url"), img([[0, 255, 0, 255]; 4]));
+        store
+    }
+
+    fn is_red(p: [u8; 3]) -> bool {
+        p[0] > 200 && p[1] < 80 && p[2] < 80
+    }
+    fn is_green(p: [u8; 3]) -> bool {
+        p[1] > 200 && p[0] < 80 && p[2] < 80
+    }
+    fn is_blue(p: [u8; 3]) -> bool {
+        p[2] > 200 && p[0] < 80 && p[1] < 80
+    }
+    fn is_white(p: [u8; 3]) -> bool {
+        p == [255, 255, 255]
+    }
+
+    /// Background layers: position, size, repeat modes, origin and clip
+    /// (CSS Backgrounds 3 §3), `fixed` against the viewport, the body's
+    /// layers on the canvas, and `image-set()` by the device scale.
+    #[test]
+    fn background_layers_are_placed_sized_repeated_and_clipped() {
+        let images = two_by_two();
+        // A 20px tile at (10, 20), once.
+        let (_, pixels) = render_with(
+            "<body style='margin:0'><div style='width:100px;height:60px;background:url(http://x/i.png) no-repeat 10px 20px / 20px 20px'></div></body>",
+            &images,
+            0.0,
+            1.0,
+        );
+        let Some(pixels) = pixels else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        assert!(is_red(px(&pixels, 15.0, 25.0)) && is_green(px(&pixels, 25.0, 25.0)) && is_blue(px(&pixels, 15.0, 35.0)) && is_white(px(&pixels, 25.0, 35.0)));
+        assert!(is_white(px(&pixels, 5.0, 5.0)) && is_white(px(&pixels, 35.0, 25.0)), "once only");
+        // `repeat`: tiles both ways from the position.
+        let (_, pixels) = render_with(
+            "<body style='margin:0'><div style='width:100px;height:60px;background:url(http://x/i.png) repeat 10px 20px / 20px 20px'></div></body>",
+            &images,
+            0.0,
+            1.0,
+        );
+        let pixels = pixels.expect("gpu");
+        assert!(is_red(px(&pixels, 35.0, 25.0)), "the next tile to the right");
+        assert!(is_green(px(&pixels, 5.0, 25.0)), "the tile before the position shows its right half");
+        assert!(is_blue(px(&pixels, 15.0, 15.0)), "the tile above shows its bottom");
+        // `space`: three 30px tiles in 100px with 5px gaps; `round`: three
+        // tiles of 33.33px.
+        let (_, pixels) = render_with(
+            "<body style='margin:0'><div style='width:100px;height:60px;background:url(http://x/i.png) space 0 0 / 30px 30px'></div>\
+             <div style='width:100px;height:60px;background:url(http://x/i.png) round 0 0 / 30px 30px'></div></body>",
+            &images,
+            0.0,
+            1.0,
+        );
+        let pixels = pixels.expect("gpu");
+        assert!(is_red(px(&pixels, 2.0, 5.0)) && is_white(px(&pixels, 32.0, 5.0)) && is_red(px(&pixels, 37.0, 5.0)) && is_red(px(&pixels, 72.0, 5.0)), "space");
+        assert!(is_green(px(&pixels, 30.0, 65.0)) && is_red(px(&pixels, 35.0, 65.0)), "round: the first tile is 33px wide");
+        // `contain` and `cover` keep the ratio.
+        let (_, pixels) = render_with(
+            "<body style='margin:0'><div style='width:100px;height:50px;background:url(http://x/i.png) no-repeat 0 0 / contain'></div>\
+             <div style='width:100px;height:50px;background:url(http://x/i.png) no-repeat 0 0 / cover'></div></body>",
+            &images,
+            0.0,
+            1.0,
+        );
+        let pixels = pixels.expect("gpu");
+        // The 2×2 image is scaled with bilinear filtering, as browsers scale
+        // images: the colours are pure at the texel centres.
+        assert!(is_red(px(&pixels, 12.5, 12.5)) && is_white(px(&pixels, 75.0, 25.0)), "contain: a 50px image, the rest bare");
+        assert!(is_green(px(&pixels, 75.0, 75.0)) && is_red(px(&pixels, 25.0, 75.0)), "cover: a 100px image cut at the box");
+        // Origin and clip boxes, with a transparent border to see through.
+        let (_, pixels) = render_with(
+            "<body style='margin:0'><div style='width:40px;height:40px;padding:10px;border:4px solid transparent;\
+             background:blue url(http://x/i.png) no-repeat;background-origin:content-box;background-clip:padding-box'></div>\
+             <div style='width:40px;height:40px;padding:10px;border:4px solid transparent;background:blue;background-clip:content-box'></div></body>",
+            &images,
+            0.0,
+            1.0,
+        );
+        let pixels = pixels.expect("gpu");
+        assert!(is_red(px(&pixels, 14.0, 14.0)) && is_blue(px(&pixels, 13.0, 13.0)), "the image at the content box's origin");
+        assert!(is_white(px(&pixels, 2.0, 2.0)) && is_blue(px(&pixels, 5.0, 5.0)), "clipped to the padding box");
+        assert!(is_white(px(&pixels, 8.0, 68.0 + 8.0)) && is_blue(px(&pixels, 20.0, 68.0 + 20.0)), "clipped to the content box");
+        // `fixed`: positioned against the viewport, clipped to the box.
+        let (_, pixels) = render_with(
+            "<body style='margin:0;height:2000px'><div style='position:absolute;top:120px;left:0;width:300px;height:100px;\
+             background:url(http://x/i.png) no-repeat 0 0 / 40px 40px fixed'></div></body>",
+            &images,
+            100.0,
+            1.0,
+        );
+        let pixels = pixels.expect("gpu");
+        assert!(is_blue(px(&pixels, 10.0, 30.0)), "the viewport-anchored image's lower part shows in the box");
+        assert!(is_white(px(&pixels, 10.0, 15.0)), "nothing above the box");
+        // The body's layers go to the canvas, positioned against the root.
+        let (_, pixels) = render_with(
+            "<body style='margin:0;background:url(http://x/i.png) no-repeat 10px 10px / 20px 20px'></body>",
+            &images,
+            0.0,
+            1.0,
+        );
+        let pixels = pixels.expect("gpu");
+        assert!(is_red(px(&pixels, 15.0, 15.0)) && is_white(px(&pixels, 15.0, 35.0)), "{:?}", px(&pixels, 15.0, 15.0));
+        // `image-set()`: the 1x candidate at scale 1, the 2x at scale 2.
+        let html = "<body style='margin:0'><div style='width:100px;height:60px;background:image-set(url(http://x/i.png) 1x, url(http://x/j.png) 2x) no-repeat 0 0 / 20px 20px'></div></body>";
+        let (_, pixels) = render_with(html, &images, 0.0, 1.0);
+        assert!(is_red(px(&pixels.expect("gpu"), 5.0, 5.0)));
+        let (_, pixels) = render_with(html, &images, 0.0, 2.0);
+        assert!(is_green(px(&pixels.expect("gpu"), 10.0, 10.0)));
+    }
+
+    /// A sliced two-line inline element shows its background as one
+    /// unbroken box; `clone` restarts it on every fragment.
+    #[test]
+    fn inline_fragment_backgrounds_slice_or_clone() {
+        let images = two_by_two();
+        for (clone, expect_red_on_second) in [(false, false), (true, true)] {
+            let (tree, pixels) = render_with(
+                &format!(
+                    "<body style='margin:0;font-size:20px;line-height:40px'><p style='margin:0;width:150px'>aaaa \
+                     <span style='background:url(http://x/i.png) no-repeat 0 0 / 100% 100%;{}'>bbbb cccc dddd eeee</span></p></body>",
+                    if clone { "box-decoration-break:clone" } else { "" }
+                ),
+                &images,
+                0.0,
+                1.0,
+            );
+            let Some(pixels) = pixels else {
+                eprintln!("no GPU; skipping");
+                return;
+            };
+            let pieces = inline_fragments(&tree, "span");
+            assert!(pieces.len() >= 2, "{pieces:?}");
+            let second = pieces[1].0;
+            let p = px(&pixels, second.x + 1.0, second.y + 1.0);
+            assert_eq!(is_red(p), expect_red_on_second, "clone {clone}: {p:?} at {second:?}");
+        }
+    }
+
+    /// Gradients: linear directions, radial, conic, repeating; blending
+    /// of layers; `background-clip: text`.
+    #[test]
+    fn gradients_blend_modes_and_text_clip_paint() {
+        let (_, pixels) = render(
+            "<body style='margin:0'>\
+             <div style='width:100px;height:20px;background:linear-gradient(to right, red, blue)'></div>\
+             <div style='width:100px;height:20px;background:linear-gradient(red, blue)'></div>\
+             <div style='width:100px;height:20px;background:repeating-linear-gradient(to right, red 0 10px, blue 10px 20px)'></div>\
+             <div style='width:100px;height:20px;background:linear-gradient(to right, red 50%, blue 40%)'></div>\
+             <div style='width:100px;height:20px;background:-webkit-linear-gradient(left, red, blue)'></div></body>",
+        );
+        let Some(pixels) = pixels else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        assert!(is_red(px(&pixels, 2.0, 10.0)) && is_blue(px(&pixels, 97.0, 10.0)), "to right");
+        let mid = px(&pixels, 50.0, 10.0);
+        assert!(mid[0] > 80 && mid[2] > 80 && mid[1] < 40, "mixed in the middle: {mid:?}");
+        assert!(is_red(px(&pixels, 50.0, 21.0)) && is_blue(px(&pixels, 50.0, 38.0)), "to bottom by default");
+        assert!(is_red(px(&pixels, 5.0, 50.0)) && is_blue(px(&pixels, 15.0, 50.0)) && is_red(px(&pixels, 25.0, 50.0)) && is_blue(px(&pixels, 95.0, 50.0)), "repeating");
+        assert!(is_red(px(&pixels, 48.0, 70.0)) && is_blue(px(&pixels, 52.0, 70.0)), "a stop before the previous one moves up to it: a hard edge at 50%");
+        assert!(is_red(px(&pixels, 2.0, 90.0)) && is_blue(px(&pixels, 97.0, 90.0)), "legacy `left` means from the left");
+        // Interpolation spaces: red to blue in oklab is a lighter purple
+        // than in sRGB; red to red the long way round the hsl hue circle
+        // passes through cyan.
+        let (_, pixels) = render(
+            "<body style='margin:0'>\
+             <div style='width:100px;height:20px;background:linear-gradient(to right in oklab, red, blue)'></div>\
+             <div style='width:100px;height:20px;background:linear-gradient(to right in hsl longer hue, red, red)'></div>\
+             <div style='width:100px;height:20px;background:linear-gradient(to right in hsl, red, red)'></div></body>",
+        );
+        let pixels = pixels.expect("gpu");
+        let oklab_mid = px(&pixels, 50.0, 10.0);
+        // oklab's midpoint of red and blue is (140, 84, 161).
+        assert!(
+            (120..=160).contains(&oklab_mid[0]) && (60..=110).contains(&oklab_mid[1]) && (140..=180).contains(&oklab_mid[2]),
+            "oklab midpoint: {oklab_mid:?} (sRGB gives {mid:?})"
+        );
+        let cyan = px(&pixels, 50.0, 30.0);
+        assert!(cyan[0] < 60 && cyan[1] > 200 && cyan[2] > 200, "longer hue: {cyan:?}");
+        assert!(is_red(px(&pixels, 50.0, 50.0)), "shorter hue: red all the way");
+
+        let (_, pixels) = render(
+            "<body style='margin:0'>\
+             <div style='width:100px;height:100px;background:radial-gradient(circle, red 0, red 10px, blue 10px)'></div>\
+             <div style='position:absolute;left:100px;top:0;width:100px;height:100px;background:conic-gradient(from 90deg, red 0deg, red 90deg, blue 90deg, blue 360deg)'></div>\
+             <div style='position:absolute;left:200px;top:0;width:100px;height:100px;background:radial-gradient(closest-side at 25% 50%, red, red 99%, blue)'></div></body>",
+        );
+        let pixels = pixels.expect("gpu");
+        assert!(is_red(px(&pixels, 50.0, 50.0)) && is_blue(px(&pixels, 80.0, 50.0)) && is_blue(px(&pixels, 50.0, 85.0)), "radial circle");
+        assert!(is_red(px(&pixels, 175.0, 75.0)), "conic from 90deg: the first quarter clockwise from the right");
+        assert!(is_blue(px(&pixels, 125.0, 75.0)) && is_blue(px(&pixels, 125.0, 25.0)) && is_blue(px(&pixels, 175.0, 25.0)), "conic: the rest");
+        assert!(is_red(px(&pixels, 225.0, 50.0)) && is_blue(px(&pixels, 275.0, 50.0)), "closest-side ellipse at 25%: 25px wide, 50px tall");
+        assert!(is_red(px(&pixels, 225.0, 5.0)), "reaching the top and bottom sides");
+
+        // Multiply red over blue is black; without blending the top layer
+        // shows.
+        let (_, pixels) = render(
+            "<body style='margin:0'>\
+             <div style='width:100px;height:20px;background-image:linear-gradient(red, red), linear-gradient(blue, blue);background-blend-mode:multiply'></div>\
+             <div style='width:100px;height:20px;background-image:linear-gradient(red, red), linear-gradient(blue, blue)'></div></body>",
+        );
+        let pixels = pixels.expect("gpu");
+        let p = px(&pixels, 50.0, 10.0);
+        assert!(p.iter().all(|&c| c < 20), "multiplied to black: {p:?}");
+        assert!(is_red(px(&pixels, 50.0, 30.0)));
+
+        // `background-clip: text` (also `-webkit-`): the gradient shows
+        // through the glyphs only; the transparent text covers nothing.
+        let (tree, pixels) = render(
+            "<body style='margin:0'><p style='margin:0;font-size:80px;line-height:100px;color:transparent;\
+             background:linear-gradient(red, red);-webkit-background-clip:text'>H</p></body>",
+        );
+        let pixels = pixels.expect("gpu");
+        let mut glyph: Option<(Rect, browser_layout::TextFragment)> = None;
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
+                && glyph.is_none()
+            {
+                glyph = Some((f.rect, t.clone()));
+            }
+        });
+        let (rect, t) = glyph.expect("text");
+        let stem_x = rect.x + t.clusters[0].x + t.clusters[0].advance * 0.22;
+        let y = rect.y + t.baseline - 20.0;
+        assert!(is_red(px(&pixels, stem_x, y)), "inside the H's left stem: {:?}", px(&pixels, stem_x, y));
+        assert!(is_white(px(&pixels, rect.x + t.clusters[0].advance * 0.5, rect.y + t.baseline - 60.0)), "between the stems above the bar");
+        assert!(is_white(px(&pixels, 250.0, 50.0)), "outside the text");
     }
 
     fn px(pixels: &[u8], x: f32, y: f32) -> [u8; 3] {
@@ -1411,7 +2565,7 @@ mod tests {
     fn inline_fragments(tree: &browser_layout::LayoutTree, tag: &str) -> Vec<(Rect, bool, bool)> {
         let mut out = Vec::new();
         tree.root.walk(&mut |f| {
-            if let FragmentContent::Inline { left, right } = f.content
+            if let FragmentContent::Inline { left, right, .. } = f.content
                 && f.style.font_size > 0.0
                 && f.node.is_some()
             {
