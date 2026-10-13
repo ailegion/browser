@@ -1534,8 +1534,9 @@ Work:
       collapsed when equal), `scroll-snap-stop`, `overflow-anchor`.
       `scrollbar-width` and `scrollbar-gutter` are layout-affecting for
       the restyle split; the rest are not. Logical forms
-      (`scroll-margin-inline-start` and the like) wait for the engine-wide
-      logical property set (`05-risks-and-open-items.md` O21). Tests:
+      (`scroll-margin-inline-start` and the like) are ELSEWHERE: the
+      engine-wide logical property set, placed by the owner 2026-10-14 in
+      Phase 5 (`05-risks-and-open-items.md` O21). Tests:
       style (every form and refusal, inherited flags, shorthand expansion
       and CSS-wide keywords, specified and shorthand serialization,
       resolved values, the pair rule on four boxes, the viewport
