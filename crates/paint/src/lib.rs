@@ -1507,7 +1507,7 @@ mod tests {
         );
         let pixels = pixels.expect("gpu");
         let top = px(&pixels, 50.0, 3.0);
-        let bottom = px(&pixels, 50.0, 37.0);
+        let bottom = px(&pixels, 50.0, 52.0);
         assert!(top[0] < bottom[0] && bottom == [200, 200, 200], "inset: the top is shaded, the bottom plain: {top:?} {bottom:?}");
         assert_eq!(px(&pixels, 3.0, 20.0), top, "and the left like the top");
         // The inset box is 56px tall (40 + two 8px borders); the next

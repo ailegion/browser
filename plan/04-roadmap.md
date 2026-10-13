@@ -1233,9 +1233,86 @@ Work:
       mapping stay one root per block, unchanged. `ensure_layout`, line
       placement, float breaking, fragment emission, truncation and the
       small-caps pass iterate paragraphs with a byte offset each.
-      **Block 3: `vertical-align` done 2026-10-11; bidi paragraphs and
-      `direction`/`unicode-bidi` done 2026-10-11; the inline box model
-      still to build.** Bidi paragraphs (`crates/layout/src/engine.rs`,
+      **Block 3 done: `vertical-align` 2026-10-11; bidi paragraphs and
+      `direction`/`unicode-bidi` 2026-10-11; the inline box model
+      2026-10-12.** The inline box model (CSS 2.1 §9.4.2, §10.6.1, §10.8;
+      CSS Fragmentation 3 §5): every `display: inline` element has one
+      `FragmentContent::Inline` fragment per line it is on (its content
+      split into one fragment per visually contiguous part when bidi
+      reordering puts other content between its parts), with `node` the
+      element, children its text, atomics and nested fragments in visual
+      order (paint order of CSS 2.1 Appendix E), `rect` the border box:
+      horizontally the content plus the edges it carries, vertically the
+      first available font's rounded ascent and descent (the content
+      area, as Blink sizes it) plus the vertical padding and borders,
+      which never change the line box. The box builder records each inline
+      element's node, text range and document-order sequence
+      (`InlineBoxInfo`, kept in step by the control insertion, trailing
+      space trim, small-caps and marker prepend passes). Per layout width
+      the edges resolve (`ResolvedEdges`: percentages against the
+      containing block's width, zero while an intrinsic size is measured
+      per CSS Sizing 3 §5.2.1; `auto` margins zero; vertical margins
+      ignored for layout, reported as used values); a decorated element
+      (a non-zero margin, border or padding on any side, or a background)
+      puts two zero-height inline boxes into the paragraph at its content's
+      start and end with the width of its inline-start and inline-end edges
+      (mapped by its own `direction`), so the edges take inline space,
+      break shaping at the element's boundaries and let an empty element
+      make a line with its line-height box. parley's breaker had no way to
+      keep such boxes with their content, so `vendor/parley` carries two
+      additions (`03-crates.md`): attached inline boxes (no break
+      opportunity of their own, a start edge moves to the next line with
+      its word, an end edge with its word, and stays after a hanging space)
+      and cloned decorations reserved on every line a stretch breaks over.
+      After breaking, `place_line_items` walks each line again from its
+      left: the reserved widths are dropped and put back around the
+      element's visual parts, the leftmost part getting the left edge and
+      the rightmost the right edge when the element has them on that line
+      (`slice`: the start edge on the line where it begins, the end edge
+      where it ends, left/right by its `direction`; `clone`: both on every
+      line). A collapsible space ending a soft-wrapped line is removed
+      (CSS Text 3 §4.1.3) so an end edge follows the last letter; an end
+      edge after a `<br>` stays on the line before it (Blink's placement);
+      `text-overflow` cuts an element's fragment with its text, an edge
+      past the cut is dropped and the marker follows what is kept. Empty
+      undecorated elements get a zero-width fragment where they sit.
+      `box-decoration-break` (`slice` | `clone`, `-webkit-` alias with
+      both IDL attributes) is in the table, cascade and CSSOM. Paint
+      (`crates/paint`): the background colour clipped by the last layer's
+      `background-clip` (`border-box`, `padding-box`, `content-box`; `text`
+      is block 4's and paints as `border-box` until then), borders per
+      side present (the top and bottom on every fragment, left and right
+      where the element has them), corners at a missing side unrounded.
+      The border painter was rewritten for every box with it, as the owner
+      placed here: each side in its wedge of the border ring (sides meet
+      along the corner diagonal), `solid`, `double` (two thirds), `dotted`
+      (round dots a width apart, fitted to the side, following the corner
+      curves), `dashed` (dashes three widths long, fitted), `inset`/
+      `outset`/`groove`/`ridge` with Blink's shading (the dark sides'
+      brightest channel down by a third; the dot and dash spacing, the
+      shading constant and the straight corner diagonal between two
+      colours are Blink's nominal rules as recalled, accepted by the owner
+      2026-10-13 since CSS leaves them to the UA and Chrome and Firefox
+      differ); radii elliptical for percentages and reduced together per
+      CSS Backgrounds 3 §5.5; the
+      `background-clip` and radius geometry is shared, so blocks follow the
+      same rules now. An inline element's own fragments feed hit testing
+      (its padding hits the element), `first_rect`, `getClientRects` (one
+      rect per line fragment), `getBoundingClientRect` and the used
+      padding/margin `getComputedStyle` reports. Tests: style (parse,
+      alias, resolved value), layout (edges take inline space around the
+      content and leave the line box alone; a start edge wraps with its
+      word, an end edge with its, no break inside a word at an edge, the
+      trailing space before an end edge removed; empty elements with edges
+      make a line in their font, without edges not; nesting, 10% padding,
+      `auto` and negative margins; a `direction: rtl` element's right edge
+      on its first line and left edge on its last; `clone` on both lines;
+      shrink-to-fit holding the edges; the empty undecorated element's
+      place; `text-overflow` cutting the fragment), paint (the `mark`
+      background covers the content area only; a sliced two-line element's
+      sides and corners; border styles and the two-colour corner on
+      blocks), tab (`getClientRects`, used padding, `boxDecorationBreak`
+      through both alias attributes). Bidi paragraphs (`crates/layout/src/engine.rs`,
       `Paragraph`): an inline root's text is split after every forced
       break; each piece is shaped, line-broken, placed and aligned as a
       parley layout of its own with its own base direction, its lines
