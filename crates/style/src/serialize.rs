@@ -103,6 +103,22 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::FlexGrow(n) | P::FlexShrink(n) | P::Opacity(n) => css_number(*n),
         P::FlexBasis(b) => b.to_css(),
         P::RowGap(g) | P::ColumnGap(g) => g.to_css(),
+        P::ScrollbarWidth(w) => w.keyword().to_owned(),
+        P::ScrollbarColor(c) => match c {
+            ScrollbarColorValue::Auto => "auto".to_owned(),
+            ScrollbarColorValue::Colors { thumb, track } => format!("{} {}", thumb.to_css(), track.to_css()),
+        },
+        P::ScrollbarGutter(g) => g.keyword().to_owned(),
+        P::OverscrollBehaviorX(b) | P::OverscrollBehaviorY(b) => b.keyword().to_owned(),
+        P::ScrollBehavior(b) => b.keyword().to_owned(),
+        P::ScrollMarginTop(m) | P::ScrollMarginRight(m) | P::ScrollMarginBottom(m) | P::ScrollMarginLeft(m) => m.to_css(),
+        P::ScrollPaddingTop(p) | P::ScrollPaddingRight(p) | P::ScrollPaddingBottom(p) | P::ScrollPaddingLeft(p) => {
+            p.to_css()
+        }
+        P::ScrollSnapType(t) => t.to_css(),
+        P::ScrollSnapAlign(a) => a.to_css(),
+        P::ScrollSnapStop(s) => s.keyword().to_owned(),
+        P::OverflowAnchor(a) => a.keyword().to_owned(),
     }
 }
 
@@ -264,7 +280,8 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
     }
     let v = |i: usize| values[i].as_str();
     Some(match name.to_ascii_lowercase().as_str() {
-        "margin" | "padding" | "inset" | "border-width" | "border-style" | "border-color" => sides_css(values),
+        "margin" | "padding" | "inset" | "scroll-margin" | "scroll-padding" | "border-width" | "border-style"
+        | "border-color" => sides_css(values),
         "border-radius" => {
             // Each longhand is `x` or `x y`; the shorthand is the four
             // horizontal radii, then `/` and the four vertical ones.
@@ -290,7 +307,7 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             border_side_css(v(0), v(4), v(8))
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => border_side_css(v(0), v(1), v(2)),
-        "overflow" | "gap" | "grid-gap" | "place-content" => {
+        "overflow" | "gap" | "grid-gap" | "place-content" | "overscroll-behavior" => {
             if v(0) == v(1) { v(0).to_owned() } else { format!("{} {}", v(0), v(1)) }
         }
         "background-position" => {
@@ -750,6 +767,27 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::RowGap => lp_css(style.row_gap),
         Id::ColumnGap => lp_css(style.column_gap),
         Id::Opacity => css_number(style.opacity),
+        Id::ScrollbarWidth => style.scrollbar_width.keyword().to_owned(),
+        Id::ScrollbarColor => match style.scrollbar_color {
+            ScrollbarColor::Auto => "auto".to_owned(),
+            ScrollbarColor::Colors { thumb, track } => format!("{} {}", thumb.to_css(), track.to_css()),
+        },
+        Id::ScrollbarGutter => style.scrollbar_gutter.keyword().to_owned(),
+        Id::OverscrollBehaviorX => style.overscroll_behavior_x.keyword().to_owned(),
+        Id::OverscrollBehaviorY => style.overscroll_behavior_y.keyword().to_owned(),
+        Id::ScrollBehavior => style.scroll_behavior.keyword().to_owned(),
+        Id::ScrollMarginTop => px(style.scroll_margin.top),
+        Id::ScrollMarginRight => px(style.scroll_margin.right),
+        Id::ScrollMarginBottom => px(style.scroll_margin.bottom),
+        Id::ScrollMarginLeft => px(style.scroll_margin.left),
+        Id::ScrollPaddingTop => lpa_css(style.scroll_padding.top),
+        Id::ScrollPaddingRight => lpa_css(style.scroll_padding.right),
+        Id::ScrollPaddingBottom => lpa_css(style.scroll_padding.bottom),
+        Id::ScrollPaddingLeft => lpa_css(style.scroll_padding.left),
+        Id::ScrollSnapType => style.scroll_snap_type.resolved_css(),
+        Id::ScrollSnapAlign => style.scroll_snap_align.to_css(),
+        Id::ScrollSnapStop => style.scroll_snap_stop.keyword().to_owned(),
+        Id::OverflowAnchor => style.overflow_anchor.keyword().to_owned(),
     }
 }
 
@@ -817,6 +855,23 @@ mod tests {
             ("text-overflow: ELLIPSIS", "text-overflow: ellipsis;"),
             ("text-overflow: \"--\"", "text-overflow: \"--\";"),
             ("text-overflow: clip ellipsis", ""),
+            ("scrollbar-width: THIN", "scrollbar-width: thin;"),
+            ("scrollbar-color: red #000", "scrollbar-color: red rgb(0, 0, 0);"),
+            ("scrollbar-color: red", ""),
+            ("scrollbar-gutter: both-edges stable", "scrollbar-gutter: stable both-edges;"),
+            ("scroll-behavior: smooth", "scroll-behavior: smooth;"),
+            ("scroll-margin-top: -0.5em", "scroll-margin-top: -0.5em;"),
+            ("scroll-margin-top: calc(1px + 1em)", "scroll-margin-top: calc(1em + 1px);"),
+            ("scroll-margin-top: 10%", ""),
+            ("scroll-padding-top: 10%", "scroll-padding-top: 10%;"),
+            ("scroll-padding-top: auto", "scroll-padding-top: auto;"),
+            ("scroll-padding-top: -1px", ""),
+            ("scroll-snap-type: x proximity", "scroll-snap-type: x proximity;"),
+            ("scroll-snap-type: Y", "scroll-snap-type: y;"),
+            ("scroll-snap-align: start start", "scroll-snap-align: start;"),
+            ("scroll-snap-align: start end", "scroll-snap-align: start end;"),
+            ("scroll-snap-stop: always", "scroll-snap-stop: always;"),
+            ("overflow-anchor: none", "overflow-anchor: none;"),
         ];
         for (input, expected) in cases {
             assert_eq!(block(input), expected, "for {input}");
@@ -873,6 +928,14 @@ mod tests {
             ("place-content: center start", "place-content: center start;"),
             ("margin: inherit", "margin: inherit;"),
             ("margin-top: inherit; margin-right: 1px; margin-bottom: inherit; margin-left: inherit", "margin-top: inherit; margin-right: 1px; margin-bottom: inherit; margin-left: inherit;"),
+            ("scroll-margin: 1px 2px", "scroll-margin: 1px 2px;"),
+            ("scroll-margin: 1px 2px 3px 4px", "scroll-margin: 1px 2px 3px 4px;"),
+            ("scroll-padding: auto 1px", "scroll-padding: auto 1px;"),
+            ("scroll-padding: inherit", "scroll-padding: inherit;"),
+            ("overscroll-behavior: contain", "overscroll-behavior: contain;"),
+            ("overscroll-behavior: auto none", "overscroll-behavior: auto none;"),
+            ("overscroll-behavior-x: contain; overscroll-behavior-y: contain", "overscroll-behavior: contain;"),
+            ("overscroll-behavior-y: contain", "overscroll-behavior-y: contain;"),
         ];
         for (input, expected) in cases {
             assert_eq!(block(input), expected, "for {input}");
@@ -926,6 +989,36 @@ mod tests {
             Some("0% 0%, 10px calc(100% - 4px)".to_owned())
         );
         assert_eq!(resolved_value(&style, PropertyId::BackgroundBlendMode, None), "normal");
+        // The scroll container properties: lengths in px, `proximity`
+        // left out, colours as `rgb()`.
+        style.scroll_margin.top = -4.0;
+        style.scroll_padding.left = ComputedLpAuto::Percent(10.0);
+        style.scroll_snap_type = ScrollSnapType::Axis {
+            axis: SnapAxis::X,
+            strictness: Some(SnapStrictness::Proximity),
+        };
+        style.scrollbar_color = ScrollbarColor::Colors {
+            thumb: Rgba::rgb8(1, 2, 3),
+            track: Rgba::BLACK,
+        };
+        assert_eq!(resolved_value(&style, PropertyId::ScrollMarginTop, None), "-4px");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollMarginLeft, None), "0px");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollPaddingLeft, None), "10%");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollPaddingTop, None), "auto");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollSnapType, None), "x");
+        style.scroll_snap_type = ScrollSnapType::Axis {
+            axis: SnapAxis::Y,
+            strictness: Some(SnapStrictness::Mandatory),
+        };
+        assert_eq!(resolved_value(&style, PropertyId::ScrollSnapType, None), "y mandatory");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollSnapAlign, None), "none");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollbarColor, None), "rgb(1, 2, 3) rgb(0, 0, 0)");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollbarGutter, None), "auto");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollbarWidth, None), "auto");
+        assert_eq!(resolved_value(&style, PropertyId::OverscrollBehaviorX, None), "auto");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollBehavior, None), "auto");
+        assert_eq!(resolved_value(&style, PropertyId::ScrollSnapStop, None), "normal");
+        assert_eq!(resolved_value(&style, PropertyId::OverflowAnchor, None), "auto");
         // Rendered: used values.
         let used = UsedValues {
             width: 200.0,

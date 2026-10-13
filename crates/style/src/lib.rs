@@ -26,7 +26,8 @@ pub use cascade::{Restyled, StateChange, StyleMap, Stylist, compute_styles, comp
 pub use state::{ElementStates, InteractionDeps, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 pub use computed::{
     AppliedDecoration, ComputedBackgroundSize, ComputedPosition, ComputedStyle, ComputedVerticalAlign, DecorationFont,
-    DecorationThickness, LetterSpacing, LineHeight, PositionOffset, UnderlineOffset, Viewport,
+    DecorationThickness, LetterSpacing, LineHeight, PositionOffset, UnderlineOffset, Viewport, ViewportOverflow,
+    viewport_overflow,
 };
 pub use image::{
     ColorInterpolation, ComputedCandidate, ComputedGradient, ComputedGradientItem, ComputedGradientPos,

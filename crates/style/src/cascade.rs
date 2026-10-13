@@ -1003,6 +1003,94 @@ mod tests {
     }
 
     #[test]
+    fn overflow_pairs_its_axes_and_propagates_to_the_viewport() {
+        use crate::computed::viewport_overflow;
+        use crate::properties::Overflow;
+        // CSS Overflow 3 §3.1: `visible` beside a scrolling axis computes
+        // to `auto`, `clip` to `hidden`; `visible` beside `clip` stays.
+        let (doc, styles) = styles_for(
+            "<div id=a style='overflow-x: auto'></div><div id=b style='overflow: clip scroll'></div>\
+             <div id=c style='overflow: visible clip'></div><div id=d style='overflow-y: hidden'></div>",
+            "",
+        );
+        let by_id = |id: &str| {
+            doc.descendants(doc.root())
+                .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+                .expect("element")
+        };
+        let o = |id: &str| {
+            let s = &styles[by_id(id)];
+            (s.overflow_x, s.overflow_y)
+        };
+        assert_eq!(o("a"), (Overflow::Auto, Overflow::Auto));
+        assert_eq!(o("b"), (Overflow::Hidden, Overflow::Scroll));
+        assert_eq!(o("c"), (Overflow::Visible, Overflow::Clip));
+        assert_eq!(o("d"), (Overflow::Auto, Overflow::Hidden));
+        // §3.3: the viewport takes the root's `overflow`, or the body's
+        // when the root's is `visible`; `visible` is `auto` and `clip`
+        // is `hidden` on the viewport; an unrendered body or root does
+        // not propagate.
+        let viewport = |html: &str, css: &str| {
+            let (doc, styles) = styles_for(html, css);
+            let v = viewport_overflow(&doc, &styles);
+            let name = v.source.and_then(|n| doc.element(n)).map(|e| e.name.local.to_string());
+            (v.x, v.y, name)
+        };
+        assert_eq!(viewport("<body></body>", ""), (Overflow::Auto, Overflow::Auto, Some("body".into())));
+        assert_eq!(viewport("<body style='overflow: hidden'></body>", ""), (Overflow::Hidden, Overflow::Hidden, Some("body".into())));
+        assert_eq!(
+            viewport("<body style='overflow: hidden'></body>", "html { overflow-y: scroll }"),
+            (Overflow::Auto, Overflow::Scroll, Some("html".into()))
+        );
+        assert_eq!(viewport("<body style='overflow: clip'></body>", ""), (Overflow::Hidden, Overflow::Hidden, Some("body".into())));
+        assert_eq!(
+            viewport("<body style='overflow: hidden; display: none'></body>", ""),
+            (Overflow::Auto, Overflow::Auto, Some("html".into()))
+        );
+        assert_eq!(viewport("<body style='overflow: hidden'></body>", "html { display: none }"), (Overflow::Auto, Overflow::Auto, None));
+    }
+
+    #[test]
+    fn scroll_properties_compute_and_scrollbar_color_inherits() {
+        use crate::properties::{Overflow, ScrollbarColor, Sides, SnapStrictness};
+        use crate::values::{ComputedLpAuto, Rgba};
+        let (doc, styles) = styles_for(
+            "<div style='color: rgb(1, 2, 3); scrollbar-color: currentcolor red; font-size: 10px; scroll-margin: 1em -2px; \
+             scroll-padding: 5% auto; scroll-snap-type: y mandatory'><p>t</p></div><textarea></textarea><input><select></select>",
+            "",
+        );
+        let s = &styles[find(&doc, "div")];
+        let p = &styles[find(&doc, "p")];
+        assert_eq!(
+            s.scrollbar_color,
+            ScrollbarColor::Colors {
+                thumb: Rgba::rgb8(1, 2, 3),
+                track: Rgba::rgb8(255, 0, 0)
+            }
+        );
+        assert_eq!(p.scrollbar_color, s.scrollbar_color, "inherited");
+        assert_eq!(
+            s.scroll_margin,
+            Sides {
+                top: 10.0,
+                right: -2.0,
+                bottom: 10.0,
+                left: -2.0
+            }
+        );
+        assert_eq!(p.scroll_margin, Sides::all(0.0), "not inherited");
+        assert_eq!(s.scroll_padding.top, ComputedLpAuto::Percent(5.0));
+        assert_eq!(s.scroll_padding.right, ComputedLpAuto::Auto);
+        assert_eq!(s.scroll_snap_type.strictness(), Some(SnapStrictness::Mandatory));
+        assert_eq!(p.scroll_snap_type.strictness(), None);
+        // The UA sheet: a textarea is a scroll container, an input and a
+        // select scroll only to their caret.
+        assert_eq!(styles[find(&doc, "textarea")].overflow_y, Overflow::Auto);
+        assert_eq!(styles[find(&doc, "input")].overflow_y, Overflow::Hidden);
+        assert_eq!(styles[find(&doc, "select")].overflow_x, Overflow::Hidden);
+    }
+
+    #[test]
     fn hidden_and_head_are_display_none() {
         let (doc, styles) = styles_for("<div hidden>x</div>", "");
         assert_eq!(styles[find(&doc, "div")].display, Display::None);

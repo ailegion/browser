@@ -888,6 +888,299 @@ impl BoxDecorationBreak {
     }
 }
 
+// ----- scroll container properties (roadmap 4a (4s)) -----
+
+/// `scrollbar-width` (CSS Scrollbars 1 §3): the thickness of a scroll
+/// container's classic scrollbars: the platform's, a thinner one, or none
+/// at all (the box still scrolls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarWidth {
+    #[default]
+    Auto,
+    Thin,
+    None,
+}
+
+impl ScrollbarWidth {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ScrollbarWidth::Auto => "auto",
+            ScrollbarWidth::Thin => "thin",
+            ScrollbarWidth::None => "none",
+        }
+    }
+}
+
+/// `scrollbar-color` as written (CSS Scrollbars 1 §2): the platform's
+/// colours, or the thumb's then the track's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrollbarColorValue {
+    Auto,
+    Colors { thumb: Color, track: Color },
+}
+
+/// `scrollbar-color` computed: colours resolved (`currentcolor` against
+/// the element's colour). Inherited.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ScrollbarColor {
+    #[default]
+    Auto,
+    Colors { thumb: Rgba, track: Rgba },
+}
+
+/// `scrollbar-gutter` (CSS Overflow 3 §4.2): whether the space a classic
+/// scrollbar would take is reserved even while there is no scrollbar
+/// (`stable`), and on both edges (`stable both-edges`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarGutter {
+    #[default]
+    Auto,
+    Stable,
+    StableBothEdges,
+}
+
+impl ScrollbarGutter {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ScrollbarGutter::Auto => "auto",
+            ScrollbarGutter::Stable => "stable",
+            ScrollbarGutter::StableBothEdges => "stable both-edges",
+        }
+    }
+}
+
+/// `overscroll-behavior-x`/`-y` (CSS Overscroll Behavior 1): what happens
+/// when a scroll reaches the end of this scroll container: `auto`, the
+/// rest goes on to the next scroller up (scroll chaining); `contain`, it
+/// stops here; `none`, it stops here and the browser's own overscroll
+/// effects (pull to refresh, navigation gestures) are off too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverscrollBehavior {
+    #[default]
+    Auto,
+    Contain,
+    None,
+}
+
+impl OverscrollBehavior {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            OverscrollBehavior::Auto => "auto",
+            OverscrollBehavior::Contain => "contain",
+            OverscrollBehavior::None => "none",
+        }
+    }
+}
+
+/// `scroll-behavior` (CSSOM View §5.1): whether a scroll a script or a
+/// navigation asks for on this box jumps (`auto`) or animates (`smooth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollBehavior {
+    #[default]
+    Auto,
+    Smooth,
+}
+
+impl ScrollBehavior {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ScrollBehavior::Auto => "auto",
+            ScrollBehavior::Smooth => "smooth",
+        }
+    }
+}
+
+/// `scroll-margin-*` as written (CSS Scroll Snap 1 §6.2): a length, or a
+/// `calc()` of lengths; percentages are not in the grammar. Negative
+/// values are allowed. Computed to pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScrollMarginValue {
+    Length(Length),
+    Calc(Calc),
+}
+
+impl ScrollMarginValue {
+    pub fn to_css(&self) -> String {
+        match self {
+            ScrollMarginValue::Length(l) => l.to_css(),
+            ScrollMarginValue::Calc(c) => c.to_css(),
+        }
+    }
+
+    pub fn to_px(&self, ctx: &LengthContext) -> f32 {
+        match self {
+            ScrollMarginValue::Length(l) => l.to_px(ctx),
+            ScrollMarginValue::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(ctx) {
+                ComputedLp::Px(px) => px,
+                // Unreachable: percentages are refused at parse time.
+                ComputedLp::Percent(_) => 0.0,
+            },
+        }
+    }
+}
+
+/// The axis of `scroll-snap-type` (CSS Scroll Snap 1 §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapAxis {
+    X,
+    Y,
+    Block,
+    Inline,
+    Both,
+}
+
+impl SnapAxis {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            SnapAxis::X => "x",
+            SnapAxis::Y => "y",
+            SnapAxis::Block => "block",
+            SnapAxis::Inline => "inline",
+            SnapAxis::Both => "both",
+        }
+    }
+}
+
+/// How strictly a snap container snaps (`scroll-snap-type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapStrictness {
+    #[default]
+    Proximity,
+    Mandatory,
+}
+
+impl SnapStrictness {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            SnapStrictness::Proximity => "proximity",
+            SnapStrictness::Mandatory => "mandatory",
+        }
+    }
+}
+
+/// `scroll-snap-type`: `none`, or an axis with an optional strictness
+/// (`proximity` when left out). Whether the strictness was written is
+/// kept so the specified value serializes as written; the resolved value
+/// drops `proximity`, as Blink's does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollSnapType {
+    #[default]
+    None,
+    Axis {
+        axis: SnapAxis,
+        strictness: Option<SnapStrictness>,
+    },
+}
+
+impl ScrollSnapType {
+    pub fn strictness(self) -> Option<SnapStrictness> {
+        match self {
+            ScrollSnapType::None => None,
+            ScrollSnapType::Axis { strictness, .. } => Some(strictness.unwrap_or_default()),
+        }
+    }
+
+    /// As written.
+    pub fn to_css(self) -> String {
+        match self {
+            ScrollSnapType::None => "none".to_owned(),
+            ScrollSnapType::Axis { axis, strictness: None } => axis.keyword().to_owned(),
+            ScrollSnapType::Axis {
+                axis,
+                strictness: Some(s),
+            } => format!("{} {}", axis.keyword(), s.keyword()),
+        }
+    }
+
+    /// The resolved value: `proximity` left out.
+    pub fn resolved_css(self) -> String {
+        match self {
+            ScrollSnapType::Axis {
+                axis,
+                strictness: Some(SnapStrictness::Proximity),
+            } => axis.keyword().to_owned(),
+            other => other.to_css(),
+        }
+    }
+}
+
+/// One axis of `scroll-snap-align` (CSS Scroll Snap 1 §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapAlign {
+    #[default]
+    None,
+    Start,
+    End,
+    Center,
+}
+
+impl SnapAlign {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            SnapAlign::None => "none",
+            SnapAlign::Start => "start",
+            SnapAlign::End => "end",
+            SnapAlign::Center => "center",
+        }
+    }
+}
+
+/// `scroll-snap-align`: the block axis alignment, then the inline axis
+/// one (the same when one value is written). Serialized as one value when
+/// the two agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrollSnapAlign {
+    pub block: SnapAlign,
+    pub inline: SnapAlign,
+}
+
+impl ScrollSnapAlign {
+    pub fn to_css(self) -> String {
+        if self.block == self.inline {
+            self.block.keyword().to_owned()
+        } else {
+            format!("{} {}", self.block.keyword(), self.inline.keyword())
+        }
+    }
+}
+
+/// `scroll-snap-stop` (CSS Scroll Snap 1 §6.4): whether a scroll may pass
+/// this snap position (`normal`) or must stop at it (`always`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollSnapStop {
+    #[default]
+    Normal,
+    Always,
+}
+
+impl ScrollSnapStop {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            ScrollSnapStop::Normal => "normal",
+            ScrollSnapStop::Always => "always",
+        }
+    }
+}
+
+/// `overflow-anchor` (CSS Scroll Anchoring 1 §4): whether this element may
+/// be the anchor node scroll anchoring keeps in place when content above
+/// it changes size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverflowAnchor {
+    #[default]
+    Auto,
+    None,
+}
+
+impl OverflowAnchor {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            OverflowAnchor::Auto => "auto",
+            OverflowAnchor::None => "none",
+        }
+    }
+}
+
 /// `text-overflow`: what a line that overflows a block with `overflow`
 /// other than `visible` ends with.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1684,6 +1977,24 @@ longhands! {
     RowGap: "row-gap" => LengthPercentage, false;
     ColumnGap: "column-gap" => LengthPercentage, false;
     Opacity: "opacity" => f32, false;
+    ScrollbarWidth: "scrollbar-width" => ScrollbarWidth, false;
+    ScrollbarColor: "scrollbar-color" => ScrollbarColorValue, true;
+    ScrollbarGutter: "scrollbar-gutter" => ScrollbarGutter, false;
+    OverscrollBehaviorX: "overscroll-behavior-x" => OverscrollBehavior, false;
+    OverscrollBehaviorY: "overscroll-behavior-y" => OverscrollBehavior, false;
+    ScrollBehavior: "scroll-behavior" => ScrollBehavior, false;
+    ScrollMarginTop: "scroll-margin-top" => ScrollMarginValue, false;
+    ScrollMarginRight: "scroll-margin-right" => ScrollMarginValue, false;
+    ScrollMarginBottom: "scroll-margin-bottom" => ScrollMarginValue, false;
+    ScrollMarginLeft: "scroll-margin-left" => ScrollMarginValue, false;
+    ScrollPaddingTop: "scroll-padding-top" => LengthPercentageAuto, false;
+    ScrollPaddingRight: "scroll-padding-right" => LengthPercentageAuto, false;
+    ScrollPaddingBottom: "scroll-padding-bottom" => LengthPercentageAuto, false;
+    ScrollPaddingLeft: "scroll-padding-left" => LengthPercentageAuto, false;
+    ScrollSnapType: "scroll-snap-type" => ScrollSnapType, false;
+    ScrollSnapAlign: "scroll-snap-align" => ScrollSnapAlign, false;
+    ScrollSnapStop: "scroll-snap-stop" => ScrollSnapStop, false;
+    OverflowAnchor: "overflow-anchor" => OverflowAnchor, false;
 }
 
 /// The declared value of a custom property.
@@ -1768,7 +2079,7 @@ pub fn is_shorthand(name: &str) -> bool {
 /// `-webkit-background-*` names are the legacy aliases of `gap`,
 /// `overflow-wrap`, `box-decoration-break`, `background-clip`,
 /// `background-origin` and `background-size`, never written).
-pub const SHORTHANDS: [&str; 29] = [
+pub const SHORTHANDS: [&str; 32] = [
     "border",
     "border-width",
     "border-style",
@@ -1781,6 +2092,9 @@ pub const SHORTHANDS: [&str; 29] = [
     "margin",
     "padding",
     "inset",
+    "scroll-margin",
+    "scroll-padding",
+    "overscroll-behavior",
     "background",
     "background-position",
     "font",
@@ -1979,7 +2293,134 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
         PropertyId::RowGap => P::RowGap(parse_gap_value(input)?),
         PropertyId::ColumnGap => P::ColumnGap(parse_gap_value(input)?),
         PropertyId::Opacity => P::Opacity(parse_opacity(input)?),
+        PropertyId::ScrollbarWidth => P::ScrollbarWidth(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "auto" => ScrollbarWidth::Auto, "thin" => ScrollbarWidth::Thin, "none" => ScrollbarWidth::None,
+            _ => return None }))?),
+        PropertyId::ScrollbarColor => P::ScrollbarColor(parse_scrollbar_color(input)?),
+        PropertyId::ScrollbarGutter => P::ScrollbarGutter(parse_scrollbar_gutter(input)?),
+        PropertyId::OverscrollBehaviorX => P::OverscrollBehaviorX(parse_overscroll_behavior(input)?),
+        PropertyId::OverscrollBehaviorY => P::OverscrollBehaviorY(parse_overscroll_behavior(input)?),
+        PropertyId::ScrollBehavior => P::ScrollBehavior(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "auto" => ScrollBehavior::Auto, "smooth" => ScrollBehavior::Smooth, _ => return None }))?),
+        PropertyId::ScrollMarginTop => P::ScrollMarginTop(parse_scroll_margin(input)?),
+        PropertyId::ScrollMarginRight => P::ScrollMarginRight(parse_scroll_margin(input)?),
+        PropertyId::ScrollMarginBottom => P::ScrollMarginBottom(parse_scroll_margin(input)?),
+        PropertyId::ScrollMarginLeft => P::ScrollMarginLeft(parse_scroll_margin(input)?),
+        PropertyId::ScrollPaddingTop => P::ScrollPaddingTop(parse_scroll_padding(input)?),
+        PropertyId::ScrollPaddingRight => P::ScrollPaddingRight(parse_scroll_padding(input)?),
+        PropertyId::ScrollPaddingBottom => P::ScrollPaddingBottom(parse_scroll_padding(input)?),
+        PropertyId::ScrollPaddingLeft => P::ScrollPaddingLeft(parse_scroll_padding(input)?),
+        PropertyId::ScrollSnapType => P::ScrollSnapType(parse_scroll_snap_type(input)?),
+        PropertyId::ScrollSnapAlign => P::ScrollSnapAlign(parse_scroll_snap_align(input)?),
+        PropertyId::ScrollSnapStop => P::ScrollSnapStop(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "normal" => ScrollSnapStop::Normal, "always" => ScrollSnapStop::Always, _ => return None }))?),
+        PropertyId::OverflowAnchor => P::OverflowAnchor(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "auto" => OverflowAnchor::Auto, "none" => OverflowAnchor::None, _ => return None }))?),
     })
+}
+
+// ----- scroll container property parsers -----
+
+/// `auto | <color>{2}`: the thumb's colour, then the track's.
+fn parse_scrollbar_color<'i>(input: &mut Parser<'i, '_>) -> Result<ScrollbarColorValue, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        return Ok(ScrollbarColorValue::Auto);
+    }
+    let thumb = parse_color(input)?;
+    let track = parse_color(input)?;
+    Ok(ScrollbarColorValue::Colors { thumb, track })
+}
+
+/// `auto | stable && both-edges?`: the two keywords in either order.
+fn parse_scrollbar_gutter<'i>(input: &mut Parser<'i, '_>) -> Result<ScrollbarGutter, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        return Ok(ScrollbarGutter::Auto);
+    }
+    let mut stable = false;
+    let mut both_edges = false;
+    for _ in 0..2 {
+        if !stable && input.try_parse(|i| i.expect_ident_matching("stable")).is_ok() {
+            stable = true;
+        } else if !both_edges && input.try_parse(|i| i.expect_ident_matching("both-edges")).is_ok() {
+            both_edges = true;
+        } else {
+            break;
+        }
+    }
+    if !stable {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(if both_edges { ScrollbarGutter::StableBothEdges } else { ScrollbarGutter::Stable })
+}
+
+fn parse_overscroll_behavior<'i>(input: &mut Parser<'i, '_>) -> Result<OverscrollBehavior, ParseErr<'i>> {
+    keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "auto" => OverscrollBehavior::Auto, "contain" => OverscrollBehavior::Contain,
+        "none" => OverscrollBehavior::None, _ => return None }))
+}
+
+/// Whether a `calc()` has a percentage anywhere in its sum.
+fn calc_has_percent(c: &Calc) -> bool {
+    c.terms.iter().any(|t| match &t.value {
+        CalcValue::Percent(_) => true,
+        CalcValue::Length(_) => false,
+        CalcValue::Nested(n) => calc_has_percent(n),
+    })
+}
+
+/// `<length>`: a length or a `calc()` of lengths; percentages, bare or
+/// inside the `calc()`, are refused. Negative values are allowed.
+fn parse_scroll_margin<'i>(input: &mut Parser<'i, '_>) -> Result<ScrollMarginValue, ParseErr<'i>> {
+    Ok(match parse_length_percentage(input)? {
+        LengthPercentage::Length(l) => ScrollMarginValue::Length(l),
+        LengthPercentage::Calc(c) if !calc_has_percent(&c) => ScrollMarginValue::Calc(c),
+        _ => return Err(input.new_custom_error(())),
+    })
+}
+
+/// `auto | <length-percentage [0,∞]>`.
+fn parse_scroll_padding<'i>(input: &mut Parser<'i, '_>) -> Result<LengthPercentageAuto, ParseErr<'i>> {
+    let v = parse_length_percentage_auto(input)?;
+    let negative = match &v {
+        LengthPercentageAuto::Length(l) => l.parts().0 < 0.0,
+        LengthPercentageAuto::Percent(p) => *p < 0.0,
+        LengthPercentageAuto::Calc(_) | LengthPercentageAuto::Auto => false,
+    };
+    if negative {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(v)
+}
+
+/// `none | [ x | y | block | inline | both ] [ mandatory | proximity ]?`.
+fn parse_scroll_snap_type<'i>(input: &mut Parser<'i, '_>) -> Result<ScrollSnapType, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+        return Ok(ScrollSnapType::None);
+    }
+    let axis = keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "x" => SnapAxis::X, "y" => SnapAxis::Y, "block" => SnapAxis::Block, "inline" => SnapAxis::Inline,
+        "both" => SnapAxis::Both, _ => return None }))?;
+    let strictness = input
+        .try_parse(|i| {
+            keyword(i, |k| Some(match_ignore_ascii_case! { k,
+                "mandatory" => SnapStrictness::Mandatory, "proximity" => SnapStrictness::Proximity,
+                _ => return None }))
+        })
+        .ok();
+    Ok(ScrollSnapType::Axis { axis, strictness })
+}
+
+/// `[ none | start | end | center ]{1,2}`: the block axis, then the inline
+/// axis (the same when one is written).
+fn parse_scroll_snap_align<'i>(input: &mut Parser<'i, '_>) -> Result<ScrollSnapAlign, ParseErr<'i>> {
+    let one = |i: &mut Parser<'i, '_>| {
+        keyword(i, |k| Some(match_ignore_ascii_case! { k,
+            "none" => SnapAlign::None, "start" => SnapAlign::Start, "end" => SnapAlign::End,
+            "center" => SnapAlign::Center, _ => return None }))
+    };
+    let block = one(input)?;
+    let inline = input.try_parse(one).unwrap_or(block);
+    Ok(ScrollSnapAlign { block, inline })
 }
 
 fn keyword<'i, T>(input: &mut Parser<'i, '_>, f: impl Fn(&str) -> Option<T>) -> Result<T, ParseErr<'i>> {
@@ -2556,6 +2997,9 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "margin" => &[MarginTop, MarginRight, MarginBottom, MarginLeft],
         "padding" => &[PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
         "inset" => &[Top, Right, Bottom, Left],
+        "scroll-margin" => &[ScrollMarginTop, ScrollMarginRight, ScrollMarginBottom, ScrollMarginLeft],
+        "scroll-padding" => &[ScrollPaddingTop, ScrollPaddingRight, ScrollPaddingBottom, ScrollPaddingLeft],
+        "overscroll-behavior" => &[OverscrollBehaviorX, OverscrollBehaviorY],
         "border-width" => &[BorderTopWidth, BorderRightWidth, BorderBottomWidth, BorderLeftWidth],
         "border-style" => &[BorderTopStyle, BorderRightStyle, BorderBottomStyle, BorderLeftStyle],
         "border-color" => &[BorderTopColor, BorderRightColor, BorderBottomColor, BorderLeftColor],
@@ -2602,6 +3046,19 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
         "inset" => {
             let s = parse_sides(input, parse_length_percentage_auto)?;
             vec![P::Top(s.top), P::Right(s.right), P::Bottom(s.bottom), P::Left(s.left)]
+        },
+        "scroll-margin" => {
+            let s = parse_sides(input, parse_scroll_margin)?;
+            vec![P::ScrollMarginTop(s.top), P::ScrollMarginRight(s.right), P::ScrollMarginBottom(s.bottom), P::ScrollMarginLeft(s.left)]
+        },
+        "scroll-padding" => {
+            let s = parse_sides(input, parse_scroll_padding)?;
+            vec![P::ScrollPaddingTop(s.top), P::ScrollPaddingRight(s.right), P::ScrollPaddingBottom(s.bottom), P::ScrollPaddingLeft(s.left)]
+        },
+        "overscroll-behavior" => {
+            let x = parse_overscroll_behavior(input)?;
+            let y = input.try_parse(parse_overscroll_behavior).unwrap_or(x);
+            vec![P::OverscrollBehaviorX(x), P::OverscrollBehaviorY(y)]
         },
         "border-width" => {
             let s = parse_sides(input, parse_border_width)?;
@@ -3265,6 +3722,84 @@ mod tests {
         assert_eq!(parse("-webkit-box-decoration-break", "inherit"), vec![D::Inherit(PropertyId::BoxDecorationBreak)]);
         assert_eq!(longhands_of("-webkit-box-decoration-break"), Some(vec![PropertyId::BoxDecorationBreak]));
         assert!(!PropertyId::BoxDecorationBreak.is_inherited());
+    }
+
+    #[test]
+    fn scroll_container_properties_of_4s() {
+        let one = |name: &str, s: &str| parse(name, s).pop();
+        use DeclaredValue as D;
+        use PropertyDeclaration as P;
+        assert_eq!(one("scrollbar-width", "thin"), Some(D::Value(P::ScrollbarWidth(ScrollbarWidth::Thin))));
+        assert_eq!(one("scrollbar-width", "NONE"), Some(D::Value(P::ScrollbarWidth(ScrollbarWidth::None))));
+        assert_eq!(one("scrollbar-width", "10px"), None);
+        assert_eq!(one("scrollbar-color", "auto"), Some(D::Value(P::ScrollbarColor(ScrollbarColorValue::Auto))));
+        assert!(matches!(
+            one("scrollbar-color", "red #000"),
+            Some(D::Value(P::ScrollbarColor(ScrollbarColorValue::Colors { thumb: Color::Named(_), track: Color::Rgba(_) })))
+        ));
+        assert_eq!(one("scrollbar-color", "red"), None, "two colours or auto");
+        assert_eq!(one("scrollbar-color", "red blue green"), None);
+        assert!(PropertyId::ScrollbarColor.is_inherited());
+        assert!(!PropertyId::ScrollbarWidth.is_inherited());
+        assert!(!PropertyId::ScrollMarginTop.is_inherited());
+        assert_eq!(one("scrollbar-gutter", "stable"), Some(D::Value(P::ScrollbarGutter(ScrollbarGutter::Stable))));
+        assert_eq!(one("scrollbar-gutter", "stable both-edges"), Some(D::Value(P::ScrollbarGutter(ScrollbarGutter::StableBothEdges))));
+        assert_eq!(one("scrollbar-gutter", "both-edges stable"), Some(D::Value(P::ScrollbarGutter(ScrollbarGutter::StableBothEdges))));
+        assert_eq!(one("scrollbar-gutter", "both-edges"), None, "both-edges needs stable");
+        assert_eq!(one("scrollbar-gutter", "stable stable"), None);
+        // `overscroll-behavior`: the shorthand gives x, then y.
+        assert_eq!(
+            parse("overscroll-behavior", "contain"),
+            vec![D::Value(P::OverscrollBehaviorX(OverscrollBehavior::Contain)), D::Value(P::OverscrollBehaviorY(OverscrollBehavior::Contain))]
+        );
+        assert_eq!(
+            parse("overscroll-behavior", "auto none"),
+            vec![D::Value(P::OverscrollBehaviorX(OverscrollBehavior::Auto)), D::Value(P::OverscrollBehaviorY(OverscrollBehavior::None))]
+        );
+        assert!(parse("overscroll-behavior", "contain contain contain").is_empty());
+        assert_eq!(parse("overscroll-behavior", "unset"), vec![D::Unset(PropertyId::OverscrollBehaviorX), D::Unset(PropertyId::OverscrollBehaviorY)]);
+        assert_eq!(one("overscroll-behavior-y", "none"), Some(D::Value(P::OverscrollBehaviorY(OverscrollBehavior::None))));
+        assert_eq!(one("scroll-behavior", "smooth"), Some(D::Value(P::ScrollBehavior(ScrollBehavior::Smooth))));
+        assert_eq!(one("scroll-behavior", "instant"), None);
+        // `scroll-margin`: lengths, negative too, a `calc()` of lengths;
+        // no percentages, bare or inside the `calc()`, no `auto`.
+        assert_eq!(one("scroll-margin-top", "-1em"), Some(D::Value(P::ScrollMarginTop(ScrollMarginValue::Length(Length::Em(-1.0))))));
+        assert!(matches!(one("scroll-margin-top", "calc(1px + 2em)"), Some(D::Value(P::ScrollMarginTop(ScrollMarginValue::Calc(_))))));
+        assert_eq!(one("scroll-margin-top", "10%"), None);
+        assert_eq!(one("scroll-margin-top", "calc(10% + 1px)"), None);
+        assert_eq!(one("scroll-margin-top", "calc(1px + calc(2% + 1px))"), None);
+        assert_eq!(one("scroll-margin-top", "auto"), None);
+        assert_eq!(parse("scroll-margin", "1px 2px").len(), 4);
+        assert_eq!(
+            longhands_of("scroll-margin"),
+            Some(vec![PropertyId::ScrollMarginTop, PropertyId::ScrollMarginRight, PropertyId::ScrollMarginBottom, PropertyId::ScrollMarginLeft])
+        );
+        // `scroll-padding`: `auto` or a non-negative length-percentage.
+        assert_eq!(one("scroll-padding-left", "auto"), Some(D::Value(P::ScrollPaddingLeft(LengthPercentageAuto::Auto))));
+        assert_eq!(one("scroll-padding-left", "10%"), Some(D::Value(P::ScrollPaddingLeft(LengthPercentageAuto::Percent(10.0)))));
+        assert_eq!(one("scroll-padding-left", "-1px"), None);
+        assert_eq!(one("scroll-padding-left", "-5%"), None);
+        let padding = parse("scroll-padding", "1px auto");
+        assert_eq!(padding.len(), 4);
+        assert_eq!(padding[3], D::Value(P::ScrollPaddingLeft(LengthPercentageAuto::Auto)));
+        assert_eq!(parse("scroll-padding", "inherit").len(), 4);
+        assert!(parse("scroll-padding", "1px -2px").is_empty());
+        // Snap and anchoring.
+        assert_eq!(one("scroll-snap-type", "none"), Some(D::Value(P::ScrollSnapType(ScrollSnapType::None))));
+        assert_eq!(one("scroll-snap-type", "x"), Some(D::Value(P::ScrollSnapType(ScrollSnapType::Axis { axis: SnapAxis::X, strictness: None }))));
+        assert_eq!(
+            one("scroll-snap-type", "both mandatory"),
+            Some(D::Value(P::ScrollSnapType(ScrollSnapType::Axis { axis: SnapAxis::Both, strictness: Some(SnapStrictness::Mandatory) })))
+        );
+        assert_eq!(one("scroll-snap-type", "mandatory"), None);
+        assert_eq!(one("scroll-snap-type", "x y"), None);
+        assert_eq!(one("scroll-snap-align", "start"), Some(D::Value(P::ScrollSnapAlign(ScrollSnapAlign { block: SnapAlign::Start, inline: SnapAlign::Start }))));
+        assert_eq!(one("scroll-snap-align", "center none"), Some(D::Value(P::ScrollSnapAlign(ScrollSnapAlign { block: SnapAlign::Center, inline: SnapAlign::None }))));
+        assert_eq!(one("scroll-snap-align", "start end center"), None);
+        assert_eq!(one("scroll-snap-stop", "always"), Some(D::Value(P::ScrollSnapStop(ScrollSnapStop::Always))));
+        assert_eq!(one("overflow-anchor", "none"), Some(D::Value(P::OverflowAnchor(OverflowAnchor::None))));
+        assert_eq!(one("overflow-anchor", "auto"), Some(D::Value(P::OverflowAnchor(OverflowAnchor::Auto))));
+        assert_eq!(one("overflow-anchor", "always"), None);
     }
 
     #[test]

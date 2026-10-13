@@ -5655,6 +5655,19 @@ mod tests {
                             [c.backgroundPositionX, c.backgroundPositionY, c.backgroundPosition, c.backgroundImage, c.backgroundClip, c.webkitBackgroundClip, c.backgroundBlendMode, a.style.backgroundPosition].join('|')"),
             "\"calc(100% - 10px)|50%|calc(100% - 10px) 50%|linear-gradient(to right, rgb(255, 0, 0) 20px, rgb(0, 0, 255))|text|text|multiply, screen|right 10px center\""
         );
+        // Roadmap 4a (4s) block 1: the scroll container properties
+        // through the CSSOM: the shorthands expand and collapse, the
+        // resolved values (`scrollbar-color` inherited, `proximity` left
+        // out of `scroll-snap-type`), the `style` attribute as written.
+        assert_eq!(
+            run_js(&mut h, "var s = document.createElement('div'); document.body.appendChild(s); s.innerHTML = '<i>x</i>'; var si = s.firstChild; \
+                            s.style.scrollMargin = '10px 2px'; s.style.scrollPadding = 'auto 5%'; s.style.overscrollBehavior = 'contain'; s.style.scrollbarColor = 'red blue'; \
+                            s.style.scrollbarGutter = 'both-edges stable'; s.style.scrollSnapType = 'x proximity'; s.style.scrollBehavior = 'smooth'; s.style.scrollbarWidth = 'thin'; var c = cs(s); \
+                            [c.scrollMarginTop, c.scrollMarginRight, c.scrollMargin, c.scrollPaddingLeft, c.scrollPadding, c.overscrollBehaviorX, c.overscrollBehavior, c.scrollbarColor, cs(si).scrollbarColor, \
+                             cs(si).scrollMarginTop, c.scrollbarGutter, c.scrollSnapType, s.style.scrollSnapType, c.scrollBehavior, c.scrollbarWidth, s.style.cssText].join('|')"),
+            "\"10px|2px|10px 2px|5%|auto 5%|contain|contain|rgb(255, 0, 0) rgb(0, 0, 255)|rgb(255, 0, 0) rgb(0, 0, 255)|0px|stable both-edges|x|x proximity|smooth|thin|\
+             scroll-margin: 10px 2px; scroll-padding: auto 5%; overscroll-behavior: contain; scrollbar-color: red blue; scrollbar-gutter: stable both-edges; scroll-snap-type: x proximity; scroll-behavior: smooth; scrollbar-width: thin;\""
+        );
     }
 
     #[test]

@@ -1484,7 +1484,63 @@ Work:
       children paint and hit-test shifted, `scrollTop`/`scrollLeft`/
       `scrollWidth`/`scrollHeight`/`scrollTo`/`scrollBy`/`scrollIntoView`
       and `scroll` events work on them, and `background-attachment:
-      local` follows their offset; (5)
+      local` follows their offset. Scope settled by the owner 2026-10-14
+      (everything Chrome and Firefox do; where they differ, Chrome's
+      choice): offsets baked into the fragment tree in page coordinates
+      and a scroller's subtree re-translated on scroll; the page's
+      scrollable overflow follows CSS Overflow 3 §2.2 (a clipped box
+      contributes its border box, not its content); classic scrollbars
+      that reserve width (Windows 17 px, Linux 15 px, macOS overlay),
+      track, thumb, arrow buttons, both axes, corner, Chrome's greys, the
+      page's scrollbar the same (the 12 px overlay goes); wheel latching
+      per gesture with a 500 ms pause, Shift+wheel horizontal in the
+      shell; keyboard-focusable scrollers (Chrome 130); middle-click
+      autoscroll; smooth scrolling for wheel, keys, buttons and track,
+      `scroll-behavior` and `behavior: smooth|instant|auto`; `scrollend`
+      and `onscroll`/`onscrollend` on elements; rounded overflow clipping
+      for every clipper; `position: fixed` neither scrolled nor clipped by
+      element scrollers; `textarea { overflow: auto }`, inputs follow their
+      caret, `select[multiple]`/`size>1` as a listbox scroller; and the
+      properties that define scroller behaviour join the item:
+      `scrollbar-width`, `scrollbar-color`, `scrollbar-gutter`,
+      `overscroll-behavior`, `scroll-behavior`, `scroll-margin-*`,
+      `scroll-padding-*`, `scroll-snap-type`/`-align`/`-stop`,
+      `overflow-anchor`, `position: sticky`. Blocks: (1) style, (2)
+      layout, (3) tab input, (4) paint, (5) script, (6) animation, (7)
+      snap and anchoring, (8) listbox.
+      **Block 1 done 2026-10-14: style.** `crates/style`: the computed
+      `overflow` pair rule (CSS Overflow 3 §3.1: `visible` beside a
+      scrolling axis computes to `auto`, `clip` to `hidden`;
+      `computed.rs`); `viewport_overflow` (§3.3: the viewport takes the
+      root element's `overflow`, or the first `body` child's when the root
+      is an HTML `html` with `visible` in both axes, each only when
+      rendered; `visible` is `auto` and `clip` is `hidden` on the viewport;
+      `ViewportOverflow::source` names the element, which then behaves as
+      `visible` itself, for block 2's layout and block 3's page
+      scrolling); the UA sheet gives `textarea` `overflow: auto` and keeps
+      `input`/`select` at `hidden`. In the table, cascade, serialization
+      and CSSOM (table-driven, camelCase for free): `scrollbar-width`
+      (`auto|thin|none`), `scrollbar-color` (`auto | <color>{2}`, thumb
+      then track, inherited, resolved against `currentcolor`),
+      `scrollbar-gutter` (`auto | stable && both-edges?`, serialized
+      `stable both-edges`), `overscroll-behavior-x`/`-y` and the shorthand
+      (`auto|contain|none`, x then y), `scroll-behavior` (`auto|smooth`),
+      `scroll-margin-*` and the shorthand (`<length>`, negative allowed,
+      `calc()` of lengths, percentages refused bare or inside the
+      `calc()`; computed px), `scroll-padding-*` and the shorthand (`auto |
+      <length-percentage [0,∞]>`), `scroll-snap-type` (`none | <axis>
+      [mandatory|proximity]?`, specified as written, resolved without
+      `proximity` as Blink), `scroll-snap-align` (block then inline,
+      collapsed when equal), `scroll-snap-stop`, `overflow-anchor`.
+      `scrollbar-width` and `scrollbar-gutter` are layout-affecting for
+      the restyle split; the rest are not. Logical forms
+      (`scroll-margin-inline-start` and the like) wait for the engine-wide
+      logical property set (`05-risks-and-open-items.md` O21). Tests:
+      style (every form and refusal, inherited flags, shorthand expansion
+      and CSS-wide keywords, specified and shorthand serialization,
+      resolved values, the pair rule on four boxes, the viewport
+      propagation six ways, computation with inheritance, the UA control
+      rules), tab (the CSSOM round trip on a fresh element). (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
       `user-select`; (6) `z-index` and `transform`/`transform-origin`

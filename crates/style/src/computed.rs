@@ -223,9 +223,85 @@ pub struct ComputedStyle {
     pub row_gap: ComputedLp,
     pub column_gap: ComputedLp,
     pub opacity: f32,
+    /// Scroll container properties (roadmap 4a (4s)).
+    pub scrollbar_width: ScrollbarWidth,
+    pub scrollbar_color: ScrollbarColor,
+    pub scrollbar_gutter: ScrollbarGutter,
+    pub overscroll_behavior_x: OverscrollBehavior,
+    pub overscroll_behavior_y: OverscrollBehavior,
+    pub scroll_behavior: ScrollBehavior,
+    /// `scroll-margin-*` in px (negative allowed).
+    pub scroll_margin: Sides<f32>,
+    /// `scroll-padding-*`: `auto`, px, or a percentage of the scrollport.
+    pub scroll_padding: Sides<ComputedLpAuto>,
+    pub scroll_snap_type: ScrollSnapType,
+    pub scroll_snap_align: ScrollSnapAlign,
+    pub scroll_snap_stop: ScrollSnapStop,
+    pub overflow_anchor: OverflowAnchor,
     /// Custom properties in effect, inherited; shared with the parent when
     /// this element declares none.
     pub custom: Arc<CustomMap>,
+}
+
+/// The `overflow` the viewport scrolls and clips by (CSS Overflow 3 §3.3):
+/// the root element's, or the body's when the root's is `visible` in both
+/// axes; `visible` becomes `auto` and `clip` becomes `hidden` on the
+/// viewport. `source` is the element the values were taken from, whose
+/// own used `overflow` is then `visible` (it does not clip or scroll
+/// itself); `None` when no element has a box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewportOverflow {
+    pub x: Overflow,
+    pub y: Overflow,
+    pub source: Option<browser_dom::NodeId>,
+}
+
+impl Default for ViewportOverflow {
+    fn default() -> Self {
+        Self {
+            x: Overflow::Auto,
+            y: Overflow::Auto,
+            source: None,
+        }
+    }
+}
+
+/// CSS Overflow 3 §3.3: the viewport takes the `overflow-x`/`-y` of the
+/// root element when it is rendered; when the root is an HTML `html`
+/// element with `visible` in both axes, the viewport takes the values of
+/// its first `body` child instead, when that is rendered. Applied to the
+/// viewport, `visible` means `auto` and `clip` means `hidden`. The
+/// element propagated from behaves as `visible` itself.
+pub fn viewport_overflow(doc: &browser_dom::Document, styles: &crate::cascade::StyleMap) -> ViewportOverflow {
+    let Some(root) = doc.document_element() else { return ViewportOverflow::default() };
+    let Some(root_style) = styles.get(root) else { return ViewportOverflow::default() };
+    if root_style.display.is_none() {
+        return ViewportOverflow::default();
+    }
+    let mut source = root;
+    let (mut x, mut y) = (root_style.overflow_x, root_style.overflow_y);
+    let is_html = doc
+        .element(root)
+        .is_some_and(|e| e.name.ns == html5ever::ns!(html) && e.name.local == html5ever::local_name!("html"));
+    if is_html && x == Overflow::Visible && y == Overflow::Visible
+        && let Some(body) = doc.body()
+        && let Some(body_style) = styles.get(body)
+        && !body_style.display.is_none()
+    {
+        source = body;
+        x = body_style.overflow_x;
+        y = body_style.overflow_y;
+    }
+    let on_viewport = |o: Overflow| match o {
+        Overflow::Visible => Overflow::Auto,
+        Overflow::Clip => Overflow::Hidden,
+        other => other,
+    };
+    ViewportOverflow {
+        x: on_viewport(x),
+        y: on_viewport(y),
+        source: Some(source),
+    }
 }
 
 /// Viewport information the cascade needs.
@@ -328,6 +404,18 @@ impl ComputedStyle {
             row_gap: ComputedLp::ZERO,
             column_gap: ComputedLp::ZERO,
             opacity: 1.0,
+            scrollbar_width: ScrollbarWidth::Auto,
+            scrollbar_color: ScrollbarColor::Auto,
+            scrollbar_gutter: ScrollbarGutter::Auto,
+            overscroll_behavior_x: OverscrollBehavior::Auto,
+            overscroll_behavior_y: OverscrollBehavior::Auto,
+            scroll_behavior: ScrollBehavior::Auto,
+            scroll_margin: Sides::all(0.0),
+            scroll_padding: Sides::all(ComputedLpAuto::Auto),
+            scroll_snap_type: ScrollSnapType::None,
+            scroll_snap_align: ScrollSnapAlign::default(),
+            scroll_snap_stop: ScrollSnapStop::Normal,
+            overflow_anchor: OverflowAnchor::Auto,
             custom: Arc::new(CustomMap::new()),
         }
     }
@@ -363,6 +451,7 @@ impl ComputedStyle {
         self.text_underline_position = p.text_underline_position;
         self.text_underline_offset = p.text_underline_offset;
         self.text_decoration_skip_ink = p.text_decoration_skip_ink;
+        self.scrollbar_color = p.scrollbar_color;
         self.custom = p.custom.clone();
         // Not inherited by spec, but the decorating boxes' lines reach
         // every in-flow descendant's text, anonymous boxes included.
@@ -455,6 +544,10 @@ impl ComputedStyle {
             || self.flex_basis != other.flex_basis
             || self.row_gap != other.row_gap
             || self.column_gap != other.column_gap
+            // The scrollbar gutter is part of the box; the other scroll
+            // properties change scrolling, not layout.
+            || self.scrollbar_width != other.scrollbar_width
+            || self.scrollbar_gutter != other.scrollbar_gutter
     }
 }
 
@@ -727,6 +820,18 @@ pub fn compute(
     pick!(max_height, MaxHeight, MaxHeight, |v| size(v));
     pick!(overflow_x, OverflowX, OverflowX, |v| v.computed());
     pick!(overflow_y, OverflowY, OverflowY, |v| v.computed());
+    // CSS Overflow 3 §3.1: `visible` computes to `auto` and `clip` to
+    // `hidden` when the other axis is neither `visible` nor `clip`, since
+    // a box cannot clip in one axis and overflow visibly in the other.
+    let scrolls = |o: Overflow| !matches!(o, Overflow::Visible | Overflow::Clip);
+    let paired = |o: Overflow, other: Overflow| match o {
+        Overflow::Visible if scrolls(other) => Overflow::Auto,
+        Overflow::Clip if scrolls(other) => Overflow::Hidden,
+        o => o,
+    };
+    let (ox, oy) = (out.overflow_x, out.overflow_y);
+    out.overflow_x = paired(ox, oy);
+    out.overflow_y = paired(oy, ox);
     pick!(visibility, Visibility, Visibility, |v| *v);
     pick!(background_color, BackgroundColor, BackgroundColor, |v| v.resolve(current));
     pick!(background_images, BackgroundImage, BackgroundImage, |v| v
@@ -883,6 +988,31 @@ pub fn compute(
     pick!(row_gap, RowGap, RowGap, |v| lp(v));
     pick!(column_gap, ColumnGap, ColumnGap, |v| lp(v));
     pick!(opacity, Opacity, Opacity, |v| *v);
+
+    pick!(scrollbar_width, ScrollbarWidth, ScrollbarWidth, |v| *v);
+    pick!(scrollbar_color, ScrollbarColor, ScrollbarColor, |v| match v {
+        ScrollbarColorValue::Auto => ScrollbarColor::Auto,
+        ScrollbarColorValue::Colors { thumb, track } => ScrollbarColor::Colors {
+            thumb: thumb.resolve(current),
+            track: track.resolve(current),
+        },
+    });
+    pick!(scrollbar_gutter, ScrollbarGutter, ScrollbarGutter, |v| *v);
+    pick!(overscroll_behavior_x, OverscrollBehaviorX, OverscrollBehaviorX, |v| *v);
+    pick!(overscroll_behavior_y, OverscrollBehaviorY, OverscrollBehaviorY, |v| *v);
+    pick!(scroll_behavior, ScrollBehavior, ScrollBehavior, |v| *v);
+    side!(scroll_margin.top, ScrollMarginTop, ScrollMarginTop, |v| v.to_px(&ctx));
+    side!(scroll_margin.right, ScrollMarginRight, ScrollMarginRight, |v| v.to_px(&ctx));
+    side!(scroll_margin.bottom, ScrollMarginBottom, ScrollMarginBottom, |v| v.to_px(&ctx));
+    side!(scroll_margin.left, ScrollMarginLeft, ScrollMarginLeft, |v| v.to_px(&ctx));
+    side!(scroll_padding.top, ScrollPaddingTop, ScrollPaddingTop, |v| lpa(v));
+    side!(scroll_padding.right, ScrollPaddingRight, ScrollPaddingRight, |v| lpa(v));
+    side!(scroll_padding.bottom, ScrollPaddingBottom, ScrollPaddingBottom, |v| lpa(v));
+    side!(scroll_padding.left, ScrollPaddingLeft, ScrollPaddingLeft, |v| lpa(v));
+    pick!(scroll_snap_type, ScrollSnapType, ScrollSnapType, |v| *v);
+    pick!(scroll_snap_align, ScrollSnapAlign, ScrollSnapAlign, |v| *v);
+    pick!(scroll_snap_stop, ScrollSnapStop, ScrollSnapStop, |v| *v);
+    pick!(overflow_anchor, OverflowAnchor, OverflowAnchor, |v| *v);
 
     // Display fixups (CSS Display 3, "blockification").
     if is_root && !out.display.is_none() {
