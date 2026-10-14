@@ -7,6 +7,8 @@ use browser_style::{
 use taffy::prelude::*;
 use taffy::style::{AlignContent, AlignItems};
 
+use crate::boxes::ScrollPlan;
+
 fn lp(v: ComputedLp) -> LengthPercentage {
     match v {
         ComputedLp::Px(px) => LengthPercentage::length(px),
@@ -73,18 +75,25 @@ fn align_content(v: AlignValue) -> Option<AlignContent> {
     })
 }
 
-fn overflow(v: Overflow) -> taffy::Overflow {
+/// Taffy's overflow for one axis: `Scroll` reserves a scrollbar gutter
+/// (`scrollbar_width`) in the other axis, `Hidden` is a scroll container
+/// without one (its automatic minimum size is zero, as for any scroll
+/// container), `Clip` and `Visible` are neither. The gutter comes from
+/// the box's `ScrollPlan`: always for `overflow: scroll`, after a pass
+/// found overflow for `auto`, never for `hidden`.
+fn overflow(v: Overflow, gutter: bool) -> taffy::Overflow {
     match v {
         Overflow::Visible => taffy::Overflow::Visible,
-        Overflow::Hidden => taffy::Overflow::Hidden,
         Overflow::Clip => taffy::Overflow::Clip,
-        Overflow::Scroll | Overflow::Auto => taffy::Overflow::Scroll,
+        Overflow::Hidden | Overflow::Scroll | Overflow::Auto if gutter => taffy::Overflow::Scroll,
+        Overflow::Hidden | Overflow::Scroll | Overflow::Auto => taffy::Overflow::Hidden,
     }
 }
 
 /// Convert a computed style to a taffy style for a box of the given kind.
-/// `blockify` forces block-level display for atomic roots.
-pub(crate) fn to_taffy(style: &ComputedStyle, is_flex_container: bool, is_replaced: bool) -> Style {
+/// `blockify` forces block-level display for atomic roots. `scroll` is
+/// the box's scroll container plan, if it is one.
+pub(crate) fn to_taffy(style: &ComputedStyle, is_flex_container: bool, is_replaced: bool, scroll: Option<&ScrollPlan>) -> Style {
     let display = match style.display {
         Display::None => taffy::Display::None,
         _ if is_flex_container => taffy::Display::Flex,
@@ -94,6 +103,10 @@ pub(crate) fn to_taffy(style: &ComputedStyle, is_flex_container: bool, is_replac
         Position::Absolute | Position::Fixed => taffy::Position::Absolute,
         _ => taffy::Position::Relative,
     };
+    let (gutter_x, gutter_y, thickness, start) = match scroll {
+        Some(p) => (p.gutter_x, p.gutter_y, p.thickness, p.start_gutter_width()),
+        None => (false, false, 0.0, 0.0),
+    };
     Style {
         display,
         item_is_replaced: is_replaced,
@@ -102,10 +115,13 @@ pub(crate) fn to_taffy(style: &ComputedStyle, is_flex_container: bool, is_replac
             BoxSizing::BorderBox => taffy::BoxSizing::BorderBox,
         },
         overflow: taffy::geometry::Point {
-            x: overflow(style.overflow_x),
-            y: overflow(style.overflow_y),
+            x: overflow(style.overflow_x, gutter_x),
+            y: overflow(style.overflow_y, gutter_y),
         },
-        scrollbar_width: 0.0,
+        scrollbar_width: thickness,
+        // `scrollbar-gutter: stable both-edges`: the mirrored gutter at
+        // the inline-start edge (our addition to the vendored taffy).
+        scrollbar_gutter_start: start,
         position,
         float: match style.float {
             Float::None => taffy::Float::None,

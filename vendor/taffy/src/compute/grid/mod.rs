@@ -103,9 +103,17 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
     let mut content_box_inset = padding_border;
     content_box_inset.bottom += scrollbar_gutter.y;
 
+    // The mirrored gutter at the inline-start edge (`scrollbar-gutter: stable both-edges`).
+    let gutter_start = style.scrollbar_gutter_start();
     match direction {
-        Direction::Ltr => content_box_inset.right += scrollbar_gutter.x,
-        Direction::Rtl => content_box_inset.left += scrollbar_gutter.x,
+        Direction::Ltr => {
+            content_box_inset.right += scrollbar_gutter.x;
+            content_box_inset.left += gutter_start;
+        }
+        Direction::Rtl => {
+            content_box_inset.left += scrollbar_gutter.x;
+            content_box_inset.right += gutter_start;
+        }
     };
 
     let align_content = style.align_content().unwrap_or(AlignContent::STRETCH);

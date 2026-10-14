@@ -74,6 +74,8 @@ where
     let mut content_box_inset = padding_border;
     content_box_inset.right += scrollbar_gutter.x;
     content_box_inset.bottom += scrollbar_gutter.y;
+    // The mirrored gutter at the inline-start edge (`scrollbar-gutter: stable both-edges`).
+    content_box_inset.left += style.scrollbar_gutter_start();
 
     let has_styles_preventing_being_collapsed_through = !style.is_block()
         || style.overflow().x.is_scroll_container()

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use browser_dom::{Document, NodeId};
 use browser_style::{
-    ComputedStyle, Direction, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position, StyleMap,
-    TextAlign, WordBreak,
+    ComputedStyle, Direction, Display, Float, FontStyle, FontVariant, LineHeight, Overflow, OverflowWrap, Position,
+    Sides, StyleMap, TextAlign, ViewportOverflow, WordBreak, viewport_overflow,
 };
 use parley::layout::YieldData;
 use parley::style::{
@@ -23,12 +23,15 @@ use taffy::prelude::*;
 
 use crate::boxes::{
     Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineBoxInfo, InlineContent,
-    InlineLayout, LineItemId, Paragraph, ResolvedEdges, TaffyId, is_bidi_control,
+    InlineLayout, LineItemId, Paragraph, ResolvedEdges, ScrollPlan, TaffyId, is_bidi_control, visible_overflow,
 };
 use crate::convert::to_taffy;
 use crate::decor::{Decorator, font_of};
 use crate::lines::{LinePlacement, node_of_atomic, node_of_box, place_lines};
-use crate::{Brush, Cluster, Fragment, FragmentContent, ImageSizes, LayoutTree, PositionedGlyph, Rect, TextFragment};
+use crate::{
+    Brush, Cluster, Fragment, FragmentContent, ImageSizes, LayoutTree, OVERFLOW_EPSILON, PositionedGlyph, Rect,
+    ScrollInfo, TextFragment,
+};
 
 /// Owns the font system and parley's scratch state. One per tab thread.
 pub struct LayoutEngine {
@@ -40,7 +43,19 @@ pub struct LayoutEngine {
     /// Decoration geometry: decorating boxes' font metrics and glyph
     /// outlines for ink skipping, cached.
     decor: Decorator,
+    /// The scroll container plans of the boxes whose fragments were
+    /// emitted in the current layout, by element, so the scroll
+    /// information can be computed from the fragment tree once every
+    /// box, atomics included, is in its final place.
+    plans: HashMap<NodeId, ScrollPlan>,
 }
+
+/// Relayouts after a pass finds an `overflow: auto` axis overflowing, so
+/// its scrollbar gutter can be reserved (the browsers' second layout).
+/// One extra pass is the normal case; a vertical gutter can make the
+/// content overflow horizontally too, whose gutter can make it overflow
+/// vertically elsewhere; gutters are only ever added, so it settles.
+const MAX_SCROLLBAR_PASSES: usize = 4;
 
 impl std::fmt::Debug for LayoutEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,6 +123,7 @@ impl LayoutEngine {
             lcx: LayoutContext::new(),
             smcp: HashMap::new(),
             decor: Decorator::default(),
+            plans: HashMap::new(),
         }
     }
 
@@ -126,12 +142,18 @@ impl LayoutEngine {
             inherited: Option<&Arc<ComputedStyle>>,
             decor: &mut Decorator,
             fonts: &mut FontContext,
+            viewport_source: Option<NodeId>,
         ) {
             let mut element_style: Option<Arc<ComputedStyle>> = None;
             let new_style = match f.node {
                 Some(n) if doc.contains(n) => {
                     if doc.get(n).is_element() {
                         element_style = styles.get(n).cloned();
+                        // The element the viewport's `overflow` came from
+                        // behaves as `visible` itself, as it was laid out.
+                        if Some(n) == viewport_source {
+                            element_style = element_style.as_ref().map(visible_overflow);
+                        }
                         element_style.clone()
                     } else {
                         doc.parent(n).and_then(|p| styles.get(p)).cloned()
@@ -156,13 +178,16 @@ impl LayoutEngine {
             }
             let next = element_style.as_ref().or(inherited);
             for c in &mut f.children {
-                refresh(c, doc, styles, next, decor, fonts);
+                refresh(c, doc, styles, next, decor, fonts, viewport_source);
             }
         }
-        refresh(&mut tree.root, doc, styles, None, &mut self.decor, &mut self.fonts);
+        let vo = viewport_overflow(doc, styles);
+        tree.viewport_overflow = vo;
+        refresh(&mut tree.root, doc, styles, None, &mut self.decor, &mut self.fonts, vo.source);
     }
 
-    /// Lay out a whole document in a viewport of the given size.
+    /// Lay out a whole document in a viewport of the given size, every
+    /// scroll container at offset zero and the page at its origin.
     pub fn layout(
         &mut self,
         doc: &Document,
@@ -171,12 +196,56 @@ impl LayoutEngine {
         viewport_height: f32,
         images: &dyn ImageSizes,
     ) -> LayoutTree {
-        let builder = BoxBuilder { doc, styles, images };
+        self.layout_with_scrolls(doc, styles, viewport_width, viewport_height, images, &HashMap::new(), (0.0, 0.0))
+    }
+
+    /// Lay out a whole document in a viewport of the given size, with
+    /// each scroll container in `scrolls` at its offset (clamped to what
+    /// the new layout allows; elements not in the map or no longer
+    /// scroll containers sit at zero) and `position: sticky` boxes placed
+    /// for a page scrolled to `page_scroll`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_with_scrolls(
+        &mut self,
+        doc: &Document,
+        styles: &StyleMap,
+        viewport_width: f32,
+        viewport_height: f32,
+        images: &dyn ImageSizes,
+        scrolls: &HashMap<NodeId, (f32, f32)>,
+        page_scroll: (f32, f32),
+    ) -> LayoutTree {
+        self.plans.clear();
+        let vo = viewport_overflow(doc, styles);
+        let builder = BoxBuilder {
+            doc,
+            styles,
+            images,
+            viewport_source: vo.source,
+        };
         let root_style = Arc::new(ComputedStyle::initial());
+        let viewport_rect = Rect::new(0.0, 0.0, viewport_width, viewport_height);
+        let empty_viewport = |overflow: ViewportOverflow| ScrollInfo {
+            padding_box: viewport_rect,
+            scrollport: viewport_rect,
+            padding: Default::default(),
+            scroll_width: viewport_width,
+            scroll_height: viewport_height,
+            overflow_x: overflow.x,
+            overflow_y: overflow.y,
+            thickness: 0.0,
+            vertical_bar: false,
+            horizontal_bar: false,
+            gutter_right: 0.0,
+            gutter_left: 0.0,
+            gutter_bottom: 0.0,
+            rtl: false,
+            offset: (0.0, 0.0),
+        };
         let Some(mut html) = builder.build_root() else {
             return LayoutTree {
                 root: Fragment {
-                    rect: Rect::new(0.0, 0.0, viewport_width, viewport_height),
+                    rect: viewport_rect,
                     node: None,
                     style: root_style,
                     content: FragmentContent::Anonymous,
@@ -186,8 +255,25 @@ impl LayoutEngine {
                 },
                 content_width: viewport_width,
                 content_height: viewport_height,
+                viewport: empty_viewport(vo),
+                viewport_overflow: vo,
+                scrollers: HashMap::new(),
+                sticky: HashMap::new(),
+                has_sticky: false,
             };
         };
+        // The viewport is a scroll container whose `overflow` is the
+        // propagated one and whose scrollbars are the root element's
+        // (`scrollbar-width`, `scrollbar-gutter`, `direction`).
+        let mut viewport_plan = ScrollPlan::from_parts(vo.x, vo.y, &html.style).unwrap_or(ScrollPlan {
+            overflow_x: vo.x,
+            overflow_y: vo.y,
+            thickness: 0.0,
+            gutter_x: false,
+            gutter_y: false,
+            start_gutter: false,
+            rtl: html.style.direction == Direction::Rtl,
+        });
 
         self.prepare_atomics(&mut html, viewport_width);
 
@@ -196,44 +282,50 @@ impl LayoutEngine {
         let mut inline_ids: Vec<TaffyId> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
         let html_id = self.build_taffy(&mut tree, &mut html, &mut inlines, &mut inline_ids, &mut entries);
-
-        let viewport_id = tree
-            .new_with_children(
-                Style {
-                    display: taffy::Display::Block,
-                    size: Size {
-                        width: Dimension::length(viewport_width),
-                        height: Dimension::length(viewport_height),
-                    },
-                    ..Style::default()
-                },
-                &[html_id],
-            )
-            .expect("taffy root");
-
-        self.run_with_floats(
-            &mut tree,
-            viewport_id,
-            Size {
-                width: AvailableSpace::Definite(viewport_width),
-                height: AvailableSpace::Definite(viewport_height),
-            },
-            &mut inlines,
-            &inline_ids,
-            &entries,
-        );
         drop(inlines);
 
-        let html_fragment = self.fragments(&html, &tree, 0.0, 0.0);
-        let mut content_width: f32 = viewport_width;
-        let mut content_height: f32 = 0.0;
-        html_fragment.walk(&mut |f| {
-            content_width = content_width.max(f.rect.right());
-            content_height = content_height.max(f.rect.bottom());
-        });
-        LayoutTree {
+        let viewport_id = tree
+            .new_with_children(viewport_style(viewport_width, viewport_height, &viewport_plan), &[html_id])
+            .expect("taffy root");
+        let available = Size {
+            width: AvailableSpace::Definite(viewport_width),
+            height: AvailableSpace::Definite(viewport_height),
+        };
+
+        // Lay out; where an `auto` axis overflows, reserve its gutter and
+        // lay out again (the browsers' second layout).
+        let mut html_fragment;
+        let mut pass = 0;
+        loop {
+            let mut inlines: Vec<&mut InlineContent> = Vec::new();
+            collect_inlines(&mut html, &mut inlines);
+            self.run_with_floats(&mut tree, viewport_id, available, &mut inlines, &inline_ids, &entries);
+            drop(inlines);
+            html_fragment = self.fragments(&html, &tree, 0.0, 0.0);
+            pass += 1;
+            if pass >= MAX_SCROLLBAR_PASSES {
+                break;
+            }
+            let infos = self.scroll_infos(&html_fragment);
+            let mut changed = add_auto_gutters(&mut html, &infos, &mut tree);
+            let viewport_info = viewport_scroll_info(&html_fragment, viewport_rect, &viewport_plan);
+            let (ox, oy) = viewport_info.overflows();
+            if viewport_plan.add_gutters(ox, oy) {
+                let _ = tree.set_style(viewport_id, viewport_style(viewport_width, viewport_height, &viewport_plan));
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let scrollers = self.scroll_infos(&html_fragment);
+        let viewport = viewport_scroll_info(&html_fragment, viewport_rect, &viewport_plan);
+        let mut has_sticky = false;
+        html_fragment.walk(&mut |f| has_sticky |= f.node.is_some() && f.style.position == Position::Sticky);
+        let mut out = LayoutTree {
             root: Fragment {
-                rect: Rect::new(0.0, 0.0, viewport_width, viewport_height),
+                rect: viewport_rect,
                 node: None,
                 style: root_style,
                 content: FragmentContent::Anonymous,
@@ -241,9 +333,38 @@ impl LayoutEngine {
                 padding: Default::default(),
                 margin: Default::default(),
             },
-            content_width,
-            content_height: content_height.max(viewport_height),
+            content_width: viewport.scroll_width,
+            content_height: viewport.scroll_height,
+            viewport,
+            viewport_overflow: vo,
+            scrollers,
+            sticky: HashMap::new(),
+            has_sticky,
+        };
+        // The offsets the scrollers had: applied by moving their content,
+        // clamped to the new extents; then the sticky boxes.
+        for (&node, &offset) in scrolls {
+            out.set_scroll_offset(node, offset);
         }
+        out.viewport.offset = out.viewport.clamp(page_scroll);
+        out.apply_sticky();
+        out
+    }
+
+    /// The scroll container information of every scroll container box
+    /// among `root`'s fragments (`root` included), from their final
+    /// places.
+    fn scroll_infos(&self, root: &Fragment) -> HashMap<NodeId, ScrollInfo> {
+        let mut out = HashMap::new();
+        root.walk(&mut |f| {
+            if let Some(n) = f.node
+                && f.is_scroll_container()
+                && let Some(plan) = self.plans.get(&n)
+            {
+                out.insert(n, scroll_info_for(f, plan));
+            }
+        });
+        out
     }
 
     /// Lay out every atomic inline box in the subtree, bottom-up, so that
@@ -350,6 +471,9 @@ impl LayoutEngine {
         let mut entries: Vec<Entry> = Vec::new();
         let root = self.build_taffy(&mut tree, node, &mut inlines, &mut inline_ids, &mut entries);
 
+        // The width taffy is told, kept across the scrollbar passes below
+        // (a pass rebuilds the root's style from the plan).
+        let mut fixed_width = None;
         if width_is_auto {
             self.run_taffy(
                 &mut tree,
@@ -365,22 +489,42 @@ impl LayoutEngine {
             let mut style = tree.style(root).cloned().unwrap_or_default();
             style.size.width = Dimension::length(width);
             let _ = tree.set_style(root, style);
+            fixed_width = Some(width);
         }
-        self.run_with_floats(
-            &mut tree,
-            root,
-            Size {
-                width: AvailableSpace::Definite(available_width),
-                height: AvailableSpace::MaxContent,
-            },
-            &mut inlines,
-            &inline_ids,
-            &entries,
-        );
         drop(inlines);
+        let available = Size {
+            width: AvailableSpace::Definite(available_width),
+            height: AvailableSpace::MaxContent,
+        };
+        // As for the document: an `auto` scroller in here (the box itself
+        // or one inside it) found overflowing gets its gutter and the box
+        // is laid out again.
+        let mut fragment;
+        let mut pass = 0;
+        loop {
+            let mut inlines: Vec<&mut InlineContent> = Vec::new();
+            collect_inlines(node, &mut inlines);
+            self.run_with_floats(&mut tree, root, available, &mut inlines, &inline_ids, &entries);
+            drop(inlines);
+            fragment = self.fragments(node, &tree, 0.0, 0.0);
+            pass += 1;
+            if pass >= MAX_SCROLLBAR_PASSES {
+                break;
+            }
+            let infos = self.scroll_infos(&fragment);
+            if !add_auto_gutters(node, &infos, &mut tree) {
+                break;
+            }
+            if let Some(width) = fixed_width
+                && let Ok(style) = tree.style(root)
+            {
+                let mut style = style.clone();
+                style.size.width = Dimension::length(width);
+                let _ = tree.set_style(root, style);
+            }
+        }
 
         let layout = tree.layout(root).cloned().unwrap_or_default();
-        let mut fragment = self.fragments(node, &tree, 0.0, 0.0);
         // Position relative to the atomic's own border box origin; the
         // margins are in the reported size and the line layout offsets
         // the box by them.
@@ -442,7 +586,7 @@ impl LayoutEngine {
                 id
             }
             BoxKind::Image { intrinsic, .. } => {
-                let mut style = to_taffy(&node.style, false, true);
+                let mut style = to_taffy(&node.style, false, true, None);
                 if let Some((w, h)) = intrinsic
                     && *h > 0.0
                 {
@@ -458,7 +602,7 @@ impl LayoutEngine {
                         ..Style::default()
                     }
                 } else {
-                    to_taffy(&node.style, is_flex, false)
+                    to_taffy(&node.style, is_flex, false, node.scroll.as_ref())
                 };
                 // Same conditions under which taffy lays the box out as an
                 // independent formatting context, plus flex, whose items are.
@@ -649,6 +793,9 @@ impl LayoutEngine {
                 margin,
             },
             BoxKind::Block | BoxKind::Flex => {
+                if let (Some(n), Some(plan)) = (node.node, node.scroll) {
+                    self.plans.insert(n, plan);
+                }
                 let mut children: Vec<Fragment> = node
                     .children
                     .iter()
@@ -1081,6 +1228,259 @@ fn build_paragraphs(
 /// positioned box), so it makes no line of its container's.
 fn out_of_flow(f: &Fragment) -> bool {
     f.node.is_some() && (f.style.float != Float::None || matches!(f.style.position, Position::Absolute | Position::Fixed))
+}
+
+// ----- scroll containers (roadmap 4a (4s)) -----
+
+/// The inline roots of a box subtree in the order `build_taffy` gave
+/// them to taffy, borrowed again for a further layout pass.
+fn collect_inlines<'a>(node: &'a mut BoxNode, out: &mut Vec<&'a mut InlineContent>) {
+    match &mut node.kind {
+        BoxKind::Inline(content) => out.push(content),
+        BoxKind::Image { .. } => {}
+        BoxKind::Block | BoxKind::Flex => {
+            for c in &mut node.children {
+                collect_inlines(c, out);
+            }
+        }
+    }
+}
+
+/// Give every `overflow: auto` scroller in the subtree whose content a
+/// pass found overflowing its scrollbar gutter, updating its taffy
+/// style; true when any was added (another pass is needed).
+fn add_auto_gutters(node: &mut BoxNode, infos: &HashMap<NodeId, ScrollInfo>, tree: &mut TaffyTree<Leaf>) -> bool {
+    let mut changed = false;
+    if let (Some(n), Some(id)) = (node.node, node.taffy)
+        && let Some(plan) = node.scroll.as_mut()
+        && let Some(info) = infos.get(&n)
+    {
+        let (ox, oy) = info.overflows();
+        if plan.add_gutters(ox, oy) {
+            let is_flex = matches!(node.kind, BoxKind::Flex);
+            let style = to_taffy(&node.style, is_flex, false, Some(&*plan));
+            let _ = tree.set_style(id, style);
+            changed = true;
+        }
+    }
+    for c in &mut node.children {
+        changed |= add_auto_gutters(c, infos, tree);
+    }
+    changed
+}
+
+/// The taffy style of the viewport node: the viewport's size, with the
+/// page scrollbars' gutters as padding so the initial containing block
+/// is what is left (CSS Overflow 3 §4.1: the ICB excludes them).
+fn viewport_style(width: f32, height: f32, plan: &ScrollPlan) -> Style {
+    let (left, right, bottom) = plan_gutters(plan);
+    Style {
+        display: taffy::Display::Block,
+        size: Size {
+            width: Dimension::length(width),
+            height: Dimension::length(height),
+        },
+        padding: taffy::Rect {
+            left: LengthPercentage::length(left),
+            right: LengthPercentage::length(right),
+            top: LengthPercentage::length(0.0),
+            bottom: LengthPercentage::length(bottom),
+        },
+        ..Style::default()
+    }
+}
+
+/// A plan's gutters on the left, right and bottom of the padding box: the
+/// vertical scrollbar's at the inline-end edge (the left in a
+/// right-to-left box), a `both-edges` one at the inline-start edge, the
+/// horizontal scrollbar's at the bottom.
+fn plan_gutters(plan: &ScrollPlan) -> (f32, f32, f32) {
+    let v = if plan.gutter_y { plan.thickness } else { 0.0 };
+    let start = plan.start_gutter_width();
+    let (left, right) = if plan.rtl { (v, start) } else { (start, v) };
+    let bottom = if plan.gutter_x { plan.thickness } else { 0.0 };
+    (left, right, bottom)
+}
+
+/// The scroll container information of an element's box fragment under
+/// its plan, from the fragment tree as it stands.
+fn scroll_info_for(f: &Fragment, plan: &ScrollPlan) -> ScrollInfo {
+    let b = &f.style.border_width;
+    let padding_box = f.rect.inset(b.top, b.right, b.bottom, b.left);
+    let (gl, gr, gb) = plan_gutters(plan);
+    let scrollport = padding_box.inset(0.0, gr, gb, gl);
+    let is_flex = matches!(f.style.display, Display::Flex | Display::InlineFlex);
+    let (scroll_width, scroll_height) = scroll_extent(&f.children, None, is_flex, &scrollport, &f.padding, plan.rtl);
+    finish_scroll_info(padding_box, scrollport, f.padding, scroll_width, scroll_height, plan, (gl, gr, gb))
+}
+
+/// The viewport's scroll container information: the page's extent is the
+/// root element's margin box (its bottom margin as collapsed through from
+/// its descendants, CSS 2.1 §8.3.1) and everything in it.
+fn viewport_scroll_info(html: &Fragment, viewport: Rect, plan: &ScrollPlan) -> ScrollInfo {
+    let (gl, gr, gb) = plan_gutters(plan);
+    let scrollport = viewport.inset(0.0, gr, gb, gl);
+    let margin_box = Rect::new(
+        html.rect.x - html.margin.left,
+        html.rect.y,
+        html.rect.width + html.margin.left + html.margin.right,
+        html.rect.height + collapsed_end_margin(html),
+    );
+    let (scroll_width, scroll_height) =
+        scroll_extent(std::slice::from_ref(html), Some(margin_box), false, &scrollport, &Sides::all(0.0), plan.rtl);
+    finish_scroll_info(viewport, scrollport, Sides::all(0.0), scroll_width, scroll_height, plan, (gl, gr, gb))
+}
+
+fn finish_scroll_info(
+    padding_box: Rect,
+    scrollport: Rect,
+    padding: Sides<f32>,
+    scroll_width: f32,
+    scroll_height: f32,
+    plan: &ScrollPlan,
+    (gl, gr, gb): (f32, f32, f32),
+) -> ScrollInfo {
+    let overflows_x = scroll_width > scrollport.width + OVERFLOW_EPSILON;
+    let overflows_y = scroll_height > scrollport.height + OVERFLOW_EPSILON;
+    let bar = |o: Overflow, overflows: bool| plan.thickness > 0.0 && (o == Overflow::Scroll || (o == Overflow::Auto && overflows));
+    ScrollInfo {
+        padding_box,
+        scrollport,
+        padding,
+        scroll_width,
+        scroll_height,
+        overflow_x: plan.overflow_x,
+        overflow_y: plan.overflow_y,
+        thickness: plan.thickness,
+        vertical_bar: bar(plan.overflow_y, overflows_y),
+        horizontal_bar: bar(plan.overflow_x, overflows_x),
+        gutter_right: gr,
+        gutter_left: gl,
+        gutter_bottom: gb,
+        rtl: plan.rtl,
+        offset: (0.0, 0.0),
+    }
+}
+
+/// The reachable extent of a scroll container's scrollable overflow area
+/// (CSS Overflow 3 §2.2) from its scroll origin, as `(width, height)`:
+/// the scrollport; the border boxes of every descendant box (a box that
+/// clips its overflow contributes its own box only, a fixed box
+/// nothing; flex items their margin boxes); the in-flow children's
+/// bounds (block children with their end margins, as browsers include
+/// them) extended by the scroller's end padding; and `extra`, if any,
+/// as both. The origin is the scrollport's top-left, or its top-right
+/// when `rtl`, where the width is how far the content reaches to the
+/// left.
+fn scroll_extent(
+    children: &[Fragment],
+    extra: Option<Rect>,
+    container_flex: bool,
+    scrollport: &Rect,
+    padding: &Sides<f32>,
+    rtl: bool,
+) -> (f32, f32) {
+    fn margin_box(c: &Fragment) -> Rect {
+        let m = &c.margin;
+        Rect::new(c.rect.x - m.left, c.rect.y - m.top, c.rect.width + m.left + m.right, c.rect.height + m.top + m.bottom)
+    }
+    fn add(all: &mut Option<Rect>, r: Rect) {
+        *all = Some(all.map_or(r, |a| a.union(&r)));
+    }
+    fn visit(c: &Fragment, parent_flex: bool, all: &mut Option<Rect>) {
+        if c.is_fixed() {
+            return;
+        }
+        add(all, if parent_flex && c.node.is_some() { margin_box(c) } else { c.rect });
+        if c.clips_children() {
+            return;
+        }
+        let flex = c.node.is_some()
+            && matches!(c.content, FragmentContent::Box | FragmentContent::Control(_))
+            && matches!(c.style.display, Display::Flex | Display::InlineFlex);
+        for k in &c.children {
+            visit(k, flex, all);
+        }
+    }
+    let mut all = extra;
+    let mut inflow = extra;
+    for c in children {
+        visit(c, container_flex, &mut all);
+        if out_of_flow(c) || matches!(c.content, FragmentContent::Marker) {
+            continue;
+        }
+        let r = if c.node.is_some() {
+            if container_flex {
+                margin_box(c)
+            } else {
+                Rect::new(c.rect.x, c.rect.y, c.rect.width, c.rect.height + c.margin.bottom)
+            }
+        } else {
+            c.rect
+        };
+        add(&mut inflow, r);
+    }
+    if let Some(i) = inflow.as_mut() {
+        if rtl {
+            i.x -= padding.left;
+            i.width += padding.left;
+        } else {
+            i.width += padding.right;
+        }
+        i.height += padding.bottom;
+    }
+    let mut right = scrollport.right();
+    let mut bottom = scrollport.bottom();
+    let mut left = scrollport.x;
+    for r in [all, inflow].into_iter().flatten() {
+        right = right.max(r.right());
+        bottom = bottom.max(r.bottom());
+        left = left.min(r.x);
+    }
+    let width = if rtl { scrollport.right() - left } else { right - scrollport.x };
+    (width, bottom - scrollport.y)
+}
+
+/// The bottom margin of a box with the bottom margins that collapse
+/// through it (CSS 2.1 §8.3.1): while the box has `height: auto`, no
+/// bottom padding or border, no minimum height and is not a formatting
+/// context root, its last in-flow child's bottom margin joins (positive
+/// margins by the largest, negative by the smallest), and so on down.
+fn collapsed_end_margin(f: &Fragment) -> f32 {
+    use browser_style::ComputedSize;
+    let mut pos = f.margin.bottom.max(0.0);
+    let mut neg = f.margin.bottom.min(0.0);
+    let mut cur = f;
+    loop {
+        let s = &cur.style;
+        let auto_height = matches!(s.height, ComputedSize::Auto)
+            && matches!(s.min_height, ComputedSize::Auto | ComputedSize::Px(0.0) | ComputedSize::Percent(0.0));
+        let root = s.overflow_x != Overflow::Visible
+            || s.overflow_y != Overflow::Visible
+            || s.float != Float::None
+            || matches!(s.position, Position::Absolute | Position::Fixed)
+            || matches!(s.display, Display::Flex | Display::InlineFlex | Display::InlineBlock);
+        if !auto_height || cur.padding.bottom > 0.0 || s.border_width.bottom > 0.0 || root {
+            break;
+        }
+        // The last in-flow child must be a block-level box; a line of
+        // inline content there ends the collapsing.
+        let Some(last) = cur
+            .children
+            .iter()
+            .rev()
+            .find(|c| !out_of_flow(c) && !matches!(c.content, FragmentContent::Marker))
+        else {
+            break;
+        };
+        if last.node.is_none() || !matches!(last.content, FragmentContent::Box | FragmentContent::Control(_)) {
+            break;
+        }
+        pos = pos.max(last.margin.bottom.max(0.0));
+        neg = neg.min(last.margin.bottom.min(0.0));
+        cur = last;
+    }
+    pos + neg
 }
 
 /// The baseline (page y) of the first line among `fragments` in tree
@@ -2501,6 +2901,326 @@ mod tests {
         let mut engine = LayoutEngine::new();
         let tree = engine.layout(&doc, &styles, 800.0, 600.0, &());
         (doc, tree, engine)
+    }
+
+    fn by_id(doc: &Document, id: &str) -> NodeId {
+        doc.descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+            .unwrap_or_else(|| panic!("element #{id}"))
+    }
+
+    /// The border box of an element's own box fragment.
+    fn box_of(tree: &LayoutTree, node: NodeId) -> Rect {
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(node) && found.is_none() && matches!(f.content, FragmentContent::Box | FragmentContent::Control(_)) {
+                found = Some(f.rect);
+            }
+        });
+        found.expect("box fragment")
+    }
+
+    fn layout_scrolled(html: &str, scrolls: &[(&str, (f32, f32))], page: (f32, f32)) -> (Document, LayoutTree) {
+        let doc = browser_dom::parse_html(html.as_bytes());
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        let map: HashMap<NodeId, (f32, f32)> = scrolls.iter().map(|&(id, o)| (by_id(&doc, id), o)).collect();
+        let mut engine = LayoutEngine::new();
+        let tree = engine.layout_with_scrolls(&doc, &styles, 800.0, 600.0, &(), &map, page);
+        (doc, tree)
+    }
+
+    #[test]
+    fn auto_scroller_reserves_its_gutter_and_offsets_move_its_content() {
+        let t = crate::SCROLLBAR_THICKNESS;
+        let (doc, mut tree) = layout(
+            "<body style='margin:0'><div id=s style='overflow:auto;width:200px;height:100px;padding:10px;border:5px solid'>\
+             <div id=c style='height:300px'>x</div></div></body>",
+            "",
+        );
+        let s = by_id(&doc, "s");
+        let c = by_id(&doc, "c");
+        assert_eq!(box_of(&tree, s), Rect::new(0.0, 0.0, 230.0, 130.0));
+        let info = tree.scroller(s).expect("a scroll container").clone();
+        assert_eq!(info.padding_box, Rect::new(5.0, 5.0, 220.0, 120.0));
+        // The vertical scrollbar's gutter comes off the padding box's right
+        // (the second pass, since `auto` starts without one), the content
+        // is laid out in what is left, and the end padding counts.
+        assert_eq!(info.scrollport, Rect::new(5.0, 5.0, 220.0 - t, 120.0));
+        assert_eq!((info.vertical_bar, info.horizontal_bar), (t > 0.0, false));
+        assert_eq!((info.gutter_right, info.gutter_left, info.gutter_bottom), (t, 0.0, 0.0));
+        assert_eq!(box_of(&tree, c), Rect::new(15.0, 15.0, 200.0 - t, 300.0));
+        assert_eq!((info.scroll_width, info.scroll_height), (220.0 - t, 320.0));
+        assert_eq!(info.max_offset(), (0.0, 200.0));
+        assert!(info.overflows().1 && !info.overflows().0);
+        // Scrolling moves the content, clamped to the extent; the offset
+        // is reported; the scroller's own box stays.
+        assert_eq!(tree.set_scroll_offset(s, (0.0, 50.0)), Some((0.0, 50.0)));
+        assert_eq!(box_of(&tree, c).y, 15.0 - 50.0);
+        assert_eq!(tree.set_scroll_offset(s, (30.0, 1000.0)), Some((0.0, 200.0)));
+        assert_eq!(box_of(&tree, c).y, 15.0 - 200.0);
+        assert_eq!(box_of(&tree, s), Rect::new(0.0, 0.0, 230.0, 130.0));
+        assert_eq!(tree.scroller(s).map(|i| i.offset), Some((0.0, 200.0)));
+        assert_eq!(tree.set_scroll_offset(c, (0.0, 1.0)), None, "not a scroll container");
+        // A layout given the offset puts the content where a scroll did.
+        let (doc2, tree2) = layout_scrolled(
+            "<body style='margin:0'><div id=s style='overflow:auto;width:200px;height:100px;padding:10px;border:5px solid'>\
+             <div id=c style='height:300px'>x</div></div></body>",
+            &[("s", (0.0, 50.0))],
+            (0.0, 0.0),
+        );
+        assert_eq!(box_of(&tree2, by_id(&doc2, "c")).y, 15.0 - 50.0);
+        assert_eq!(tree2.scroller(by_id(&doc2, "s")).map(|i| i.offset), Some((0.0, 50.0)));
+    }
+
+    #[test]
+    fn scroll_gutters_follow_overflow_scrollbar_width_and_scrollbar_gutter() {
+        let t = crate::SCROLLBAR_THICKNESS;
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div id=a style='overflow:scroll;width:100px;height:50px'>x</div>\
+             <div id=b style='overflow:scroll;scrollbar-width:none;width:100px;height:50px'>x</div>\
+             <div id=c style='overflow:auto;scrollbar-gutter:stable;width:100px;height:50px'>x</div>\
+             <div id=d style='overflow:auto;scrollbar-gutter:stable both-edges;width:100px;height:50px'><p id=p style='margin:0'>x</p></div>\
+             <div id=e style='overflow:hidden;width:100px;height:50px'><div style='height:500px'></div></div>\
+             <div id=f style='overflow:auto;scrollbar-width:thin;width:100px;height:50px'><div style='height:500px'></div></div>\
+             </body>",
+            "",
+        );
+        // `scroll`: both gutters and both bars, overflow or not.
+        let a = tree.scroller(by_id(&doc, "a")).expect("a");
+        assert_eq!(a.scrollport, Rect::new(0.0, 0.0, 100.0 - t, 50.0 - t));
+        assert_eq!((a.vertical_bar, a.horizontal_bar), (t > 0.0, t > 0.0));
+        assert_eq!((a.scroll_width, a.scroll_height), (100.0 - t, 50.0 - t), "nothing overflows: the scrollport");
+        // `scrollbar-width: none`: no gutters, no bars, still a scroller.
+        let b = tree.scroller(by_id(&doc, "b")).expect("b");
+        assert_eq!(b.scrollport, Rect::new(0.0, 50.0, 100.0, 50.0));
+        assert!(!b.vertical_bar && !b.horizontal_bar && b.thickness == 0.0);
+        // `scrollbar-gutter: stable`: the vertical gutter without a bar.
+        let c = tree.scroller(by_id(&doc, "c")).expect("c");
+        assert_eq!((c.gutter_right, c.vertical_bar), (t, false));
+        assert_eq!(c.scrollport.width, 100.0 - t);
+        // `both-edges`: the start gutter too; the content starts after it.
+        let d = tree.scroller(by_id(&doc, "d")).expect("d");
+        assert_eq!((d.gutter_left, d.gutter_right), (t, t));
+        assert_eq!(box_of(&tree, by_id(&doc, "p")), Rect::new(t, 150.0, 100.0 - 2.0 * t, box_of(&tree, by_id(&doc, "p")).height));
+        // `hidden`: a scroll container without gutters or bars, with an
+        // extent to scroll programmatically.
+        let e = tree.scroller(by_id(&doc, "e")).expect("e");
+        assert_eq!((e.gutter_right, e.vertical_bar, e.scroll_height), (0.0, false, 500.0));
+        assert_eq!(e.user_scrollable(), (false, false));
+        assert_eq!(e.max_offset(), (0.0, 450.0));
+        // `thin`.
+        let f = tree.scroller(by_id(&doc, "f")).expect("f");
+        assert_eq!(f.gutter_right, crate::THIN_SCROLLBAR_THICKNESS);
+    }
+
+    #[test]
+    fn a_vertical_gutter_can_bring_the_horizontal_bar_and_margins_count() {
+        let t = crate::SCROLLBAR_THICKNESS;
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div id=s style='overflow:auto;width:200px;height:100px'><div style='width:190px;height:150px'></div></div>\
+             <div id=m style='overflow:auto;height:50px;padding-bottom:20px;width:100px'><div style='height:100px;margin-bottom:30px'></div></div>\
+             <div id=x style='display:flex;overflow:auto;width:100px;height:50px'><div style='width:80px;height:10px;margin-right:50px;flex:none'></div></div>\
+             </body>",
+            "",
+        );
+        // 190 fits 200 until the vertical gutter takes its share; then the
+        // horizontal bar comes too (a third pass), never the other way.
+        let s = tree.scroller(by_id(&doc, "s")).expect("s");
+        if t > 0.0 {
+            assert!(s.vertical_bar && s.horizontal_bar, "{s:?}");
+            assert_eq!(s.scrollport, Rect::new(0.0, 0.0, 200.0 - t, 100.0 - t));
+            assert_eq!((s.scroll_width, s.scroll_height), (190.0, 150.0));
+        } else {
+            assert!(!s.horizontal_bar);
+        }
+        // A block child's end margin and the scroller's end padding extend
+        // the scrollable overflow; a flex item counts with its margin box.
+        let m = tree.scroller(by_id(&doc, "m")).expect("m");
+        assert_eq!(m.scroll_height, 150.0);
+        let x = tree.scroller(by_id(&doc, "x")).expect("x");
+        assert_eq!(x.scroll_width, 130.0);
+    }
+
+    #[test]
+    fn rtl_scroller_scrolls_leftward_from_the_right() {
+        let t = crate::SCROLLBAR_THICKNESS;
+        let (doc, mut tree) = layout(
+            "<body style='margin:0'><div id=s dir=rtl style='overflow:auto;width:100px;height:50px'><div id=c style='width:300px;height:10px'></div></div></body>",
+            "",
+        );
+        let s = by_id(&doc, "s");
+        let c = by_id(&doc, "c");
+        let info = tree.scroller(s).expect("s").clone();
+        assert!(info.rtl);
+        // Nothing overflows vertically, so no vertical bar; the horizontal
+        // one takes the bottom; the content's right edge is at the
+        // scroll origin and 200px of it lie to the left.
+        assert_eq!((info.vertical_bar, info.horizontal_bar), (false, t > 0.0));
+        assert_eq!(info.scrollport, Rect::new(0.0, 0.0, 100.0, 50.0 - t));
+        assert_eq!(box_of(&tree, c), Rect::new(-200.0, 0.0, 300.0, 10.0));
+        assert_eq!(info.scroll_width, 300.0);
+        assert_eq!(info.max_offset(), (200.0, 0.0));
+        assert_eq!(info.clamp((50.0, 0.0)), (0.0, 0.0), "positive offsets are out of range");
+        assert_eq!(tree.set_scroll_offset(s, (-50.0, 0.0)), Some((-50.0, 0.0)));
+        assert_eq!(box_of(&tree, c).x, -150.0, "scrolling left moves the content right");
+        assert_eq!(tree.set_scroll_offset(s, (-1000.0, 0.0)), Some((-200.0, 0.0)));
+        assert_eq!(box_of(&tree, c).x, 0.0);
+        // The vertical bar of a right-to-left scroller is on the left.
+        let (doc, tree) = layout(
+            "<body style='margin:0'><div id=s dir=rtl style='overflow:auto;width:100px;height:50px'><div style='height:300px'></div></div></body>",
+            "",
+        );
+        let info = tree.scroller(by_id(&doc, "s")).expect("s");
+        assert_eq!((info.gutter_left, info.gutter_right), (t, 0.0));
+        assert_eq!(info.scrollport, Rect::new(t, 0.0, 100.0 - t, 50.0));
+        assert_eq!(info.vertical_track().map(|r| r.x), (t > 0.0).then_some(0.0));
+    }
+
+    #[test]
+    fn clipped_and_fixed_content_does_not_extend_or_scroll() {
+        let (doc, mut tree) = layout(
+            "<body style='margin:0'><div id=s style='overflow:auto;height:100px'>\
+             <div id=h style='overflow:hidden;height:50px'><div style='height:5000px'></div></div>\
+             <div id=f style='position:fixed;top:0;height:10px'></div>\
+             <div style='height:200px'></div></div></body>",
+            "",
+        );
+        let s = by_id(&doc, "s");
+        let f = by_id(&doc, "f");
+        let info = tree.scroller(s).expect("s").clone();
+        assert_eq!(info.scroll_height, 250.0, "the hidden box counts as its 50px, not its content");
+        // The page: the scroller's own content does not stretch it either.
+        assert_eq!(tree.content_height, 600.0);
+        assert!(!tree.viewport.vertical_bar);
+        let before = box_of(&tree, f);
+        tree.set_scroll_offset(s, (0.0, 100.0));
+        assert_eq!(box_of(&tree, f), before, "a fixed box stays while its scroller scrolls");
+        assert_eq!(box_of(&tree, by_id(&doc, "h")).y, -100.0);
+    }
+
+    #[test]
+    fn the_page_extent_is_the_root_margin_box_and_the_viewport_overflow_propagates() {
+        let t = crate::SCROLLBAR_THICKNESS;
+        // The body's bottom margin collapses through `html` and counts; a
+        // tall page gets the viewport's vertical gutter, which narrows the
+        // initial containing block (the second layout).
+        let (doc, tree) = layout("<body style='margin:0 0 50px'><div style='height:1000px'></div></body>", "");
+        assert_eq!(tree.content_height, 1050.0);
+        assert_eq!(tree.content_width, 800.0 - t);
+        assert_eq!((tree.viewport.vertical_bar, tree.viewport.horizontal_bar), (t > 0.0, false));
+        assert_eq!(tree.viewport.scrollport, Rect::new(0.0, 0.0, 800.0 - t, 600.0));
+        assert_eq!(find_by_tag(&doc, &tree, "html").width, 800.0 - t);
+        assert_eq!(tree.viewport.max_offset(), (0.0, 450.0));
+        // `overflow: hidden` on the body goes to the viewport: no bar, no
+        // user scrolling, the body itself does not clip, and the extent
+        // is still there for scripts.
+        let (doc, tree) = layout("<body style='margin:0;overflow:hidden'><div style='height:1000px'></div></body>", "");
+        assert_eq!((tree.viewport.overflow_x, tree.viewport.overflow_y), (Overflow::Hidden, Overflow::Hidden));
+        let body = doc.body().expect("body");
+        assert_eq!(tree.viewport_overflow.source, Some(body));
+        assert!(!tree.viewport.vertical_bar);
+        assert_eq!(tree.viewport.scrollport.width, 800.0);
+        assert_eq!(tree.content_height, 1000.0);
+        let mut clips = None;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(body) {
+                clips = Some(f.clips_children());
+            }
+        });
+        assert_eq!(clips, Some(false), "the propagated element behaves as visible");
+        assert!(tree.scroller(body).is_none(), "and is not a scroll container of its own");
+        // `overflow-y: scroll` on the root: the gutter even on a short page.
+        let (_, tree) = layout("<body style='margin:0'>short</body>", "html { overflow-y: scroll }");
+        assert_eq!((tree.viewport.vertical_bar, tree.viewport.scrollport.width), (t > 0.0, 800.0 - t));
+        assert_eq!(tree.content_height, 600.0);
+    }
+
+    #[test]
+    fn sticky_boxes_follow_the_scrollport_within_their_containing_block() {
+        let (doc, mut tree) = layout(
+            "<body style='margin:0'><div id=s style='overflow:auto;height:100px'>\
+             <div id=cb style='height:300px'><div id=h style='position:sticky;top:0;height:20px'></div><div style='height:280px'></div></div>\
+             <div style='height:500px'></div></div></body>",
+            "",
+        );
+        let s = by_id(&doc, "s");
+        let h = by_id(&doc, "h");
+        let cb = by_id(&doc, "cb");
+        assert!(tree.has_sticky);
+        assert_eq!(box_of(&tree, h).y, 0.0);
+        // Scrolled past it, the box sticks to the scrollport's top.
+        tree.set_scroll_offset(s, (0.0, 50.0));
+        assert_eq!(box_of(&tree, cb).y, -50.0);
+        assert_eq!(box_of(&tree, h).y, 0.0);
+        assert_eq!(tree.sticky.get(&h), Some(&(0.0, 50.0)));
+        // Until its containing block's end pushes it out.
+        tree.set_scroll_offset(s, (0.0, 290.0));
+        assert_eq!(box_of(&tree, cb).bottom(), 10.0);
+        assert_eq!(box_of(&tree, h).y, -10.0);
+        // Back to the top: the shift is undone.
+        tree.set_scroll_offset(s, (0.0, 0.0));
+        assert_eq!(box_of(&tree, h).y, 0.0);
+        assert!(!tree.sticky.contains_key(&h));
+        // Stuck to the viewport: the page scroll is told to the tree.
+        let (doc, mut tree) = layout(
+            "<body style='margin:0'><div id=h style='position:sticky;top:10px;height:20px'></div><div style='height:2000px'></div></body>",
+            "",
+        );
+        let h = by_id(&doc, "h");
+        // At the page's top the box already sits 10px down (Chrome does the
+        // same: the inset applies whatever the scroll).
+        assert_eq!(box_of(&tree, h).y, 10.0);
+        tree.set_page_scroll((0.0, 100.0));
+        assert_eq!(box_of(&tree, h).y, 110.0);
+        tree.set_page_scroll((0.0, 0.0));
+        assert_eq!(box_of(&tree, h).y, 10.0);
+        // A layout given the page scroll places it the same way; a bottom
+        // inset pulls a box up from below the scrollport.
+        let (doc, tree) = layout_scrolled(
+            "<body style='margin:0'><div style='height:2000px'></div><div id=b style='position:sticky;bottom:0;height:20px'></div></body>",
+            &[],
+            (0.0, 100.0),
+        );
+        assert_eq!(box_of(&tree, by_id(&doc, "b")).y, 100.0 + 600.0 - 20.0);
+    }
+
+    #[test]
+    fn hit_testing_goes_through_the_scrollport_only() {
+        let t = crate::SCROLLBAR_THICKNESS;
+        let (doc, mut tree) = layout(
+            "<body style='margin:0'><div id=s style='overflow:auto;width:200px;height:100px'>\
+             <div id=a style='height:100px'></div><div id=b style='height:300px'></div></div></body>",
+            "",
+        );
+        let (s, a, b) = (by_id(&doc, "s"), by_id(&doc, "a"), by_id(&doc, "b"));
+        assert_eq!(tree.hit_test(100.0, 50.0), Some(a));
+        tree.set_scroll_offset(s, (0.0, 150.0));
+        assert_eq!(tree.hit_test(100.0, 50.0), Some(b), "the content moved under the point");
+        if t > 0.0 {
+            assert_eq!(tree.hit_test(200.0 - t / 2.0, 50.0), Some(s), "the scrollbar is the scroller itself");
+        }
+        assert_ne!(tree.hit_test(100.0, 150.0), Some(b), "below the scroller nothing of its content hits");
+        assert_ne!(tree.hit_test(100.0, 150.0), Some(s));
+    }
+
+    #[test]
+    fn textareas_and_inline_blocks_are_scroll_containers() {
+        let t = crate::SCROLLBAR_THICKNESS;
+        let (doc, tree) = layout(
+            "<body style='margin:0'><textarea id=t>1\n2\n3\n4\n5\n6\n7\n8\n9\n10</textarea>\
+             <span id=b style='display:inline-block;overflow:auto;width:100px;height:30px'><div id=i style='height:200px'></div></span></body>",
+            "",
+        );
+        let ta = tree.scroller(by_id(&doc, "t")).expect("textarea");
+        assert_eq!((ta.overflow_y, ta.vertical_bar), (Overflow::Auto, t > 0.0));
+        assert!(ta.scroll_height > ta.scrollport.height);
+        let b = tree.scroller(by_id(&doc, "b")).expect("inline-block");
+        assert_eq!((b.vertical_bar, b.scroll_height), (t > 0.0, 200.0));
+        assert_eq!(box_of(&tree, by_id(&doc, "i")).width, 100.0 - t, "the gutter was reserved inside the atomic's own layout");
     }
 
     /// The decoration lines of the first text fragment whose text is `s`,

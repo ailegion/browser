@@ -130,6 +130,12 @@ pub trait CoreStyle {
     fn scrollbar_width(&self) -> f32 {
         0.0
     }
+    /// How much space (in points) should be reserved at the inline-start edge as well, for the
+    /// mirrored gutter of CSS `scrollbar-gutter: stable both-edges` (the browser project's addition).
+    #[inline(always)]
+    fn scrollbar_gutter_start(&self) -> f32 {
+        0.0
+    }
 
     // Position properties
     /// What should the `position` value of this struct use as a base offset?
@@ -617,6 +623,9 @@ pub struct Style<S: CheapCloneStr = DefaultCheapStr> {
     pub overflow: Point<Overflow>,
     /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
     pub scrollbar_width: f32,
+    /// How much space (in points) should be reserved at the inline-start edge as well, for the
+    /// mirrored gutter of CSS `scrollbar-gutter: stable both-edges` (the browser project's addition).
+    pub scrollbar_gutter_start: f32,
     /// The layout-affecting parts of the CSS `contain` property
     pub contain: Contain,
 
@@ -770,6 +779,7 @@ impl<S: CheapCloneStr> Style<S> {
         direction: Direction::Ltr,
         overflow: Point { x: Overflow::Visible, y: Overflow::Visible },
         scrollbar_width: 0.0,
+        scrollbar_gutter_start: 0.0,
         contain: Contain::NONE,
         #[cfg(feature = "float_layout")]
         float: Float::None,
@@ -881,6 +891,10 @@ impl<S: CheapCloneStr> CoreStyle for Style<S> {
         self.scrollbar_width
     }
     #[inline(always)]
+    fn scrollbar_gutter_start(&self) -> f32 {
+        self.scrollbar_gutter_start
+    }
+    #[inline(always)]
     fn position(&self) -> Position {
         self.position
     }
@@ -952,6 +966,10 @@ impl<T: CoreStyle> CoreStyle for &'_ T {
     #[inline(always)]
     fn scrollbar_width(&self) -> f32 {
         (*self).scrollbar_width()
+    }
+    #[inline(always)]
+    fn scrollbar_gutter_start(&self) -> f32 {
+        (*self).scrollbar_gutter_start()
     }
     #[inline(always)]
     fn position(&self) -> Position {
@@ -1430,6 +1448,7 @@ mod tests {
             direction: Default::default(),
             overflow: Default::default(),
             scrollbar_width: 0.0,
+            scrollbar_gutter_start: 0.0,
             contain: Default::default(),
             position: Default::default(),
             #[cfg(feature = "flexbox")]

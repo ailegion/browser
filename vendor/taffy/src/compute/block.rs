@@ -475,9 +475,11 @@ fn compute_inner(
             Overflow::Scroll => style.scrollbar_width(),
             _ => 0.0,
         });
+        // The mirrored gutter at the inline-start edge (`scrollbar-gutter: stable both-edges`).
+        let start = style.scrollbar_gutter_start();
         match direction {
-            Direction::Ltr => Rect { top: 0.0, left: 0.0, right: offsets.x, bottom: offsets.y },
-            Direction::Rtl => Rect { top: 0.0, left: offsets.x, right: 0.0, bottom: offsets.y },
+            Direction::Ltr => Rect { top: 0.0, left: start, right: offsets.x, bottom: offsets.y },
+            Direction::Rtl => Rect { top: 0.0, left: offsets.x, right: start, bottom: offsets.y },
         }
     };
     let padding_border = padding + border;

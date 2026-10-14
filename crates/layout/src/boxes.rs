@@ -7,7 +7,8 @@ use std::sync::Arc;
 use browser_dom::{Directionality, Document, NodeId, NodeKind, strong_direction};
 use browser_style::{
     BoxDecorationBreak, ComputedLp, ComputedLpAuto, ComputedStyle, Direction, Display, Float, FontVariant,
-    LetterSpacing, ListStylePosition, ListStyleType, Rgba, Sides, StyleMap, TextTransform, UnicodeBidi, WhiteSpace,
+    LetterSpacing, ListStylePosition, ListStyleType, Overflow, Rgba, Sides, StyleMap, TextTransform, UnicodeBidi,
+    WhiteSpace,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -28,6 +29,83 @@ pub(crate) enum BoxKind {
     },
 }
 
+/// How a scroll container's box is laid out (roadmap 4a (4s)): which
+/// scrollbar gutters taffy reserves and how thick. `gutter_y` is the
+/// vertical scrollbar's gutter (at the inline-end edge), `gutter_x` the
+/// horizontal one's (at the bottom). An `auto` axis starts without a
+/// gutter and gets one when a layout pass finds it overflowing (the
+/// browsers' second layout); a gutter is never taken away within one
+/// layout, which is how Blink avoids the add/remove oscillation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScrollPlan {
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
+    pub thickness: f32,
+    pub gutter_x: bool,
+    pub gutter_y: bool,
+    /// `scrollbar-gutter: stable both-edges`: a gutter at the inline-start
+    /// edge too, as wide as the vertical one; taffy has no such gutter, so
+    /// it goes into the padding it is given and comes out of the padding
+    /// reported.
+    pub start_gutter: bool,
+    pub rtl: bool,
+}
+
+impl ScrollPlan {
+    /// The plan for a box's style, or `None` when it is not a scroll
+    /// container (`overflow` neither `auto`, `scroll` nor `hidden` in
+    /// either axis).
+    pub fn for_style(style: &ComputedStyle) -> Option<Self> {
+        Self::from_parts(style.overflow_x, style.overflow_y, style)
+    }
+
+    /// The plan for a box with the given effective `overflow` per axis
+    /// and the `scrollbar-*` and `direction` of `style` (the viewport's
+    /// `overflow` is propagated, its scrollbar properties are the root
+    /// element's).
+    pub fn from_parts(overflow_x: Overflow, overflow_y: Overflow, style: &ComputedStyle) -> Option<Self> {
+        use browser_style::ScrollbarGutter;
+        let scrolls = |o: Overflow| matches!(o, Overflow::Auto | Overflow::Scroll | Overflow::Hidden);
+        if !scrolls(overflow_x) && !scrolls(overflow_y) {
+            return None;
+        }
+        let thickness = crate::scrollbar_thickness(style.scrollbar_width);
+        let stable = thickness > 0.0 && style.scrollbar_gutter != ScrollbarGutter::Auto;
+        Some(Self {
+            overflow_x,
+            overflow_y,
+            thickness,
+            gutter_x: thickness > 0.0 && overflow_x == Overflow::Scroll,
+            // `scrollbar-gutter` applies to the inline axis only (CSS
+            // Overflow 3 §4.2): the vertical scrollbar's gutter is kept
+            // whenever the box is a scroll container in that axis.
+            gutter_y: thickness > 0.0 && (overflow_y == Overflow::Scroll || (stable && scrolls(overflow_y))),
+            start_gutter: stable && style.scrollbar_gutter == ScrollbarGutter::StableBothEdges && scrolls(overflow_y),
+            rtl: style.direction == Direction::Rtl,
+        })
+    }
+
+    /// The gutter at the inline-start edge, if any.
+    pub fn start_gutter_width(&self) -> f32 {
+        if self.start_gutter { self.thickness } else { 0.0 }
+    }
+
+    /// Give the axes found overflowing their gutters; true when one was
+    /// added.
+    pub fn add_gutters(&mut self, overflow_x: bool, overflow_y: bool) -> bool {
+        let mut added = false;
+        if overflow_y && self.overflow_y == Overflow::Auto && self.thickness > 0.0 && !self.gutter_y {
+            self.gutter_y = true;
+            added = true;
+        }
+        if overflow_x && self.overflow_x == Overflow::Auto && self.thickness > 0.0 && !self.gutter_x {
+            self.gutter_x = true;
+            added = true;
+        }
+        added
+    }
+}
+
 pub(crate) struct BoxNode {
     pub kind: BoxKind,
     pub node: Option<NodeId>,
@@ -38,6 +116,9 @@ pub(crate) struct BoxNode {
     pub taffy: Option<TaffyId>,
     /// A form control with its own drawing.
     pub control: Option<Control>,
+    /// The box is a scroll container: its gutters, decided per layout
+    /// pass.
+    pub scroll: Option<ScrollPlan>,
     /// A list item's `list-style-position: outside` marker: an inline
     /// root of its own, outside the flow (not a taffy child), laid out
     /// unbroken and placed left of the item's content edge on its first
@@ -61,8 +142,18 @@ impl BoxNode {
             anonymous: false,
             taffy: None,
             control: None,
+            scroll: None,
             marker: None,
             hangs: false,
+        }
+    }
+
+    /// Make the box a scroll container when its style says so (block,
+    /// flex and control boxes with an element; never inline roots,
+    /// images or anonymous boxes).
+    fn plan_scrolling(&mut self) {
+        if self.node.is_some() && !self.anonymous && matches!(self.kind, BoxKind::Block | BoxKind::Flex) {
+            self.scroll = ScrollPlan::for_style(&self.style);
         }
     }
 
@@ -777,6 +868,22 @@ pub(crate) struct BoxBuilder<'a> {
     pub doc: &'a Document,
     pub styles: &'a StyleMap,
     pub images: &'a dyn ImageSizes,
+    /// The element whose `overflow` the viewport took (CSS Overflow 3
+    /// §3.3): its own used value is `visible`, so its box neither clips
+    /// nor scrolls.
+    pub viewport_source: Option<NodeId>,
+}
+
+/// `style` with `overflow: visible` in both axes, for the element the
+/// viewport's `overflow` was propagated from.
+pub(crate) fn visible_overflow(style: &Arc<ComputedStyle>) -> Arc<ComputedStyle> {
+    if style.overflow_x == Overflow::Visible && style.overflow_y == Overflow::Visible {
+        return style.clone();
+    }
+    let mut s = (**style).clone();
+    s.overflow_x = Overflow::Visible;
+    s.overflow_y = Overflow::Visible;
+    Arc::new(s)
 }
 
 /// Element nesting deeper than this is flattened: a stack overflow aborts
@@ -928,8 +1035,11 @@ impl BoxBuilder<'_> {
 
     /// Build a block-level or atomic box for an element.
     fn build_element(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
+        let style = if self.viewport_source == Some(id) { visible_overflow(&style) } else { style };
         if let Some(kind) = self.control_kind(id) {
-            return self.build_control(id, style, kind);
+            let mut b = self.build_control(id, style, kind);
+            b.plan_scrolling();
+            return b;
         }
         if self.is_image(id) {
             let url = self
@@ -965,6 +1075,7 @@ impl BoxBuilder<'_> {
         if style.display == Display::ListItem {
             self.add_marker(id, &style, &mut b);
         }
+        b.plan_scrolling();
         b
     }
 
@@ -1468,7 +1579,7 @@ mod tests {
     fn small_caps_are_synthesized_over_the_given_ranges() {
         // Built as written; the engine asks for synthesis per shaped run.
         let (doc, styles) = build("<p style='font-variant: small-caps; font-size: 20px'>Hello <b>ab</b>!<img src=x.png> stra\u{df}e</p>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares, viewport_source: None };
         let root = builder.build_root().expect("root");
         let p = &root.children[0].children[0];
         let BoxKind::Inline(c) = &p.children[0].kind else { panic!("inline root") };
@@ -1528,7 +1639,7 @@ mod tests {
              <li style='list-style-type: none; list-style-image: url(http://x/m.png)'>four</li>\
              <li style='list-style-type: none'>five</li></ul>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares, viewport_source: None };
         let root = builder.build_root().expect("root");
         let ul = &root.children[0].children[0];
         let inline = |b: &BoxNode| match &b.kind {
@@ -1575,7 +1686,7 @@ mod tests {
             "<p>a <span dir=rtl>b </span></p><p><bdo dir=rtl>ab<br>cd</bdo></p>\
              <div dir=rtl style='white-space:pre'>x\ny</div><div style='unicode-bidi:bidi-override'>q</div>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
         let root = builder.build_root().expect("root");
         let texts = inline_text(&root);
         assert_eq!(texts[0], "a \u{2067}b\u{2069}");
@@ -1592,7 +1703,7 @@ mod tests {
     #[test]
     fn an_empty_item_gets_its_marker_as_its_one_line() {
         let (doc, styles) = build("<ul><li></li><li><div></div></li></ul>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
         let root = builder.build_root().expect("root");
         let ul = &root.children[0].children[0];
         // Nothing else to make a line: the marker root is in flow, hanging.
@@ -1624,7 +1735,7 @@ mod tests {
     #[test]
     fn collapses_whitespace_and_splits_blocks() {
         let (doc, styles) = build("<body>  Hello   <b>big</b>\n world <div>block</div> tail  </body>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["Hello big world", "block", "tail"]);
@@ -1633,7 +1744,7 @@ mod tests {
     #[test]
     fn pre_keeps_newlines_and_br_breaks() {
         let (doc, styles) = build("<pre>a\n  b</pre><p>x<br>y</p>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["a\n  b", "x\ny"]);
@@ -1642,7 +1753,7 @@ mod tests {
     #[test]
     fn list_markers() {
         let (doc, styles) = build("<ol start=3><li>a<li value=7>b<li>c</ol><ul><li>d</ul>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["3. ", "a", "7. ", "b", "8. ", "c", "\u{2022} ", "d"]);
@@ -1655,7 +1766,7 @@ mod tests {
              <input type=checkbox checked><input type=radio><select><option>One<option selected>Two</select>\
              <input type=submit><input type=button value='Go'><textarea>text\nhere</textarea><button>Push</button></body>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &() };
+        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
         let root = builder.build_root().expect("root");
         // Controls are inline-level, so they sit in the body's inline
         // root as atomics; visit those too.

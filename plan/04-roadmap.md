@@ -1541,7 +1541,75 @@ Work:
       and CSS-wide keywords, specified and shorthand serialization,
       resolved values, the pair rule on four boxes, the viewport
       propagation six ways, computation with inheritance, the UA control
-      rules), tab (the CSSOM round trip on a fresh element). (5)
+      rules), tab (the CSSOM round trip on a fresh element).
+      **Block 2 done 2026-10-14: layout.** `crates/layout`: a block,
+      flex or control box of an element with `overflow` `auto`, `scroll`
+      or `hidden` in either axis is a scroll container (`Fragment::
+      is_scroll_container`); the element the viewport's `overflow` came
+      from is built with `visible` (`BoxBuilder::viewport_source`,
+      `visible_overflow`, kept by `refresh_styles`), so it neither clips
+      nor scrolls. `LayoutTree` carries a `ScrollInfo` per scroller
+      (`scrollers`, by element) and one for the viewport (`viewport`):
+      padding box, scrollport (the padding box less the gutters; CSS
+      Overflow 3 §4.1), scrollable overflow extent from the scroll origin
+      (§2.2: the scrollport, every descendant box's border box with a
+      clipping descendant contributing its own box only and fixed boxes
+      nothing, flex items' margin boxes, the in-flow children with block
+      children's end margins extended by the scroller's end padding; for
+      the viewport also the root's margin box with the bottom margins
+      collapsed through it per CSS 2.1 §8.3.1), effective overflow per
+      axis, bar presence, gutters, `direction` and the current offset;
+      helpers for the reachable range, clamping, user-scrollable axes,
+      scroll chaining (`can_scroll_by`), the scrolled content box and the
+      scrollbar tracks and corner. Gutters (`ScrollPlan`, `convert.rs`):
+      the thickness by `scrollbar-width` and platform (`scrollbar_
+      thickness`: Windows 17 px, Linux 15 px, macOS overlay 0; `thin`
+      11 px as recalled from Blink), taffy `Overflow::Scroll` on an axis
+      exactly when its gutter exists: always for `scroll`, never for
+      `hidden`, for `auto` after a pass found the axis overflowing (the
+      browsers' second layout: `layout_with_scrolls` and `layout_atomic`
+      lay out, emit fragments, compute the infos, add the gutters found
+      missing (`add_auto_gutters`, never removing one within a layout, as
+      Blink) and repeat, at most four passes); `scrollbar-gutter: stable`
+      keeps the vertical gutter without overflow and `both-edges` mirrors
+      it at the inline-start edge through a second addition to the
+      vendored taffy (`Style::scrollbar_gutter_start`, `03-crates.md`).
+      The viewport is laid out the same way: its gutters are the taffy
+      viewport node's padding (the initial containing block shrinks, as
+      in browsers), its `overflow` the propagated one, its scrollbar
+      properties the root's. A right-to-left scroller has its origin at
+      the scrollport's top-right, its vertical gutter on the left and
+      offsets in `-max..=0`. Offsets live in the tab; `layout_with_
+      scrolls` takes them (and the page offset) and `LayoutTree::set_
+      scroll_offset` applies one without a relayout by translating the
+      scroller's content (fixed boxes stay, nested scrollers' infos
+      follow); `content_width`/`content_height` are the viewport's
+      extent. `hit_test` reaches a scroller's content through its
+      scrollport only; its scrollbars and border are the element.
+      `position: sticky` (CSS Positioned 3 §3.4, `apply_sticky`): after
+      every layout, element scroll or `set_page_scroll`, each sticky box
+      is shifted so its inset edges stay inside its nearest scroll
+      container's scrollport (hidden ones too; the viewport at the page
+      offset) within its containing block's content box (the scrolled
+      content box when the scroller is the containing block), Blink's
+      order for two insets on one axis, percentages against the
+      scrollport, an inline element's fragments shifted together; the
+      previous shift is undone first. Tests: layout (gutter and content
+      width on the second pass, offsets applied, clamped and reported,
+      a fresh layout with offsets matching; `scroll`, `scrollbar-width:
+      none`/`thin`, `scrollbar-gutter: stable`/`both-edges`, `hidden`;
+      the vertical gutter bringing the horizontal bar, end margins and
+      padding, flex margin boxes; right-to-left offsets and the left
+      bar; clipped and fixed content; the page's extent with the body's
+      bottom margin and the viewport gutter narrowing `html`, `body
+      {overflow: hidden}` propagated and the body not clipping, `html
+      {overflow-y: scroll}`; sticky in a scroller against its containing
+      block's end, against the viewport, with `bottom`; hit testing
+      through the scrollport and on the scrollbar; a textarea and an
+      inline-block as scrollers with the gutter inside the atomic's own
+      layout). Paint snapshots unchanged (the `03-floats.png` flake at
+      (136, 175) showed once under the parallel run, verified as the one
+      known pixel and the actual image removed). (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
       `user-select`; (6) `z-index` and `transform`/`transform-origin`
