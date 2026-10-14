@@ -750,15 +750,30 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             TabOutput::Message(TabToShell::Cursor(cursor)) => {
-                let icon = match cursor {
-                    PageCursor::Default => CursorIcon::Default,
-                    PageCursor::Pointer => CursorIcon::Pointer,
-                    PageCursor::Text => CursorIcon::Text,
-                    PageCursor::AllScroll => CursorIcon::AllScroll,
-                };
+                let icon = cursor_icon(cursor);
                 self.tabs[index].cursor = icon;
                 if is_current && let Some(active) = &self.active {
+                    // `cursor: none` hides the pointer over the page.
+                    active.window.set_cursor_visible(cursor != PageCursor::None);
                     active.window.set_cursor(icon);
+                }
+            }
+            TabOutput::Message(TabToShell::CursorImage(image)) => {
+                // A `cursor: url()` image: a custom cursor with its hotspot.
+                let source = winit::window::CustomCursor::from_rgba(
+                    image.rgba,
+                    image.width,
+                    image.height,
+                    image.hotspot.0,
+                    image.hotspot.1,
+                );
+                if let Ok(source) = source
+                    && is_current
+                    && let Some(active) = &self.active
+                {
+                    let cursor = event_loop.create_custom_cursor(source);
+                    active.window.set_cursor_visible(true);
+                    active.window.set_cursor(cursor);
                 }
             }
             TabOutput::Message(TabToShell::OpenInNewTab { url }) => {
@@ -877,12 +892,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let cursor = self.chrome.mouse_move(x, y);
                     let dirty = self.chrome.take_dirty();
                     if let Some(active) = &self.active {
-                        active.window.set_cursor(match cursor {
-                            PageCursor::Text => CursorIcon::Text,
-                            PageCursor::Pointer => CursorIcon::Pointer,
-                            PageCursor::Default => CursorIcon::Default,
-                            PageCursor::AllScroll => CursorIcon::AllScroll,
-                        });
+                        active.window.set_cursor_visible(true);
+                        active.window.set_cursor(cursor_icon(cursor));
                         if dirty {
                             active.window.request_redraw();
                         }
@@ -1143,6 +1154,48 @@ impl ApplicationHandler<UserEvent> for App {
 /// The key the page gets for a key the chrome and the shell's shortcuts
 /// did not take: the named keys it acts on, or the text a key produced
 /// (not with Ctrl or Alt held, which are not text).
+/// The window cursor for a page cursor (CSS `cursor` keywords map one to
+/// one onto the platform cursors winit names; `none` keeps the default
+/// icon and the pointer is hidden instead).
+fn cursor_icon(cursor: PageCursor) -> CursorIcon {
+    match cursor {
+        PageCursor::Default | PageCursor::None => CursorIcon::Default,
+        PageCursor::Pointer => CursorIcon::Pointer,
+        PageCursor::Text => CursorIcon::Text,
+        PageCursor::AllScroll => CursorIcon::AllScroll,
+        PageCursor::ContextMenu => CursorIcon::ContextMenu,
+        PageCursor::Help => CursorIcon::Help,
+        PageCursor::Progress => CursorIcon::Progress,
+        PageCursor::Wait => CursorIcon::Wait,
+        PageCursor::Cell => CursorIcon::Cell,
+        PageCursor::Crosshair => CursorIcon::Crosshair,
+        PageCursor::VerticalText => CursorIcon::VerticalText,
+        PageCursor::Alias => CursorIcon::Alias,
+        PageCursor::Copy => CursorIcon::Copy,
+        PageCursor::Move => CursorIcon::Move,
+        PageCursor::NoDrop => CursorIcon::NoDrop,
+        PageCursor::NotAllowed => CursorIcon::NotAllowed,
+        PageCursor::Grab => CursorIcon::Grab,
+        PageCursor::Grabbing => CursorIcon::Grabbing,
+        PageCursor::EResize => CursorIcon::EResize,
+        PageCursor::NResize => CursorIcon::NResize,
+        PageCursor::NeResize => CursorIcon::NeResize,
+        PageCursor::NwResize => CursorIcon::NwResize,
+        PageCursor::SResize => CursorIcon::SResize,
+        PageCursor::SeResize => CursorIcon::SeResize,
+        PageCursor::SwResize => CursorIcon::SwResize,
+        PageCursor::WResize => CursorIcon::WResize,
+        PageCursor::EwResize => CursorIcon::EwResize,
+        PageCursor::NsResize => CursorIcon::NsResize,
+        PageCursor::NeswResize => CursorIcon::NeswResize,
+        PageCursor::NwseResize => CursorIcon::NwseResize,
+        PageCursor::ColResize => CursorIcon::ColResize,
+        PageCursor::RowResize => CursorIcon::RowResize,
+        PageCursor::ZoomIn => CursorIcon::ZoomIn,
+        PageCursor::ZoomOut => CursorIcon::ZoomOut,
+    }
+}
+
 fn page_key(key: &Key, text: Option<&str>, ctrl: bool, alt: bool, shift: bool) -> Option<PageKey> {
     match key {
         Key::Named(NamedKey::ContextMenu) => Some(PageKey::ContextMenu),

@@ -888,6 +888,288 @@ impl BoxDecorationBreak {
     }
 }
 
+// ----- box-shadow, outline, cursor, pointer-events, user-select (4a block 5) -----
+
+/// One `box-shadow` as written (CSS Backgrounds 3 §7): `inset?`, the
+/// offsets, the blur radius and the spread distance (the last two
+/// optional), and a colour (`currentcolor` when left out).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxShadow {
+    pub inset: bool,
+    pub x: Length,
+    pub y: Length,
+    pub blur: Option<Length>,
+    pub spread: Option<Length>,
+    pub color: Option<Color>,
+}
+
+impl BoxShadow {
+    /// Serialized as Chrome does: the colour first when written, then the
+    /// lengths written, `inset` last.
+    pub fn to_css(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(c) = self.color {
+            parts.push(c.to_css());
+        }
+        parts.push(self.x.to_css());
+        parts.push(self.y.to_css());
+        if let Some(b) = self.blur {
+            parts.push(b.to_css());
+        }
+        if let Some(s) = self.spread {
+            parts.push(s.to_css());
+        }
+        if self.inset {
+            parts.push("inset".to_owned());
+        }
+        parts.join(" ")
+    }
+}
+
+/// A computed `box-shadow`: every length in px, the colour resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComputedBoxShadow {
+    pub inset: bool,
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Rgba,
+}
+
+impl ComputedBoxShadow {
+    /// The resolved value as Chrome gives it: `rgb() x y blur spread
+    /// [inset]`.
+    pub fn to_css(&self) -> String {
+        let mut s = format!(
+            "{} {}px {}px {}px {}px",
+            self.color.to_css(),
+            css_number(self.x),
+            css_number(self.y),
+            css_number(self.blur),
+            css_number(self.spread)
+        );
+        if self.inset {
+            s.push_str(" inset");
+        }
+        s
+    }
+}
+
+/// `outline-style` (CSS Basic UI 4 §4.2): the border styles plus `auto`,
+/// the platform focus ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutlineStyle {
+    #[default]
+    None,
+    Auto,
+    Border(BorderStyle),
+}
+
+impl OutlineStyle {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            OutlineStyle::None => "none",
+            OutlineStyle::Auto => "auto",
+            OutlineStyle::Border(b) => b.keyword(),
+        }
+    }
+
+    pub fn is_visible(self) -> bool {
+        !matches!(self, OutlineStyle::None | OutlineStyle::Border(BorderStyle::None | BorderStyle::Hidden))
+    }
+}
+
+/// `cursor` keywords (CSS Basic UI 4 §8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorKeyword {
+    #[default]
+    Auto,
+    Default,
+    None,
+    ContextMenu,
+    Help,
+    Pointer,
+    Progress,
+    Wait,
+    Cell,
+    Crosshair,
+    Text,
+    VerticalText,
+    Alias,
+    Copy,
+    Move,
+    NoDrop,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    EResize,
+    NResize,
+    NeResize,
+    NwResize,
+    SResize,
+    SeResize,
+    SwResize,
+    WResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ColResize,
+    RowResize,
+    AllScroll,
+    ZoomIn,
+    ZoomOut,
+}
+
+impl CursorKeyword {
+    pub const ALL: &'static [(&'static str, CursorKeyword)] = &[
+        ("auto", CursorKeyword::Auto),
+        ("default", CursorKeyword::Default),
+        ("none", CursorKeyword::None),
+        ("context-menu", CursorKeyword::ContextMenu),
+        ("help", CursorKeyword::Help),
+        ("pointer", CursorKeyword::Pointer),
+        ("progress", CursorKeyword::Progress),
+        ("wait", CursorKeyword::Wait),
+        ("cell", CursorKeyword::Cell),
+        ("crosshair", CursorKeyword::Crosshair),
+        ("text", CursorKeyword::Text),
+        ("vertical-text", CursorKeyword::VerticalText),
+        ("alias", CursorKeyword::Alias),
+        ("copy", CursorKeyword::Copy),
+        ("move", CursorKeyword::Move),
+        ("no-drop", CursorKeyword::NoDrop),
+        ("not-allowed", CursorKeyword::NotAllowed),
+        ("grab", CursorKeyword::Grab),
+        ("grabbing", CursorKeyword::Grabbing),
+        ("e-resize", CursorKeyword::EResize),
+        ("n-resize", CursorKeyword::NResize),
+        ("ne-resize", CursorKeyword::NeResize),
+        ("nw-resize", CursorKeyword::NwResize),
+        ("s-resize", CursorKeyword::SResize),
+        ("se-resize", CursorKeyword::SeResize),
+        ("sw-resize", CursorKeyword::SwResize),
+        ("w-resize", CursorKeyword::WResize),
+        ("ew-resize", CursorKeyword::EwResize),
+        ("ns-resize", CursorKeyword::NsResize),
+        ("nesw-resize", CursorKeyword::NeswResize),
+        ("nwse-resize", CursorKeyword::NwseResize),
+        ("col-resize", CursorKeyword::ColResize),
+        ("row-resize", CursorKeyword::RowResize),
+        ("all-scroll", CursorKeyword::AllScroll),
+        ("zoom-in", CursorKeyword::ZoomIn),
+        ("zoom-out", CursorKeyword::ZoomOut),
+    ];
+
+    pub fn keyword(self) -> &'static str {
+        Self::ALL.iter().find(|(_, k)| *k == self).map_or("auto", |(n, _)| n)
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        let lower = name.to_ascii_lowercase();
+        // The `-webkit-` legacy names Chrome still takes.
+        let lower = match lower.as_str() {
+            "-webkit-grab" => "grab",
+            "-webkit-grabbing" => "grabbing",
+            "-webkit-zoom-in" => "zoom-in",
+            "-webkit-zoom-out" => "zoom-out",
+            other => other,
+        };
+        Self::ALL.iter().find(|(n, _)| *n == lower).map(|(_, k)| *k)
+    }
+}
+
+/// `cursor`: image cursors with their hotspots, then the keyword used
+/// when none of the images loads (CSS Basic UI 4 §8.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorValue {
+    pub images: Vec<CursorImage>,
+    pub keyword: CursorKeyword,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorImage {
+    pub url: Arc<str>,
+    pub hotspot: Option<(f32, f32)>,
+}
+
+impl CursorValue {
+    pub fn to_css(&self) -> String {
+        let mut parts: Vec<String> = self
+            .images
+            .iter()
+            .map(|i| match i.hotspot {
+                Some((x, y)) => format!("{} {} {}", css_url(&i.url), css_number(x), css_number(y)),
+                None => css_url(&i.url),
+            })
+            .collect();
+        parts.push(self.keyword.keyword().to_owned());
+        parts.join(", ")
+    }
+}
+
+/// `pointer-events` (CSS Basic UI 4 / SVG 2): for HTML content `none`
+/// lets events through to what is below; every other value acts as
+/// `auto`, as it does in browsers for non-SVG boxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PointerEvents {
+    #[default]
+    Auto,
+    None,
+    VisiblePainted,
+    VisibleFill,
+    VisibleStroke,
+    Visible,
+    Painted,
+    Fill,
+    Stroke,
+    BoundingBox,
+    All,
+}
+
+impl PointerEvents {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            PointerEvents::Auto => "auto",
+            PointerEvents::None => "none",
+            PointerEvents::VisiblePainted => "visiblePainted",
+            PointerEvents::VisibleFill => "visibleFill",
+            PointerEvents::VisibleStroke => "visibleStroke",
+            PointerEvents::Visible => "visible",
+            PointerEvents::Painted => "painted",
+            PointerEvents::Fill => "fill",
+            PointerEvents::Stroke => "stroke",
+            PointerEvents::BoundingBox => "bounding-box",
+            PointerEvents::All => "all",
+        }
+    }
+}
+
+/// `user-select` (CSS Basic UI 4 §7.1), as written; `auto` resolves per
+/// element in the tab (its used value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserSelect {
+    #[default]
+    Auto,
+    Text,
+    None,
+    Contain,
+    All,
+}
+
+impl UserSelect {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            UserSelect::Auto => "auto",
+            UserSelect::Text => "text",
+            UserSelect::None => "none",
+            UserSelect::Contain => "contain",
+            UserSelect::All => "all",
+        }
+    }
+}
+
 // ----- scroll container properties (roadmap 4a (4s)) -----
 
 /// `scrollbar-width` (CSS Scrollbars 1 §3): the thickness of a scroll
@@ -1995,6 +2277,14 @@ longhands! {
     ScrollSnapAlign: "scroll-snap-align" => ScrollSnapAlign, false;
     ScrollSnapStop: "scroll-snap-stop" => ScrollSnapStop, false;
     OverflowAnchor: "overflow-anchor" => OverflowAnchor, false;
+    BoxShadow: "box-shadow" => Vec<BoxShadow>, false;
+    OutlineWidth: "outline-width" => BorderWidth, false;
+    OutlineStyle: "outline-style" => OutlineStyle, false;
+    OutlineColor: "outline-color" => Color, false;
+    OutlineOffset: "outline-offset" => Length, false;
+    Cursor: "cursor" => CursorValue, true;
+    PointerEvents: "pointer-events" => PointerEvents, true;
+    UserSelect: "user-select" => UserSelect, false;
 }
 
 /// The declared value of a custom property.
@@ -2079,7 +2369,9 @@ pub fn is_shorthand(name: &str) -> bool {
 /// `-webkit-background-*` names are the legacy aliases of `gap`,
 /// `overflow-wrap`, `box-decoration-break`, `background-clip`,
 /// `background-origin` and `background-size`, never written).
-pub const SHORTHANDS: [&str; 32] = [
+pub const SHORTHANDS: [&str; 34] = [
+    "outline",
+    "-webkit-user-select",
     "border",
     "border-width",
     "border-style",
@@ -2316,7 +2608,126 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "normal" => ScrollSnapStop::Normal, "always" => ScrollSnapStop::Always, _ => return None }))?),
         PropertyId::OverflowAnchor => P::OverflowAnchor(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "auto" => OverflowAnchor::Auto, "none" => OverflowAnchor::None, _ => return None }))?),
+        PropertyId::BoxShadow => P::BoxShadow(parse_box_shadow_list(input)?),
+        PropertyId::OutlineWidth => P::OutlineWidth(parse_border_width(input)?),
+        PropertyId::OutlineStyle => P::OutlineStyle(parse_outline_style(input)?),
+        PropertyId::OutlineColor => P::OutlineColor(parse_outline_color(input)?),
+        PropertyId::OutlineOffset => P::OutlineOffset(parse_length(input)?),
+        PropertyId::Cursor => P::Cursor(parse_cursor(input)?),
+        PropertyId::PointerEvents => P::PointerEvents(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "auto" => PointerEvents::Auto, "none" => PointerEvents::None, "visiblepainted" => PointerEvents::VisiblePainted,
+            "visiblefill" => PointerEvents::VisibleFill, "visiblestroke" => PointerEvents::VisibleStroke,
+            "visible" => PointerEvents::Visible, "painted" => PointerEvents::Painted, "fill" => PointerEvents::Fill,
+            "stroke" => PointerEvents::Stroke, "bounding-box" => PointerEvents::BoundingBox, "all" => PointerEvents::All,
+            _ => return None }))?),
+        PropertyId::UserSelect => P::UserSelect(parse_user_select(input)?),
     })
+}
+
+// ----- box-shadow, outline, cursor, user-select parsers -----
+
+/// `none | <shadow>#`, a shadow being `inset? && <length>{2,4} &&
+/// <color>?` in any order.
+fn parse_box_shadow_list<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<BoxShadow>, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+        return Ok(Vec::new());
+    }
+    input.parse_comma_separated(parse_box_shadow)
+}
+
+fn parse_box_shadow<'i>(input: &mut Parser<'i, '_>) -> Result<BoxShadow, ParseErr<'i>> {
+    let mut inset = false;
+    let mut lengths: Vec<Length> = Vec::new();
+    let mut color = None;
+    loop {
+        if !inset && input.try_parse(|i| i.expect_ident_matching("inset")).is_ok() {
+            inset = true;
+            continue;
+        }
+        if lengths.is_empty()
+            && let Ok(l) = input.try_parse(parse_length)
+        {
+            lengths.push(l);
+            while lengths.len() < 4 {
+                match input.try_parse(parse_length) {
+                    Ok(l) => lengths.push(l),
+                    Err(_) => break,
+                }
+            }
+            continue;
+        }
+        if color.is_none()
+            && let Ok(c) = input.try_parse(parse_color)
+        {
+            color = Some(c);
+            continue;
+        }
+        break;
+    }
+    if lengths.len() < 2 {
+        return Err(input.new_custom_error(()));
+    }
+    // A negative blur radius is invalid.
+    if lengths.get(2).is_some_and(|b| b.parts().0 < 0.0) {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(BoxShadow {
+        inset,
+        x: lengths[0],
+        y: lengths[1],
+        blur: lengths.get(2).copied(),
+        spread: lengths.get(3).copied(),
+        color,
+    })
+}
+
+fn parse_outline_style<'i>(input: &mut Parser<'i, '_>) -> Result<OutlineStyle, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        return Ok(OutlineStyle::Auto);
+    }
+    let b = parse_border_style(input)?;
+    // `hidden` is a border style only.
+    if b == BorderStyle::Hidden {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(if b == BorderStyle::None { OutlineStyle::None } else { OutlineStyle::Border(b) })
+}
+
+/// A colour, or `invert` (CSS Basic UI 4 §4.1), which Chrome and Firefox
+/// treat as `currentcolor`... as the spec allows UAs that cannot invert.
+fn parse_outline_color<'i>(input: &mut Parser<'i, '_>) -> Result<Color, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("invert")).is_ok() {
+        return Ok(Color::CurrentColor);
+    }
+    parse_color(input)
+}
+
+/// `[ <url> [<x> <y>]? , ]* <keyword>`.
+fn parse_cursor<'i>(input: &mut Parser<'i, '_>) -> Result<CursorValue, ParseErr<'i>> {
+    let mut images = Vec::new();
+    loop {
+        let url = input.try_parse(|i| i.expect_url().map(|u| u.to_string()));
+        let Ok(url) = url else { break };
+        let hotspot = match input.try_parse(parse_number) {
+            Ok(x) => Some((x, parse_number(input)?)),
+            Err(_) => None,
+        };
+        images.push(CursorImage {
+            url: Arc::from(url.as_str()),
+            hotspot,
+        });
+        input.expect_comma()?;
+    }
+    let location = input.current_source_location();
+    let ident = input.expect_ident()?.clone();
+    let keyword = CursorKeyword::parse(&ident).ok_or_else(|| location.new_unexpected_token_error(Token::Ident(ident)))?;
+    Ok(CursorValue { images, keyword })
+}
+
+fn parse_user_select<'i>(input: &mut Parser<'i, '_>) -> Result<UserSelect, ParseErr<'i>> {
+    keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "auto" => UserSelect::Auto, "text" => UserSelect::Text, "none" => UserSelect::None,
+        "contain" => UserSelect::Contain, "all" => UserSelect::All, _ => return None }))
 }
 
 // ----- scroll container property parsers -----
@@ -2997,6 +3408,8 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "margin" => &[MarginTop, MarginRight, MarginBottom, MarginLeft],
         "padding" => &[PaddingTop, PaddingRight, PaddingBottom, PaddingLeft],
         "inset" => &[Top, Right, Bottom, Left],
+        "outline" => &[OutlineWidth, OutlineStyle, OutlineColor],
+        "-webkit-user-select" => &[UserSelect],
         "scroll-margin" => &[ScrollMarginTop, ScrollMarginRight, ScrollMarginBottom, ScrollMarginLeft],
         "scroll-padding" => &[ScrollPaddingTop, ScrollPaddingRight, ScrollPaddingBottom, ScrollPaddingLeft],
         "overscroll-behavior" => &[OverscrollBehaviorX, OverscrollBehaviorY],
@@ -3047,6 +3460,35 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
             let s = parse_sides(input, parse_length_percentage_auto)?;
             vec![P::Top(s.top), P::Right(s.right), P::Bottom(s.bottom), P::Left(s.left)]
         },
+        "outline" => {
+            // <width> || <style> || <color>, each at most once; the parts
+            // left out are initial (medium, none, currentcolor).
+            let mut width = None;
+            let mut style = None;
+            let mut color = None;
+            let mut any = false;
+            for _ in 0..3 {
+                if width.is_none() && let Ok(w) = input.try_parse(parse_border_width) {
+                    width = Some(w);
+                    any = true;
+                } else if style.is_none() && let Ok(s) = input.try_parse(parse_outline_style) {
+                    style = Some(s);
+                    any = true;
+                } else if color.is_none() && let Ok(c) = input.try_parse(parse_outline_color) {
+                    color = Some(c);
+                    any = true;
+                } else {
+                    break;
+                }
+            }
+            if !any { return Err(input.new_custom_error(())); }
+            vec![
+                P::OutlineWidth(width.unwrap_or(BorderWidth::Medium)),
+                P::OutlineStyle(style.unwrap_or(OutlineStyle::None)),
+                P::OutlineColor(color.unwrap_or(Color::CurrentColor)),
+            ]
+        },
+        "-webkit-user-select" => vec![P::UserSelect(parse_user_select(input)?)],
         "scroll-margin" => {
             let s = parse_sides(input, parse_scroll_margin)?;
             vec![P::ScrollMarginTop(s.top), P::ScrollMarginRight(s.right), P::ScrollMarginBottom(s.bottom), P::ScrollMarginLeft(s.left)]
@@ -3800,6 +4242,57 @@ mod tests {
         assert_eq!(one("overflow-anchor", "none"), Some(D::Value(P::OverflowAnchor(OverflowAnchor::None))));
         assert_eq!(one("overflow-anchor", "auto"), Some(D::Value(P::OverflowAnchor(OverflowAnchor::Auto))));
         assert_eq!(one("overflow-anchor", "always"), None);
+    }
+
+    #[test]
+    fn box_shadow_outline_cursor_pointer_events_user_select() {
+        let one = |name: &str, s: &str| parse(name, s).pop();
+        use DeclaredValue as D;
+        use PropertyDeclaration as P;
+        let shadows = |s: &str| match one("box-shadow", s) {
+            Some(D::Value(P::BoxShadow(v))) => Some(v),
+            _ => None,
+        };
+        assert_eq!(shadows("none").map(|v| v.len()), Some(0));
+        let v = shadows("inset 1px 2px 3px 4px red, 0 0 blue").expect("two shadows");
+        assert_eq!(v.len(), 2);
+        assert!(v[0].inset && v[0].blur == Some(Length::Px(3.0)) && v[0].spread == Some(Length::Px(4.0)) && v[0].color.is_some());
+        assert!(!v[1].inset && v[1].blur.is_none());
+        assert_eq!(shadows("red 1px 2px inset").map(|v| v[0].inset), Some(true), "any order");
+        assert!(shadows("1px").is_none(), "two lengths at least");
+        assert!(shadows("1px 1px -1px").is_none(), "no negative blur");
+        assert!(shadows("1px 1px 1px 1px 1px").is_none());
+        assert!(shadows("inset inset 1px 1px").is_none());
+        // outline
+        assert_eq!(one("outline-style", "auto"), Some(D::Value(P::OutlineStyle(OutlineStyle::Auto))));
+        assert_eq!(one("outline-style", "dotted"), Some(D::Value(P::OutlineStyle(OutlineStyle::Border(BorderStyle::Dotted)))));
+        assert_eq!(one("outline-style", "hidden"), None);
+        assert_eq!(one("outline-color", "invert"), Some(D::Value(P::OutlineColor(Color::CurrentColor))));
+        assert_eq!(one("outline-offset", "-2px"), Some(D::Value(P::OutlineOffset(Length::Px(-2.0)))));
+        assert_eq!(parse("outline", "thin dashed red").len(), 3);
+        assert_eq!(parse("outline", "auto").len(), 3);
+        assert!(parse("outline", "1px 2px").is_empty());
+        assert_eq!(longhands_of("outline"), Some(vec![PropertyId::OutlineWidth, PropertyId::OutlineStyle, PropertyId::OutlineColor]));
+        // cursor
+        let cursor = |s: &str| match one("cursor", s) {
+            Some(D::Value(P::Cursor(c))) => Some(c),
+            _ => None,
+        };
+        assert_eq!(cursor("pointer").map(|c| c.keyword), Some(CursorKeyword::Pointer));
+        assert_eq!(cursor("-webkit-grab").map(|c| c.keyword), Some(CursorKeyword::Grab));
+        let c = cursor("url(a.cur) 2 3, url(b.png), move").expect("images");
+        assert_eq!(c.images.len(), 2);
+        assert_eq!(c.images[0].hotspot, Some((2.0, 3.0)));
+        assert_eq!(c.keyword, CursorKeyword::Move);
+        assert!(cursor("url(a.cur)").is_none(), "a keyword must end the list");
+        assert!(cursor("hand").is_none());
+        assert!(PropertyId::Cursor.is_inherited() && PropertyId::PointerEvents.is_inherited() && !PropertyId::UserSelect.is_inherited());
+        // pointer-events, user-select and its prefixed alias
+        assert_eq!(one("pointer-events", "none"), Some(D::Value(P::PointerEvents(PointerEvents::None))));
+        assert_eq!(one("pointer-events", "visiblePainted"), Some(D::Value(P::PointerEvents(PointerEvents::VisiblePainted))));
+        assert_eq!(one("user-select", "contain"), Some(D::Value(P::UserSelect(UserSelect::Contain))));
+        assert_eq!(parse("-webkit-user-select", "none"), vec![D::Value(P::UserSelect(UserSelect::None))]);
+        assert_eq!(one("user-select", "element"), None);
     }
 
     #[test]

@@ -1984,6 +1984,7 @@ fn emit_marker(
             skew: synthesis.skew(),
             decorations: Vec::new(),
             baseline,
+            selectable: style.user_select_used != browser_style::UserSelect::None,
         };
         let mut fragment = Fragment {
             rect: Rect::new(ox + x0, oy, run.advance(), line_height),
@@ -2153,6 +2154,7 @@ fn emit_text_fragments(
                             skew: synthesis.skew(),
                             decorations: Vec::new(),
                             baseline,
+                            selectable: span_style.user_select_used != browser_style::UserSelect::None,
                         };
                         let fragment = Fragment {
                             rect: Rect::new(0.0, oy + line_top, x1 - x0, line_height),

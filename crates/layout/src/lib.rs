@@ -528,6 +528,10 @@ pub struct TextFragment {
     pub decorations: Vec<Decoration>,
     /// Baseline y relative to the fragment's top.
     pub baseline: f32,
+    /// Whether the text can be selected (the element's used
+    /// `user-select` is not `none`): unselectable text is skipped by
+    /// pointer selection, select-all, find and copy.
+    pub selectable: bool,
 }
 
 /// A form control the painter draws something particular for, beyond
@@ -783,7 +787,9 @@ impl LayoutTree {
         }
         fn visit(f: &Fragment, x: f32, y: f32, best: &mut Option<NodeId>, scrollers: &HashMap<NodeId, ScrollInfo>) {
             let inside = f.rect.contains(x, y);
-            if inside && f.node.is_some() {
+            // `pointer-events: none`: the box is not hit; what it contains
+            // still is where it says otherwise (the value inherits).
+            if inside && f.node.is_some() && f.style.pointer_events != browser_style::PointerEvents::None {
                 *best = f.node;
             }
             if let Some(info) = f.node.filter(|_| f.is_scroll_container()).and_then(|n| scrollers.get(&n)) {

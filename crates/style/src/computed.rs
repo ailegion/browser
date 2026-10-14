@@ -238,6 +238,21 @@ pub struct ComputedStyle {
     pub scroll_snap_align: ScrollSnapAlign,
     pub scroll_snap_stop: ScrollSnapStop,
     pub overflow_anchor: OverflowAnchor,
+    /// 4a block 5.
+    pub box_shadow: Vec<ComputedBoxShadow>,
+    /// Outline width in px (0 when the style is `none`), style, colour,
+    /// offset.
+    pub outline_width: f32,
+    pub outline_style: OutlineStyle,
+    pub outline_color: Rgba,
+    pub outline_offset: f32,
+    pub cursor: CursorValue,
+    pub pointer_events: PointerEvents,
+    pub user_select: UserSelect,
+    /// The used `user-select` (CSS Basic UI 4 §7.1): `auto` is `all` or
+    /// `none` under a parent whose used value is that, else `text`; never
+    /// `auto`.
+    pub user_select_used: UserSelect,
     /// Custom properties in effect, inherited; shared with the parent when
     /// this element declares none.
     pub custom: Arc<CustomMap>,
@@ -416,6 +431,18 @@ impl ComputedStyle {
             scroll_snap_align: ScrollSnapAlign::default(),
             scroll_snap_stop: ScrollSnapStop::Normal,
             overflow_anchor: OverflowAnchor::Auto,
+            box_shadow: Vec::new(),
+            outline_width: 0.0,
+            outline_style: OutlineStyle::None,
+            outline_color: Rgba::BLACK,
+            outline_offset: 0.0,
+            cursor: CursorValue {
+                images: Vec::new(),
+                keyword: CursorKeyword::Auto,
+            },
+            pointer_events: PointerEvents::Auto,
+            user_select: UserSelect::Auto,
+            user_select_used: UserSelect::Text,
             custom: Arc::new(CustomMap::new()),
         }
     }
@@ -452,6 +479,14 @@ impl ComputedStyle {
         self.text_underline_offset = p.text_underline_offset;
         self.text_decoration_skip_ink = p.text_decoration_skip_ink;
         self.scrollbar_color = p.scrollbar_color;
+        self.cursor = p.cursor.clone();
+        self.pointer_events = p.pointer_events;
+        // Not inherited, but `auto` resolves through the parent's used value.
+        self.user_select_used = match p.user_select_used {
+            UserSelect::All => UserSelect::All,
+            UserSelect::None => UserSelect::None,
+            _ => UserSelect::Text,
+        };
         self.custom = p.custom.clone();
         // Not inherited by spec, but the decorating boxes' lines reach
         // every in-flow descendant's text, anonymous boxes included.
@@ -1013,6 +1048,45 @@ pub fn compute(
     pick!(scroll_snap_align, ScrollSnapAlign, ScrollSnapAlign, |v| *v);
     pick!(scroll_snap_stop, ScrollSnapStop, ScrollSnapStop, |v| *v);
     pick!(overflow_anchor, OverflowAnchor, OverflowAnchor, |v| *v);
+
+    pick!(box_shadow, BoxShadow, BoxShadow, |v| v
+        .iter()
+        .map(|s| ComputedBoxShadow {
+            inset: s.inset,
+            x: s.x.to_px(&ctx),
+            y: s.y.to_px(&ctx),
+            blur: s.blur.map_or(0.0, |b| b.to_px(&ctx).max(0.0)),
+            spread: s.spread.map_or(0.0, |b| b.to_px(&ctx)),
+            color: s.color.map_or(current, |c| c.resolve(current)),
+        })
+        .collect());
+    pick!(outline_style, OutlineStyle, OutlineStyle, |v| *v);
+    // The outline width is 0 when the style is `none`, as a border's is.
+    out.outline_width = if out.outline_style.is_visible() {
+        match resolve(decls, PropertyId::OutlineWidth) {
+            Resolved::Specified(PropertyDeclaration::OutlineWidth(w)) => bw(w),
+            Resolved::Inherit => parent.outline_width,
+            _ => 3.0,
+        }
+    } else {
+        0.0
+    };
+    pick!(outline_color, OutlineColor, OutlineColor, |v| v.resolve(current));
+    if matches!(resolve(decls, PropertyId::OutlineColor), Resolved::Initial) {
+        out.outline_color = current;
+    }
+    pick!(outline_offset, OutlineOffset, OutlineOffset, |v| v.to_px(&ctx));
+    pick!(cursor, Cursor, Cursor, |v| v.clone());
+    pick!(pointer_events, PointerEvents, PointerEvents, |v| *v);
+    pick!(user_select, UserSelect, UserSelect, |v| *v);
+    out.user_select_used = match out.user_select {
+        UserSelect::Auto => match parent.user_select_used {
+            UserSelect::All => UserSelect::All,
+            UserSelect::None => UserSelect::None,
+            _ => UserSelect::Text,
+        },
+        v => v,
+    };
 
     // Display fixups (CSS Display 3, "blockification").
     if is_root && !out.display.is_none() {

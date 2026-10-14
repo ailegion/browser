@@ -24,7 +24,8 @@ use browser_style::{
     BackgroundAttachment, BackgroundBox, BlendMode, BorderStyle, BoxDecorationBreak, ColorInterpolation,
     ComputedBackgroundSize, ComputedGradient, ComputedGradientItem, ComputedGradientPos, ComputedGradientShape,
     ComputedImage, ComputedLp, ComputedLpAuto, ComputedRadialSize, ComputedStyle, HueMethod, InterpolationSpace,
-    LinearDirection, PositionEdge, PositionOffset, RadialShape, Rgba, ScrollbarColor, TextDecorationStyle, Visibility,
+    LinearDirection, OutlineStyle, PositionEdge, PositionOffset, RadialShape, Rgba, ScrollbarColor, TextDecorationStyle,
+    Visibility,
 };
 use vello::peniko::color::{ColorSpaceTag, DynamicColor, HueDirection};
 use skrifa::instance::{LocationRef, NormalizedCoord, Size as FontSize};
@@ -168,9 +169,6 @@ pub struct PaintOptions {
     /// Find-in-page matches, and the current one, drawn over the selection.
     pub matches: SelectionRanges,
     pub current_match: SelectionRanges,
-    /// Page rectangles to draw the keyboard focus ring around, over
-    /// everything else.
-    pub focus_ring: Vec<Rect>,
     /// The text caret of the focused control, in page coordinates.
     pub caret: Option<Rect>,
     /// The IME's composition text in the focused control, underlined.
@@ -182,14 +180,10 @@ pub struct PaintOptions {
     pub scrollbar_pressed: Option<(NodeId, bool, ScrollbarPart)>,
 }
 
-/// The keyboard focus ring.
-const FOCUS_RING: Color = Color::from_rgb8(0x1a, 0x5f, 0xd6);
 /// Controls: the border, the fill of a checked box, and the marks.
 const CONTROL_BORDER: Color = Color::from_rgb8(0x76, 0x76, 0x76);
 const CONTROL_ON: Color = Color::from_rgb8(0x1a, 0x5f, 0xd6);
 const CONTROL_MARK: Color = Color::from_rgb8(0x30, 0x30, 0x38);
-const FOCUS_RING_WIDTH: f64 = 2.0;
-const FOCUS_RING_OFFSET: f64 = 1.0;
 
 /// Behind selected text.
 const SELECTION: Color = Color::from_rgb8(0xb4, 0xd5, 0xfe);
@@ -267,6 +261,7 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         scrollbar_pressed: options.scrollbar_pressed,
         clip_depth: 0,
         deferred_fixed: Vec::new(),
+        outlines: Vec::new(),
     };
     if let (Some(h), Some(style)) = (html, &canvas_layers) {
         painter.canvas_layers(style, h);
@@ -275,13 +270,13 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         painter.fragment(html);
     }
     painter.paint_deferred_fixed();
+    // Outlines come after all content (Blink's outline phase), so a box's
+    // outline is not covered by what follows it.
+    painter.paint_outlines();
     if let Some(c) = &options.caret {
         painter
             .scene
             .fill(Fill::NonZero, painter.transform, CONTROL_MARK, None, &krect(c));
-    }
-    for r in &options.focus_ring {
-        painter.focus_ring(r);
     }
 }
 
@@ -310,6 +305,10 @@ struct Painter<'a> {
     /// `deferred_fixed` and paints once the outermost clip is closed.
     clip_depth: usize,
     deferred_fixed: Vec<&'a Fragment>,
+    /// The boxes with an outline, by element, with every fragment's
+    /// border box (an inline element has one per line): painted after
+    /// everything else.
+    outlines: Vec<(NodeId, Arc<ComputedStyle>, Vec<Rect>)>,
 }
 
 fn color(c: Rgba) -> Color {
@@ -366,6 +365,17 @@ impl<'a> Painter<'a> {
                 .push_layer(Fill::NonZero, Mix::Normal, opacity, self.transform, &krect(&f.rect));
         }
 
+        // An element's box: outer shadows under it, inset shadows over
+        // its background, its outline later.
+        let own_box = f.node.is_some()
+            && matches!(f.content, FragmentContent::Box | FragmentContent::Control(_) | FragmentContent::Image(_) | FragmentContent::Inline { .. });
+        let sides = match &f.content {
+            FragmentContent::Inline { left, right, .. } => [true, *right, true, *left],
+            _ => ALL_SIDES,
+        };
+        if own_box && !f.style.box_shadow.is_empty() {
+            self.box_shadows(f, sides, false);
+        }
         match &f.content {
             FragmentContent::Box => {
                 if !offscreen && !f.node.is_some_and(|n| self.skip_background_of.contains(&n)) {
@@ -396,11 +406,22 @@ impl<'a> Painter<'a> {
             // edges it carries (the top and bottom on every fragment, the
             // left and right where the element starts and ends; CSS 2.1
             // §9.4.2). Corners at a missing side have no radius.
-            FragmentContent::Inline { left, right, .. } => {
+            FragmentContent::Inline { .. } => {
                 if !offscreen {
-                    let sides = [true, *right, true, *left];
                     self.background_and_border(f, sides);
                 }
+            }
+        }
+        if own_box && !f.style.box_shadow.is_empty() {
+            self.box_shadows(f, sides, true);
+        }
+        if own_box
+            && f.style.outline_style.is_visible()
+            && let Some(n) = f.node
+        {
+            match self.outlines.iter_mut().find(|(node, _, _)| *node == n) {
+                Some((_, _, rects)) => rects.push(f.rect),
+                None => self.outlines.push((n, f.style.clone(), vec![f.rect])),
             }
         }
 
@@ -692,11 +713,17 @@ impl<'a> Painter<'a> {
     /// the lines from each outer corner to the matching inner corner), so
     /// sides of different colours meet along the corner diagonal.
     fn border_with(&mut self, g: &BoxGeometry, style: &ComputedStyle) {
+        let styles = [style.border_style.top, style.border_style.right, style.border_style.bottom, style.border_style.left];
+        let colors = [style.border_color.top, style.border_color.right, style.border_color.bottom, style.border_color.left];
+        self.ring_with(g, styles, colors);
+    }
+
+    /// A ring of four sides in the given styles and colours (borders and
+    /// outlines alike).
+    fn ring_with(&mut self, g: &BoxGeometry, styles: [BorderStyle; 4], colors: [Rgba; 4]) {
         if g.width.iter().all(|w| *w <= 0.0) {
             return;
         }
-        let styles = [style.border_style.top, style.border_style.right, style.border_style.bottom, style.border_style.left];
-        let colors = [style.border_color.top, style.border_color.right, style.border_color.bottom, style.border_color.left];
         let outer = g.outer_path();
         let inner = g.inset_path(g.width);
         let drawn = |i: usize| g.width[i] > 0.0 && styles[i].is_visible() && !colors[i].is_transparent();
@@ -873,15 +900,274 @@ impl<'a> Painter<'a> {
     }
 
     /// A rounded outline just outside `rect`.
-    fn focus_ring(&mut self, rect: &Rect) {
-        if !intersects(rect, &self.visible) {
+    /// The `box-shadow`s of a box (CSS Backgrounds 3 §7), outer ones
+    /// (`inset == false`) or inset ones, the last layer first. An outer
+    /// shadow is the border box moved by the offsets and grown by the
+    /// spread (its radii adjusted per §7.1), blurred by a Gaussian of
+    /// half the blur radius, drawn outside the border box only; an inset
+    /// shadow fills the padding box outside the shrunk, moved padding
+    /// box, blurred, inside the padding box only.
+    fn box_shadows(&mut self, f: &Fragment, sides: [bool; 4], inset: bool) {
+        let style = &f.style;
+        let g = BoxGeometry::new(&f.rect, style, sides);
+        let t = self.transform;
+        for s in style.box_shadow.iter().rev().filter(|s| s.inset == inset) {
+            if s.color.is_transparent() {
+                continue;
+            }
+            let sigma = f64::from(s.blur) / 2.0;
+            let (base, base_radii) = if inset { (g.inset_rect(g.width), g.inset_radii(g.width)) } else { (g.rect, g.radii) };
+            let spread = f64::from(s.spread) * if inset { -1.0 } else { 1.0 };
+            let shape = base.inflate(spread, spread) + vello::kurbo::Vec2::new(f64::from(s.x), f64::from(s.y));
+            let radii = base_radii.map(|(rx, ry)| (spread_radius(rx, spread), spread_radius(ry, spread)));
+            if inset {
+                // Inside the padding box, everything but the moved shape.
+                let clip = rounded_rect_path(base, base_radii);
+                self.scene.push_clip_layer(Fill::NonZero, t, &clip);
+                self.scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, t,&clip);
+                self.scene.fill(Fill::NonZero, t, color(s.color), None, &clip);
+                self.scene
+                    .push_layer(Fill::NonZero, vello::peniko::BlendMode::new(Mix::Normal, vello::peniko::Compose::DestOut), 1.0, t,&clip);
+                self.blurred_shape(shape, radii, Color::BLACK, sigma);
+                self.scene.pop_layer();
+                self.scene.pop_layer();
+                self.scene.pop_layer();
+            } else {
+                // Outside the border box only.
+                let extent = shape.inflate(3.0 * sigma + 1.0, 3.0 * sigma + 1.0).union(g.rect);
+                let mut outside = BezPath::from_vec(extent.path_elements(0.1).collect());
+                outside.extend(g.outer_path().iter());
+                self.scene.push_clip_layer(Fill::EvenOdd, t, &outside);
+                self.blurred_shape(shape, radii, color(s.color), sigma);
+                self.scene.pop_layer();
+            }
+        }
+    }
+
+    /// A rounded rectangle blurred by `sigma`: vello blurs one radius at
+    /// a time, so each corner's radius is drawn in its own quadrant of
+    /// the shape, the quadrants meeting on the straight edges where the
+    /// radius makes no difference.
+    fn blurred_shape(&mut self, shape: KRect, radii: [(f64, f64); 4], c: Color, sigma: f64) {
+        let t = self.transform;
+        let r: [f64; 4] = radii.map(|(x, y)| x.min(y));
+        if r.iter().all(|v| (v - r[0]).abs() < 0.01) {
+            self.scene.draw_blurred_rounded_rect(t, shape, c, r[0], sigma);
             return;
         }
-        let outer = krect(rect).inflate(FOCUS_RING_OFFSET + FOCUS_RING_WIDTH, FOCUS_RING_OFFSET + FOCUS_RING_WIDTH);
-        let inner = krect(rect).inflate(FOCUS_RING_OFFSET, FOCUS_RING_OFFSET);
-        let mut path = RoundedRect::from_rect(outer, 4.0).to_path(0.1);
-        path.extend(RoundedRect::from_rect(inner, 2.0).to_path(0.1));
-        self.scene.fill(Fill::EvenOdd, self.transform, FOCUS_RING, None, &path);
+        let (cx, cy) = ((shape.x0 + shape.x1) / 2.0, (shape.y0 + shape.y1) / 2.0);
+        let big = 3.0 * sigma + shape.width().max(shape.height());
+        let quadrants = [
+            KRect::new(shape.x0 - big, shape.y0 - big, cx, cy),
+            KRect::new(cx, shape.y0 - big, shape.x1 + big, cy),
+            KRect::new(cx, cy, shape.x1 + big, shape.y1 + big),
+            KRect::new(shape.x0 - big, cy, cx, shape.y1 + big),
+        ];
+        for (q, radius) in quadrants.iter().zip(r) {
+            self.scene.push_clip_layer(Fill::NonZero, t, q);
+            self.scene.draw_blurred_rounded_rect(t, shape, c, radius, sigma);
+            self.scene.pop_layer();
+        }
+    }
+
+    /// The outlines collected during the walk (CSS Basic UI 4 §4): each
+    /// drawn around the element's border box moved out by `outline-
+    /// offset` (in by a negative one), `outline-width` wide, in its
+    /// style and colour, its corners following the border radii (grown by
+    /// the offset and width, as Chrome rounds outlines). A box with one
+    /// fragment uses the border painter; an inline element broken over
+    /// lines gets one outline around the union of its fragments (Blink's
+    /// complex outline). `auto` is the platform focus ring: a 2px ring of
+    /// the outline colour with a 1px white ring inside it, as Chrome
+    /// draws it.
+    fn paint_outlines(&mut self) {
+        let outlines = std::mem::take(&mut self.outlines);
+        for (_, style, rects) in &outlines {
+            if !rects.iter().any(|r| intersects(&r.inset(-64.0, -64.0, -64.0, -64.0), &self.visible)) {
+                continue;
+            }
+            let offset = f64::from(style.outline_offset);
+            match style.outline_style {
+                OutlineStyle::Auto => self.focus_ring(style, rects, offset),
+                OutlineStyle::Border(border) if rects.len() == 1 => {
+                    let w = f64::from(style.outline_width);
+                    let r = rects[0];
+                    let outer = Rect::new(
+                        r.x - (offset + w) as f32,
+                        r.y - (offset + w) as f32,
+                        r.width + 2.0 * (offset + w) as f32,
+                        r.height + 2.0 * (offset + w) as f32,
+                    );
+                    if outer.width <= 0.0 || outer.height <= 0.0 {
+                        continue;
+                    }
+                    let mut g = BoxGeometry::new(&r, style, ALL_SIDES);
+                    g.rect = krect(&outer);
+                    g.width = [w; 4];
+                    g.radii = g.radii.map(|(x, y)| ((x + offset + w).max(0.0), (y + offset + w).max(0.0)));
+                    self.ring_with(&g, [border; 4], [style.outline_color; 4]);
+                }
+                OutlineStyle::Border(border) => {
+                    self.complex_outline(rects, offset, f64::from(style.outline_width), border, style.outline_color);
+                }
+                OutlineStyle::None => {}
+            }
+        }
+    }
+
+    /// Chrome's focus ring for `outline-style: auto`: 2px of the outline
+    /// colour outside the box (past the offset), with a 1px white ring
+    /// inside it, corners rounded by the border radii or 2px at least.
+    fn focus_ring(&mut self, style: &ComputedStyle, rects: &[Rect], offset: f64) {
+        const RING: f64 = 2.0;
+        const INNER: f64 = 1.0;
+        let dark = color(style.outline_color);
+        if rects.len() == 1 {
+            let r = rects[0];
+            let g = BoxGeometry::new(&r, style, ALL_SIDES);
+            let radius = |d: f64| g.radii.map(|(x, y)| ((x + d).max(2.0 + d.max(0.0)), (y + d).max(2.0 + d.max(0.0))));
+            let outer = rounded_rect_path(g.rect.inflate(offset + RING, offset + RING), radius(offset + RING));
+            let mid = rounded_rect_path(g.rect.inflate(offset, offset), radius(offset));
+            let inner = rounded_rect_path(g.rect.inflate(offset - INNER, offset - INNER), radius(offset - INNER));
+            let mut ring = outer;
+            ring.extend(mid.iter());
+            self.scene.fill(Fill::EvenOdd, self.transform, dark, None, &ring);
+            let mut white = mid;
+            white.extend(inner.iter());
+            self.scene.fill(Fill::EvenOdd, self.transform, Color::WHITE, None, &white);
+        } else {
+            self.band(rects, offset, offset + RING, dark);
+            self.band(rects, offset - INNER, offset, Color::WHITE);
+        }
+    }
+
+    /// The region between the union of `rects` grown by `inner` and the
+    /// union grown by `outer`, filled with `c` (via a destination-out
+    /// layer, so overlapping rectangles make one shape).
+    fn band(&mut self, rects: &[Rect], inner: f64, outer: f64, c: Color) {
+        let t = self.transform;
+        let grown = |d: f64| -> BezPath {
+            let mut p = BezPath::new();
+            for r in rects {
+                p.extend(krect(r).inflate(d, d).path_elements(0.1));
+            }
+            p
+        };
+        let outer_path = grown(outer);
+        self.scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, t,&outer_path);
+        self.scene.fill(Fill::NonZero, t, c, None, &outer_path);
+        self.scene
+            .push_layer(Fill::NonZero, vello::peniko::BlendMode::new(Mix::Normal, vello::peniko::Compose::DestOut), 1.0, t,&outer_path);
+        self.scene.fill(Fill::NonZero, t, Color::BLACK, None, &grown(inner));
+        self.scene.pop_layer();
+        self.scene.pop_layer();
+    }
+
+    /// An outline around the union of several fragments (an inline
+    /// element over lines): the boundary of the union grown by the
+    /// offset, traced as right-angle loops, each edge drawn `width`
+    /// outward in the style and colour (edges facing up and left take the
+    /// top/left shading of `inset`/`groove`/`ridge`/`outset`; dots and
+    /// dashes run along the loops).
+    fn complex_outline(&mut self, rects: &[Rect], offset: f64, width: f64, style: BorderStyle, c: Rgba) {
+        let t = self.transform;
+        let loops = union_loops(rects, offset);
+        match style {
+            BorderStyle::None | BorderStyle::Hidden => {}
+            BorderStyle::Solid => self.band(rects, offset, offset + width, color(c)),
+            BorderStyle::Double => {
+                self.band(rects, offset + width * 2.0 / 3.0, offset + width, color(c));
+                self.band(rects, offset, offset + width / 3.0, color(c));
+            }
+            BorderStyle::Dotted | BorderStyle::Dashed => {
+                let mid = union_loops(rects, offset + width / 2.0);
+                let mut path = BezPath::new();
+                for l in &mid {
+                    for (i, p) in l.iter().enumerate() {
+                        if i == 0 {
+                            path.move_to(*p);
+                        } else {
+                            path.line_to(*p);
+                        }
+                    }
+                    path.close_path();
+                }
+                let stroke = if style == BorderStyle::Dotted {
+                    Stroke::new(width).with_caps(Cap::Round).with_dashes(0.0, [0.0, 2.0 * width])
+                } else {
+                    Stroke::new(width).with_caps(Cap::Butt).with_dashes(0.0, [3.0 * width, 3.0 * width])
+                };
+                self.scene.stroke(&stroke, t, color(c), None, &path);
+            }
+            BorderStyle::Inset | BorderStyle::Outset | BorderStyle::Groove | BorderStyle::Ridge => {
+                // Each edge's band, in the shade of the side it faces.
+                let shade = |facing_top_left: bool, outer_half: bool| -> Rgba {
+                    match style {
+                        BorderStyle::Inset => if facing_top_left { dark(c) } else { c },
+                        BorderStyle::Outset => if facing_top_left { c } else { dark(c) },
+                        BorderStyle::Groove => if facing_top_left == outer_half { dark(c) } else { c },
+                        _ => if facing_top_left == outer_half { c } else { dark(c) },
+                    }
+                };
+                let two = matches!(style, BorderStyle::Groove | BorderStyle::Ridge);
+                for l in &loops {
+                    let n = l.len();
+                    for i in 0..n {
+                        let (a, b) = (l[i], l[(i + 1) % n]);
+                        // The outward normal: the loops are traced with the
+                        // inside on the left... determined per edge below.
+                        let (nx, ny) = edge_outward(l, i);
+                        let facing_top_left = ny < 0.0 || nx < 0.0;
+                        let bands: Vec<(f64, f64, bool)> = if two {
+                            vec![(width / 2.0, width, true), (0.0, width / 2.0, false)]
+                        } else {
+                            vec![(0.0, width, true)]
+                        };
+                        for (from, to, outer_half) in bands {
+                            let quad = [
+                                a + vello::kurbo::Vec2::new(nx * from, ny * from),
+                                b + vello::kurbo::Vec2::new(nx * from, ny * from),
+                                b + vello::kurbo::Vec2::new(nx * to, ny * to),
+                                a + vello::kurbo::Vec2::new(nx * to, ny * to),
+                            ];
+                            // Extended past the corners by the width so
+                            // neighbouring edges meet; the band mask keeps
+                            // the result inside the outline.
+                            let dir = (b - a).normalize();
+                            let ext = vello::kurbo::Vec2::new(dir.x * width, dir.y * width);
+                            let mut p = BezPath::new();
+                            p.move_to(quad[0] - ext);
+                            p.line_to(quad[1] + ext);
+                            p.line_to(quad[2] + ext);
+                            p.line_to(quad[3] - ext);
+                            p.close_path();
+                            let mut mask = BezPath::new();
+                            for r in rects {
+                                mask.extend(krect(r).inflate(offset + to, offset + to).path_elements(0.1));
+                            }
+                            self.scene.push_clip_layer(Fill::NonZero, t, &mask);
+                            self.scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, t,&mask);
+                            self.scene.fill(Fill::NonZero, t, color(shade(facing_top_left, outer_half)), None, &p);
+                            self.scene.push_layer(
+                                Fill::NonZero,
+                                vello::peniko::BlendMode::new(Mix::Normal, vello::peniko::Compose::DestOut),
+                                1.0,
+                                t,
+                                &mask,
+                            );
+                            let mut inner = BezPath::new();
+                            for r in rects {
+                                inner.extend(krect(r).inflate(offset + from, offset + from).path_elements(0.1));
+                            }
+                            self.scene.fill(Fill::NonZero, t, Color::BLACK, None, &inner);
+                            self.scene.pop_layer();
+                            self.scene.pop_layer();
+                            self.scene.pop_layer();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn text(&mut self, rect: &Rect, t: &TextFragment, node: Option<NodeId>) {
@@ -1844,6 +2130,29 @@ impl BoxGeometry {
         rounded_rect_path(self.rect, self.radii)
     }
 
+    /// The rectangle `inset` inside the outer one.
+    fn inset_rect(&self, inset: [f64; 4]) -> KRect {
+        let r = &self.rect;
+        KRect::new(
+            r.x0 + inset[3],
+            r.y0 + inset[0],
+            (r.x1 - inset[1]).max(r.x0 + inset[3]),
+            (r.y1 - inset[2]).max(r.y0 + inset[0]),
+        )
+    }
+
+    /// The radii of the edge `inset` inside the outer one (§5.3).
+    fn inset_radii(&self, inset: [f64; 4]) -> [(f64, f64); 4] {
+        let [tl, tr, br, bl] = self.radii;
+        let r = |v: f64, by: f64| (v - by).max(0.0);
+        [
+            (r(tl.0, inset[3]), r(tl.1, inset[0])),
+            (r(tr.0, inset[1]), r(tr.1, inset[0])),
+            (r(br.0, inset[1]), r(br.1, inset[2])),
+            (r(bl.0, inset[3]), r(bl.1, inset[2])),
+        ]
+    }
+
     /// The edge `inset` (top, right, bottom, left) inside the outer one,
     /// its radii reduced by the insets (§5.3: the padding edge's radii
     /// are the outer ones less the border widths).
@@ -1920,6 +2229,126 @@ impl BoxGeometry {
 /// A rectangle with elliptical corners (radii top-left, top-right,
 /// bottom-right, bottom-left as (rx, ry)), clockwise from the top-left
 /// corner's end.
+/// A shadow's corner radius for a border radius `r` and a spread `s`
+/// (CSS Backgrounds 3 §7.1): `r + s`, floored at zero, with the spread
+/// scaled by `1 + (r/|s| - 1)^3` when the radius is smaller than the
+/// spread, so small radii keep sharper corners.
+fn spread_radius(r: f64, s: f64) -> f64 {
+    if s == 0.0 || r <= 0.0 && s < 0.0 {
+        return r.max(0.0);
+    }
+    let factor = if r < s.abs() { 1.0 + (r / s.abs() - 1.0).powi(3) } else { 1.0 };
+    (r + s * factor).max(0.0)
+}
+
+/// The outward unit normal of edge `i` of a right-angle loop: the loop
+/// is traced so that the inside is on its left... the normal points to
+/// the side where the loop's area is not (found from the loop's winding).
+fn edge_outward(l: &[Point], i: usize) -> (f64, f64) {
+    let n = l.len();
+    let (a, b) = (l[i], l[(i + 1) % n]);
+    // Shoelace: positive area = counter-clockwise in y-down coordinates
+    // means the inside is on the right of each edge.
+    let area: f64 = (0..n).map(|k| { let (p, q) = (l[k], l[(k + 1) % n]); p.x * q.y - q.x * p.y }).sum();
+    let d = b - a;
+    let len = d.hypot().max(1.0e-6);
+    let (nx, ny) = (-d.y / len, d.x / len);
+    if area > 0.0 { (-nx, -ny) } else { (nx, ny) }
+}
+
+/// The boundary loops of the union of `rects` each grown by `grow`: the
+/// plane is cut along every rectangle edge, cells inside any rectangle
+/// are marked, and the edges between a marked and an unmarked cell are
+/// linked into closed right-angle loops.
+fn union_loops(rects: &[Rect], grow: f64) -> Vec<Vec<Point>> {
+    let boxes: Vec<KRect> = rects.iter().map(|r| krect(r).inflate(grow, grow)).filter(|r| r.width() > 0.0 && r.height() > 0.0).collect();
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+    let mut xs: Vec<f64> = boxes.iter().flat_map(|b| [b.x0, b.x1]).collect();
+    let mut ys: Vec<f64> = boxes.iter().flat_map(|b| [b.y0, b.y1]).collect();
+    xs.sort_by(|a, b| a.total_cmp(b));
+    ys.sort_by(|a, b| a.total_cmp(b));
+    xs.dedup_by(|a, b| (*a - *b).abs() < 1.0e-6);
+    ys.dedup_by(|a, b| (*a - *b).abs() < 1.0e-6);
+    let covered = |i: usize, j: usize| -> bool {
+        if i + 1 >= xs.len() || j + 1 >= ys.len() {
+            return false;
+        }
+        let (cx, cy) = ((xs[i] + xs[i + 1]) / 2.0, (ys[j] + ys[j + 1]) / 2.0);
+        boxes.iter().any(|b| b.contains(Point::new(cx, cy)))
+    };
+    // Directed boundary edges with the covered cell on their right (so
+    // the loops run clockwise in y-down coordinates).
+    let mut edges: Vec<(Point, Point)> = Vec::new();
+    for j in 0..ys.len() - 1 {
+        for i in 0..xs.len() - 1 {
+            if !covered(i, j) {
+                continue;
+            }
+            let (x0, x1, y0, y1) = (xs[i], xs[i + 1], ys[j], ys[j + 1]);
+            if j == 0 || !covered(i, j - 1) {
+                edges.push((Point::new(x0, y0), Point::new(x1, y0)));
+            }
+            if !covered(i + 1, j) {
+                edges.push((Point::new(x1, y0), Point::new(x1, y1)));
+            }
+            if !covered(i, j + 1) {
+                edges.push((Point::new(x1, y1), Point::new(x0, y1)));
+            }
+            if i == 0 || !covered(i - 1, j) {
+                edges.push((Point::new(x0, y1), Point::new(x0, y0)));
+            }
+        }
+    }
+    let mut loops = Vec::new();
+    let mut used = vec![false; edges.len()];
+    let same = |a: Point, b: Point| (a.x - b.x).abs() < 1.0e-6 && (a.y - b.y).abs() < 1.0e-6;
+    for start in 0..edges.len() {
+        if used[start] {
+            continue;
+        }
+        let mut l: Vec<Point> = vec![edges[start].0];
+        let mut cur = start;
+        loop {
+            used[cur] = true;
+            let end = edges[cur].1;
+            // Merge collinear points.
+            if l.len() >= 2 {
+                let (p, q) = (l[l.len() - 2], l[l.len() - 1]);
+                if (p.x == q.x && q.x == end.x) || (p.y == q.y && q.y == end.y) {
+                    l.pop();
+                }
+            }
+            if same(end, l[0]) {
+                break;
+            }
+            l.push(end);
+            // Prefer the edge that turns right (keeps the loop tight at a
+            // touching corner), else any continuing edge.
+            let next = (0..edges.len()).filter(|&k| !used[k] && same(edges[k].0, end)).min_by_key(|&k| {
+                let d1 = edges[cur].1 - edges[cur].0;
+                let d2 = edges[k].1 - edges[k].0;
+                let cross = d1.x * d2.y - d1.y * d2.x;
+                if cross > 0.0 { 0 } else if cross == 0.0 { 1 } else { 2 }
+            });
+            match next {
+                Some(k) => cur = k,
+                None => break,
+            }
+        }
+        if l.len() >= 4 {
+            // Drop a collinear closing point.
+            let (p, q, r) = (l[l.len() - 1], l[0], l[1]);
+            if (p.x == q.x && q.x == r.x) || (p.y == q.y && q.y == r.y) {
+                l.remove(0);
+            }
+            loops.push(l);
+        }
+    }
+    loops
+}
+
 fn rounded_rect_path(r: KRect, radii: [(f64, f64); 4]) -> BezPath {
     let mut path = BezPath::new();
     let [tl, tr, br, bl] = radii;
@@ -2117,24 +2546,7 @@ mod tests {
         let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
         assert_eq!([pixels[800], pixels[801], pixels[802]], [0xff, 0x96, 0x32]);
 
-        // A focus ring around a rectangle: blue just outside it, canvas
-        // further out and inside.
-        options = PaintOptions {
-            focus_ring: vec![browser_layout::Rect::new(50.0, 50.0, 40.0, 20.0)],
-            ..PaintOptions::default()
-        };
-        options.viewport_width = 200.0;
-        options.viewport_height = 100.0;
-        options.scale = 1.0;
-        paint(&tree, &images, &options, &mut scene);
-        let pixels = render_offscreen(&scene, 200, 100, Color::WHITE).expect("gpu");
-        let px = |x: usize, y: usize| {
-            let i = (y * 200 + x) * 4;
-            [pixels[i], pixels[i + 1], pixels[i + 2]]
-        };
-        assert_eq!(px(70, 48), [0x1a, 0x5f, 0xd6], "ring above the box");
-        assert_eq!(px(70, 60), [255, 255, 255], "inside is untouched");
-        assert_eq!(px(70, 44), [255, 255, 255], "outside the ring");
+        let _ = &mut options;
     }
 
     /// A checked box is filled blue, an unchecked one white, and the
@@ -2518,6 +2930,46 @@ mod tests {
         let Some(pixels) = pixels else { return };
         assert!(is_blue(px(&pixels, 50.0, 10.0)), "the local layer moved up with the content");
         assert!(is_red(px(&pixels, 50.0, 60.0)), "the scroll layer stayed");
+    }
+
+    #[test]
+    fn outlines_shadows_and_the_focus_ring_paint() {
+        // An outline outside the box past its offset; nothing inside or
+        // further out; a spread shadow around a second box; an inset
+        // shadow inside a third; the `auto` ring: dark outside, white
+        // just inside, the box's own colour further in.
+        const HTML: &str = "<body style='margin:0'>\
+            <div style='position:absolute;left:50px;top:50px;width:40px;height:20px;outline:2px solid blue;outline-offset:2px'></div>\
+            <div style='position:absolute;left:150px;top:50px;width:40px;height:20px;background:#ddd;box-shadow:0 0 0 10px red'></div>\
+            <div style='position:absolute;left:50px;top:100px;width:60px;height:30px;background:white;box-shadow:inset 0 0 0 5px lime'></div>\
+            <div style='position:absolute;left:150px;top:100px;width:40px;height:20px;background:#ddd;outline-style:auto;outline-color:rgb(16,16,16)'></div>\
+            <p style='position:absolute;left:220px;top:20px;width:60px;margin:0;font-size:16px'>aaa <span id=s style='outline:2px solid blue'>bb bb bb</span></p></body>";
+        let (_, _, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_blue(px(&pixels, 70.0, 46.5)), "outline above the box: {:?}", px(&pixels, 70.0, 46.5));
+        assert!(is_white(px(&pixels, 70.0, 60.0)), "inside untouched");
+        assert!(is_white(px(&pixels, 70.0, 43.0)), "outside the outline");
+        assert!(is_white(px(&pixels, 70.0, 49.0)), "the offset gap");
+        assert!(is_red(px(&pixels, 145.0, 60.0)), "the spread shadow left of the box");
+        assert!(is_red(px(&pixels, 170.0, 44.0)), "and above it");
+        assert!(!is_red(px(&pixels, 170.0, 60.0)), "not under the box");
+        assert!(is_green(px(&pixels, 52.0, 115.0)), "inset shadow inside the edge: {:?}", px(&pixels, 52.0, 115.0));
+        assert!(is_white(px(&pixels, 80.0, 115.0)), "the inset shadow's middle is clear");
+        let ring = px(&pixels, 170.0, 98.5);
+        assert!(ring[0] < 40 && ring[1] < 40 && ring[2] < 40, "the auto ring is dark: {ring:?}");
+        assert!(is_white(px(&pixels, 170.0, 100.5)), "its white inner line, just inside the border edge");
+        assert_eq!(px(&pixels, 170.0, 101.5), [0xdd, 0xdd, 0xdd], "the box under it");
+        // The inline element broken over two lines gets one outline: blue
+        // ink on the line it ends on too.
+        let mut blue = 0;
+        for y in 20..80 {
+            for x in 215..300 {
+                if is_blue(px(&pixels, x as f32, y as f32)) {
+                    blue += 1;
+                }
+            }
+        }
+        assert!(blue > 40, "an outline around the broken inline: {blue} blue pixels");
     }
 
     #[test]

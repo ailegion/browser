@@ -114,3 +114,10 @@ rt { font-size: 50%; }
 
 summary { display: block; }
 details > summary:first-of-type { display: list-item; }
+
+/* Keyboard focus: the platform focus ring (`outline-style: auto`), as
+   Chrome's sheet has it; a click does not show it. */
+:focus-visible { outline: -webkit-focus-ring-color auto 1px; }
+/* The `-webkit-user-select` the controls' sheets use. */
+button, input, select, textarea, meter, progress { user-select: none; }
+input, textarea { user-select: contain; }

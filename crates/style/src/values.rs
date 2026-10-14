@@ -610,6 +610,11 @@ pub fn parse_color<'i>(input: &mut Parser<'i, '_>) -> Result<Color, ParseErr<'i>
             if name.eq_ignore_ascii_case("transparent") {
                 return Ok(Color::Transparent);
             }
+            // Chrome's focus ring colour (its `-webkit-focus-ring-color`
+            // system colour: rgb(16, 16, 16) in light mode).
+            if name.eq_ignore_ascii_case("-webkit-focus-ring-color") {
+                return Ok(Color::Rgba(Rgba::rgb8(16, 16, 16)));
+            }
             named_color(&name)
                 .map(Color::Named)
                 .ok_or_else(|| location.new_unexpected_token_error(Token::Ident(name)))

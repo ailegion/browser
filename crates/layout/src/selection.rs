@@ -60,7 +60,9 @@ struct TextRef<'a> {
 
 fn texts(tree: &LayoutTree) -> Vec<TextRef<'_>> {
     fn visit<'a>(f: &'a Fragment, out: &mut Vec<TextRef<'a>>) {
-        if let (FragmentContent::Text(t), Some(node)) = (&f.content, f.node) {
+        if let (FragmentContent::Text(t), Some(node)) = (&f.content, f.node)
+            && t.selectable
+        {
             out.push(TextRef {
                 rect: f.rect,
                 node,

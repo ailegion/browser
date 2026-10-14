@@ -282,10 +282,9 @@ pub(crate) struct TabState {
     deps: InteractionDeps,
     hover: Option<NodeId>,
     focus: Option<NodeId>,
-    /// Where the focus ring is drawn: the focused element's boxes, when
-    /// focus came from the keyboard. Kept up to date with focus and layout
-    /// so a repaint does not walk the tree.
-    focus_ring: Vec<Rect>,
+    /// The `cursor: url()` image last sent to the shell, by URL, so a
+    /// pointer move over the same element does not send it again.
+    cursor_image_sent: Option<Arc<str>>,
     /// Byte offset of the caret in the focused text control's value.
     caret: usize,
     /// The other end of the selection inside the focused text control,
@@ -457,7 +456,7 @@ impl TabState {
             deps: InteractionDeps::default(),
             hover: None,
             focus: None,
-            focus_ring: Vec::new(),
+            cursor_image_sent: None,
             caret: 0,
             sel_anchor: None,
             control_drag: false,
@@ -1216,65 +1215,95 @@ impl TabState {
         }
     }
 
-    /// The boxes of the focused element, one per line for inline content,
-    /// or nothing when focus did not come from the keyboard.
-    fn compute_focus_ring(&self) -> Vec<Rect> {
-        let (Some(doc), Some(tree), Some(focus)) = (&self.doc, &self.layout, self.focus) else {
-            return Vec::new();
-        };
-        if !self.states.has(focus, ElementStates::FOCUS_VISIBLE) {
-            return Vec::new();
-        }
-        let mut rects: Vec<Rect> = Vec::new();
-        tree.root.walk(&mut |f| {
-            let Some(n) = f.node else { return };
-            let mut cur = Some(n);
-            let inside = loop {
-                match cur {
-                    Some(c) if c == focus => break true,
-                    Some(c) => cur = doc.parent(c),
-                    None => break false,
-                }
-            };
-            if inside && f.rect.width > 0.0 && f.rect.height > 0.0 {
-                // A box fragment covers its own children; keep the outer one.
-                if let Some(last) = rects.last()
-                    && last.x <= f.rect.x
-                    && last.y <= f.rect.y
-                    && last.right() >= f.rect.right()
-                    && last.bottom() >= f.rect.bottom()
-                {
-                    return;
-                }
-                rects.push(f.rect);
-            }
-        });
-        // Join text fragments that sit side by side on one line.
-        rects.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
-        let mut merged: Vec<Rect> = Vec::new();
-        for r in rects {
-            match merged.last_mut() {
-                Some(m)
-                    if (m.y - r.y).abs() < 0.5 && (m.height - r.height).abs() < 0.5 && r.x <= m.right() + 0.5 =>
-                {
-                    let right = m.right().max(r.right());
-                    m.width = right - m.x;
-                }
-                _ => merged.push(r),
-            }
-        }
-        merged
-    }
-
     /// Scroll so the focused element is inside every scroller above it
-    /// and the viewport, with a margin, its `scroll-margin` counted.
+    /// and the viewport, with a margin, its `scroll-margin` counted. (The
+    /// focus ring itself is the `:focus-visible` element's `outline:
+    /// auto` from the UA sheet, painted with the page.)
     fn scroll_focus_into_view(&mut self) {
         let Some(focus) = self.focus else { return };
         self.reveal(focus, &|tree, doc| element_rect(tree, doc, focus), Reveal::Nearest(24.0), true, true);
         if self.focus.is_some() {
-            self.focus_ring = self.compute_focus_ring();
             self.update_caret();
         }
+    }
+
+    /// The outermost ancestor-or-self of `node` whose used `user-select`
+    /// is `pred`'s (`all` takes the outermost, `contain` the nearest).
+    fn user_select_root(&self, node: NodeId, want: browser_style::UserSelect, outermost: bool) -> Option<NodeId> {
+        let doc = self.doc.as_ref()?;
+        let mut found = None;
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if doc.get(n).is_element() && self.styles.get(n).is_some_and(|s| s.user_select_used == want) {
+                found = Some(n);
+                if !outermost {
+                    break;
+                }
+            }
+            cur = doc.parent(n);
+        }
+        found
+    }
+
+    /// The first and last selectable text positions inside an element, in
+    /// tree order.
+    fn element_text_extent(&self, node: NodeId) -> Option<(TextPos, TextPos)> {
+        let (doc, tree) = (self.doc.as_ref()?, self.layout.as_ref()?);
+        let mut first = None;
+        let mut last = None;
+        tree.root.walk(&mut |f| {
+            let (browser_layout::FragmentContent::Text(t), Some(n)) = (&f.content, f.node) else { return };
+            if !t.selectable {
+                return;
+            }
+            let mut cur = Some(n);
+            let inside = loop {
+                match cur {
+                    Some(c) if c == node => break true,
+                    Some(c) => cur = doc.parent(c),
+                    None => break false,
+                }
+            };
+            if !inside {
+                return;
+            }
+            let start = TextPos { node: n, offset: t.range.start };
+            let end = TextPos { node: n, offset: t.range.end };
+            if first.is_none() {
+                first = Some(start);
+            }
+            last = Some(end);
+        });
+        Some((first?, last?))
+    }
+
+    /// `user-select: all` and `contain` on a selection end: a position
+    /// inside an `all` element becomes that element's start or end
+    /// (whichever is on `anchor`'s far side), a focus outside the
+    /// `contain` element the anchor is in is held at that element's edge.
+    fn constrain_selection_focus(&self, anchor: TextPos, focus: TextPos) -> TextPos {
+        use browser_style::UserSelect;
+        let Some(tree) = self.layout.as_ref() else { return focus };
+        let before = |a: TextPos, b: TextPos| {
+            let keys = selection::position_keys(tree, &[a, b]);
+            matches!((keys[0], keys[1]), (Some(x), Some(y)) if x < y)
+        };
+        let anchor_el = self.element_of(anchor.node);
+        let focus_el = self.element_of(focus.node);
+        let mut focus = focus;
+        if let Some(c) = anchor_el.and_then(|e| self.user_select_root(e, UserSelect::Contain, false))
+            && focus_el.and_then(|e| self.user_select_root(e, UserSelect::Contain, false)) != Some(c)
+            && let Some((start, end)) = self.element_text_extent(c)
+        {
+            focus = if before(focus, anchor) { start } else { end };
+        }
+        if let Some(a) = focus_el.and_then(|e| self.user_select_root(e, UserSelect::All, true))
+            && anchor_el.and_then(|e| self.user_select_root(e, UserSelect::All, true)) != Some(a)
+            && let Some((start, end)) = self.element_text_extent(a)
+        {
+            focus = if before(focus, anchor) { start } else { end };
+        }
+        focus
     }
 
     // ----- find in page -----
@@ -1419,10 +1448,21 @@ impl TabState {
             self.set_selection(None);
             return;
         };
-        let sel = match (clicks, pos) {
-            (2, Some(p)) => selection::word_at(tree, p),
-            (3, Some(p)) => selection::paragraph_at(tree, p),
-            (_, Some(p)) => {
+        // A press in a `user-select: all` element selects all of it.
+        let all = pos
+            .and_then(|p| self.element_of(p.node))
+            .and_then(|e| self.user_select_root(e, browser_style::UserSelect::All, true))
+            .and_then(|a| self.element_text_extent(a));
+        let sel = match (clicks, pos, all) {
+            (_, Some(_), Some((start, end))) => {
+                if !on_link {
+                    self.select_anchor = Some(start);
+                }
+                Some((start, end))
+            }
+            (2, Some(p), _) => selection::word_at(tree, p),
+            (3, Some(p), _) => selection::paragraph_at(tree, p),
+            (_, Some(p), _) => {
                 if !on_link {
                     self.select_anchor = Some(p);
                 }
@@ -1433,10 +1473,12 @@ impl TabState {
         self.set_selection(sel);
     }
 
-    /// Move the selection's focus to the pointer during a drag.
+    /// Move the selection's focus to the pointer during a drag, within
+    /// what `user-select` allows.
     fn extend_selection_to(&mut self, x: f32, y: f32) {
         let Some(anchor) = self.select_anchor else { return };
         if let Some(focus) = self.text_position_at(x, y) {
+            let focus = self.constrain_selection_focus(anchor, focus);
             self.set_selection(Some((anchor, focus)));
         }
     }
@@ -1815,10 +1857,25 @@ impl TabState {
                 .is_some_and(|d| d.contains(n) && (!d.get(n).is_element() || d.element(n).is_some_and(is_text_control)))
         });
         let over_bar = self.mouse.is_some_and(|(x, y)| self.over_scrollbar_area(x, y));
+        // The hovered element's `cursor` (inherited): an image of its list
+        // that is decoded and no larger than 128×128 (Chrome's limit),
+        // else its keyword; `auto` is the pointer over links, the I-beam
+        // over text, the arrow elsewhere.
+        let css = hit.and_then(|h| self.styles.get(h)).map(|s| s.cursor.clone());
+        let image = css.as_ref().and_then(|c| {
+            c.images.iter().find_map(|i| {
+                let url = Url::parse(&i.url).ok()?;
+                let img = self.images.get(&url)?;
+                (img.width <= 128 && img.height <= 128).then(|| (i.url.clone(), i.hotspot, img.clone()))
+            })
+        });
+        let keyword = css.as_ref().map(|c| c.keyword).unwrap_or_default();
         let cursor = if self.pan.is_some() {
             Cursor::AllScroll
         } else if over_bar {
             Cursor::Default
+        } else if keyword != browser_style::CursorKeyword::Auto {
+            css_cursor(keyword)
         } else if over_link {
             Cursor::Pointer
         } else if over_text {
@@ -1826,7 +1883,32 @@ impl TabState {
         } else {
             Cursor::Default
         };
-        self.set_cursor(cursor);
+        match image.filter(|_| self.pan.is_none() && !over_bar) {
+            Some((url, hotspot, img)) => {
+                if self.cursor_image_sent.as_deref() != Some(&*url) {
+                    self.cursor_image_sent = Some(url);
+                    self.cursor = cursor;
+                    let (w, h) = (img.width as u16, img.height as u16);
+                    let (hx, hy) = hotspot.map_or((0, 0), |(x, y)| (x.round().clamp(0.0, f32::from(w)) as u16, y.round().clamp(0.0, f32::from(h)) as u16));
+                    self.send(TabToShell::CursorImage(browser_ipc_types::CursorImage {
+                        width: w,
+                        height: h,
+                        rgba: img.data.data().to_vec(),
+                        hotspot: (hx, hy),
+                    }));
+                }
+            }
+            None => {
+                if self.cursor_image_sent.take().is_some() {
+                    // Back from an image cursor: the keyword one, resent.
+                    self.cursor = Cursor::Default;
+                    self.send(TabToShell::Cursor(cursor));
+                    self.cursor = cursor;
+                } else {
+                    self.set_cursor(cursor);
+                }
+            }
+        }
 
         let Some(doc) = &self.doc else { return };
         let changed = self.states.set_chain(doc, hit, ElementStates::HOVER);
@@ -1871,11 +1953,6 @@ impl TabState {
             self.restyle_for(changed, StateKind::Focus);
             // A text control starts with the caret at its end.
             self.caret = target.map(|t| self.control_value(t).len()).unwrap_or(0);
-        }
-        let ring = self.compute_focus_ring();
-        if ring != self.focus_ring {
-            self.focus_ring = ring;
-            self.needs_paint = true;
         }
         self.update_caret();
         if target != old
@@ -2297,7 +2374,7 @@ impl TabState {
         self.states = ElementStates::default();
         self.hover = None;
         self.focus = None;
-        self.focus_ring.clear();
+        self.cursor_image_sent = None;
         self.caret_rect = None;
         self.press_control = None;
         self.press = None;
@@ -2818,7 +2895,6 @@ impl TabState {
             self.sel_anchor = None;
             self.composition = None;
             self.control_drag = false;
-            self.focus_ring.clear();
             self.caret_rect = None;
             self.states.set_single(None, ElementStates::FOCUS);
             self.states.set_single(None, ElementStates::FOCUS_VISIBLE);
@@ -3023,9 +3099,13 @@ impl TabState {
         for (_, style) in self.styles.iter() {
             // Every layer's image; an `image-set()` the candidate this
             // device's scale chooses.
-            let layers = style.background_images.iter().filter_map(|i| i.url_to_fetch(scale));
-            for u in layers.chain(style.list_style_image.iter()) {
-                if let Ok(url) = Url::parse(u) {
+            let mut names: Vec<String> =
+                style.background_images.iter().filter_map(|i| i.url_to_fetch(scale)).map(|u| u.to_string()).collect();
+            names.extend(style.list_style_image.iter().map(|s| s.to_string()));
+            // `cursor: url()` images too.
+            names.extend(style.cursor.images.iter().map(|i| i.url.to_string()));
+            for u in names {
+                if let Ok(url) = Url::parse(&u) {
                     urls.push(url);
                 }
             }
@@ -3176,7 +3256,6 @@ impl TabState {
             self.refresh_find(prefer, false);
         }
         if self.focus.is_some() {
-            self.focus_ring = self.compute_focus_ring();
             self.update_caret();
         }
     }
@@ -3196,7 +3275,6 @@ impl TabState {
             },
             matches: self.find.as_ref().map(|f| f.ranges.clone()).unwrap_or_default(),
             current_match: self.find.as_ref().map(|f| f.current_ranges.clone()).unwrap_or_default(),
-            focus_ring: self.focus_ring.clone(),
             caret: self.caret_rect,
             composition: self.composition_ranges(),
             scrollbar_hover: match self.bar_hover {
@@ -3256,6 +3334,48 @@ fn parse_media_attr(attr: Option<&str>) -> MediaQueryList {
     match attr {
         Some(s) => MediaQueryList::parse_str(s),
         None => MediaQueryList::all(),
+    }
+}
+
+/// The shell cursor for a CSS `cursor` keyword other than `auto`.
+fn css_cursor(k: browser_style::CursorKeyword) -> Cursor {
+    use browser_style::CursorKeyword as K;
+    match k {
+        K::Auto | K::Default => Cursor::Default,
+        K::None => Cursor::None,
+        K::ContextMenu => Cursor::ContextMenu,
+        K::Help => Cursor::Help,
+        K::Pointer => Cursor::Pointer,
+        K::Progress => Cursor::Progress,
+        K::Wait => Cursor::Wait,
+        K::Cell => Cursor::Cell,
+        K::Crosshair => Cursor::Crosshair,
+        K::Text => Cursor::Text,
+        K::VerticalText => Cursor::VerticalText,
+        K::Alias => Cursor::Alias,
+        K::Copy => Cursor::Copy,
+        K::Move => Cursor::Move,
+        K::NoDrop => Cursor::NoDrop,
+        K::NotAllowed => Cursor::NotAllowed,
+        K::Grab => Cursor::Grab,
+        K::Grabbing => Cursor::Grabbing,
+        K::EResize => Cursor::EResize,
+        K::NResize => Cursor::NResize,
+        K::NeResize => Cursor::NeResize,
+        K::NwResize => Cursor::NwResize,
+        K::SResize => Cursor::SResize,
+        K::SeResize => Cursor::SeResize,
+        K::SwResize => Cursor::SwResize,
+        K::WResize => Cursor::WResize,
+        K::EwResize => Cursor::EwResize,
+        K::NsResize => Cursor::NsResize,
+        K::NeswResize => Cursor::NeswResize,
+        K::NwseResize => Cursor::NwseResize,
+        K::ColResize => Cursor::ColResize,
+        K::RowResize => Cursor::RowResize,
+        K::AllScroll => Cursor::AllScroll,
+        K::ZoomIn => Cursor::ZoomIn,
+        K::ZoomOut => Cursor::ZoomOut,
     }
 }
 
@@ -3637,6 +3757,15 @@ mod tests {
 
         fn style(&self, tag: &str) -> Arc<browser_style::ComputedStyle> {
             self.state.styles[self.find(tag)].clone()
+        }
+
+        /// Whether the focused element shows the focus ring: its computed
+        /// `outline-style` is `auto` (the UA's `:focus-visible` rule).
+        fn focus_ring_outline(&self) -> bool {
+            self.state
+                .focus
+                .and_then(|f| self.state.styles.get(f))
+                .is_some_and(|s| s.outline_style == browser_style::OutlineStyle::Auto)
         }
 
         fn cursors(&self) -> Vec<Cursor> {
@@ -4247,14 +4376,14 @@ mod tests {
             h.key(Key::Tab, false);
             assert_eq!(h.focus_id().as_deref(), Some(id));
             assert_eq!(h.color_of(id), [255, 0, 0, 255], ":focus-visible on {id}");
-            assert!(!h.state.focus_ring.is_empty(), "a ring on {id}");
+            assert!(h.focus_ring_outline(), "a ring on {id}");
         }
         assert!(h.state.scroll_y > 900.0, "the last link was scrolled into view");
         assert!(h.focus_outs().is_empty());
         h.key(Key::Tab, false);
         assert_eq!(h.focus_id(), None);
         assert_eq!(h.focus_outs(), vec![true], "past the end, focus leaves the page");
-        assert!(h.state.focus_ring.is_empty());
+        assert!(!h.focus_ring_outline());
 
         // Shift+Tab from nothing starts at the last; keeps going back.
         h.key(Key::Tab, true);
@@ -4275,7 +4404,7 @@ mod tests {
         h.click("a");
         assert_eq!(h.focus_id().as_deref(), Some("a1"));
         assert_ne!(h.color_of("a1"), [255, 0, 0, 255], "no :focus-visible from a click");
-        assert!(h.state.focus_ring.is_empty());
+        assert!(!h.focus_ring_outline());
         h.key(Key::Tab, false);
         assert_eq!(h.focus_id().as_deref(), Some("s"));
         let a2 = h.by_id("a2");
@@ -4543,12 +4672,12 @@ mod tests {
         // Focus the link from the keyboard, then let the timer remove it.
         h.key(Key::Tab, false);
         assert_eq!(h.state.focus, Some(h.by_id("link")));
-        assert!(!h.state.focus_ring.is_empty());
+        assert!(h.focus_ring_outline());
         std::thread::sleep(std::time::Duration::from_millis(40));
         h.pump();
         assert_eq!(console_texts(&h).last().map(String::as_str), Some("2 P big"));
         assert_eq!(h.state.focus, None, "the focused link left the document");
-        assert!(h.state.focus_ring.is_empty());
+        assert!(!h.focus_ring_outline());
         assert!(!h.state.needs_style && !h.state.needs_layout, "the flush ran");
         assert_eq!(h.title().as_deref(), Some("Changed"));
         let root = h.by_id("root");
@@ -6080,6 +6209,43 @@ mod tests {
             assert!(h.state.scroll_animations.is_empty());
             h.send(ShellToTab::MouseUp { x: 800.0 - t / 2.0, y: thumb.y + 2.0, button: MouseButton::Left });
         }
+    }
+
+    #[test]
+    fn cursor_pointer_events_and_user_select() {
+        let mut h = Harness::load(
+            "<style>body { margin: 0 } #c { cursor: move; width: 100px; height: 50px } \
+             #n { pointer-events: none; position: absolute; top: 50px; left: 0; width: 100px; height: 50px; background: red } \
+             #l { display: block; height: 50px; width: 100px } p { margin: 0; height: 20px }</style>\
+             <div id=c></div><a href=x id=l>link</a><div id=n></div>\
+             <p id=u style='user-select: none'>secret</p><p id=a style='user-select: all'>all of this</p>\
+             <p id=k style='user-select: contain'>inside contain</p><p id=after>after</p>",
+        );
+        // `cursor: move` on the box; through a `pointer-events: none` box
+        // the link below is hovered, with the pointer cursor.
+        h.send(ShellToTab::MouseMove { x: 50.0, y: 25.0 });
+        assert_eq!(h.state.cursor, Cursor::Move);
+        h.send(ShellToTab::MouseMove { x: 50.0, y: 75.0 });
+        assert_eq!(h.state.hover, Some(h.by_id("l")));
+        assert_eq!(h.state.cursor, Cursor::Pointer);
+        // `user-select: none` text is left out of select-all and copy.
+        h.send(ShellToTab::SelectAll);
+        let all = h.selected().unwrap_or_default();
+        assert!(!all.contains("secret") && all.contains("all of this"), "{all:?}");
+        // A press in a `user-select: all` element selects the whole of it.
+        let (x, y) = h.center("p");
+        let _ = (x, y);
+        let a = h.rect_of(h.by_id("a"));
+        h.send(ShellToTab::MouseDown { x: a.x + 5.0, y: a.y + a.height / 2.0, button: MouseButton::Left });
+        assert_eq!(h.selected().as_deref(), Some("all of this"));
+        h.send(ShellToTab::MouseUp { x: a.x + 5.0, y: a.y + a.height / 2.0, button: MouseButton::Left });
+        // A drag out of a `contain` element stays inside it.
+        let k = h.rect_of(h.by_id("k"));
+        let after = h.rect_of(h.by_id("after"));
+        h.send(ShellToTab::MouseDown { x: k.x + 2.0, y: k.y + k.height / 2.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseMove { x: after.right() - 2.0, y: after.y + after.height / 2.0 });
+        assert_eq!(h.selected().as_deref(), Some("inside contain"));
+        h.send(ShellToTab::MouseUp { x: after.right() - 2.0, y: after.y + after.height / 2.0, button: MouseButton::Left });
     }
 
     #[test]

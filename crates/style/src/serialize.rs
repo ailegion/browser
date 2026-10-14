@@ -119,6 +119,20 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::ScrollSnapAlign(a) => a.to_css(),
         P::ScrollSnapStop(s) => s.keyword().to_owned(),
         P::OverflowAnchor(a) => a.keyword().to_owned(),
+        P::BoxShadow(list) => {
+            if list.is_empty() {
+                "none".to_owned()
+            } else {
+                layers(list.iter().map(BoxShadow::to_css))
+            }
+        }
+        P::OutlineWidth(w) => border_width_css(w),
+        P::OutlineStyle(s) => s.keyword().to_owned(),
+        P::OutlineColor(c) => c.to_css(),
+        P::OutlineOffset(l) => l.to_css(),
+        P::Cursor(c) => c.to_css(),
+        P::PointerEvents(p) => p.keyword().to_owned(),
+        P::UserSelect(u) => u.keyword().to_owned(),
     }
 }
 
@@ -437,7 +451,23 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             }
             parts.join(" ")
         }
-        "place-items" | "word-wrap" | "-webkit-box-decoration-break" => v(0).to_owned(),
+        "place-items" | "word-wrap" | "-webkit-box-decoration-break" | "-webkit-user-select" => v(0).to_owned(),
+        "outline" => {
+            // Chrome's order: colour, style, width; the initial parts left
+            // out, `none` alone for the initial value.
+            let (width, style, color) = (v(0), v(1), v(2));
+            let mut parts: Vec<&str> = Vec::new();
+            if color != "currentcolor" {
+                parts.push(color);
+            }
+            if style != "none" {
+                parts.push(style);
+            }
+            if width != "medium" {
+                parts.push(width);
+            }
+            if parts.is_empty() { "none".to_owned() } else { parts.join(" ") }
+        }
         _ => return None,
     })
 }
@@ -788,6 +818,20 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::ScrollSnapAlign => style.scroll_snap_align.to_css(),
         Id::ScrollSnapStop => style.scroll_snap_stop.keyword().to_owned(),
         Id::OverflowAnchor => style.overflow_anchor.keyword().to_owned(),
+        Id::BoxShadow => {
+            if style.box_shadow.is_empty() {
+                "none".to_owned()
+            } else {
+                layers(style.box_shadow.iter().map(ComputedBoxShadow::to_css))
+            }
+        }
+        Id::OutlineWidth => px(style.outline_width),
+        Id::OutlineStyle => style.outline_style.keyword().to_owned(),
+        Id::OutlineColor => style.outline_color.to_css(),
+        Id::OutlineOffset => px(style.outline_offset),
+        Id::Cursor => style.cursor.to_css(),
+        Id::PointerEvents => style.pointer_events.keyword().to_owned(),
+        Id::UserSelect => style.user_select.keyword().to_owned(),
     }
 }
 
@@ -872,6 +916,14 @@ mod tests {
             ("scroll-snap-align: start end", "scroll-snap-align: start end;"),
             ("scroll-snap-stop: always", "scroll-snap-stop: always;"),
             ("overflow-anchor: none", "overflow-anchor: none;"),
+            ("box-shadow: 1px 2px red inset", "box-shadow: red 1px 2px inset;"),
+            ("box-shadow: 0 0 10px", "box-shadow: 0px 0px 10px;"),
+            ("box-shadow: none", "box-shadow: none;"),
+            ("outline-style: AUTO", "outline-style: auto;"),
+            ("outline-offset: 3px", "outline-offset: 3px;"),
+            ("cursor: url(a.cur) 1 2, pointer", "cursor: url(\"a.cur\") 1 2, pointer;"),
+            ("pointer-events: none", "pointer-events: none;"),
+            ("-webkit-user-select: none", "user-select: none;"),
         ];
         for (input, expected) in cases {
             assert_eq!(block(input), expected, "for {input}");
@@ -936,6 +988,9 @@ mod tests {
             ("overscroll-behavior: auto none", "overscroll-behavior: auto none;"),
             ("overscroll-behavior-x: contain; overscroll-behavior-y: contain", "overscroll-behavior: contain;"),
             ("overscroll-behavior-y: contain", "overscroll-behavior-y: contain;"),
+            ("outline: 2px dashed red", "outline: red dashed 2px;"),
+            ("outline: none", "outline: none;"),
+            ("outline: auto", "outline: auto;"),
         ];
         for (input, expected) in cases {
             assert_eq!(block(input), expected, "for {input}");
@@ -1019,6 +1074,21 @@ mod tests {
         assert_eq!(resolved_value(&style, PropertyId::ScrollBehavior, None), "auto");
         assert_eq!(resolved_value(&style, PropertyId::ScrollSnapStop, None), "normal");
         assert_eq!(resolved_value(&style, PropertyId::OverflowAnchor, None), "auto");
+        style.box_shadow = vec![ComputedBoxShadow {
+            inset: true,
+            x: 1.0,
+            y: 2.0,
+            blur: 0.0,
+            spread: 0.0,
+            color: Rgba::rgb8(255, 0, 0),
+        }];
+        assert_eq!(resolved_value(&style, PropertyId::BoxShadow, None), "rgb(255, 0, 0) 1px 2px 0px 0px inset");
+        style.outline_style = OutlineStyle::Auto;
+        style.outline_width = 1.0;
+        assert_eq!(resolved_value(&style, PropertyId::OutlineStyle, None), "auto");
+        assert_eq!(resolved_value(&style, PropertyId::OutlineWidth, None), "1px");
+        assert_eq!(resolved_value(&style, PropertyId::Cursor, None), "auto");
+        assert_eq!(resolved_value(&style, PropertyId::UserSelect, None), "auto");
         // Rendered: used values.
         let used = UsedValues {
             width: 200.0,

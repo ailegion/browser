@@ -43,8 +43,50 @@ pub enum Cursor {
     Default,
     Pointer,
     Text,
-    /// Middle-click autoscroll is on: the four-way arrow.
+    /// Middle-click autoscroll is on, or CSS `all-scroll`.
     AllScroll,
+    /// The rest of CSS `cursor`'s keywords (CSS Basic UI 4 §8.2).
+    None,
+    ContextMenu,
+    Help,
+    Progress,
+    Wait,
+    Cell,
+    Crosshair,
+    VerticalText,
+    Alias,
+    Copy,
+    Move,
+    NoDrop,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    EResize,
+    NResize,
+    NeResize,
+    NwResize,
+    SResize,
+    SeResize,
+    SwResize,
+    WResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ColResize,
+    RowResize,
+    ZoomIn,
+    ZoomOut,
+}
+
+/// A `cursor: url()` image, decoded, with its hotspot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorImage {
+    pub width: u16,
+    pub height: u16,
+    /// RGBA8 pixels, row-major, straight alpha.
+    pub rgba: Vec<u8>,
+    pub hotspot: (u16, u16),
 }
 
 /// A key the page may act on. Text keys come as `Character` with what
@@ -169,6 +211,8 @@ pub enum TabToShell {
     },
     /// What the pointer is over calls for a different cursor.
     Cursor(Cursor),
+    /// What the pointer is over has a `cursor: url()` image.
+    CursorImage(CursorImage),
     /// The user asked for a link in a new tab (middle click).
     OpenInNewTab { url: Url },
     /// Text the user copied; the shell owns the clipboard.

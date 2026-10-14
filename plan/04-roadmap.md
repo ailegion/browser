@@ -1803,10 +1803,71 @@ Work:
       off by one under the parallel test run) showed once on
       `01-text-and-boxes.png` too, at (593, 64), green 205↔204, compared
       before anything else and the actual image removed; rerun before
-      suspecting a change. (5)
+      suspecting a change.
+      **(4s) stopped by the owner 2026-10-14 after block 6**: blocks 7
+      (scroll snap, scroll anchoring) and 8 (listbox `select`) are NOT
+      BUILT; `scroll-snap-type`/`-align`/`-stop` and `overflow-anchor`
+      are in the table and CSSOM only and do nothing in layout or
+      scrolling; (4s) is not done. The owner moved on to block 5 for
+      visible progress. (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
-      `user-select`; (6) `z-index` and `transform`/`transform-origin`
+      `user-select`.
+      **Block 5 done 2026-10-14: `box-shadow`, `outline`, `cursor`,
+      `pointer-events`, `user-select`.** Style: `box-shadow` (`none` or a
+      list of `inset? && <length>{2,4} && <color>?`, a negative blur
+      refused; computed to px with the colour resolved, serialized colour
+      first and `inset` last as Chrome does), `outline-width`/`-style`
+      (`auto` plus the border styles; `hidden` refused)/`-color` (`invert`
+      taken as `currentcolor`)/`-offset` and the `outline` shorthand
+      (serialized colour, style, width), `cursor` (every keyword of CSS
+      Basic UI 4 §8.2, the `-webkit-` grab/zoom names, `url()` images
+      with hotspots before the keyword; inherited), `pointer-events` (all
+      keywords; inherited; only `none` acts on HTML boxes, as in
+      browsers), `user-select` with the `-webkit-user-select` alias and
+      its used value (`auto` → the parent's `all`/`none`, else `text`;
+      `ComputedStyle::user_select_used`); `-webkit-focus-ring-color` as a
+      colour (rgb(16,16,16), Chrome's); the UA sheet gives
+      `:focus-visible { outline: -webkit-focus-ring-color auto 1px }`,
+      controls `user-select: none` and text controls `contain`. Paint:
+      outer shadows under the box (the border box moved and grown by the
+      spread, its radii adjusted per §7.1, blurred by a Gaussian of half
+      the blur radius with vello's blurred rounded rectangle, one quadrant
+      per differing corner radius, drawn outside the border box only),
+      inset shadows over the background inside the padding box (the
+      padding box less the moved, shrunk shape, via a destination-out
+      layer); outlines in a phase after all content (Blink's), around the
+      border box moved out by the offset, with the border painter for a
+      single box (corners rounded by the border radii plus offset and
+      width, as Chrome rounds outlines) and for an inline element broken
+      over lines one outline around the union of its fragments (the
+      union's boundary traced as right-angle loops: solid/double as bands
+      through a destination-out layer, dotted/dashed as dashed strokes
+      along the loops, inset/outset/groove/ridge per edge in the shade of
+      the side it faces); `outline-style: auto` is Chrome's focus ring:
+      2px of the outline colour outside the offset with a 1px white line
+      inside it, corners at least 2px round. The tab's old blue focus
+      ring and `PaintOptions::focus_ring` are gone (the ring is the
+      element's outline). Input: the hovered element's `cursor` goes to
+      the shell (every keyword mapped to the platform cursor; `none` hides
+      the pointer; a `url()` image no larger than 128×128, Chrome's limit,
+      fetched like a background image and sent decoded with its hotspot
+      as `TabToShell::CursorImage`, the shell making a custom cursor;
+      `auto` keeps the link/text/arrow rule); `pointer-events: none` boxes
+      are passed over by hit testing (their children with another value
+      are still hit); unselectable text (`user-select: none`, used value)
+      is skipped by pointer selection, select-all, find and copy
+      (`TextFragment::selectable`), a press in a `user-select: all`
+      element selects all of it and a drag into one takes it whole, a
+      drag out of a `contain` element stays at its edge. Tests: style
+      (every form and refusal, inheritance flags, shorthand expansion,
+      serialization, resolved values), paint (an outline past its offset,
+      a spread shadow, an inset shadow, the auto ring's dark and white
+      lines, an outline around a two-line inline), tab (`cursor: move`,
+      the link under a `pointer-events: none` box hovered with the
+      pointer cursor, select-all leaving `none` text out, a press
+      selecting a `user-select: all` element, a drag kept inside a
+      `contain` one). (6) `z-index` and `transform`/`transform-origin`
       with stacking contexts, paint order and hit testing through
       transforms; (7) `grid-*` through taffy grid; (8) `transition-*`,
       `animation-*`, `@keyframes` with the tab's animation clock and
