@@ -1763,7 +1763,47 @@ Work:
       page with `scroll-margin`, `end`, `container: nearest`, a bad enum;
       `scroll`+`scrollend` for a script scroll, `scrollend` after a wheel
       latch, the document's for a key; the scrolling element's
-      `clientWidth` without the scrollbar). (5)
+      `clientWidth` without the scrollbar).
+      **Block 6 done 2026-10-14: animation** (`crates/tab/src/document/
+      scrolling.rs`, `ScrollAnimation`). Scrolls animate on the tab's
+      timer (a 16 ms step, `scroll_animations_tick`) as Chrome's
+      `ScrollOffsetAnimationCurve` does, as recalled: an ease-in-out
+      cubic Bézier (0.42, 0, 0.58, 1); a wheel tick over 12 ticks of
+      1/60 s for deltas up to 120 px down to 6 ticks at 480 px and
+      beyond, keys, scrollbar buttons and track over 9 ticks (150 ms), a
+      programmatic smooth scroll over the square root of its distance in
+      ticks; a new delta of the same kind of scroll retargets the running
+      animation from where it is, adding to its target, with its current
+      speed carried into the new curve's first control point (Chrome's
+      `EaseInOutWithInitialSlope`); a user scroll over a programmatic
+      animation, or the reverse, starts afresh from the current offset.
+      Thumb drags, Shift+track jumps, selection autoscroll, middle-click
+      autoscroll and instant script scrolls take over at once and drop
+      the animation of their target. Programmatic scrolls are smooth with
+      `behavior: smooth`, or with `auto` (the default of `scrollTo`,
+      `scrollBy`, `scrollIntoView` and the `scrollTop`/`scrollLeft`
+      setters) on a box with `scroll-behavior: smooth` (the root
+      element's for the viewport; CSSOM View §5.1), `instant` never;
+      `View` records them as requests the tab animates after the script,
+      so the offsets a script reads meanwhile are the current ones;
+      `scrollIntoView` and the tab's `reveal` account for the animated
+      part of inner scrollers when aligning the outer ones. Fragment
+      navigation and keyboard focus follow `scroll-behavior` too; find
+      in page and the caret reveal are instant. Each frame's step fires
+      `scroll` at the next flush; `scrollend` waits until the target's
+      animation has ended (and no gesture holds it). Tests: tab (a wheel
+      tick's first frame, midpoint and end over 200 ms, a second tick
+      adding to the target, two key presses over 150 ms each, a smooth
+      `scrollTo` with `scrollY` reading the current offset, `scroll` per
+      frame and one `scrollend`, an instant scroll cancelling, `scroll-
+      behavior: smooth` on the root for `scrollTo` and the `scrollTop`
+      setter with `instant` still jumping, a thumb press dropping an
+      animation; the harness finishes animations within each pump unless
+      a test steps them). The GPU flake of `03-floats.png` (one channel
+      off by one under the parallel test run) showed once on
+      `01-text-and-boxes.png` too, at (593, 64), green 205↔204, compared
+      before anything else and the actual image removed; rerun before
+      suspecting a change. (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
       `user-select`; (6) `z-index` and `transform`/`transform-origin`

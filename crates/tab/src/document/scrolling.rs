@@ -91,6 +91,125 @@ pub(super) struct Pan {
     pub pointer: (f32, f32),
 }
 
+/// Why a scroll animates: the duration rule of Chrome's
+/// `ScrollOffsetAnimationCurve` (as recalled, in 1/60 s ticks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnimationKind {
+    /// A wheel: 12 ticks for deltas up to 120 px, down to 6 ticks at
+    /// 480 px and beyond.
+    Wheel,
+    /// Keys, scrollbar buttons and track: 9 ticks.
+    Constant,
+    /// A programmatic smooth scroll: the square root of the distance in
+    /// pixels, as ticks.
+    Programmatic,
+}
+
+/// A scroll in flight toward `to` (CSS Overflow 3 §3.4 / CSSOM View's
+/// smooth scrolling and Chrome's animated user scrolls): an ease-in-out
+/// curve over `duration` from `from`, its first slope carrying the speed
+/// a retarget found the previous animation at.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ScrollAnimation {
+    pub from: (f32, f32),
+    pub to: (f32, f32),
+    pub start: Instant,
+    pub duration: Duration,
+    /// The cubic Bézier control points, ease-in-out unless retargeted.
+    pub curve: (f32, f32, f32, f32),
+    pub user: bool,
+}
+
+/// The frame interval the animations step at.
+const ANIMATION_TICK: Duration = Duration::from_millis(16);
+const EASE_IN_OUT: (f32, f32, f32, f32) = (0.42, 0.0, 0.58, 1.0);
+
+impl ScrollAnimation {
+    fn progress(&self, now: Instant) -> f32 {
+        if self.duration.is_zero() {
+            return 1.0;
+        }
+        (now.duration_since(self.start).as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    fn eased(&self, p: f32) -> f32 {
+        cubic_bezier(self.curve, p)
+    }
+
+    pub fn position(&self, now: Instant) -> (f32, f32) {
+        let e = self.eased(self.progress(now));
+        (self.from.0 + (self.to.0 - self.from.0) * e, self.from.1 + (self.to.1 - self.from.1) * e)
+    }
+
+    /// The speed along the path in px/s at `now`.
+    fn velocity(&self, now: Instant) -> f32 {
+        let p = self.progress(now);
+        let d = 1.0e-3;
+        let (a, b) = (self.eased((p - d).max(0.0)), self.eased((p + d).min(1.0)));
+        let dp = ((p + d).min(1.0) - (p - d).max(0.0)).max(1.0e-6);
+        let slope = (b - a) / dp;
+        let distance = ((self.to.0 - self.from.0).powi(2) + (self.to.1 - self.from.1).powi(2)).sqrt();
+        slope * distance / self.duration.as_secs_f32().max(1.0e-3)
+    }
+
+    pub fn done(&self, now: Instant) -> bool {
+        self.progress(now) >= 1.0
+    }
+}
+
+/// The duration for a scroll of `distance` px per `kind`.
+fn animation_duration(kind: AnimationKind, distance: f32) -> Duration {
+    let ticks = match kind {
+        AnimationKind::Wheel => {
+            if distance <= 120.0 {
+                12.0
+            } else if distance >= 480.0 {
+                6.0
+            } else {
+                12.0 - 6.0 * (distance - 120.0) / 360.0
+            }
+        }
+        AnimationKind::Constant => 9.0,
+        AnimationKind::Programmatic => distance.abs().sqrt(),
+    };
+    Duration::from_secs_f32(ticks / 60.0)
+}
+
+/// Ease-in-out whose first control point gives the curve an initial
+/// slope (Chrome's `EaseInOutWithInitialSlope`, as recalled): the speed
+/// an interrupted animation had carries into the new one.
+fn ease_in_out_with_slope(slope: f32) -> (f32, f32, f32, f32) {
+    let slope = slope.clamp(0.0, 1000.0);
+    let (mut x1, mut y1) = (EASE_IN_OUT.0, EASE_IN_OUT.0 * slope);
+    if y1 > 1.0 {
+        y1 = 1.0;
+        x1 = 1.0 / slope;
+    }
+    (x1, y1, EASE_IN_OUT.2, EASE_IN_OUT.3)
+}
+
+/// `y` of the cubic Bézier through (0,0), (x1,y1), (x2,y2), (1,1) at `x`
+/// (CSS Easing 1 §2.4), solved by bisection.
+pub(super) fn cubic_bezier((x1, y1, x2, y2): (f32, f32, f32, f32), x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let at = |t: f32, a: f32, b: f32| 3.0 * (1.0 - t).powi(2) * t * a + 3.0 * (1.0 - t) * t * t * b + t * t * t;
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.0;
+        if at(mid, x1, x2) < x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    at((lo + hi) / 2.0, y1, y2)
+}
+
 /// How a rectangle is brought into a scrollport.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Reveal {
@@ -260,6 +379,134 @@ impl TabState {
         self.set_scroll(target, (info.offset.0 + dx, info.offset.1 + dy), user)
     }
 
+    // ----- animated scrolls -----
+
+    /// Whether the box of `target` asks for smooth programmatic scrolling
+    /// (`scroll-behavior: smooth`; the root element's for the viewport).
+    pub(super) fn smooth_behavior(&self, target: ScrollTarget) -> bool {
+        let node = match target {
+            ScrollTarget::Page => self.doc.as_ref().and_then(|d| d.document_element()),
+            ScrollTarget::Element(n) => Some(n),
+        };
+        node.and_then(|n| self.styles.get(n))
+            .is_some_and(|s| s.scroll_behavior == browser_style::ScrollBehavior::Smooth)
+    }
+
+    /// Animate `target` to `to` (clamped), a `user` scroll leaving its
+    /// `hidden` axes alone. A running animation of the target is retargeted
+    /// from where it is, keeping its speed; a programmatic one in the way
+    /// of a user scroll is dropped and the delta taken from the current
+    /// position.
+    pub(super) fn animate_scroll(&mut self, target: ScrollTarget, to: (f32, f32), user: bool, kind: AnimationKind) {
+        let Some(info) = self.scroll_info(target) else { return };
+        let (ux, uy) = info.user_scrollable();
+        let to = info.clamp((if user && !ux { info.offset.0 } else { to.0 }, if user && !uy { info.offset.1 } else { to.1 }));
+        let now = Instant::now();
+        let current = self.scroll_animations.get(&target).copied();
+        let (from, slope) = match current {
+            Some(a) if a.user == user && !a.done(now) => {
+                let position = a.position(now);
+                let distance = ((to.0 - position.0).powi(2) + (to.1 - position.1).powi(2)).sqrt();
+                let duration = animation_duration(kind, distance).as_secs_f32();
+                let slope = if distance > 0.0 { a.velocity(now) * duration / distance } else { 0.0 };
+                (position, slope)
+            }
+            _ => (info.offset, 0.0),
+        };
+        if from == to {
+            self.scroll_animations.remove(&target);
+            return;
+        }
+        let distance = ((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt();
+        self.scroll_animations.insert(
+            target,
+            ScrollAnimation {
+                from,
+                to,
+                start: now,
+                duration: animation_duration(kind, distance),
+                curve: if slope > 0.0 { ease_in_out_with_slope(slope) } else { EASE_IN_OUT },
+                user,
+            },
+        );
+        // The animation's own first step: content moves from this frame.
+        self.set_scroll(target, from, user);
+    }
+
+    /// Animate by a delta from the animation's target when one runs
+    /// (deltas accumulate, as Chrome's wheel ticks do), else from the
+    /// current offset.
+    pub(super) fn animate_scroll_by(&mut self, target: ScrollTarget, dx: f32, dy: f32, user: bool, kind: AnimationKind) {
+        let now = Instant::now();
+        let base = match self.scroll_animations.get(&target) {
+            Some(a) if a.user == user && !a.done(now) => a.to,
+            _ => match self.scroll_info(target) {
+                Some(i) => i.offset,
+                None => return,
+            },
+        };
+        self.animate_scroll(target, (base.0 + dx, base.1 + dy), user, kind);
+    }
+
+    /// Stop an animation where it is (a drag, a pan, an instant scroll
+    /// took over).
+    pub(super) fn cancel_scroll_animation(&mut self, target: ScrollTarget) {
+        self.scroll_animations.remove(&target);
+    }
+
+    pub(super) fn animating(&self, target: ScrollTarget) -> bool {
+        self.scroll_animations.contains_key(&target)
+    }
+
+    /// Step every animation to `now`; finished ones end.
+    pub(super) fn scroll_animations_tick(&mut self, now: Instant) {
+        let targets: Vec<ScrollTarget> = self.scroll_animations.keys().copied().collect();
+        for t in targets {
+            let Some(a) = self.scroll_animations.get(&t).copied() else { continue };
+            if !self.target_exists(t) {
+                self.scroll_animations.remove(&t);
+                continue;
+            }
+            // The last step lands exactly on the target.
+            let done = a.done(now);
+            let position = if done { a.to } else { a.position(now) };
+            self.set_scroll(t, position, a.user);
+            if done {
+                self.scroll_animations.remove(&t);
+            }
+        }
+    }
+
+    pub(super) fn scroll_animation_wake(&self) -> Option<Instant> {
+        (!self.scroll_animations.is_empty()).then(|| Instant::now() + ANIMATION_TICK)
+    }
+
+    /// Let every animation reach its end now (tests).
+    #[cfg(test)]
+    pub(super) fn finish_scroll_animations(&mut self) {
+        let targets: Vec<(ScrollTarget, ScrollAnimation)> = self.scroll_animations.drain().collect();
+        for (t, a) in targets {
+            self.set_scroll(t, a.to, a.user);
+        }
+    }
+
+    /// A user scroll by a delta: animated as Chrome animates wheel and
+    /// key scrolls.
+    pub(super) fn user_scroll_by(&mut self, target: ScrollTarget, dx: f32, dy: f32, kind: AnimationKind) {
+        self.animate_scroll_by(target, dx, dy, true, kind);
+    }
+
+    /// A programmatic scroll to `to`: smooth when `smooth` says so, else
+    /// at once (dropping any animation of the target).
+    pub(super) fn programmatic_scroll(&mut self, target: ScrollTarget, to: (f32, f32), smooth: bool) {
+        if smooth {
+            self.animate_scroll(target, to, false, AnimationKind::Programmatic);
+        } else {
+            self.cancel_scroll_animation(target);
+            self.set_scroll(target, to, false);
+        }
+    }
+
     /// Bring the page's offset back into range after a layout.
     pub(super) fn clamp_scroll(&mut self) {
         if self.layout.is_none() {
@@ -327,7 +574,7 @@ impl TabState {
         match target {
             Some(t) => {
                 self.wheel_latch = Some(Latch { target: t, at: now });
-                self.scroll_by(t, dx, dy, true);
+                self.user_scroll_by(t, dx, dy, AnimationKind::Wheel);
             }
             None => self.wheel_latch = None,
         }
@@ -347,8 +594,10 @@ impl TabState {
                 KeyScroll::Home => (0.0, -1.0e9),
                 KeyScroll::End => (0.0, 1.0e9),
             };
-            if info.can_scroll_by(dx, dy) {
-                self.scroll_by(t, dx, dy, true);
+            // With an animation running toward an end, the key still goes
+            // to this scroller (it adds to the target).
+            if info.can_scroll_by(dx, dy) || self.animating(t) {
+                self.user_scroll_by(t, dx, dy, AnimationKind::Constant);
                 return;
             }
         }
@@ -448,6 +697,7 @@ impl TabState {
         let (along, _, _) = self.along_bar(target, g.vertical, x, y);
         match part {
             ScrollbarPart::Thumb => {
+                self.cancel_scroll_animation(target);
                 let thumb = g.thumb_rect();
                 let start = if g.vertical { thumb.y } else { thumb.x };
                 self.scroll_drag = Some(ScrollDrag {
@@ -488,14 +738,15 @@ impl TabState {
             ScrollbarPart::Thumb => 0.0,
         };
         if vertical {
-            self.scroll_by(target, 0.0, d, true);
+            self.user_scroll_by(target, 0.0, d, AnimationKind::Constant);
         } else {
-            self.scroll_by(target, d, 0.0, true);
+            self.user_scroll_by(target, d, 0.0, AnimationKind::Constant);
         }
     }
 
-    /// Scroll so a bar's thumb is at `position` along it.
+    /// Scroll so a bar's thumb is at `position` along it, at once.
     fn set_bar_position(&mut self, target: ScrollTarget, vertical: bool, position: f32) {
+        self.cancel_scroll_animation(target);
         let Some(info) = self.scroll_info(target) else { return };
         let want = if vertical {
             (info.offset.0, position)
@@ -610,6 +861,7 @@ impl TabState {
         let (x, y) = self.mouse?;
         self.select_anchor?;
         let (target, dx, dy) = self.autoscroll_target(x, y)?;
+        self.cancel_scroll_animation(target);
         if self.scroll_by(target, dx, dy, true) {
             self.extend_selection_to(x, y);
         }
@@ -696,6 +948,7 @@ impl TabState {
             return;
         }
         if let Some(t) = self.chain_target(start, dx, dy) {
+            self.cancel_scroll_animation(t);
             self.scroll_by(t, dx, dy, true);
         }
     }
@@ -726,6 +979,7 @@ impl TabState {
         rect_of: &dyn Fn(&LayoutTree, &Document) -> Option<Rect>,
         how: Reveal,
         with_margin: bool,
+        smooth_allowed: bool,
     ) {
         let margin = if with_margin {
             self.styles.get(node).map(|s| s.scroll_margin).unwrap_or(Sides::all(0.0))
@@ -733,13 +987,16 @@ impl TabState {
             Sides::all(0.0)
         };
         let parent = self.doc.as_ref().and_then(|d| d.parent(node));
+        // What the scrollers below, still animating toward their targets,
+        // will have moved the rectangle by.
+        let mut pending = (0.0f32, 0.0f32);
         for t in self.scroll_chain(parent) {
             let rect = {
                 let (Some(tree), Some(doc)) = (&self.layout, &self.doc) else { return };
                 let Some(r) = rect_of(tree, doc) else { return };
                 Rect::new(
-                    r.x - margin.left,
-                    r.y - margin.top,
+                    r.x - margin.left - pending.0,
+                    r.y - margin.top - pending.1,
                     r.width + margin.left + margin.right,
                     r.height + margin.top + margin.bottom,
                 )
@@ -766,7 +1023,16 @@ impl TabState {
             );
             let (dx, dy) = reveal_delta(how, rect, port);
             if dx != 0.0 || dy != 0.0 {
-                self.scroll_by(t, dx, dy, false);
+                let to = (info.offset.0 + dx, info.offset.1 + dy);
+                let smooth = smooth_allowed && self.smooth_behavior(t);
+                self.programmatic_scroll(t, to, smooth);
+                if smooth && let Some(after) = self.scroll_info(t) {
+                    // Instant scrolls moved the rectangle in the tree;
+                    // the animated part is still to come.
+                    let target = after.clamp(to);
+                    pending.0 += target.0 - after.offset.0;
+                    pending.1 += target.1 - after.offset.1;
+                }
             }
         }
     }

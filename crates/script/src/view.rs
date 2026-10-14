@@ -68,6 +68,14 @@ pub struct View {
     pub element_scrolls: HashMap<NodeId, (f32, f32)>,
     /// A script moved an element scroll container.
     pub elements_scrolled: bool,
+    /// The scrolls the script asked for, in order: the page (`None`) or
+    /// an element, the target offset, and whether it is smooth
+    /// (`behavior: smooth`, or `auto` on a box with `scroll-behavior:
+    /// smooth`). Instant ones are applied here at once (later reads see
+    /// them) and listed so the tab drops an animation they override;
+    /// smooth ones the tab animates after the script, the offsets read
+    /// meanwhile being the current ones, as in browsers.
+    pub scroll_requests: Vec<(Option<NodeId>, (f32, f32), bool)>,
     /// The window's outer size and the screen's size, in CSS pixels.
     pub window: (f32, f32),
     pub screen: (f32, f32),
@@ -257,6 +265,42 @@ impl View {
         true
     }
 
+    /// Whether a scroll of `target` (the page for `None`) with `behavior`
+    /// is smooth: `smooth` is, `instant` is not, `auto` follows the box's
+    /// `scroll-behavior` (the root element's for the page; CSSOM View
+    /// §5.1).
+    pub fn smooth(&self, doc: &Document, target: Option<NodeId>, behavior: ScrollBehaviorArg) -> bool {
+        match behavior {
+            ScrollBehaviorArg::Smooth => true,
+            ScrollBehaviorArg::Instant => false,
+            ScrollBehaviorArg::Auto => target
+                .or_else(|| doc.document_element())
+                .and_then(|n| self.styles.get(n))
+                .is_some_and(|s| s.scroll_behavior == browser_style::ScrollBehavior::Smooth),
+        }
+    }
+
+    /// Scroll the page (`None`) or an element scroller to `(x, y)`: at
+    /// once, or as a smooth request for the tab. False for a box that is
+    /// no scroll container.
+    pub fn request_scroll(&mut self, doc: &Document, target: Option<NodeId>, x: f32, y: f32, behavior: ScrollBehaviorArg) -> bool {
+        if target.is_some_and(|n| self.scroller(n).is_none()) {
+            return false;
+        }
+        if self.smooth(doc, target, behavior) {
+            self.scroll_requests.push((target, (x, y), true));
+            return true;
+        }
+        self.scroll_requests.push((target, (x, y), false));
+        match target {
+            None => {
+                self.set_scroll(x, y);
+                true
+            }
+            Some(n) => self.set_element_scroll(n, x, y),
+        }
+    }
+
     /// The scroll container state of an element, if it is one.
     pub fn scroller(&self, id: NodeId) -> Option<browser_layout::ScrollInfo> {
         self.layout.as_ref().and_then(|t| t.scroller(id)).cloned()
@@ -413,6 +457,14 @@ pub(crate) fn with_layout<T>(
     };
     view.ensure_layout(doc, states, *generation);
     Ok(Some(f(view, doc, quirks)))
+}
+
+/// `ScrollBehavior` of CSSOM View's `ScrollOptions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollBehaviorArg {
+    Auto,
+    Instant,
+    Smooth,
 }
 
 /// The element that scrolls the page: `html`, or `body` in quirks mode.
@@ -835,22 +887,21 @@ fn geo_set(this: &JsValue, args: &[JsValue], prop: &GeoProp, context: &mut Conte
     let v = args.get_or_undefined(0).to_number(context)?;
     let v = if v.is_finite() { v as f32 } else { 0.0 };
     with_layout(context, |view, doc, quirks| {
+        // The setter scrolls with behavior `auto` (CSSOM View §6.1): the
+        // box's `scroll-behavior` decides.
         if scrolling_element(doc, quirks) == Some(id) {
+            let (x, y) = view.scroll;
             match prop {
-                GeoProp::ScrollTop => view.set_scroll(view.scroll.0, v),
-                GeoProp::ScrollLeft => view.set_scroll(v, view.scroll.1),
-                _ => {}
-            }
+                GeoProp::ScrollTop => view.request_scroll(doc, None, x, v, ScrollBehaviorArg::Auto),
+                GeoProp::ScrollLeft => view.request_scroll(doc, None, v, y, ScrollBehaviorArg::Auto),
+                _ => false,
+            };
         } else if let Some(info) = view.scroller(id) {
             match prop {
-                GeoProp::ScrollTop => {
-                    view.set_element_scroll(id, info.offset.0, v);
-                }
-                GeoProp::ScrollLeft => {
-                    view.set_element_scroll(id, v, info.offset.1);
-                }
-                _ => {}
-            }
+                GeoProp::ScrollTop => view.request_scroll(doc, Some(id), info.offset.0, v, ScrollBehaviorArg::Auto),
+                GeoProp::ScrollLeft => view.request_scroll(doc, Some(id), v, info.offset.1, ScrollBehaviorArg::Auto),
+                _ => false,
+            };
         }
     })?;
     Ok(JsValue::undefined())
@@ -869,20 +920,24 @@ enum GeoMethod {
 }
 
 /// `ScrollOptions.behavior` and `ScrollIntoViewOptions.behavior`: a
-/// WebIDL enum, so anything but its three values throws. The scroll is
-/// applied at once; `smooth` animates in roadmap 4a (4s) block 6.
-fn scroll_behavior(options: &JsObject, context: &mut Context) -> JsResult<()> {
+/// WebIDL enum, so anything but its three values throws; `auto` when
+/// left out.
+fn scroll_behavior(options: &JsObject, context: &mut Context) -> JsResult<ScrollBehaviorArg> {
     let v = options.get(js_string!("behavior"), context)?;
     if v.is_undefined() {
-        return Ok(());
+        return Ok(ScrollBehaviorArg::Auto);
     }
     let s = v.to_string(context)?.to_std_string_escaped();
-    if !matches!(s.as_str(), "auto" | "instant" | "smooth") {
-        return Err(JsNativeError::typ()
-            .with_message(format!("The provided value '{s}' is not a valid enum value of type ScrollBehavior."))
-            .into());
-    }
-    Ok(())
+    Ok(match s.as_str() {
+        "auto" => ScrollBehaviorArg::Auto,
+        "instant" => ScrollBehaviorArg::Instant,
+        "smooth" => ScrollBehaviorArg::Smooth,
+        _ => {
+            return Err(JsNativeError::typ()
+                .with_message(format!("The provided value '{s}' is not a valid enum value of type ScrollBehavior."))
+                .into());
+        }
+    })
 }
 
 /// The scroll-snap-free alignment of `scrollIntoView`'s `block`/`inline`
@@ -919,8 +974,19 @@ fn into_view_delta(how: &str, lo: f32, hi: f32, port_lo: f32, port_hi: f32) -> f
 /// `scroll-margin` is aligned per `block`/`inline` inside the scrollport
 /// shrunk by the box's `scroll-padding` (the root element's for the
 /// viewport); `container: "nearest"` stops after the first.
-fn scroll_into_view(view: &mut View, doc: &Document, id: NodeId, block: &str, inline: &str, nearest_only: bool) {
+fn scroll_into_view(
+    view: &mut View,
+    doc: &Document,
+    id: NodeId,
+    block: &str,
+    inline: &str,
+    nearest_only: bool,
+    behavior: ScrollBehaviorArg,
+) {
     let margin = view.styles.get(id).map(|s| s.scroll_margin).unwrap_or(Sides::all(0.0));
+    // What the scrollers below, animating toward their targets, will
+    // still move the element by.
+    let mut pending = (0.0f32, 0.0f32);
     let grow = |r: Rect| Rect::new(r.x - margin.left, r.y - margin.top, r.width + margin.left + margin.right, r.height + margin.top + margin.bottom);
     let padded = |port: Rect, padding: Sides<browser_style::ComputedLpAuto>| {
         let r = |v: browser_style::ComputedLpAuto, basis: f32| v.resolve(basis).unwrap_or(0.0);
@@ -934,17 +1000,22 @@ fn scroll_into_view(view: &mut View, doc: &Document, id: NodeId, block: &str, in
     let ancestors: Vec<NodeId> = doc.ancestors(id).collect();
     for a in ancestors {
         let Some(info) = view.scroller(a) else { continue };
-        let rect = grow(view.bounding(doc, id));
+        let rect = grow(view.bounding(doc, id)).translate(-pending.0, -pending.1);
         let padding = view.styles.get(a).map(|s| s.scroll_padding).unwrap_or(Sides::all(browser_style::ComputedLpAuto::Auto));
         let port = padded(info.scrollport, padding);
         let dy = into_view_delta(block, rect.y, rect.bottom(), port.y, port.bottom());
         let dx = into_view_delta(inline, rect.x, rect.right(), port.x, port.right());
-        view.set_element_scroll(a, info.offset.0 + dx, info.offset.1 + dy);
+        let to = info.clamp((info.offset.0 + dx, info.offset.1 + dy));
+        if view.smooth(doc, Some(a), behavior) {
+            pending.0 += to.0 - info.offset.0;
+            pending.1 += to.1 - info.offset.1;
+        }
+        view.request_scroll(doc, Some(a), to.0, to.1, behavior);
         if nearest_only {
             return;
         }
     }
-    let rect = grow(view.bounding(doc, id));
+    let rect = grow(view.bounding(doc, id)).translate(-pending.0, -pending.1);
     let Some(tree) = &view.layout else { return };
     let port = tree.viewport.scrollport.translate(view.scroll.0, view.scroll.1);
     let padding = doc
@@ -956,23 +1027,24 @@ fn scroll_into_view(view: &mut View, doc: &Document, id: NodeId, block: &str, in
     let dy = into_view_delta(block, rect.y, rect.bottom(), port.y, port.bottom());
     let dx = into_view_delta(inline, rect.x, rect.right(), port.x, port.right());
     let (sx, sy) = view.scroll;
-    view.set_scroll(sx + dx, sy + dy);
+    view.request_scroll(doc, None, sx + dx, sy + dy, behavior);
 }
 
 /// `scrollTo(x, y)`, `scrollTo({left, top, behavior})`, `scrollBy(...)`:
 /// the target offset, with missing parts kept (`by`: added); a
 /// non-finite part is 0 (WebIDL `unrestricted double` normalized per
 /// CSSOM View).
-fn scroll_args(args: &[JsValue], current: (f32, f32), by: bool, context: &mut Context) -> JsResult<(f32, f32)> {
+fn scroll_args(args: &[JsValue], current: (f32, f32), by: bool, context: &mut Context) -> JsResult<((f32, f32), ScrollBehaviorArg)> {
     let first = args.get_or_undefined(0);
     let finite = |v: f64| if v.is_finite() { v as f32 } else { 0.0 };
+    let mut behavior = ScrollBehaviorArg::Auto;
     let (dx, dy) = if let Some(o) = first.as_object() {
         let num = |name: &str, context: &mut Context| -> JsResult<Option<f32>> {
             let v = o.get(JsString::from(name), context)?;
             Ok(if v.is_undefined() { None } else { Some(finite(v.to_number(context)?)) })
         };
         let out = (num("left", context)?, num("top", context)?);
-        scroll_behavior(&o, context)?;
+        behavior = scroll_behavior(&o, context)?;
         out
     } else {
         let x = if first.is_undefined() { None } else { Some(finite(first.to_number(context)?)) };
@@ -980,11 +1052,12 @@ fn scroll_args(args: &[JsValue], current: (f32, f32), by: bool, context: &mut Co
         let y = if second.is_undefined() { None } else { Some(finite(second.to_number(context)?)) };
         (x, y)
     };
-    Ok(if by {
+    let to = if by {
         (current.0 + dx.unwrap_or(0.0), current.1 + dy.unwrap_or(0.0))
     } else {
         (dx.unwrap_or(current.0), dy.unwrap_or(current.1))
-    })
+    };
+    Ok((to, behavior))
 }
 
 fn geo_call(this: &JsValue, args: &[JsValue], method: &GeoMethod, context: &mut Context) -> JsResult<JsValue> {
@@ -994,7 +1067,7 @@ fn geo_call(this: &JsValue, args: &[JsValue], method: &GeoMethod, context: &mut 
         .ok_or_else(illegal_invocation)?;
     let Some(id) = node.id else { return Err(illegal_invocation()) };
     // Arguments first: reading them runs script.
-    let (block, inline, nearest_only) = match method {
+    let (block, inline, nearest_only, behavior) = match method {
         GeoMethod::ScrollIntoView => {
             let arg = args.get_or_undefined(0);
             if let Some(o) = arg.as_object() {
@@ -1015,15 +1088,15 @@ fn geo_call(this: &JsValue, args: &[JsValue], method: &GeoMethod, context: &mut 
                 let block = s("block", "start", POSITIONS, context)?;
                 let inline = s("inline", "nearest", POSITIONS, context)?;
                 let container = s("container", "all", &["all", "nearest"], context)?;
-                scroll_behavior(&o, context)?;
-                (block, inline, container == "nearest")
+                let behavior = scroll_behavior(&o, context)?;
+                (block, inline, container == "nearest", behavior)
             } else if arg.is_undefined() || arg.to_boolean() {
-                ("start".to_owned(), "nearest".to_owned(), false)
+                ("start".to_owned(), "nearest".to_owned(), false, ScrollBehaviorArg::Auto)
             } else {
-                ("end".to_owned(), "nearest".to_owned(), false)
+                ("end".to_owned(), "nearest".to_owned(), false, ScrollBehaviorArg::Auto)
             }
         }
-        _ => (String::new(), String::new(), false),
+        _ => (String::new(), String::new(), false, ScrollBehaviorArg::Auto),
     };
     // `scrollTo`/`scrollBy` are relative to the box's own offset: the
     // page's for the scrolling element, the scroller's for a scroll
@@ -1057,16 +1130,13 @@ fn geo_call(this: &JsValue, args: &[JsValue], method: &GeoMethod, context: &mut 
                 view.rects_of(doc, id).into_iter().map(|r| r.translate(-sx, -sy)).collect()
             }
             GeoMethod::ScrollIntoView => {
-                scroll_into_view(view, doc, id, &block, &inline, nearest_only);
+                scroll_into_view(view, doc, id, &block, &inline, nearest_only, behavior);
                 Vec::new()
             }
             GeoMethod::ScrollTo | GeoMethod::ScrollBy => {
-                if let Some((x, y)) = target {
-                    if scrolling_element(doc, quirks) == Some(id) {
-                        view.set_scroll(x, y);
-                    } else {
-                        view.set_element_scroll(id, x, y);
-                    }
+                if let Some(((x, y), behavior)) = target {
+                    let page = scrolling_element(doc, quirks) == Some(id);
+                    view.request_scroll(doc, if page { None } else { Some(id) }, x, y, behavior);
                 }
                 Vec::new()
             }
@@ -1209,8 +1279,8 @@ enum WinMethod {
 
 fn win_scroll(_: &JsValue, args: &[JsValue], method: &WinMethod, context: &mut Context) -> JsResult<JsValue> {
     let current = with_layout(context, |view, _, _| view.scroll)?.unwrap_or_default();
-    let (x, y) = scroll_args(args, current, matches!(method, WinMethod::ScrollBy), context)?;
-    with_layout(context, |view, _, _| view.set_scroll(x, y))?;
+    let ((x, y), behavior) = scroll_args(args, current, matches!(method, WinMethod::ScrollBy), context)?;
+    with_layout(context, |view, doc, _| view.request_scroll(doc, None, x, y, behavior))?;
     Ok(JsValue::undefined())
 }
 

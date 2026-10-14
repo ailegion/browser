@@ -653,11 +653,17 @@ impl TabState {
             }
         }
         // `scrollend` once nothing holds the scroll any more (a key's or a
-        // script's scroll ends at once; a wheel gesture when its latch
-        // runs out, a drag when the button goes up).
+        // script's instant scroll ends at once; a wheel gesture when its
+        // latch runs out, a drag when the button goes up, an animation
+        // when it reaches its end).
         if !self.scrollend_pending.is_empty() && !self.scroll_gesture_active() {
-            for t in std::mem::take(&mut self.scrollend_pending) {
-                fired |= self.fire_scroll_event(t, "scrollend", visual);
+            let pending = std::mem::take(&mut self.scrollend_pending);
+            for t in pending {
+                if self.animating(t) {
+                    self.scrollend_pending.push(t);
+                } else {
+                    fired |= self.fire_scroll_event(t, "scrollend", visual);
+                }
             }
         }
         fired

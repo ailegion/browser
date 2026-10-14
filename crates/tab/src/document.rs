@@ -31,7 +31,7 @@ mod scrolling;
 mod user_events;
 
 use editing::Composition;
-use scrolling::{BarRepeat, KeyScroll, Latch, Pan, Reveal, ScrollDrag, ScrollTarget, element_rect};
+use scrolling::{AnimationKind, BarRepeat, KeyScroll, Latch, Pan, Reveal, ScrollAnimation, ScrollDrag, ScrollTarget, element_rect};
 use user_events::{Modifiers, button_bit};
 
 /// Nested `@import` depth allowed.
@@ -363,6 +363,8 @@ pub(crate) struct TabState {
     bar_pressed: Option<(ScrollTarget, bool, ScrollbarPart)>,
     /// Middle-click autoscroll.
     pan: Option<Pan>,
+    /// The scrolls in flight, one per target (`scrolling.rs`).
+    scroll_animations: HashMap<ScrollTarget, ScrollAnimation>,
     /// The node under the last primary press: scrolling keys start their
     /// search for a scroller there when nothing is focused (Blink's
     /// mouse press node).
@@ -489,6 +491,7 @@ impl TabState {
             bar_hover: None,
             bar_pressed: None,
             pan: None,
+            scroll_animations: HashMap::new(),
             press_scroll_start: None,
             cursor: Cursor::Default,
             selection: None,
@@ -1267,7 +1270,7 @@ impl TabState {
     /// and the viewport, with a margin, its `scroll-margin` counted.
     fn scroll_focus_into_view(&mut self) {
         let Some(focus) = self.focus else { return };
-        self.reveal(focus, &|tree, doc| element_rect(tree, doc, focus), Reveal::Nearest(24.0), true);
+        self.reveal(focus, &|tree, doc| element_rect(tree, doc, focus), Reveal::Nearest(24.0), true, true);
         if self.focus.is_some() {
             self.focus_ring = self.compute_focus_ring();
             self.update_caret();
@@ -1361,7 +1364,7 @@ impl TabState {
             return;
         };
         let Some(node) = self.element_of(a.node) else { return };
-        self.reveal(node, &|tree, _| selection::first_rect(tree, a, b), Reveal::Third, false);
+        self.reveal(node, &|tree, _| selection::first_rect(tree, a, b), Reveal::Third, false, false);
     }
 
     fn report_find(&mut self) {
@@ -1593,6 +1596,7 @@ impl TabState {
         self.pending_scroll_targets.clear();
         self.scrollend_pending.clear();
         self.scrolls.clear();
+        self.scroll_animations.clear();
         self.wheel_latch = None;
         self.scroll_drag = None;
         self.bar_repeat = None;
@@ -1635,9 +1639,11 @@ impl TabState {
                 &|tree, doc| tree.first_rect(|n| n == t || doc.parent(n) == Some(t)),
                 Reveal::Start,
                 true,
+                true,
             ),
             None => {
-                self.set_scroll(ScrollTarget::Page, (self.scroll_x, 0.0), false);
+                let smooth = self.smooth_behavior(ScrollTarget::Page);
+                self.programmatic_scroll(ScrollTarget::Page, (self.scroll_x, 0.0), smooth);
             }
         }
         self.needs_paint = true;
@@ -1654,6 +1660,7 @@ impl TabState {
             self.bar_repeat.as_ref().map(|r| r.next),
             self.pan_next_wake(),
             self.scrollend_wake(),
+            self.scroll_animation_wake(),
             self.script.as_ref().and_then(ScriptHost::next_wake),
             self.frame_due,
         ]
@@ -1672,6 +1679,7 @@ impl TabState {
         }
         self.bar_repeat_tick(now);
         self.pan_tick(now);
+        self.scroll_animations_tick(now);
         // Script timers, then an animation frame if one is due: each
         // callback is a task with its own microtask checkpoint.
         if self
@@ -2413,6 +2421,17 @@ impl TabState {
             // the offsets that differ from the ones last reported).
             self.needs_paint = true;
             self.hover_dirty = true;
+        }
+        // The script's scrolls in their order: an instant one (already
+        // applied) drops any animation of its target, a smooth one starts
+        // animating from where the target is now.
+        for (node, to, smooth) in view.scroll_requests.drain(..) {
+            let target = node.map_or(ScrollTarget::Page, ScrollTarget::Element);
+            if smooth {
+                self.animate_scroll(target, to, false, AnimationKind::Programmatic);
+            } else {
+                self.cancel_scroll_animation(target);
+            }
         }
         self.view = view;
     }
@@ -3427,6 +3446,9 @@ mod tests {
         state: TabState,
         net_events: Receiver<NetToTab>,
         messages: Arc<Mutex<Vec<TabToShell>>>,
+        /// Scroll animations complete within each `pump` (the default);
+        /// off, a test steps them itself.
+        instant_scroll: bool,
     }
 
     fn data_url(html: &str, fragment: Option<&str>) -> Url {
@@ -3479,6 +3501,7 @@ mod tests {
                 state,
                 net_events,
                 messages,
+                instant_scroll: true,
             };
             h.state.handle_shell(ShellToTab::Navigate { url });
             h
@@ -3540,6 +3563,11 @@ mod tests {
             // first so what they start is delivered in the same call.
             loop {
                 self.state.tick();
+                // Scroll animations reach their end at once unless a test
+                // watches them frame by frame.
+                if self.instant_scroll {
+                    self.state.finish_scroll_animations();
+                }
                 self.state.flush();
                 let mut delivered = false;
                 while let Ok(ev) = self.net_events.try_recv() {
@@ -5978,6 +6006,80 @@ mod tests {
         // follows at once.
         h.key(Key::End, false);
         assert_eq!(run_js(&mut h, "log.splice(0).join(' ')"), "\"doc:#document win dend\"");
+    }
+
+    #[test]
+    fn scrolls_animate_like_chrome_and_fire_scroll_per_frame() {
+        use std::time::Duration;
+        let mut h = Harness::load(TALL);
+        h.instant_scroll = false;
+        let page = ScrollTarget::Page;
+        let advance = |h: &mut Harness, ms: u64| {
+            for a in h.state.scroll_animations.values_mut() {
+                a.start -= Duration::from_millis(ms);
+            }
+            h.pump();
+        };
+        // A wheel tick: ease-in-out over 200ms (a delta up to 120px); the
+        // first frame moves nothing, midway it is between, at the end 100.
+        h.wheel_at(400.0, 300.0, 100.0);
+        assert!(h.state.scroll_y < 1.0, "{}", h.state.scroll_y);
+        assert!(h.state.scroll_animations.contains_key(&page));
+        assert!(h.state.next_wake().is_some());
+        advance(&mut h, 100);
+        let mid = h.state.scroll_y;
+        assert!(mid > 20.0 && mid < 80.0, "{mid}");
+        // A second tick adds to the target and the motion goes on.
+        h.wheel_at(400.0, 300.0, 100.0);
+        assert!(h.state.scroll_y >= mid);
+        advance(&mut h, 300);
+        assert_eq!(h.state.scroll_y, 200.0);
+        assert!(h.state.scroll_animations.is_empty());
+        // Keys: 150ms each, a second press adds its line to the target.
+        h.key(Key::ArrowDown, false);
+        h.key(Key::ArrowDown, false);
+        assert!(h.state.scroll_y < 280.0);
+        advance(&mut h, 300);
+        assert_eq!(h.state.scroll_y, 280.0);
+        h.expire_latch();
+        h.pump();
+        // A programmatic smooth scroll: `scrollY` still reads the current
+        // offset; `scroll` fires per frame, `scrollend` once at the end.
+        assert_eq!(run_js(&mut h, "var n = 0, ends = 0; addEventListener('scroll', () => n++); addEventListener('scrollend', () => ends++); scrollTo({top: 0, behavior: 'smooth'}); scrollY"), "280");
+        let mut frames = 0;
+        while !h.state.scroll_animations.is_empty() && frames < 100 {
+            advance(&mut h, 40);
+            frames += 1;
+        }
+        assert_eq!(h.state.scroll_y, 0.0);
+        assert_eq!(run_js(&mut h, "[n >= 3, ends].join()"), "\"true,1\"");
+        // An instant scroll cancels a smooth one in flight.
+        assert_eq!(run_js(&mut h, "scrollTo({top: 200, behavior: 'smooth'}); scrollTo(0, 50); scrollY"), "50");
+        h.pump();
+        assert!(h.state.scroll_animations.is_empty());
+        assert_eq!(h.state.scroll_y, 50.0);
+        // `scroll-behavior: smooth` on the root makes `auto` scrolls smooth,
+        // `instant` still jumps; the `scrollTop` setter follows it too.
+        assert_eq!(run_js(&mut h, "document.documentElement.style.scrollBehavior = 'smooth'; scrollTo(0, 300); scrollY"), "50");
+        assert!(h.state.scroll_animations.contains_key(&page));
+        advance(&mut h, 2000);
+        assert_eq!(h.state.scroll_y, 300.0);
+        assert_eq!(run_js(&mut h, "scrollTo({top: 0, behavior: 'instant'}); scrollY"), "0");
+        // (The page has no doctype: the scrolling element is `body`.)
+        assert_eq!(run_js(&mut h, "document.scrollingElement.scrollTop = 100; scrollY"), "0");
+        assert!(h.state.scroll_animations.contains_key(&page), "the setter's smooth scroll animates");
+        advance(&mut h, 2000);
+        assert_eq!(h.state.scroll_y, 100.0);
+        // A thumb drag takes over from an animation at once.
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        if t > 0.0 {
+            h.wheel_at(400.0, 300.0, 100.0);
+            assert!(h.state.scroll_animations.contains_key(&page));
+            let thumb = h.state.scroll_info(page).expect("page").vertical_scrollbar().expect("bar").thumb_rect();
+            h.send(ShellToTab::MouseDown { x: 800.0 - t / 2.0, y: thumb.y + 2.0, button: MouseButton::Left });
+            assert!(h.state.scroll_animations.is_empty());
+            h.send(ShellToTab::MouseUp { x: 800.0 - t / 2.0, y: thumb.y + 2.0, button: MouseButton::Left });
+        }
     }
 
     #[test]
