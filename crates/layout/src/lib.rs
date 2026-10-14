@@ -253,6 +253,202 @@ impl ScrollInfo {
         self.padding_box = self.padding_box.translate(dx, dy);
         self.scrollport = self.scrollport.translate(dx, dy);
     }
+
+    /// The geometry of the vertical scrollbar, if one is shown.
+    pub fn vertical_scrollbar(&self) -> Option<ScrollbarGeometry> {
+        let track = self.vertical_track()?;
+        Some(ScrollbarGeometry::new(
+            track,
+            true,
+            self.thickness,
+            self.scroll_height,
+            self.scrollport.height,
+            self.offset.1,
+        ))
+    }
+
+    /// The geometry of the horizontal scrollbar, if one is shown. Its
+    /// position runs from 0 at the scroll origin: for a right-to-left
+    /// scroller that is `offset.0 + max`, so the thumb sits at the right
+    /// when nothing is scrolled.
+    pub fn horizontal_scrollbar(&self) -> Option<ScrollbarGeometry> {
+        let track = self.horizontal_track()?;
+        let (mx, _) = self.max_offset();
+        let position = if self.rtl { self.offset.0 + mx } else { self.offset.0 };
+        Some(ScrollbarGeometry::new(track, false, self.thickness, self.scroll_width, self.scrollport.width, position))
+    }
+
+    /// The scroll offset for a horizontal scrollbar position (the inverse
+    /// of `horizontal_scrollbar`'s mapping).
+    pub fn offset_for_horizontal_position(&self, position: f32) -> f32 {
+        let (mx, _) = self.max_offset();
+        if self.rtl { position - mx } else { position }
+    }
+}
+
+/// The part of a classic scrollbar under a point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbarPart {
+    /// The arrow button at the start (top or left): a line step back.
+    ButtonStart,
+    /// The arrow button at the end: a line step forward.
+    ButtonEnd,
+    /// The track before the thumb: a page step back.
+    TrackBefore,
+    /// The track after the thumb: a page step forward.
+    TrackAfter,
+    Thumb,
+}
+
+/// A classic scrollbar's geometry (Chrome's, as recalled: an arrow button
+/// of the bar's thickness at each end, the thumb between them no shorter
+/// than the thickness), for hit testing, dragging and drawing. Rectangles
+/// are in the coordinates of the `ScrollInfo` it came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarGeometry {
+    /// The whole bar: buttons and track.
+    pub bar: Rect,
+    pub vertical: bool,
+    pub thickness: f32,
+    /// The length of each arrow button along the bar (zero when the bar
+    /// is too short for them).
+    pub button: f32,
+    /// The scrollable extent and the scrollport length along the bar.
+    pub content: f32,
+    pub viewport: f32,
+    /// The position along the bar's axis, 0 at the start, up to
+    /// `max_position`.
+    pub position: f32,
+}
+
+impl ScrollbarGeometry {
+    pub fn new(bar: Rect, vertical: bool, thickness: f32, content: f32, viewport: f32, position: f32) -> Self {
+        let length = if vertical { bar.height } else { bar.width };
+        // Buttons need room for themselves and a minimal thumb.
+        let button = if length >= 3.0 * thickness { thickness } else { 0.0 };
+        Self {
+            bar,
+            vertical,
+            thickness,
+            button,
+            content,
+            viewport,
+            position,
+        }
+    }
+
+    pub fn max_position(&self) -> f32 {
+        (self.content - self.viewport).max(0.0)
+    }
+
+    /// The bar's extent along its axis: start coordinate and length.
+    fn axis(&self) -> (f32, f32) {
+        if self.vertical { (self.bar.y, self.bar.height) } else { (self.bar.x, self.bar.width) }
+    }
+
+    /// The track between the buttons: start coordinate and length.
+    pub fn track(&self) -> (f32, f32) {
+        let (start, length) = self.axis();
+        (start + self.button, (length - 2.0 * self.button).max(0.0))
+    }
+
+    /// A rectangle along the bar from `from` for `length`.
+    fn along(&self, from: f32, length: f32) -> Rect {
+        if self.vertical {
+            Rect::new(self.bar.x, from, self.bar.width, length)
+        } else {
+            Rect::new(from, self.bar.y, length, self.bar.height)
+        }
+    }
+
+    pub fn button_start_rect(&self) -> Option<Rect> {
+        (self.button > 0.0).then(|| self.along(self.axis().0, self.button))
+    }
+
+    pub fn button_end_rect(&self) -> Option<Rect> {
+        let (start, length) = self.axis();
+        (self.button > 0.0).then(|| self.along(start + length - self.button, self.button))
+    }
+
+    pub fn track_rect(&self) -> Rect {
+        let (start, length) = self.track();
+        self.along(start, length)
+    }
+
+    pub fn thumb_length(&self) -> f32 {
+        let (_, track) = self.track();
+        if self.content <= 0.0 {
+            return track;
+        }
+        (track * self.viewport / self.content).max(self.thickness.min(track)).min(track)
+    }
+
+    pub fn thumb_rect(&self) -> Rect {
+        let (start, track) = self.track();
+        let len = self.thumb_length();
+        let range = track - len;
+        let max = self.max_position();
+        let at = if max > 0.0 && range > 0.0 { range * (self.position / max).clamp(0.0, 1.0) } else { 0.0 };
+        self.along(start + at, len)
+    }
+
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        self.bar.contains(x, y)
+    }
+
+    pub fn hit(&self, x: f32, y: f32) -> Option<ScrollbarPart> {
+        if !self.contains(x, y) {
+            return None;
+        }
+        let p = if self.vertical { y } else { x };
+        let (start, length) = self.axis();
+        if self.button > 0.0 {
+            if p < start + self.button {
+                return Some(ScrollbarPart::ButtonStart);
+            }
+            if p >= start + length - self.button {
+                return Some(ScrollbarPart::ButtonEnd);
+            }
+        }
+        let thumb = self.thumb_rect();
+        let (t0, t1) = if self.vertical { (thumb.y, thumb.bottom()) } else { (thumb.x, thumb.right()) };
+        Some(if p < t0 {
+            ScrollbarPart::TrackBefore
+        } else if p >= t1 {
+            ScrollbarPart::TrackAfter
+        } else {
+            ScrollbarPart::Thumb
+        })
+    }
+
+    /// The position that puts the thumb's start at `at` along the bar.
+    pub fn position_for_thumb_start(&self, at: f32) -> f32 {
+        let (start, track) = self.track();
+        let range = track - self.thumb_length();
+        if range <= 0.0 {
+            return 0.0;
+        }
+        ((at - start) / range * self.max_position()).clamp(0.0, self.max_position())
+    }
+
+    /// The position that centres the thumb on `at` (Shift+click on the
+    /// track).
+    pub fn position_for_thumb_centre(&self, at: f32) -> f32 {
+        self.position_for_thumb_start(at - self.thumb_length() / 2.0)
+    }
+
+    /// How far a point is from the bar across its axis (0 inside), for
+    /// the drag that snaps back when the pointer strays too far.
+    pub fn distance_across(&self, x: f32, y: f32) -> f32 {
+        let (p, lo, hi) = if self.vertical { (x, self.bar.x, self.bar.right()) } else { (y, self.bar.y, self.bar.bottom()) };
+        if p < lo {
+            lo - p
+        } else if p > hi {
+            p - hi
+        } else {
+            0.0
+        }
+    }
 }
 
 /// One glyph positioned relative to its text fragment's origin.

@@ -359,7 +359,7 @@ impl TabState {
             return false;
         }
         let Some((x, y)) = self.mouse else { return false };
-        if self.event_doc().is_none() || self.over_scrollbar() {
+        if self.event_doc().is_none() || self.over_scrollbar_area(x, y) {
             return false;
         }
         self.process_pointer_capture();

@@ -7,9 +7,9 @@ use std::sync::Arc;
 use browser_dom::{Document, HtmlParser, NodeId};
 use browser_ipc_types::{Cursor, Key, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
 use browser_layout::selection::{self, TextPos};
-use browser_layout::{LayoutEngine, LayoutTree, Rect, SelectionRanges};
-use browser_chrome::scrollbar::{Scrollbar, ScrollbarHit};
+use browser_layout::{LayoutEngine, LayoutTree, Rect, ScrollbarPart, SelectionRanges};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
+use browser_paint::scrollbar::{ScrollbarState, draw_corner, draw_scrollbar};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_script::{
     ConsoleLevel, ConsoleLine, EventTargetRef, HostRequest, ImageSizeMap, ModuleProgress, ModuleScript, ScriptHost, View,
@@ -27,9 +27,11 @@ use vello::Scene;
 use crate::{OutputSink, TabOutput};
 
 mod editing;
+mod scrolling;
 mod user_events;
 
 use editing::Composition;
+use scrolling::{BarRepeat, KeyScroll, Latch, Pan, Reveal, ScrollDrag, ScrollTarget, element_rect};
 use user_events::{Modifiers, button_bit};
 
 /// Nested `@import` depth allowed.
@@ -340,9 +342,25 @@ pub(crate) struct TabState {
     /// last fired for.
     viewport_reported: (f32, f32),
     scroll_reported: (f32, f32),
-    /// The scrollbar thumb is being dragged: where in the thumb it was
-    /// grabbed, in logical pixels from its top.
-    scroll_drag: Option<f32>,
+    /// The element scroll containers' offsets (`scrolling.rs`): the truth
+    /// the layout tree is given and keeps applied.
+    scrolls: HashMap<NodeId, (f32, f32)>,
+    /// The wheel gesture in progress and the scroller it is latched to.
+    wheel_latch: Option<Latch>,
+    /// A scrollbar thumb being dragged.
+    scroll_drag: Option<ScrollDrag>,
+    /// A scrollbar button or track held down, repeating.
+    bar_repeat: Option<BarRepeat>,
+    /// The scrollbar part under the pointer and the one pressed, for the
+    /// highlights: the target, whether the vertical bar, the part.
+    bar_hover: Option<(ScrollTarget, bool, ScrollbarPart)>,
+    bar_pressed: Option<(ScrollTarget, bool, ScrollbarPart)>,
+    /// Middle-click autoscroll.
+    pan: Option<Pan>,
+    /// The node under the last primary press: scrolling keys start their
+    /// search for a scroller there when nothing is focused (Blink's
+    /// mouse press node).
+    press_scroll_start: Option<NodeId>,
     cursor: Cursor,
 
     /// The text selection as anchor (where the drag began) and focus (where
@@ -455,7 +473,14 @@ impl TabState {
             focus_value: None,
             viewport_reported: (viewport.width, viewport.height),
             scroll_reported: (0.0, 0.0),
+            scrolls: HashMap::new(),
+            wheel_latch: None,
             scroll_drag: None,
+            bar_repeat: None,
+            bar_hover: None,
+            bar_pressed: None,
+            pan: None,
+            press_scroll_start: None,
             cursor: Cursor::Default,
             selection: None,
             select_anchor: None,
@@ -557,21 +582,12 @@ impl TabState {
                 if !self.fire_wheel(dx, dy) {
                     return;
                 }
-                self.scroll_x += dx;
-                self.scroll_y += dy;
-                self.clamp_scroll();
-                self.needs_paint = true;
-                self.hover_dirty = true;
+                self.wheel_scroll(dx, dy);
             }
             ShellToTab::MouseMove { x, y } => {
                 self.mouse = Some((x, y));
-                if let Some(grab) = self.scroll_drag {
-                    if let Some(sb) = self.scrollbar() {
-                        self.scroll_y = sb.offset_for_thumb_top(y - grab);
-                        self.clamp_scroll();
-                        self.needs_paint = true;
-                    }
-                } else {
+                self.pan_move(x, y);
+                if !self.scrollbar_mouse_move(x, y) {
                     self.hover_dirty = true;
                     self.pointer_moved = true;
                 }
@@ -580,9 +596,10 @@ impl TabState {
                 }
                 if self.select_anchor.is_some() {
                     self.extend_selection_to(x, y);
-                    // Outside the viewport the page scrolls toward the
-                    // pointer until it comes back.
-                    let outside = y < 0.0 || y > self.viewport.height;
+                    // Outside a scroller's port (or the viewport) the
+                    // scroller scrolls toward the pointer until it comes
+                    // back.
+                    let outside = self.autoscroll_wanted(x, y);
                     if outside && self.autoscroll.is_none() {
                         self.autoscroll = Some(std::time::Instant::now());
                     } else if !outside {
@@ -598,18 +615,16 @@ impl TabState {
             }
             ShellToTab::MouseDown { x, y, button } => {
                 self.mouse = Some((x, y));
-                if button == MouseButton::Left
-                    && let Some(sb) = self.scrollbar()
-                    && let Some(hit) = sb.hit(x, y)
-                {
-                    // The scrollbar is above the page: no click reaches it.
-                    match hit {
-                        ScrollbarHit::Thumb => self.scroll_drag = Some(y - sb.thumb().y0 as f32),
-                        ScrollbarHit::Before => self.scroll_y -= self.viewport.height * 0.9,
-                        ScrollbarHit::After => self.scroll_y += self.viewport.height * 0.9,
-                    }
-                    self.clamp_scroll();
-                    self.needs_paint = true;
+                // A press while middle-click autoscroll is on only ends it.
+                if self.pan.is_some() {
+                    self.stop_pan();
+                    return;
+                }
+                // The scrollbars are above the page: no press reaches it.
+                if button == MouseButton::Left && self.scrollbar_mouse_down(x, y, self.modifiers.shift) {
+                    return;
+                }
+                if self.over_scrollbar_area(x, y) {
                     return;
                 }
                 self.update_hover();
@@ -643,6 +658,7 @@ impl TabState {
                 // selection within it, not the page's.
                 let mut in_control = false;
                 if button == MouseButton::Left {
+                    self.press_scroll_start = hit;
                     self.set_active(hit);
                     if proceed {
                         let focus = hit.and_then(|h| self.focusable_ancestor(h));
@@ -663,6 +679,12 @@ impl TabState {
                     let on_link = self.press.is_some();
                     self.begin_selection(x, y, clicks, on_link);
                 }
+                // A middle press off a link starts autoscroll (unless a
+                // listener cancelled the press), as browsers do on
+                // Windows and Linux.
+                if button == MouseButton::Middle && proceed && self.press.is_none() {
+                    self.start_pan(x, y, hit);
+                }
             }
             ShellToTab::MouseUp { x, y, button } => {
                 self.mouse = Some((x, y));
@@ -671,10 +693,11 @@ impl TabState {
                     self.control_drag = false;
                     self.autoscroll = None;
                 }
+                if button == MouseButton::Middle {
+                    self.pan_release();
+                }
                 self.buttons &= !button_bit(button);
-                if self.scroll_drag.take().is_some() {
-                    self.needs_paint = true;
-                    self.hover_dirty = true;
+                if self.scrollbar_mouse_up() {
                     return;
                 }
                 self.update_hover();
@@ -805,6 +828,8 @@ impl TabState {
         // produces a character also fires the legacy `keypress`, whose
         // cancellation stops only the text it would insert: browsers
         // scroll and activate on `keydown`.
+        // Any key ends middle-click autoscroll.
+        self.stop_pan();
         if !self.fire_key("keydown", &key, code, repeat, shift, ctrl, alt) {
             return;
         }
@@ -848,7 +873,6 @@ impl TabState {
             }
             return;
         }
-        let h = self.viewport.height;
         match key {
             Key::Enter if (link || button) && !ctrl && !alt => {
                 if self.fire_synthetic_click(f) && link {
@@ -857,25 +881,17 @@ impl TabState {
             }
             Key::Space if toggle || button => self.space_armed = Some(f),
             Key::ArrowUp | Key::ArrowDown if select => self.step_select(f, key == Key::ArrowDown),
-            Key::ArrowDown => self.scroll_by(0.0, LINE_SCROLL),
-            Key::ArrowUp => self.scroll_by(0.0, -LINE_SCROLL),
-            Key::ArrowRight => self.scroll_by(LINE_SCROLL, 0.0),
-            Key::ArrowLeft => self.scroll_by(-LINE_SCROLL, 0.0),
-            Key::PageDown => self.scroll_by(0.0, h * 0.9),
-            Key::PageUp => self.scroll_by(0.0, -h * 0.9),
-            Key::Space => self.scroll_by(0.0, if shift { -h * 0.9 } else { h * 0.9 }),
-            Key::Home => self.scroll_by(0.0, -1.0e9),
-            Key::End => self.scroll_by(0.0, 1.0e9),
+            Key::ArrowDown => self.keyboard_scroll(KeyScroll::Line(0.0, LINE_SCROLL)),
+            Key::ArrowUp => self.keyboard_scroll(KeyScroll::Line(0.0, -LINE_SCROLL)),
+            Key::ArrowRight => self.keyboard_scroll(KeyScroll::Line(LINE_SCROLL, 0.0)),
+            Key::ArrowLeft => self.keyboard_scroll(KeyScroll::Line(-LINE_SCROLL, 0.0)),
+            Key::PageDown => self.keyboard_scroll(KeyScroll::Page(1.0)),
+            Key::PageUp => self.keyboard_scroll(KeyScroll::Page(-1.0)),
+            Key::Space => self.keyboard_scroll(KeyScroll::Page(if shift { -1.0 } else { 1.0 })),
+            Key::Home => self.keyboard_scroll(KeyScroll::Home),
+            Key::End => self.keyboard_scroll(KeyScroll::End),
             _ => {}
         }
-    }
-
-    fn scroll_by(&mut self, dx: f32, dy: f32) {
-        self.scroll_x += dx;
-        self.scroll_y += dy;
-        self.clamp_scroll();
-        self.needs_paint = true;
-        self.hover_dirty = true;
     }
 
     /// The live value of a text control: a textarea's text, an input's
@@ -955,7 +971,57 @@ impl TabState {
         if caret != self.caret_rect {
             self.caret_rect = caret;
             self.needs_paint = true;
+            // The caret stays in view: the control scrolls to it (an
+            // input sideways, a textarea down), then the scrollers above
+            // and the page, as browsers reveal a moved caret.
+            if let (Some(rect), Some(control)) = (caret, self.text_focus()) {
+                self.reveal_caret(control, rect);
+            }
         }
+    }
+
+    /// Scroll the control and everything above it so the caret shows;
+    /// the caret rectangle is placed again after, since it moved with
+    /// the control's content.
+    fn reveal_caret(&mut self, control: NodeId, rect: Rect) {
+        // The control itself is a scroll container (`overflow: auto` on
+        // a textarea, `hidden` on an input): the chain starts with it.
+        let chain = self.scroll_chain(Some(control));
+        let mut rect = rect;
+        for t in chain {
+            let Some(info) = self.scroll_info(t) else { continue };
+            let port = match t {
+                ScrollTarget::Page => info.scrollport.translate(self.scroll_x, self.scroll_y),
+                ScrollTarget::Element(_) => info.scrollport,
+            };
+            let mut dy = 0.0;
+            if rect.bottom() > port.bottom() {
+                dy = rect.bottom() - port.bottom();
+            }
+            if rect.y < port.y {
+                dy = rect.y - port.y;
+            }
+            let mut dx = 0.0;
+            if rect.right() > port.right() {
+                dx = rect.right() - port.right();
+            }
+            if rect.x < port.x {
+                dx = rect.x - port.x;
+            }
+            if dx == 0.0 && dy == 0.0 {
+                continue;
+            }
+            let before = info.offset;
+            if self.scroll_by(t, dx, dy, false)
+                && let ScrollTarget::Element(_) = t
+                && let Some(after) = self.scroll_info(t)
+            {
+                // The content, caret included, moved with the scroll (by
+                // what the clamp allowed).
+                rect = rect.translate(before.0 - after.offset.0, before.1 - after.offset.1);
+            }
+        }
+        self.caret_rect = Some(rect);
     }
 
     /// Flip a checkbox, or check a radio and clear the rest of its group
@@ -1079,7 +1145,9 @@ impl TabState {
         let mut normal: Vec<(usize, NodeId)> = Vec::new();
         for (i, n) in doc.descendants(doc.root()).enumerate() {
             let Some(e) = doc.element(n) else { continue };
-            if !is_focusable(e) || !rendered.contains(&n) {
+            // Scrollers with nothing focusable inside take keyboard focus
+            // too (Chrome's keyboard-focusable scrollers).
+            if !rendered.contains(&n) || !(is_focusable(e) || self.keyboard_focusable_scroller(n)) {
                 continue;
             }
             match tabindex(e) {
@@ -1186,31 +1254,15 @@ impl TabState {
         merged
     }
 
-    /// Scroll so the focus ring is inside the viewport, with a margin.
+    /// Scroll so the focused element is inside every scroller above it
+    /// and the viewport, with a margin, its `scroll-margin` counted.
     fn scroll_focus_into_view(&mut self) {
-        let Some(first) = self.focus_ring.first().copied() else { return };
-        let union = self.focus_ring.iter().fold(first, |u, r| {
-            let x = u.x.min(r.x);
-            let y = u.y.min(r.y);
-            Rect::new(x, y, u.right().max(r.right()) - x, u.bottom().max(r.bottom()) - y)
-        });
-        let margin = 24.0;
-        let (w, h) = (self.viewport.width, self.viewport.height);
-        if union.bottom() + margin > self.scroll_y + h {
-            self.scroll_y = union.bottom() + margin - h;
+        let Some(focus) = self.focus else { return };
+        self.reveal(focus, &|tree, doc| element_rect(tree, doc, focus), Reveal::Nearest(24.0), true);
+        if self.focus.is_some() {
+            self.focus_ring = self.compute_focus_ring();
+            self.update_caret();
         }
-        if union.y - margin < self.scroll_y {
-            self.scroll_y = union.y - margin;
-        }
-        if union.right() + margin > self.scroll_x + w {
-            self.scroll_x = union.right() + margin - w;
-        }
-        if union.x - margin < self.scroll_x {
-            self.scroll_x = union.x - margin;
-        }
-        self.clamp_scroll();
-        self.needs_paint = true;
-        self.hover_dirty = true;
     }
 
     // ----- find in page -----
@@ -1292,22 +1344,15 @@ impl TabState {
         self.report_find();
     }
 
-    /// Bring the current match into the viewport, a third of the way down.
+    /// Bring the current match into view, a third of the way down, through
+    /// every scroller above it and the viewport. The highlights are
+    /// placed again after, since the match may have moved.
     fn scroll_to_current_match(&mut self) {
-        let Some(tree) = self.layout.as_ref() else { return };
         let Some((a, b)) = self.find.as_ref().and_then(|f| f.current.map(|i| f.matches[i])) else {
             return;
         };
-        let Some(rect) = selection::first_rect(tree, a, b) else { return };
-        let (w, h) = (self.viewport.width, self.viewport.height);
-        if rect.y < self.scroll_y || rect.bottom() > self.scroll_y + h {
-            self.scroll_y = rect.y - h / 3.0;
-        }
-        if rect.x < self.scroll_x || rect.right() > self.scroll_x + w {
-            self.scroll_x = rect.x - w / 3.0;
-        }
-        self.clamp_scroll();
-        self.hover_dirty = true;
+        let Some(node) = self.element_of(a.node) else { return };
+        self.reveal(node, &|tree, _| selection::first_rect(tree, a, b), Reveal::Third, false);
     }
 
     fn report_find(&mut self) {
@@ -1395,29 +1440,6 @@ impl TabState {
             (Some((a, b)), Some(tree)) => selection::selection_ranges(tree, a, b),
             _ => SelectionRanges::default(),
         }
-    }
-
-    /// One step of scrolling toward a pointer held outside the viewport
-    /// during a selection drag. Returns when the next step is due.
-    fn autoscroll_step(&mut self) -> Option<std::time::Instant> {
-        let (x, y) = self.mouse?;
-        self.select_anchor?;
-        let over = if y < 0.0 {
-            y
-        } else if y > self.viewport.height {
-            y - self.viewport.height
-        } else {
-            return None;
-        };
-        let before = self.scroll_y;
-        self.scroll_y += (over * 0.25).clamp(-60.0, 60.0);
-        self.clamp_scroll();
-        if self.scroll_y != before {
-            self.needs_paint = true;
-            self.hover_dirty = true;
-            self.extend_selection_to(x, y);
-        }
-        Some(std::time::Instant::now() + std::time::Duration::from_millis(50))
     }
 
     // ----- navigation -----
@@ -1558,6 +1580,13 @@ impl TabState {
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_reported = (0.0, 0.0);
+        self.scrolls.clear();
+        self.wheel_latch = None;
+        self.scroll_drag = None;
+        self.bar_repeat = None;
+        self.bar_pressed = None;
+        self.press_scroll_start = None;
+        self.stop_pan();
         // The new document's scripts run while it parses, so its context
         // starts here; the old document's timers stop with its context.
         self.new_script_host();
@@ -1586,13 +1615,19 @@ impl TabState {
             tracing::debug!(tab = self.id.0, "no element for fragment {fragment:?}");
             return;
         }
-        let rect = target.and_then(|t| {
-            self.layout
-                .as_ref()?
-                .first_rect(|n| n == t || doc.parent(n) == Some(t))
-        });
-        self.scroll_y = rect.map_or(0.0, |r| r.y);
-        self.clamp_scroll();
+        match target {
+            // The element's top at the top of every scroller above it and
+            // of the viewport, its `scroll-margin` counted.
+            Some(t) => self.reveal(
+                t,
+                &|tree, doc| tree.first_rect(|n| n == t || doc.parent(n) == Some(t)),
+                Reveal::Start,
+                true,
+            ),
+            None => {
+                self.set_scroll(ScrollTarget::Page, (self.scroll_x, 0.0), false);
+            }
+        }
         self.needs_paint = true;
 
         let changed = self.states.set_single(target, ElementStates::TARGET);
@@ -1604,6 +1639,8 @@ impl TabState {
         [
             self.refresh.as_ref().map(|(at, _)| *at),
             self.autoscroll,
+            self.bar_repeat.as_ref().map(|r| r.next),
+            self.pan_next_wake(),
             self.script.as_ref().and_then(ScriptHost::next_wake),
             self.frame_due,
         ]
@@ -1620,6 +1657,8 @@ impl TabState {
         {
             self.autoscroll = self.autoscroll_step();
         }
+        self.bar_repeat_tick(now);
+        self.pan_tick(now);
         // Script timers, then an animation frame if one is due: each
         // callback is a task with its own microtask checkpoint.
         if self
@@ -1723,24 +1762,14 @@ impl TabState {
     }
 
     /// Re-evaluate what is under the pointer; restyle if it changed.
-    /// The page's vertical scrollbar, if the content overflows.
-    fn scrollbar(&self) -> Option<Scrollbar> {
-        let content_height = self.layout.as_ref()?.content_height;
-        Scrollbar::vertical(self.viewport.width, self.viewport.height, content_height, self.scroll_y)
-    }
-
-    fn over_scrollbar(&self) -> bool {
-        self.mouse
-            .is_some_and(|(x, y)| self.scrollbar().is_some_and(|sb| sb.contains(x, y)))
-    }
-
     fn update_hover(&mut self) {
         self.hover_dirty = false;
-        // The scrollbar covers the page under it.
-        let raw = if self.over_scrollbar() {
-            None
-        } else {
-            self.mouse.and_then(|(x, y)| self.hit_node(x, y))
+        self.update_bar_hover();
+        // The page's scrollbars cover the page under them; an element's
+        // scrollbars are part of the element (`hit_test` says so).
+        let raw = match self.mouse {
+            Some((x, y)) if !self.over_page_scrollbar(x, y) => self.hit_node(x, y),
+            _ => None,
         };
         // A capturing element is what the pointer is "over" until release.
         let hit = match self.pointer_capture {
@@ -1764,17 +1793,19 @@ impl TabState {
                 .as_ref()
                 .is_some_and(|d| d.contains(n) && (!d.get(n).is_element() || d.element(n).is_some_and(is_text_control)))
         });
-        let cursor = if over_link {
+        let over_bar = self.mouse.is_some_and(|(x, y)| self.over_scrollbar_area(x, y));
+        let cursor = if self.pan.is_some() {
+            Cursor::AllScroll
+        } else if over_bar {
+            Cursor::Default
+        } else if over_link {
             Cursor::Pointer
         } else if over_text {
             Cursor::Text
         } else {
             Cursor::Default
         };
-        if cursor != self.cursor {
-            self.cursor = cursor;
-            self.send(TabToShell::Cursor(cursor));
-        }
+        self.set_cursor(cursor);
 
         let Some(doc) = &self.doc else { return };
         let changed = self.states.set_chain(doc, hit, ElementStates::HOVER);
@@ -2319,6 +2350,7 @@ impl TabState {
         view.viewport = (self.viewport.width, self.viewport.height);
         view.scale = self.viewport.scale_factor;
         view.scroll = (self.scroll_x, self.scroll_y);
+        view.element_scrolls = std::mem::take(&mut self.scrolls);
         view.window = self.window_size;
         view.screen = self.screen_size;
         view.engine = self.engine.take();
@@ -2344,6 +2376,7 @@ impl TabState {
         self.engine = view.engine.take();
         self.styles = std::mem::take(&mut view.styles);
         self.layout = view.layout.take();
+        self.scrolls = std::mem::take(&mut view.element_scrolls);
         self.deps = std::mem::take(&mut view.deps);
         self.loaded_sheets = std::mem::take(&mut view.loaded_sheets);
         // A layout the script forced that nothing changed after is the
@@ -2358,11 +2391,7 @@ impl TabState {
             self.after_layout();
         }
         if view.scroll_changed {
-            self.scroll_x = view.scroll.0;
-            self.scroll_y = view.scroll.1;
-            self.clamp_scroll();
-            self.needs_paint = true;
-            self.hover_dirty = true;
+            self.set_scroll(ScrollTarget::Page, view.scroll, false);
         }
         self.view = view;
     }
@@ -2988,18 +3017,6 @@ impl TabState {
         stylist
     }
 
-    fn clamp_scroll(&mut self) {
-        let (cw, ch) = self
-            .layout
-            .as_ref()
-            .map(|l| (l.content_width, l.content_height))
-            .unwrap_or((self.viewport.width, self.viewport.height));
-        let max_x = (cw - self.viewport.width).max(0.0);
-        let max_y = (ch - self.viewport.height).max(0.0);
-        self.scroll_x = self.scroll_x.clamp(0.0, max_x);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_y);
-    }
-
     /// Called after each batch of events: do the work that is due.
     pub fn flush(&mut self) {
         // A capture a listener asked for takes effect before the batch's
@@ -3088,7 +3105,15 @@ impl TabState {
         let Some(doc) = &self.doc else { return };
         let Some(engine) = &mut self.engine else { return };
         let started = std::time::Instant::now();
-        let tree = engine.layout(doc, &self.styles, self.viewport.width, self.viewport.height, &self.images);
+        let tree = engine.layout_with_scrolls(
+            doc,
+            &self.styles,
+            self.viewport.width,
+            self.viewport.height,
+            &self.images,
+            &self.scrolls,
+            (self.scroll_x, self.scroll_y),
+        );
         self.layouts += 1;
         tracing::debug!(
             tab = self.id.0,
@@ -3102,10 +3127,10 @@ impl TabState {
     }
 
     /// What follows a new layout, the tab's own or one a script forced:
-    /// the scroll offset clamped, find matches and the focus ring and
-    /// caret placed again.
+    /// the scroll offsets as the tree applied them, find matches and the
+    /// focus ring and caret placed again.
     fn after_layout(&mut self) {
-        self.clamp_scroll();
+        self.sync_scrolls_after_layout();
         if self.find.is_some() {
             let prefer = self.current_match_start();
             self.refresh_find(prefer, false);
@@ -3138,9 +3163,27 @@ impl TabState {
         let started = std::time::Instant::now();
         paint(tree, &self.images, &options, &mut self.scene);
         tracing::debug!(tab = self.id.0, paint_ms = started.elapsed().as_millis(), "repaint");
-        if let Some(sb) = self.scrollbar() {
-            let active = self.scroll_drag.is_some() || self.over_scrollbar();
-            sb.draw(&mut self.scene, self.viewport.scale_factor, active);
+        // The page's classic scrollbars, over everything, in their gutters
+        // (the elements' are the painter's, roadmap 4a (4s) block 4).
+        let page = tree.viewport.clone();
+        let (vertical, horizontal, corner) = {
+            let mut page = page;
+            page.offset = (self.scroll_x, self.scroll_y);
+            (page.vertical_scrollbar(), page.horizontal_scrollbar(), page.corner())
+        };
+        let transform = vello::kurbo::Affine::scale(f64::from(self.viewport.scale_factor));
+        let state = |vertical: bool| ScrollbarState {
+            hover: self.bar_hover.filter(|&(t, v, _)| t == ScrollTarget::Page && v == vertical).map(|(_, _, p)| p),
+            pressed: self.bar_pressed.filter(|&(t, v, _)| t == ScrollTarget::Page && v == vertical).map(|(_, _, p)| p),
+        };
+        if let Some(g) = &vertical {
+            draw_scrollbar(&mut self.scene, transform, g, state(true));
+        }
+        if let Some(g) = &horizontal {
+            draw_scrollbar(&mut self.scene, transform, g, state(false));
+        }
+        if let Some(c) = &corner {
+            draw_corner(&mut self.scene, transform, c);
         }
         let scene = std::mem::take(&mut self.scene);
         (self.output)(self.id, TabOutput::Frame(scene));
@@ -3540,27 +3583,56 @@ mod tests {
 
     #[test]
     fn scrollbar_pages_drags_and_covers_the_page() {
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        if t == 0.0 {
+            return; // overlay scrollbars: nothing to press
+        }
         let mut h = Harness::load(TALL);
-        let sb = h.state.scrollbar().expect("tall page has a scrollbar");
-        let x = (sb.track.x0 + sb.track.x1) as f32 / 2.0;
-        // Click on the track below the thumb: a page down.
+        let page = |h: &Harness| h.state.scroll_info(ScrollTarget::Page).expect("layout");
+        let bar = page(&h).vertical_scrollbar().expect("tall page has a scrollbar");
+        assert_eq!(bar.bar, Rect::new(800.0 - t, 0.0, t, 600.0), "the classic bar sits in its gutter");
+        assert_eq!(page(&h).scrollport.width, 800.0 - t);
+        let x = bar.bar.x + t / 2.0;
+        // Click on the track below the thumb: a page down (seven eighths
+        // of the viewport or all but 40px, Blink's step).
         h.send(ShellToTab::MouseDown { x, y: 500.0, button: MouseButton::Left });
         h.send(ShellToTab::MouseUp { x, y: 500.0, button: MouseButton::Left });
-        assert_eq!(h.state.scroll_y, 540.0);
+        assert_eq!(h.state.scroll_y, 560.0);
         assert!(h.state.hover.is_none(), "the link under the track was not hit");
-        // Drag the thumb back to the top.
-        let thumb = h.state.scrollbar().expect("bar").thumb();
-        let grab_y = (thumb.y0 + 5.0) as f32;
+        // The arrow buttons: a line each way.
+        h.send(ShellToTab::MouseDown { x, y: 600.0 - t / 2.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y: 600.0 - t / 2.0, button: MouseButton::Left });
+        assert_eq!(h.state.scroll_y, 600.0);
+        h.send(ShellToTab::MouseDown { x, y: t / 2.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y: t / 2.0, button: MouseButton::Left });
+        assert_eq!(h.state.scroll_y, 560.0);
+        // Drag the thumb back to the top, then down; far off the bar it
+        // snaps back to where the drag began.
+        let thumb = page(&h).vertical_scrollbar().expect("bar").thumb_rect();
+        let grab_y = thumb.y + 5.0;
         h.send(ShellToTab::MouseDown { x, y: grab_y, button: MouseButton::Left });
-        h.send(ShellToTab::MouseMove { x, y: 5.0 });
+        h.send(ShellToTab::MouseMove { x, y: t + 5.0 });
         assert_eq!(h.state.scroll_y, 0.0);
-        h.send(ShellToTab::MouseMove { x, y: 5.0 + 100.0 });
+        h.send(ShellToTab::MouseMove { x, y: t + 5.0 + 100.0 });
         assert!(h.state.scroll_y > 0.0 && h.state.scroll_y < 1500.0, "{}", h.state.scroll_y);
+        h.send(ShellToTab::MouseMove { x: x - 10.0 * t, y: t + 5.0 + 100.0 });
+        assert_eq!(h.state.scroll_y, 560.0, "snapped back to the drag origin");
         h.send(ShellToTab::MouseUp { x, y: 105.0, button: MouseButton::Left });
         assert!(h.state.scroll_drag.is_none());
-        // A short page has no bar.
+        // Shift+click on the track (below the thumb, which ends near 427
+        // here) jumps so the thumb centres there.
+        let thumb = page(&h).vertical_scrollbar().expect("bar").thumb_rect();
+        assert!(thumb.bottom() < 450.0, "{thumb:?}");
+        h.send(ShellToTab::Modifiers { shift: true, ctrl: false, alt: false, meta: false });
+        h.send(ShellToTab::MouseDown { x, y: 450.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y: 450.0, button: MouseButton::Left });
+        h.send(ShellToTab::Modifiers { shift: false, ctrl: false, alt: false, meta: false });
+        let thumb = page(&h).vertical_scrollbar().expect("bar").thumb_rect();
+        assert!((thumb.y + thumb.height / 2.0 - 450.0).abs() < 1.0, "{thumb:?}");
+        // A short page has no bar and no gutter.
         let h2 = Harness::load("<p>short</p>");
-        assert!(h2.state.scrollbar().is_none());
+        assert!(page(&h2).vertical_scrollbar().is_none());
+        assert_eq!(page(&h2).scrollport.width, 800.0);
     }
 
     #[test]
@@ -5508,8 +5580,10 @@ mod tests {
         let mut h = Harness::load(TALL);
         h.key(Key::ArrowDown, false);
         assert_eq!(h.state.scroll_y, 40.0);
+        // A page is seven eighths of the viewport or all but 40px,
+        // whichever is more (Blink's page step): 560 here.
         h.key(Key::PageDown, false);
-        assert_eq!(h.state.scroll_y, 580.0);
+        assert_eq!(h.state.scroll_y, 600.0);
         h.key(Key::Space, true);
         assert_eq!(h.state.scroll_y, 40.0);
         h.key(Key::End, false);
@@ -5517,7 +5591,328 @@ mod tests {
         h.key(Key::Home, false);
         assert_eq!(h.state.scroll_y, 0.0);
         h.key(Key::Space, false);
-        assert_eq!(h.state.scroll_y, 540.0);
+        assert_eq!(h.state.scroll_y, 560.0);
+    }
+
+    impl Harness {
+        /// An element scroll container's offset.
+        fn offset_of(&self, id: &str) -> (f32, f32) {
+            let node = self.by_id(id);
+            self.state.layout.as_ref().and_then(|t| t.scroller(node)).map(|i| i.offset).unwrap_or_else(|| panic!("#{id} is not a scroller"))
+        }
+
+        fn wheel_at(&mut self, x: f32, y: f32, dy: f32) {
+            self.send(ShellToTab::MouseMove { x, y });
+            self.send(ShellToTab::Scroll { dx: 0.0, dy });
+        }
+
+        /// End the wheel gesture: the next wheel event picks its target anew.
+        fn expire_latch(&mut self) {
+            if let Some(l) = self.state.wheel_latch.as_mut() {
+                l.at -= std::time::Duration::from_secs(1);
+            }
+        }
+    }
+
+    const SCROLL_PAGE: &str = "<!doctype html><style>body { margin: 0 } \
+        #s { overflow: auto; width: 300px; height: 100px } #c { height: 1000px } \
+        #n { overflow: auto; height: 50px; overscroll-behavior: contain } #tall { height: 1500px }</style>\
+        <div id=s><div id=c><a href='#x' id=l>link</a><p id=m>needle</p></div></div>\
+        <div id=n><div style='height: 300px'>inner</div></div><div id=tall></div>";
+
+    #[test]
+    fn wheel_scrolls_the_innermost_scroller_latches_and_chains() {
+        let mut h = Harness::load(SCROLL_PAGE);
+        // Over the scroller: it scrolls, the page does not.
+        h.wheel_at(150.0, 50.0, 30.0);
+        assert_eq!(h.offset_of("s"), (0.0, 30.0));
+        assert_eq!(h.state.scroll_y, 0.0);
+        // The gesture stays latched to it at its end: nothing chains yet.
+        h.wheel_at(150.0, 50.0, 2000.0);
+        assert_eq!(h.offset_of("s"), (0.0, 900.0));
+        assert_eq!(h.state.scroll_y, 0.0);
+        // A new gesture from a scroller at its end goes on to the page.
+        h.expire_latch();
+        h.wheel_at(150.0, 50.0, 10.0);
+        assert_eq!(h.state.scroll_y, 10.0);
+        assert_eq!(h.offset_of("s"), (0.0, 900.0));
+        // Upward, the scroller can move again.
+        h.expire_latch();
+        h.wheel_at(150.0, 50.0, -10.0);
+        assert_eq!(h.offset_of("s"), (0.0, 890.0));
+        assert_eq!(h.state.scroll_y, 10.0);
+        // `overscroll-behavior: contain` stops the chain at #n (at page
+        // y 100..150, so viewport y 90..140 now).
+        h.expire_latch();
+        h.wheel_at(150.0, 120.0, 1000.0);
+        assert_eq!(h.offset_of("n"), (0.0, 250.0));
+        h.expire_latch();
+        h.wheel_at(150.0, 120.0, 10.0);
+        assert_eq!(h.state.scroll_y, 10.0, "contained: the page did not take the rest");
+        // A layout a script forces keeps the offsets.
+        let kept = run_js(&mut h, "document.body.appendChild(document.createElement('i')); document.getElementById('s').offsetHeight");
+        assert_eq!(kept, "100");
+        assert_eq!(h.offset_of("s"), (0.0, 890.0));
+        assert_eq!(h.offset_of("n"), (0.0, 250.0));
+        // `overflow: hidden` on the body: the viewport takes it, the user
+        // cannot scroll the page, a script can.
+        let mut h = Harness::load("<style>body { overflow: hidden; margin: 0 }</style><div style='height: 3000px'><a href=x>x</a></div>");
+        h.wheel_at(100.0, 100.0, 100.0);
+        assert_eq!(h.state.scroll_y, 0.0);
+        h.key(Key::PageDown, false);
+        assert_eq!(h.state.scroll_y, 0.0);
+        assert_eq!(run_js(&mut h, "scrollTo(0, 100); scrollY"), "100");
+        assert_eq!(h.state.scroll_y, 100.0);
+    }
+
+    #[test]
+    fn keys_scroll_the_scroller_of_the_focus_or_of_the_last_press() {
+        let mut h = Harness::load(SCROLL_PAGE);
+        // A press inside the scroller: the keys go to it (nothing is
+        // focused by a press on plain text).
+        h.send(ShellToTab::MouseDown { x: 150.0, y: 60.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x: 150.0, y: 60.0, button: MouseButton::Left });
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.offset_of("s"), (0.0, 40.0));
+        assert_eq!(h.state.scroll_y, 0.0);
+        // Its page step is its own scrollport's.
+        h.key(Key::PageDown, false);
+        assert_eq!(h.offset_of("s"), (0.0, 40.0 + scrolling::page_step(100.0)));
+        h.key(Key::End, false);
+        assert_eq!(h.offset_of("s"), (0.0, 900.0));
+        // At its end the key goes on to the page.
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.state.scroll_y, 40.0);
+        h.key(Key::Home, false);
+        assert_eq!(h.offset_of("s"), (0.0, 0.0), "Home moves the scroller that can");
+        // Focus inside the scroller (Tab to the link) makes it the target.
+        h.key(Key::Tab, false);
+        assert_eq!(h.state.focus, Some(h.by_id("l")));
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.offset_of("s"), (0.0, 40.0));
+        // A scroller with nothing focusable inside is in the Tab order
+        // and scrolls while focused; the link after it comes next.
+        let mut h = Harness::load(
+            "<style>body { margin: 0 }</style><div id=k style='overflow: auto; height: 50px'><div style='height: 500px'>text</div></div><a href=x id=a>after</a>",
+        );
+        h.key(Key::Tab, false);
+        assert_eq!(h.state.focus, Some(h.by_id("k")));
+        h.key(Key::ArrowDown, false);
+        assert_eq!(h.offset_of("k"), (0.0, 40.0));
+        h.key(Key::Tab, false);
+        assert_eq!(h.state.focus, Some(h.by_id("a")));
+    }
+
+    #[test]
+    fn element_scrollbars_page_drag_and_take_the_wheel() {
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        if t == 0.0 {
+            return;
+        }
+        let mut h = Harness::load(SCROLL_PAGE);
+        let s = h.by_id("s");
+        let bar = h.state.scroll_info(ScrollTarget::Element(s)).expect("scroller").vertical_scrollbar().expect("bar");
+        assert_eq!(bar.bar, Rect::new(300.0 - t, 0.0, t, 100.0));
+        let x = bar.bar.x + t / 2.0;
+        // The track below the thumb (above the bottom button): the
+        // scroller's own page step; the press reaches nothing in the page.
+        h.send(ShellToTab::MouseDown { x, y: 70.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y: 70.0, button: MouseButton::Left });
+        assert_eq!(h.offset_of("s"), (0.0, scrolling::page_step(100.0)));
+        assert_eq!(h.state.scroll_y, 0.0);
+        assert!(h.state.select_anchor.is_none());
+        // The end button: a line; held, it repeats after a quarter second.
+        h.send(ShellToTab::MouseDown { x, y: 100.0 - t / 2.0, button: MouseButton::Left });
+        let after_press = h.offset_of("s").1;
+        assert_eq!(after_press, scrolling::page_step(100.0) + 40.0);
+        assert!(h.state.next_wake().is_some(), "a repeat is pending");
+        if let Some(r) = h.state.bar_repeat.as_mut() {
+            r.next = std::time::Instant::now();
+        }
+        h.pump();
+        assert_eq!(h.offset_of("s").1, after_press + 40.0);
+        h.send(ShellToTab::MouseUp { x, y: 100.0 - t / 2.0, button: MouseButton::Left });
+        assert!(h.state.bar_repeat.is_none());
+        // Drag the thumb down.
+        let thumb = h.state.scroll_info(ScrollTarget::Element(s)).expect("scroller").vertical_scrollbar().expect("bar").thumb_rect();
+        let before = h.offset_of("s").1;
+        h.send(ShellToTab::MouseDown { x, y: thumb.y + 3.0, button: MouseButton::Left });
+        h.send(ShellToTab::MouseMove { x, y: thumb.y + 13.0 });
+        let dragged = h.offset_of("s").1;
+        assert!(dragged > before && dragged < 900.0, "{dragged}");
+        h.send(ShellToTab::MouseUp { x, y: thumb.y + 13.0, button: MouseButton::Left });
+        // The pointer over the bar hovers the scroller with the arrow
+        // cursor, and the wheel there scrolls it.
+        h.send(ShellToTab::MouseMove { x, y: 50.0 });
+        assert_eq!(h.state.hover, Some(s));
+        assert_eq!(h.state.cursor, Cursor::Default);
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 10.0 });
+        assert_eq!(h.offset_of("s").1, dragged + 10.0);
+        assert_eq!(h.state.scroll_y, 0.0);
+    }
+
+    #[test]
+    fn a_selection_drag_autoscrolls_the_scroller_it_started_in() {
+        let lines: String = (1..=40).map(|i| format!("<p>line {i}</p>")).collect();
+        let mut h = Harness::load(&format!(
+            "<style>body {{ margin: 0 }} p {{ margin: 0 }} #s {{ overflow: auto; height: 100px; width: 200px }}</style><div id=s>{lines}</div><div style='height: 2000px'></div>"
+        ));
+        h.send(ShellToTab::MouseDown { x: 2.0, y: 2.0, button: MouseButton::Left });
+        assert!(h.state.select_anchor.is_some());
+        // Below the scroller but inside the viewport: the scroller scrolls.
+        h.send(ShellToTab::MouseMove { x: 50.0, y: 160.0 });
+        assert!(h.state.autoscroll.is_some(), "the pointer is outside the scroller's port");
+        let mut steps = 0;
+        loop {
+            let before = h.offset_of("s").1;
+            h.state.autoscroll = Some(std::time::Instant::now());
+            h.pump();
+            steps += 1;
+            if h.offset_of("s").1 == before || steps > 500 {
+                break;
+            }
+        }
+        assert!(h.offset_of("s").1 > 100.0, "scrolled toward the pointer: {:?}", h.offset_of("s"));
+        assert_eq!(h.state.scroll_y, 0.0, "the page did not move");
+        assert!(steps > 3, "a step at a time: {steps}");
+        let selected = h.selected().unwrap_or_default();
+        assert!(selected.contains("line 20"), "the selection followed: {selected:?}");
+        h.send(ShellToTab::MouseUp { x: 50.0, y: 160.0, button: MouseButton::Left });
+        assert!(h.state.autoscroll.is_none());
+    }
+
+    #[test]
+    fn middle_click_autoscroll_pans_toward_the_pointer() {
+        let mut h = Harness::load(TALL);
+        // A press off a link starts it; the four-way cursor shows.
+        h.send(ShellToTab::MouseDown { x: 400.0, y: 300.0, button: MouseButton::Middle });
+        assert!(h.state.pan.is_some());
+        assert_eq!(h.cursors().last(), Some(&Cursor::AllScroll));
+        h.send(ShellToTab::MouseMove { x: 400.0, y: 400.0 });
+        if let Some(p) = h.state.pan.as_mut() {
+            p.last -= std::time::Duration::from_millis(100);
+        }
+        h.state.tick();
+        let after_tick = h.state.scroll_y;
+        assert!(after_tick > 0.0, "scrolled down toward the pointer");
+        // Released after a drag: it ends and the cursor returns.
+        h.send(ShellToTab::MouseUp { x: 400.0, y: 400.0, button: MouseButton::Middle });
+        assert!(h.state.pan.is_none());
+        assert_eq!(h.cursors().last(), Some(&Cursor::Default));
+        // A click (no drag) leaves the mode on until a key or a press.
+        h.send(ShellToTab::MouseDown { x: 400.0, y: 300.0, button: MouseButton::Middle });
+        h.send(ShellToTab::MouseUp { x: 400.0, y: 300.0, button: MouseButton::Middle });
+        assert!(h.state.pan.is_some_and(|p| !p.pressed));
+        h.send(ShellToTab::MouseMove { x: 400.0, y: 200.0 });
+        if let Some(p) = h.state.pan.as_mut() {
+            p.last -= std::time::Duration::from_millis(100);
+        }
+        h.state.tick();
+        assert!(h.state.scroll_y < after_tick, "panning up");
+        h.key(Key::Escape, false);
+        assert!(h.state.pan.is_none());
+        // Within the dead zone nothing moves; on a link the middle button
+        // keeps its meaning (no pan).
+        h.send(ShellToTab::MouseDown { x: 400.0, y: 300.0, button: MouseButton::Middle });
+        h.send(ShellToTab::MouseMove { x: 405.0, y: 305.0 });
+        let before = h.state.scroll_y;
+        if let Some(p) = h.state.pan.as_mut() {
+            p.last -= std::time::Duration::from_millis(100);
+        }
+        h.state.tick();
+        assert_eq!(h.state.scroll_y, before);
+        h.send(ShellToTab::MouseUp { x: 405.0, y: 305.0, button: MouseButton::Middle });
+        h.stop_pan_for_test();
+        let (x, y) = h.center("a");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Middle });
+        assert!(h.state.pan.is_none());
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Middle });
+    }
+
+    impl Harness {
+        fn stop_pan_for_test(&mut self) {
+            self.state.stop_pan();
+        }
+    }
+
+    #[test]
+    fn focus_fragment_and_find_reach_into_scrollers() {
+        const PAGE: &str = "<style>body { margin: 0 } #s { overflow: auto; height: 100px; margin-top: 2000px; scroll-padding-top: 10px } \
+            #a { scroll-margin-top: 30px }</style>\
+            <div id=s><div style='height: 900px'></div><a href='#t' id=a>deep</a><h2 id=t>target</h2><div style='height: 500px'></div></div>";
+        // Tab to the link: the scroller and the page both move so it shows.
+        let mut h = Harness::load(PAGE);
+        h.key(Key::Tab, false);
+        assert_eq!(h.state.focus, Some(h.by_id("a")));
+        let s = h.by_id("s");
+        let port = h.state.layout.as_ref().expect("layout").scroller(s).expect("a scroller").scrollport;
+        let link = h.rect_of(h.by_id("a"));
+        assert!(h.offset_of("s").1 > 0.0, "the scroller scrolled: {:?}", h.offset_of("s"));
+        assert!(link.y >= port.y && link.bottom() <= port.bottom(), "inside the scroller's port: {link:?} in {port:?}");
+        assert!(link.y - 30.0 - 24.0 >= port.y - 0.5, "its scroll-margin and the focus margin are inside too");
+        // The page scrolled as far as it goes (2100px of content).
+        assert_eq!(h.state.scroll_y, 1500.0, "the page scrolled to the scroller");
+        assert!(link.y >= h.state.scroll_y && link.bottom() <= h.state.scroll_y + 600.0);
+        // The fragment: the heading's top at the scroller's top, past its
+        // `scroll-padding`, and the scroller's top at the viewport's.
+        let h = Harness::load_url(data_url(PAGE, Some("t")));
+        let s = h.by_id("s");
+        let port = h.state.layout.as_ref().expect("layout").scroller(s).expect("a scroller").scrollport;
+        let heading = h.rect_of(h.by_id("t"));
+        assert!((heading.y - port.y - 10.0).abs() < 0.5, "{heading:?} in {port:?}");
+        // The page goes as far toward the scroller as its 2100px allow.
+        assert_eq!(h.state.scroll_y, 1500.0, "{port:?}");
+        // Find: the match a third of the way down the scroller and the page.
+        let mut h = Harness::load(PAGE);
+        h.send(ShellToTab::Find { query: "target".into() });
+        let s = h.by_id("s");
+        let port = h.state.layout.as_ref().expect("layout").scroller(s).expect("a scroller").scrollport;
+        let heading = h.rect_of(h.by_id("t"));
+        assert!(h.offset_of("s").1 > 0.0);
+        assert!(heading.y >= port.y && heading.bottom() <= port.bottom(), "{heading:?} in {port:?}");
+        assert!(h.state.scroll_y > 1000.0 && heading.y >= h.state.scroll_y && heading.bottom() <= h.state.scroll_y + 600.0);
+    }
+
+    #[test]
+    fn the_caret_keeps_its_control_scrolled_to_it() {
+        let lines: String = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut h = Harness::load(&format!(
+            "<style>body {{ margin: 0 }}</style><textarea id=ta rows=3>{lines}</textarea><input id=i style='width: 100px' value='{}'>",
+            "wide ".repeat(30)
+        ));
+        // Focus by click puts the caret at the end: the textarea scrolls
+        // down to it and the caret rectangle is inside its port.
+        let (x, y) = h.center("textarea");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(h.state.focus, Some(h.by_id("ta")));
+        let ta = h.by_id("ta");
+        let port = h.state.layout.as_ref().expect("layout").scroller(ta).expect("a scroller").scrollport;
+        let caret = h.state.caret_rect.expect("a caret");
+        assert!(h.offset_of("ta").1 > 0.0, "{:?}", h.offset_of("ta"));
+        assert!(caret.y >= port.y - 0.5 && caret.bottom() <= port.bottom() + 0.5, "{caret:?} in {port:?}");
+        // Up through the lines: the textarea follows back up to the first
+        // line. The caret's line is what is revealed, so the 1px of
+        // padding above it stays scrolled out (Blink reveals the caret
+        // rectangle, not the padding).
+        for _ in 0..25 {
+            h.key(Key::ArrowUp, false);
+        }
+        assert_eq!(h.offset_of("ta"), (0.0, 1.0));
+        let caret = h.state.caret_rect.expect("a caret");
+        assert!(caret.y >= port.y - 0.5);
+        // An input scrolls sideways to its caret at the end of a long value.
+        let (x, y) = h.center("input");
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        h.key(Key::End, false);
+        let i = h.by_id("i");
+        let port = h.state.layout.as_ref().expect("layout").scroller(i).expect("a scroller").scrollport;
+        let caret = h.state.caret_rect.expect("a caret");
+        assert!(h.offset_of("i").0 > 0.0, "{:?}", h.offset_of("i"));
+        assert!(caret.x >= port.x - 0.5 && caret.right() <= port.right() + 0.5, "{caret:?} in {port:?}");
+        h.key(Key::Home, false);
+        assert_eq!(h.offset_of("i").0, 0.0);
     }
 
     #[test]

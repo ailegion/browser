@@ -43,6 +43,8 @@ pub enum Cursor {
     Default,
     Pointer,
     Text,
+    /// Middle-click autoscroll is on: the four-way arrow.
+    AllScroll,
 }
 
 /// A key the page may act on. Text keys come as `Character` with what

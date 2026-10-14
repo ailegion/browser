@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod offscreen;
+pub mod scrollbar;
 
 use std::collections::HashMap;
 use std::sync::Arc;

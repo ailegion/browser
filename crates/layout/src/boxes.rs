@@ -49,6 +49,15 @@ pub(crate) struct ScrollPlan {
     /// reported.
     pub start_gutter: bool,
     pub rtl: bool,
+    /// A single-line text control: what scrolls is its inner editor, the
+    /// content box, so its padding stays put and is not part of the
+    /// scrollable area (Blink's `LayoutTextControlSingleLine`); a
+    /// textarea scrolls its padding with its content.
+    pub inner_editor: bool,
+    /// A text control: its scrollable overflow keeps room for the caret
+    /// after the last character (one pixel), so the caret at the end of
+    /// the value can be scrolled into view, as in Blink.
+    pub caret_room: bool,
 }
 
 impl ScrollPlan {
@@ -82,6 +91,8 @@ impl ScrollPlan {
             gutter_y: thickness > 0.0 && (overflow_y == Overflow::Scroll || (stable && scrolls(overflow_y))),
             start_gutter: stable && style.scrollbar_gutter == ScrollbarGutter::StableBothEdges && scrolls(overflow_y),
             rtl: style.direction == Direction::Rtl,
+            inner_editor: false,
+            caret_room: false,
         })
     }
 
@@ -1039,6 +1050,12 @@ impl BoxBuilder<'_> {
         if let Some(kind) = self.control_kind(id) {
             let mut b = self.build_control(id, style, kind);
             b.plan_scrolling();
+            if matches!(kind, ControlKind::Text { .. })
+                && let Some(plan) = b.scroll.as_mut()
+            {
+                plan.inner_editor = true;
+                plan.caret_room = true;
+            }
             return b;
         }
         if self.is_image(id) {
@@ -1076,6 +1093,14 @@ impl BoxBuilder<'_> {
             self.add_marker(id, &style, &mut b);
         }
         b.plan_scrolling();
+        if let Some(plan) = b.scroll.as_mut()
+            && self
+                .doc
+                .element(id)
+                .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("textarea"))
+        {
+            plan.caret_room = true;
+        }
         b
     }
 

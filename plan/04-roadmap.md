@@ -1609,7 +1609,94 @@ Work:
       inline-block as scrollers with the gutter inside the atomic's own
       layout). Paint snapshots unchanged (the `03-floats.png` flake at
       (136, 175) showed once under the parallel run, verified as the one
-      known pixel and the actual image removed). (5)
+      known pixel and the actual image removed). Found while building
+      block 3 and fixed here: the end padding extends the in-flow
+      children's whole extent (a word overflowing its line box too), not
+      only their boxes; a single-line text input's scrollable part is its
+      content box (its padding stays put, Blink's inner editor;
+      `ScrollPlan::inner_editor`); text controls keep one pixel of room
+      after the last character for the caret (`caret_room`).
+      **Block 3 done 2026-10-14: tab input** (`crates/tab/src/document/
+      scrolling.rs`). The tab keeps the element offsets (`scrolls`),
+      gives them to every layout (`layout_with_scrolls`, the script
+      `View` too through `View::element_scrolls`, so a layout a script
+      forces keeps them), takes back what the tree applied after a layout
+      (`sync_scrolls_after_layout`) and moves a scroller without a
+      relayout (`set_scroll`); the page offset is clamped by the
+      viewport's scrollport and told to the tree for sticky boxes. A user
+      scroll leaves a `hidden` axis alone (the viewport's propagated
+      `hidden` too: `body { overflow: hidden }` stops wheel, keys and
+      drags, scripts still scroll); programmatic scrolls move anything.
+      Wheel: `wheel` fires first; then the gesture's target: latched to
+      the scroller of the previous wheel event while they come within
+      500 ms (Chrome's latching), else the first scroll container up from
+      the node under the pointer that can move in the delta's direction
+      (`can_scroll_by`), then the page; a scroller with `overscroll-
+      behavior` other than `auto` on the larger delta's axis that cannot
+      move ends the chain. Keys: Arrow 40 px, Page/Space a page step of
+      the target (`max(0.875 × port, port − 40)`, Blink's; the page's was
+      0.9 × viewport before), Home/End to the ends; the target is the
+      first scroller up from the focused element, or from the node under
+      the last primary press when nothing is focused, that can move that
+      way, then the page. Scrollers with nothing focusable inside are in
+      the Tab order (Chrome's keyboard-focusable scrollers;
+      `keyboard_focusable_scroller`), with the focus ring. Scrollbars:
+      the geometry is shared (`browser_layout::ScrollbarGeometry`: arrow
+      buttons of the bar's thickness at the ends when the bar is at
+      least three thicknesses long, the thumb no shorter than the
+      thickness) and the look is `browser_paint::scrollbar` (Chrome's
+      classic greys as recalled: track `f1f1f1`, thumb `c1c1c1`/hover
+      `a8a8a8`/pressed `787878`, button hover `d2d2d2`, pressed `787878`
+      with a white arrow, disabled arrow `a3a3a3`, corner `dcdcdc`); the
+      tab draws the page's two bars and corner in their gutters after
+      the painter, highlighted by hover and press (the elements' bars are
+      drawn by the painter in block 4; their geometry already takes
+      input). A primary press on a bar: the thumb starts a drag (the
+      pointer further than eight thicknesses off the bar snaps the
+      thumb back to where the drag began, Blink's rule), a button a line
+      step and the track a page step, both repeating after 250 ms every
+      50 ms while held (the track pausing once the thumb reaches the
+      pointer), Shift on the track jumps so the thumb centres on the
+      pointer; a wheel over a bar scrolls its scroller; the page's bars
+      cover the page (nothing under them is hovered), an element's bars
+      are the element (hovered, arrow cursor); no page mouse events for
+      presses or moves on a bar. The 12 px overlay bar of chrome block 3
+      is gone from the tab (`browser_chrome::scrollbar` stays unused by
+      it). Selection drags autoscroll the first scroller up from the
+      anchor whose scrollport the pointer is outside, both axes, the
+      page's step rule (a quarter of the distance, at most 60 px, every
+      50 ms). Middle-click autoscroll (Windows/Linux browsers): a middle
+      press off a link where something can scroll starts it with the
+      four-way cursor (`Cursor::AllScroll`, new in `ipc-types`, mapped by
+      the shell); moving past 15 px scrolls toward the pointer at
+      `0.000008 × distance^2.2` px/ms per axis (Blink's constants as
+      recalled) through the chain from the press; released after moving
+      it ends, released in place it stays on until the next press, key
+      or wheel. Into view through every scroller: `reveal` walks the
+      scroll containers above a node, innermost first, then the page,
+      bringing the rectangle (grown by the element's `scroll-margin` for
+      focus and fragments) into each scrollport inset by its `scroll-
+      padding` (the root's for the page); keyboard focus nearest with
+      the 24 px margin, fragments at the top, find a third down (the
+      existing page rules); the caret follows its control (`reveal_
+      caret`: the textarea or input scrolls to the caret, then the
+      scrollers above it) on every caret move and on focus. The shell
+      turns a vertical wheel into a horizontal one while Shift is held.
+      Tests: tab (wheel to the innermost scroller, latched at its end, a
+      new gesture chaining to the page, `overscroll-behavior: contain`,
+      offsets kept across a script-forced layout, `body { overflow:
+      hidden }` for the user and not for a script; keys to the pressed
+      scroller with its own page step, to the page at its end, Home,
+      focus inside, a focusable scroller in the Tab order; the page bar's
+      classic geometry, track, buttons, drag, snap-back and Shift+click,
+      no bar or gutter on a short page; an element's bar: track, button
+      with its repeat, drag, hover and the wheel over it; a selection
+      drag autoscrolling a scroller a step at a time with the selection
+      following; middle-click autoscroll both ways, the click mode, the
+      dead zone, no pan on a link; focus, fragment and find reaching into
+      a scroller with `scroll-padding` and `scroll-margin` and the page
+      going as far as it can; the caret keeping a textarea and an input
+      scrolled to it), paint (the bars in every state). (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
       `user-select`; (6) `z-index` and `transform`/`transform-origin`

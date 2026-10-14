@@ -61,6 +61,9 @@ pub struct View {
     pub scale: f32,
     /// The scroll offset; a script may change it (`scroll_changed`).
     pub scroll: (f32, f32),
+    /// The element scroll containers' offsets, as the tab keeps them, so
+    /// a layout forced here keeps every scroller where it was.
+    pub element_scrolls: HashMap<NodeId, (f32, f32)>,
     /// The window's outer size and the screen's size, in CSS pixels.
     pub window: (f32, f32),
     pub screen: (f32, f32),
@@ -121,7 +124,15 @@ impl View {
         self.styles = compute_styles_with(doc, &stylist, &vp, states);
         self.deps = stylist.interaction_deps();
         let Some(engine) = &mut self.engine else { return };
-        let tree = engine.layout(doc, &self.styles, self.viewport.0, self.viewport.1, &self.images);
+        let tree = engine.layout_with_scrolls(
+            doc,
+            &self.styles,
+            self.viewport.0,
+            self.viewport.1,
+            &self.images,
+            &self.element_scrolls,
+            self.scroll,
+        );
         self.layout = Some(tree);
         self.rect_index = None;
         self.clean_generation = Some(generation);
@@ -204,9 +215,16 @@ impl View {
     }
 
     fn clamp_scroll(&mut self) {
-        let (cw, ch) = self.content_size();
-        self.scroll.0 = self.scroll.0.clamp(0.0, (cw - self.viewport.0).max(0.0));
-        self.scroll.1 = self.scroll.1.clamp(0.0, (ch - self.viewport.1).max(0.0));
+        // The page scrolls over the viewport's scrollable overflow within
+        // its scrollport (the viewport less the page scrollbars).
+        match &self.layout {
+            Some(tree) => self.scroll = tree.viewport.clamp(self.scroll),
+            None => {
+                let (cw, ch) = self.content_size();
+                self.scroll.0 = self.scroll.0.clamp(0.0, (cw - self.viewport.0).max(0.0));
+                self.scroll.1 = self.scroll.1.clamp(0.0, (ch - self.viewport.1).max(0.0));
+            }
+        }
     }
 
     /// Scroll the page to `(x, y)` (clamped); the tab applies it after

@@ -273,6 +273,8 @@ impl LayoutEngine {
             gutter_y: false,
             start_gutter: false,
             rtl: html.style.direction == Direction::Rtl,
+            inner_editor: false,
+            caret_room: false,
         });
 
         self.prepare_atomics(&mut html, viewport_width);
@@ -1308,9 +1310,21 @@ fn scroll_info_for(f: &Fragment, plan: &ScrollPlan) -> ScrollInfo {
     let b = &f.style.border_width;
     let padding_box = f.rect.inset(b.top, b.right, b.bottom, b.left);
     let (gl, gr, gb) = plan_gutters(plan);
-    let scrollport = padding_box.inset(0.0, gr, gb, gl);
+    let mut scrollport = padding_box.inset(0.0, gr, gb, gl);
+    // A text input's inner editor scrolls within the content box; the
+    // padding is outside the scrollable area.
+    let end_padding = if plan.inner_editor {
+        let p = &f.padding;
+        scrollport = scrollport.inset(p.top, p.right, p.bottom, p.left);
+        Sides::all(0.0)
+    } else {
+        f.padding
+    };
     let is_flex = matches!(f.style.display, Display::Flex | Display::InlineFlex);
-    let (scroll_width, scroll_height) = scroll_extent(&f.children, None, is_flex, &scrollport, &f.padding, plan.rtl);
+    let (mut scroll_width, scroll_height) = scroll_extent(&f.children, None, is_flex, &scrollport, &end_padding, plan.rtl);
+    if plan.caret_room {
+        scroll_width += 1.0;
+    }
     finish_scroll_info(padding_box, scrollport, f.padding, scroll_width, scroll_height, plan, (gl, gr, gb))
 }
 
@@ -1405,20 +1419,22 @@ fn scroll_extent(
     let mut all = extra;
     let mut inflow = extra;
     for c in children {
-        visit(c, container_flex, &mut all);
+        // The child's whole extent (its box and what overflows it, such as
+        // a long word past its line box).
+        let mut sub = None;
+        visit(c, container_flex, &mut sub);
+        if let Some(r) = sub {
+            add(&mut all, r);
+        }
         if out_of_flow(c) || matches!(c.content, FragmentContent::Marker) {
             continue;
         }
-        let r = if c.node.is_some() {
-            if container_flex {
-                margin_box(c)
-            } else {
-                Rect::new(c.rect.x, c.rect.y, c.rect.width, c.rect.height + c.margin.bottom)
-            }
-        } else {
-            c.rect
-        };
-        add(&mut inflow, r);
+        if let Some(r) = sub {
+            add(&mut inflow, r);
+        }
+        if c.node.is_some() && !container_flex {
+            add(&mut inflow, Rect::new(c.rect.x, c.rect.y, c.rect.width, c.rect.height + c.margin.bottom));
+        }
     }
     if let Some(i) = inflow.as_mut() {
         if rtl {

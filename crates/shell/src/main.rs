@@ -754,6 +754,7 @@ impl ApplicationHandler<UserEvent> for App {
                     PageCursor::Default => CursorIcon::Default,
                     PageCursor::Pointer => CursorIcon::Pointer,
                     PageCursor::Text => CursorIcon::Text,
+                    PageCursor::AllScroll => CursorIcon::AllScroll,
                 };
                 self.tabs[index].cursor = icon;
                 if is_current && let Some(active) = &self.active {
@@ -848,13 +849,18 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send_viewport();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
+                let (mut dx, mut dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (-x * LINE_SCROLL_PX, -y * LINE_SCROLL_PX),
                     MouseScrollDelta::PixelDelta(p) => {
                         let scale = self.scale();
                         (-(p.x as f32) / scale, -(p.y as f32) / scale)
                     }
                 };
+                // Shift turns a vertical wheel into a horizontal scroll, as
+                // Chrome and Firefox do on Windows and Linux.
+                if self.modifiers.state().shift_key() && dx == 0.0 {
+                    (dx, dy) = (dy, 0.0);
+                }
                 self.scroll(dx, dy);
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -875,6 +881,7 @@ impl ApplicationHandler<UserEvent> for App {
                             PageCursor::Text => CursorIcon::Text,
                             PageCursor::Pointer => CursorIcon::Pointer,
                             PageCursor::Default => CursorIcon::Default,
+                            PageCursor::AllScroll => CursorIcon::AllScroll,
                         });
                         if dirty {
                             active.window.request_redraw();
