@@ -228,8 +228,31 @@ impl TabState {
         if changed {
             self.needs_paint = true;
             self.hover_dirty = true;
+            if !self.pending_scroll_targets.contains(&target) {
+                self.pending_scroll_targets.push(target);
+            }
         }
         changed
+    }
+
+    /// Whether a user gesture still holds a scroll: a thumb drag, a held
+    /// button or track, middle-click autoscroll, a selection drag past an
+    /// edge, or a wheel gesture whose latch has not run out. `scrollend`
+    /// waits for it to end.
+    pub(super) fn scroll_gesture_active(&self) -> bool {
+        self.scroll_drag.is_some()
+            || self.bar_repeat.is_some()
+            || self.pan.is_some()
+            || self.autoscroll.is_some()
+            || self.wheel_latch.is_some_and(|l| Instant::now().duration_since(l.at) < WHEEL_LATCH)
+    }
+
+    /// When a `scrollend` owed to a wheel gesture becomes due.
+    pub(super) fn scrollend_wake(&self) -> Option<Instant> {
+        if self.scrollend_pending.is_empty() {
+            return None;
+        }
+        self.wheel_latch.map(|l| l.at + WHEEL_LATCH)
     }
 
     pub(super) fn scroll_by(&mut self, target: ScrollTarget, dx: f32, dy: f32, user: bool) -> bool {

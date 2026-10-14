@@ -605,25 +605,95 @@ impl TabState {
                 fired = true;
             }
         }
-        let scroll = (self.scroll_x, self.scroll_y);
-        if scroll != self.scroll_reported {
-            self.scroll_reported = scroll;
-            if self.wants_event(EventTargetRef::Document, "scroll") {
-                self.fire_user_event(
-                    EventTargetRef::Document,
-                    "scroll",
-                    UiEventInit {
-                        bubbles: true,
-                        ..UiEventInit::default()
-                    },
-                );
-                fired = true;
+        // HTML "run the scroll steps": every target whose offset changed
+        // since last reported gets `scroll`, in the order they scrolled;
+        // the page's is the document's and bubbles (and the visual
+        // viewport's), an element's does not bubble. Scrolls that did not
+        // pass the tab's `set_scroll` (a script's, a layout's clamp) are
+        // found by comparing offsets, in tree order.
+        use super::scrolling::ScrollTarget;
+        let mut targets = std::mem::take(&mut self.pending_scroll_targets);
+        if let (Some(doc), Some(tree)) = (&self.doc, &self.layout) {
+            self.element_scroll_reported.retain(|n, _| tree.scroller(*n).is_some());
+            for n in doc.descendants(doc.root()) {
+                if let Some(i) = tree.scroller(n) {
+                    let reported = self.element_scroll_reported.get(&n).copied().unwrap_or((0.0, 0.0));
+                    if i.offset != reported && !targets.contains(&ScrollTarget::Element(n)) {
+                        targets.push(ScrollTarget::Element(n));
+                    }
+                }
             }
-            if let Some(target) = visual
-                && self.wants_event(target, "scroll")
-            {
-                self.fire_user_event(target, "scroll", UiEventInit::default());
-                fired = true;
+        }
+        let scroll = (self.scroll_x, self.scroll_y);
+        if scroll != self.scroll_reported && !targets.contains(&ScrollTarget::Page) {
+            targets.push(ScrollTarget::Page);
+        }
+        for t in targets {
+            match t {
+                ScrollTarget::Page => {
+                    if scroll == self.scroll_reported {
+                        continue;
+                    }
+                    self.scroll_reported = scroll;
+                    fired |= self.fire_scroll_event(t, "scroll", visual);
+                }
+                ScrollTarget::Element(n) => {
+                    let Some(offset) = self.layout.as_ref().and_then(|tr| tr.scroller(n)).map(|i| i.offset) else {
+                        continue;
+                    };
+                    if self.element_scroll_reported.get(&n).copied().unwrap_or((0.0, 0.0)) == offset {
+                        continue;
+                    }
+                    self.element_scroll_reported.insert(n, offset);
+                    fired |= self.fire_scroll_event(t, "scroll", visual);
+                }
+            }
+            if !self.scrollend_pending.contains(&t) {
+                self.scrollend_pending.push(t);
+            }
+        }
+        // `scrollend` once nothing holds the scroll any more (a key's or a
+        // script's scroll ends at once; a wheel gesture when its latch
+        // runs out, a drag when the button goes up).
+        if !self.scrollend_pending.is_empty() && !self.scroll_gesture_active() {
+            for t in std::mem::take(&mut self.scrollend_pending) {
+                fired |= self.fire_scroll_event(t, "scrollend", visual);
+            }
+        }
+        fired
+    }
+
+    /// `scroll` or `scrollend` at a scroll target: the document (bubbling
+    /// to the window) and the visual viewport for the page, the element
+    /// (not bubbling) for a scroller. True when something fired.
+    fn fire_scroll_event(&mut self, target: super::scrolling::ScrollTarget, kind: &str, visual: Option<EventTargetRef>) -> bool {
+        use super::scrolling::ScrollTarget;
+        let mut fired = false;
+        match target {
+            ScrollTarget::Page => {
+                if self.wants_event(EventTargetRef::Document, kind) {
+                    self.fire_user_event(
+                        EventTargetRef::Document,
+                        kind,
+                        UiEventInit {
+                            bubbles: true,
+                            ..UiEventInit::default()
+                        },
+                    );
+                    fired = true;
+                }
+                if let Some(v) = visual
+                    && self.wants_event(v, kind)
+                {
+                    self.fire_user_event(v, kind, UiEventInit::default());
+                    fired = true;
+                }
+            }
+            ScrollTarget::Element(n) => {
+                if self.live(n) && self.wants_event(EventTargetRef::Node(n), kind) {
+                    self.fire_user_event(EventTargetRef::Node(n), kind, UiEventInit::default());
+                    fired = true;
+                }
             }
         }
         fired

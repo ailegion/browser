@@ -1722,7 +1722,48 @@ Work:
       gutter, a rounded `overflow: hidden` corner left white, a fixed box
       painted and hit outside its clipper, `local` moving with the
       content beside `scroll` staying, `scrollbar-color` on the track,
-      corner and vertical track); snapshots unchanged. (5)
+      corner and vertical track); snapshots unchanged.
+      **Block 5 done 2026-10-14: script.** `crates/script/src/view.rs`:
+      on a scroll container (`hidden` included) `scrollTop`/`scrollLeft`
+      read the offset and set it (clamped, non-finite as 0, a
+      right-to-left scroller's `scrollLeft` in `-max..=0`), the tree
+      moving the content at once (`View::set_element_scroll`) so later
+      reads see it and the tab taking the offset back
+      (`View::element_scrolls`, `elements_scrolled`); `scrollWidth`/
+      `scrollHeight` are the scroller's extent, `clientWidth`/
+      `clientHeight` its padding box less the gutters (the scrolling
+      element's the viewport's scrollport; `innerWidth` keeps the
+      scrollbar), `clientLeft` counts a left gutter; `offsetTop`/
+      `offsetLeft` are layout positions: the offsets of the scrollers up
+      to and including the `offsetParent` are added back; `scrollTo`/
+      `scroll`/`scrollBy` work on scrollers relative to their own offset,
+      read their arguments on anything (a non-scroller stays), and check
+      `behavior` as the WebIDL enum (`auto`/`instant`/`smooth`, else
+      `TypeError`; applied at once, `smooth` animates in block 6);
+      `scrollIntoView` follows CSSOM View §12.3: for each scroll container
+      from the nearest ancestor out, then the viewport, the element's
+      bounding box grown by its `scroll-margin` is aligned per `block`/
+      `inline` (`start`/`center`/`end`/`nearest`, `nearest` taking the
+      start edge for a box taller than the port) inside the scrollport
+      shrunk by the box's `scroll-padding` (the root's for the viewport),
+      `container: "nearest"` stopping after the first, the enums checked.
+      Events (`crates/tab`, `fire_view_events`): HTML's "run the scroll
+      steps": the targets whose offset changed since last reported, in
+      the order they scrolled (`pending_scroll_targets` from the tab's
+      scrolls, plus a script's and a layout's found by comparing offsets
+      in tree order), get `scroll`: the document's bubbling (and the
+      visual viewport's), an element's not; each then owes `scrollend`
+      (`onscrollend` on elements, the document, the window and the visual
+      viewport), fired once no gesture holds the scroll (a key's or a
+      script's at once, a wheel's when its latch runs out, with a wake for
+      it, a drag's when the button goes up). Tests: tab (`scrollTop` set
+      and read with the moved rects and `offsetTop` unmoved, `hidden`,
+      NaN, a non-scroller, right-to-left `scrollLeft`, `scrollTo`/
+      `scrollBy`/`behavior`, `scrollIntoView` through the scroller and the
+      page with `scroll-margin`, `end`, `container: nearest`, a bad enum;
+      `scroll`+`scrollend` for a script scroll, `scrollend` after a wheel
+      latch, the document's for a key; the scrolling element's
+      `clientWidth` without the scrollbar). (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
       `user-select`; (6) `z-index` and `transform`/`transform-origin`

@@ -339,9 +339,15 @@ pub(crate) struct TabState {
     /// on blur if it differs.
     focus_value: Option<String>,
     /// The viewport size and scroll offset `resize` and `scroll` were
-    /// last fired for.
+    /// last fired for, the page's and each element scroller's.
     viewport_reported: (f32, f32),
     scroll_reported: (f32, f32),
+    element_scroll_reported: HashMap<NodeId, (f32, f32)>,
+    /// The scroll event targets pending, in the order they scrolled
+    /// (HTML's "pending scroll event targets"), and those owed a
+    /// `scrollend` once no gesture holds them.
+    pending_scroll_targets: Vec<ScrollTarget>,
+    scrollend_pending: Vec<ScrollTarget>,
     /// The element scroll containers' offsets (`scrolling.rs`): the truth
     /// the layout tree is given and keeps applied.
     scrolls: HashMap<NodeId, (f32, f32)>,
@@ -473,6 +479,9 @@ impl TabState {
             focus_value: None,
             viewport_reported: (viewport.width, viewport.height),
             scroll_reported: (0.0, 0.0),
+            element_scroll_reported: HashMap::new(),
+            pending_scroll_targets: Vec::new(),
+            scrollend_pending: Vec::new(),
             scrolls: HashMap::new(),
             wheel_latch: None,
             scroll_drag: None,
@@ -1580,6 +1589,9 @@ impl TabState {
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_reported = (0.0, 0.0);
+        self.element_scroll_reported.clear();
+        self.pending_scroll_targets.clear();
+        self.scrollend_pending.clear();
         self.scrolls.clear();
         self.wheel_latch = None;
         self.scroll_drag = None;
@@ -1641,6 +1653,7 @@ impl TabState {
             self.autoscroll,
             self.bar_repeat.as_ref().map(|r| r.next),
             self.pan_next_wake(),
+            self.scrollend_wake(),
             self.script.as_ref().and_then(ScriptHost::next_wake),
             self.frame_due,
         ]
@@ -2363,6 +2376,7 @@ impl TabState {
         view.clean_generation = if fresh { Some(host.generation()) } else { None };
         view.recomputed = false;
         view.scroll_changed = false;
+        view.elements_scrolled = false;
         self.host_layout_fresh = false;
         host.lend_view(view);
         f(host);
@@ -2392,6 +2406,13 @@ impl TabState {
         }
         if view.scroll_changed {
             self.set_scroll(ScrollTarget::Page, view.scroll, false);
+        }
+        if view.elements_scrolled {
+            // The script moved scrollers in the tree itself; the `scroll`
+            // events follow at the next flush (`fire_view_events` finds
+            // the offsets that differ from the ones last reported).
+            self.needs_paint = true;
+            self.hover_dirty = true;
         }
         self.view = view;
     }
@@ -4732,10 +4753,11 @@ mod tests {
             run_js(&mut h, "var cr = document.getElementById('s').getClientRects(); [cr.length, cr[0].width > 0, cr.item(0) === cr[0], cr.item(5), document.getElementById('s').offsetWidth > 0].join()"),
             "\"1,true,true,,true\""
         );
-        // The window and the scrolling element.
+        // The window and the scrolling element: `innerWidth` counts the
+        // page scrollbar, the scrolling element's `clientWidth` does not.
         assert_eq!(
             run_js(&mut h, "[document.scrollingElement === document.documentElement, innerWidth, innerHeight, devicePixelRatio, scrollX, scrollY, document.documentElement.clientWidth, document.documentElement.scrollHeight > 3000].join()"),
-            "\"true,800,600,1,0,0,800,true\""
+            format!("\"true,800,600,1,0,0,{},true\"", 800.0 - browser_layout::SCROLLBAR_THICKNESS)
         );
         assert_eq!(
             run_js(&mut h, "window.scrollTo(0, 100); [scrollY, pageYOffset, document.documentElement.scrollTop, a.getBoundingClientRect().y].join()"),
@@ -5893,6 +5915,69 @@ mod tests {
         assert!(h.offset_of("s").1 > 0.0);
         assert!(heading.y >= port.y && heading.bottom() <= port.bottom(), "{heading:?} in {port:?}");
         assert!(h.state.scroll_y > 1000.0 && heading.y >= h.state.scroll_y && heading.bottom() <= h.state.scroll_y + 600.0);
+    }
+
+    #[test]
+    fn element_scrolling_from_script_and_its_events() {
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        let mut h = Harness::load(
+            "<style>body { margin: 0 } p { margin: 0 } #s { overflow: auto; width: 200px; height: 100px; position: relative; margin-top: 300px } \
+             #in { height: 50px } #c { height: 1000px } #h { overflow: hidden; height: 50px } \
+             #r { overflow: auto; width: 100px; height: 40px; direction: rtl } #t { scroll-margin-top: 20px }</style>\
+             <div id=s><div id=in></div><div id=c><p id=t>t</p><div style='height: 882px'></div><div id=u style='height: 50px'></div></div></div>\
+             <div id=h><div style='height: 500px'></div></div>\
+             <div id=r><div style='width: 300px; height: 10px'></div></div><div style='height: 2000px'></div>\
+             <script>var log = []; var s = document.getElementById('s'), inn = document.getElementById('in'), t = document.getElementById('t'), \
+               u = document.getElementById('u'), hd = document.getElementById('h'), r = document.getElementById('r');</script>",
+        );
+        // `scrollTop` moves the content at once; the client box leaves the
+        // gutter out; `offsetTop` is the layout position, scrolled or not.
+        assert_eq!(
+            run_js(&mut h, "s.scrollTop = 150; [s.scrollTop, s.scrollHeight, s.clientWidth, s.clientHeight, s.scrollWidth, s.clientLeft, inn.getBoundingClientRect().y, inn.offsetTop, t.offsetTop, t.getBoundingClientRect().y].join()"),
+            format!("\"150,1050,{w},100,{w},0,150,0,50,200\"", w = 200.0 - t)
+        );
+        assert_eq!(h.offset_of("s"), (0.0, 150.0), "the tab took the offset");
+        // `overflow: hidden` scrolls for a script, clamped; NaN is 0; a
+        // box that is no scroller ignores it.
+        assert_eq!(run_js(&mut h, "hd.scrollTop = 30; var a = hd.scrollTop; hd.scrollTop = 1e9; var b = hd.scrollTop; hd.scrollTop = NaN; var c = hd.scrollTop; t.scrollTop = 10; [a, b, c, t.scrollTop].join()"), "\"30,450,0,0\"");
+        // Right-to-left: `scrollLeft` runs from -max to 0.
+        assert_eq!(run_js(&mut h, "var a = r.scrollLeft; r.scrollLeft = -50; var b = r.scrollLeft; r.scrollLeft = 10; var c = r.scrollLeft; r.scrollLeft = -1000; [a, b, c, r.scrollLeft].join()"), "\"0,-50,0,-200\"");
+        // `scrollTo`/`scrollBy` on an element; `behavior` is checked; a
+        // non-scroller reads its arguments and stays.
+        assert_eq!(run_js(&mut h, "s.scrollTo({top: 10}); s.scrollBy(0, 5); s.scrollTo(0, 7); var e = ''; try { s.scrollTo({top: 1, behavior: 'bogus'}) } catch (x) { e = x.name } t.scrollTo(0, 10); [s.scrollTop, e, t.scrollTop].join()"), "\"7,TypeError,0\"");
+        // `scrollIntoView` through the scroller and the page, with the
+        // target's `scroll-margin`; `block: end`; `container: nearest`
+        // leaves the page alone.
+        assert_eq!(run_js(&mut h, "s.scrollTop = 0; scrollTo(0, 0); t.scrollIntoView(); [s.scrollTop, scrollY].join()"), "\"30,300\"");
+        // `end`: u's bottom at the scroller's bottom (900), then at the
+        // viewport's bottom, which is above the page's top: clamped to 0.
+        assert_eq!(run_js(&mut h, "u.scrollIntoView({block: 'end'}); [s.scrollTop, scrollY].join()"), "\"900,0\"");
+        assert_eq!(run_js(&mut h, "scrollTo(0, 0); s.scrollTop = 0; u.scrollIntoView({block: 'start', container: 'nearest'}); [s.scrollTop, scrollY].join()"), "\"950,0\"");
+        assert_eq!(run_js(&mut h, "var e = ''; try { u.scrollIntoView({block: 'middle'}) } catch (x) { e = x.name } e"), "\"TypeError\"");
+        // Events: `scroll` at the element (not bubbling) and `scrollend`
+        // right after for a script's scroll; a wheel gesture's `scrollend`
+        // waits for the gesture to end.
+        run_js(&mut h, "s.scrollTop = 0; scrollTo(0, 0); document.addEventListener('scroll', e => log.push('doc:' + e.target.nodeName)); \
+                        s.onscroll = () => log.push('s:' + s.scrollTop); s.onscrollend = () => log.push('send'); document.onscrollend = () => log.push('dend'); \
+                        window.addEventListener('scroll', () => log.push('win')); 0");
+        // The scroll back to 0 above fires after that script, at the
+        // listeners it registered (as in browsers): drain it.
+        h.pump();
+        assert_eq!(run_js(&mut h, "log.splice(0).join(' ')"), "\"s:0 send\"");
+        assert_eq!(run_js(&mut h, "s.scrollTop = 20; 0"), "0");
+        h.pump();
+        assert_eq!(run_js(&mut h, "log.splice(0).join(' ')"), "\"s:20 send\"");
+        h.wheel_at(100.0, 350.0, 10.0);
+        assert_eq!(run_js(&mut h, "log.splice(0).join(' ')"), "\"s:30\"");
+        assert!(h.state.next_wake().is_some(), "the scrollend waits for the latch");
+        h.expire_latch();
+        h.pump();
+        assert_eq!(run_js(&mut h, "log.splice(0).join(' ')"), "\"send\"");
+        // A key with nothing focused or pressed scrolls the page: the
+        // document's `scroll` bubbles to the window, its `scrollend`
+        // follows at once.
+        h.key(Key::End, false);
+        assert_eq!(run_js(&mut h, "log.splice(0).join(' ')"), "\"doc:#document win dend\"");
     }
 
     #[test]

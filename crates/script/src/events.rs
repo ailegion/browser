@@ -1137,6 +1137,7 @@ const HANDLER_NAMES: &[&str] = &[
     "onreset",
     "onresize",
     "onscroll",
+    "onscrollend",
     "onselect",
     "onsubmit",
     "ontoggle",

@@ -62,8 +62,12 @@ pub struct View {
     /// The scroll offset; a script may change it (`scroll_changed`).
     pub scroll: (f32, f32),
     /// The element scroll containers' offsets, as the tab keeps them, so
-    /// a layout forced here keeps every scroller where it was.
+    /// a layout forced here keeps every scroller where it was. A script
+    /// scroll of an element is applied to the tree at once (later reads
+    /// see the moved content) and recorded here for the tab.
     pub element_scrolls: HashMap<NodeId, (f32, f32)>,
+    /// A script moved an element scroll container.
+    pub elements_scrolled: bool,
     /// The window's outer size and the screen's size, in CSS pixels.
     pub window: (f32, f32),
     pub screen: (f32, f32),
@@ -236,6 +240,45 @@ impl View {
         if self.scroll != before {
             self.scroll_changed = true;
         }
+    }
+
+    /// Scroll an element scroll container to `(x, y)` (clamped), moving
+    /// its content in the tree now. False when it is not a scroll
+    /// container.
+    pub fn set_element_scroll(&mut self, id: NodeId, x: f32, y: f32) -> bool {
+        let Some(tree) = self.layout.as_mut() else { return false };
+        let before = tree.scroller(id).map(|i| i.offset);
+        let Some(new) = tree.set_scroll_offset(id, (x, y)) else { return false };
+        self.element_scrolls.insert(id, new);
+        if before != Some(new) {
+            self.elements_scrolled = true;
+            self.rect_index = None;
+        }
+        true
+    }
+
+    /// The scroll container state of an element, if it is one.
+    pub fn scroller(&self, id: NodeId) -> Option<browser_layout::ScrollInfo> {
+        self.layout.as_ref().and_then(|t| t.scroller(id)).cloned()
+    }
+
+    /// The scroll offsets of the scroll containers among `id`'s
+    /// ancestors up to and including `until` (every one when `None`),
+    /// summed: what the layout positions of `id` differ from its page
+    /// coordinates by.
+    pub fn ancestor_scroll(&self, doc: &Document, id: NodeId, until: Option<NodeId>) -> (f32, f32) {
+        let Some(tree) = &self.layout else { return (0.0, 0.0) };
+        let mut sum = (0.0, 0.0);
+        for a in doc.ancestors(id) {
+            if let Some(info) = tree.scroller(a) {
+                sum.0 += info.offset.0;
+                sum.1 += info.offset.1;
+            }
+            if Some(a) == until {
+                break;
+            }
+        }
+        sum
     }
 
     fn index(&mut self) -> &HashMap<NodeId, Vec<FragmentBox>> {
@@ -686,6 +729,11 @@ fn geometry(view: &mut View, doc: &Document, quirks: bool, id: NodeId, prop: &Ge
     let style = view.styles.get(id).cloned();
     let pad_box = style.as_ref().map_or(rect, |s| padding_box(rect, s));
     let num = |v: f32| Geo::Num(f64::from(v.round()));
+    // An element scroll container: its client box is its padding box
+    // less the scrollbar gutters (CSSOM View §6.1), its scroll extent
+    // and offset the layout's.
+    let info = view.scroller(id);
+    let viewport = view.layout.as_ref().map(|t| t.viewport.clone());
     match prop {
         GeoProp::OffsetWidth => num(rect.width),
         GeoProp::OffsetHeight => num(rect.height),
@@ -698,20 +746,53 @@ fn geometry(view: &mut View, doc: &Document, quirks: bool, id: NodeId, prop: &Ge
                 }
                 None => Rect::default(),
             };
-            if matches!(prop, GeoProp::OffsetLeft) { num(rect.x - origin.x) } else { num(rect.y - origin.y) }
+            // Layout positions, not scrolled ones: the offsets of the
+            // scrollers between the element and its offsetParent (that one
+            // included) are added back, since the page coordinates have
+            // them taken off.
+            let (sx, sy) = view.ancestor_scroll(doc, id, parent);
+            if matches!(prop, GeoProp::OffsetLeft) { num(rect.x + sx - origin.x) } else { num(rect.y + sy - origin.y) }
         }
         GeoProp::OffsetParent => Geo::Node(offset_parent(view, doc, id)),
-        // The scrolling element's client box is the viewport.
-        GeoProp::ClientWidth => num(if scroller { view.viewport.0 } else { pad_box.width }),
-        GeoProp::ClientHeight => num(if scroller { view.viewport.1 } else { pad_box.height }),
-        GeoProp::ClientLeft => num(if scroller { 0.0 } else { pad_box.x - rect.x }),
-        GeoProp::ClientTop => num(if scroller { 0.0 } else { pad_box.y - rect.y }),
+        // The scrolling element's client box is the viewport less the
+        // page scrollbars.
+        GeoProp::ClientWidth => num(match (&viewport, &info) {
+            (Some(v), _) if scroller => v.scrollport.width,
+            (_, Some(i)) => i.padding_box.width - i.gutter_left - i.gutter_right,
+            _ if scroller => view.viewport.0,
+            _ => pad_box.width,
+        }),
+        GeoProp::ClientHeight => num(match (&viewport, &info) {
+            (Some(v), _) if scroller => v.scrollport.height,
+            (_, Some(i)) => i.padding_box.height - i.gutter_bottom,
+            _ if scroller => view.viewport.1,
+            _ => pad_box.height,
+        }),
+        // `clientLeft` counts a scrollbar on the left (a right-to-left
+        // scroller's).
+        GeoProp::ClientLeft => num(match (&viewport, &info) {
+            (Some(v), _) if scroller => v.gutter_left,
+            (_, Some(i)) => i.padding_box.x - rect.x + i.gutter_left,
+            _ if scroller => 0.0,
+            _ => pad_box.x - rect.x,
+        }),
+        GeoProp::ClientTop => num(match &info {
+            _ if scroller => 0.0,
+            Some(i) => i.padding_box.y - rect.y,
+            None => pad_box.y - rect.y,
+        }),
         GeoProp::ScrollWidth | GeoProp::ScrollHeight => {
-            let (w, h) = if scroller { view.content_size() } else { view.content_extent(doc, id, pad_box) };
+            let (w, h) = if scroller {
+                view.content_size()
+            } else if let Some(i) = &info {
+                (i.scroll_width, i.scroll_height)
+            } else {
+                view.content_extent(doc, id, pad_box)
+            };
             num(if matches!(prop, GeoProp::ScrollWidth) { w } else { h })
         }
-        GeoProp::ScrollTop => Geo::Num(f64::from(if scroller { view.scroll.1 } else { 0.0 })),
-        GeoProp::ScrollLeft => Geo::Num(f64::from(if scroller { view.scroll.0 } else { 0.0 })),
+        GeoProp::ScrollTop => Geo::Num(f64::from(if scroller { view.scroll.1 } else { info.map_or(0.0, |i| i.offset.1) })),
+        GeoProp::ScrollLeft => Geo::Num(f64::from(if scroller { view.scroll.0 } else { info.map_or(0.0, |i| i.offset.0) })),
     }
 }
 
@@ -742,20 +823,32 @@ fn geo_get(this: &JsValue, _: &[JsValue], prop: &GeoProp, context: &mut Context)
 }
 
 /// `scrollTop = ` and `scrollLeft = `: the page scrolls for the
-/// scrolling element; other elements do not scroll (no scroll
-/// containers yet, Phase 5).
+/// scrolling element, a scroll container (`overflow: hidden` included)
+/// scrolls its content; anything else ignores it (CSSOM View §6.1).
+/// A non-finite value is 0.
 fn geo_set(this: &JsValue, args: &[JsValue], prop: &GeoProp, context: &mut Context) -> JsResult<JsValue> {
     let node = this
         .as_object()
         .and_then(|o| o.downcast_ref::<DomNode>().map(|d| d.clone()))
         .ok_or_else(illegal_invocation)?;
     let Some(id) = node.id else { return Err(illegal_invocation()) };
-    let v = args.get_or_undefined(0).to_number(context)? as f32;
+    let v = args.get_or_undefined(0).to_number(context)?;
+    let v = if v.is_finite() { v as f32 } else { 0.0 };
     with_layout(context, |view, doc, quirks| {
         if scrolling_element(doc, quirks) == Some(id) {
             match prop {
                 GeoProp::ScrollTop => view.set_scroll(view.scroll.0, v),
                 GeoProp::ScrollLeft => view.set_scroll(v, view.scroll.1),
+                _ => {}
+            }
+        } else if let Some(info) = view.scroller(id) {
+            match prop {
+                GeoProp::ScrollTop => {
+                    view.set_element_scroll(id, info.offset.0, v);
+                }
+                GeoProp::ScrollLeft => {
+                    view.set_element_scroll(id, v, info.offset.1);
+                }
                 _ => {}
             }
         }
@@ -769,44 +862,122 @@ enum GeoMethod {
     ClientRects,
     ScrollIntoView,
     /// `scrollTo`/`scroll`/`scrollBy` on an element: the page for the
-    /// scrolling element, nothing elsewhere.
+    /// scrolling element, a scroll container's content, nothing
+    /// elsewhere.
     ScrollTo,
     ScrollBy,
 }
 
-/// Where `scrollIntoView` puts an edge: `start`, `center`, `end` or
-/// `nearest` (nothing when already in view).
-fn align(block: &str, lo: f32, hi: f32, view_lo: f32, view_size: f32) -> f32 {
-    match block {
-        "start" => lo,
-        "center" => (lo + hi) / 2.0 - view_size / 2.0,
-        "end" => hi - view_size,
-        _ => {
-            if lo >= view_lo && hi <= view_lo + view_size {
-                view_lo
-            } else if (lo - view_lo).abs() < (hi - (view_lo + view_size)).abs() {
-                lo
-            } else {
-                hi - view_size
-            }
-        }
+/// `ScrollOptions.behavior` and `ScrollIntoViewOptions.behavior`: a
+/// WebIDL enum, so anything but its three values throws. The scroll is
+/// applied at once; `smooth` animates in roadmap 4a (4s) block 6.
+fn scroll_behavior(options: &JsObject, context: &mut Context) -> JsResult<()> {
+    let v = options.get(js_string!("behavior"), context)?;
+    if v.is_undefined() {
+        return Ok(());
     }
+    let s = v.to_string(context)?.to_std_string_escaped();
+    if !matches!(s.as_str(), "auto" | "instant" | "smooth") {
+        return Err(JsNativeError::typ()
+            .with_message(format!("The provided value '{s}' is not a valid enum value of type ScrollBehavior."))
+            .into());
+    }
+    Ok(())
 }
 
-/// `scrollTo(x, y)`, `scrollTo({left, top})`, `scrollBy(...)`: the
-/// target offset, with missing parts kept (`by`: added).
+/// The scroll-snap-free alignment of `scrollIntoView`'s `block`/`inline`
+/// per CSSOM View §12.3 "scroll an element into view", for one axis: the
+/// element's edges `lo..hi` grown by its `scroll-margin`, the scrollport
+/// `port_lo..port_hi` shrunk by the scroller's `scroll-padding`; the
+/// change of the scroller's offset that aligns them.
+fn into_view_delta(how: &str, lo: f32, hi: f32, port_lo: f32, port_hi: f32) -> f32 {
+    let size = port_hi - port_lo;
+    let new_lo = match how {
+        "start" => lo,
+        "center" => (lo + hi) / 2.0 - size / 2.0,
+        "end" => hi - size,
+        // `nearest`: nothing when inside; else whichever edge is nearer,
+        // the start edge when the element is taller than the port.
+        _ => {
+            if lo >= port_lo && hi <= port_hi {
+                port_lo
+            } else if hi - lo > size {
+                if lo < port_lo { hi - size } else { lo }
+            } else if lo < port_lo {
+                lo
+            } else {
+                hi - size
+            }
+        }
+    };
+    new_lo - port_lo
+}
+
+/// `scrollIntoView` (CSSOM View §12.3, §12.4): for each scrolling box
+/// from the nearest ancestor scroll container to the viewport (hidden
+/// ones too), scroll it so the element's bounding box grown by its
+/// `scroll-margin` is aligned per `block`/`inline` inside the scrollport
+/// shrunk by the box's `scroll-padding` (the root element's for the
+/// viewport); `container: "nearest"` stops after the first.
+fn scroll_into_view(view: &mut View, doc: &Document, id: NodeId, block: &str, inline: &str, nearest_only: bool) {
+    let margin = view.styles.get(id).map(|s| s.scroll_margin).unwrap_or(Sides::all(0.0));
+    let grow = |r: Rect| Rect::new(r.x - margin.left, r.y - margin.top, r.width + margin.left + margin.right, r.height + margin.top + margin.bottom);
+    let padded = |port: Rect, padding: Sides<browser_style::ComputedLpAuto>| {
+        let r = |v: browser_style::ComputedLpAuto, basis: f32| v.resolve(basis).unwrap_or(0.0);
+        Rect::new(
+            port.x + r(padding.left, port.width),
+            port.y + r(padding.top, port.height),
+            (port.width - r(padding.left, port.width) - r(padding.right, port.width)).max(0.0),
+            (port.height - r(padding.top, port.height) - r(padding.bottom, port.height)).max(0.0),
+        )
+    };
+    let ancestors: Vec<NodeId> = doc.ancestors(id).collect();
+    for a in ancestors {
+        let Some(info) = view.scroller(a) else { continue };
+        let rect = grow(view.bounding(doc, id));
+        let padding = view.styles.get(a).map(|s| s.scroll_padding).unwrap_or(Sides::all(browser_style::ComputedLpAuto::Auto));
+        let port = padded(info.scrollport, padding);
+        let dy = into_view_delta(block, rect.y, rect.bottom(), port.y, port.bottom());
+        let dx = into_view_delta(inline, rect.x, rect.right(), port.x, port.right());
+        view.set_element_scroll(a, info.offset.0 + dx, info.offset.1 + dy);
+        if nearest_only {
+            return;
+        }
+    }
+    let rect = grow(view.bounding(doc, id));
+    let Some(tree) = &view.layout else { return };
+    let port = tree.viewport.scrollport.translate(view.scroll.0, view.scroll.1);
+    let padding = doc
+        .document_element()
+        .and_then(|r| view.styles.get(r))
+        .map(|s| s.scroll_padding)
+        .unwrap_or(Sides::all(browser_style::ComputedLpAuto::Auto));
+    let port = padded(port, padding);
+    let dy = into_view_delta(block, rect.y, rect.bottom(), port.y, port.bottom());
+    let dx = into_view_delta(inline, rect.x, rect.right(), port.x, port.right());
+    let (sx, sy) = view.scroll;
+    view.set_scroll(sx + dx, sy + dy);
+}
+
+/// `scrollTo(x, y)`, `scrollTo({left, top, behavior})`, `scrollBy(...)`:
+/// the target offset, with missing parts kept (`by`: added); a
+/// non-finite part is 0 (WebIDL `unrestricted double` normalized per
+/// CSSOM View).
 fn scroll_args(args: &[JsValue], current: (f32, f32), by: bool, context: &mut Context) -> JsResult<(f32, f32)> {
     let first = args.get_or_undefined(0);
+    let finite = |v: f64| if v.is_finite() { v as f32 } else { 0.0 };
     let (dx, dy) = if let Some(o) = first.as_object() {
         let num = |name: &str, context: &mut Context| -> JsResult<Option<f32>> {
             let v = o.get(JsString::from(name), context)?;
-            Ok(if v.is_undefined() { None } else { Some(v.to_number(context)? as f32) })
+            Ok(if v.is_undefined() { None } else { Some(finite(v.to_number(context)?)) })
         };
-        (num("left", context)?, num("top", context)?)
+        let out = (num("left", context)?, num("top", context)?);
+        scroll_behavior(&o, context)?;
+        out
     } else {
-        let x = if first.is_undefined() { None } else { Some(first.to_number(context)? as f32) };
+        let x = if first.is_undefined() { None } else { Some(finite(first.to_number(context)?)) };
         let second = args.get_or_undefined(1);
-        let y = if second.is_undefined() { None } else { Some(second.to_number(context)? as f32) };
+        let y = if second.is_undefined() { None } else { Some(finite(second.to_number(context)?)) };
         (x, y)
     };
     Ok(if by {
@@ -823,31 +994,57 @@ fn geo_call(this: &JsValue, args: &[JsValue], method: &GeoMethod, context: &mut 
         .ok_or_else(illegal_invocation)?;
     let Some(id) = node.id else { return Err(illegal_invocation()) };
     // Arguments first: reading them runs script.
-    let (block, inline) = match method {
+    let (block, inline, nearest_only) = match method {
         GeoMethod::ScrollIntoView => {
             let arg = args.get_or_undefined(0);
             if let Some(o) = arg.as_object() {
-                let s = |name: &str, default: &str, context: &mut Context| -> JsResult<String> {
+                let s = |name: &str, default: &str, allowed: &[&str], context: &mut Context| -> JsResult<String> {
                     let v = o.get(JsString::from(name), context)?;
-                    Ok(if v.is_undefined() {
-                        default.to_owned()
-                    } else {
-                        v.to_string(context)?.to_std_string_escaped()
-                    })
+                    if v.is_undefined() {
+                        return Ok(default.to_owned());
+                    }
+                    let s = v.to_string(context)?.to_std_string_escaped();
+                    if !allowed.contains(&s.as_str()) {
+                        return Err(JsNativeError::typ()
+                            .with_message(format!("The provided value '{s}' is not a valid enum value of type ScrollLogicalPosition."))
+                            .into());
+                    }
+                    Ok(s)
                 };
-                (s("block", "start", context)?, s("inline", "nearest", context)?)
+                const POSITIONS: &[&str] = &["start", "center", "end", "nearest"];
+                let block = s("block", "start", POSITIONS, context)?;
+                let inline = s("inline", "nearest", POSITIONS, context)?;
+                let container = s("container", "all", &["all", "nearest"], context)?;
+                scroll_behavior(&o, context)?;
+                (block, inline, container == "nearest")
             } else if arg.is_undefined() || arg.to_boolean() {
-                ("start".to_owned(), "nearest".to_owned())
+                ("start".to_owned(), "nearest".to_owned(), false)
             } else {
-                ("end".to_owned(), "nearest".to_owned())
+                ("end".to_owned(), "nearest".to_owned(), false)
             }
         }
-        _ => (String::new(), String::new()),
+        _ => (String::new(), String::new(), false),
     };
-    let current = with_layout(context, |view, _, _| view.scroll)?.unwrap_or_default();
-    let target = match method {
-        GeoMethod::ScrollTo => Some(scroll_args(args, current, false, context)?),
-        GeoMethod::ScrollBy => Some(scroll_args(args, current, true, context)?),
+    // `scrollTo`/`scrollBy` are relative to the box's own offset: the
+    // page's for the scrolling element, the scroller's for a scroll
+    // container, nothing otherwise.
+    let current = with_layout(context, |view, doc, quirks| {
+        if scrolling_element(doc, quirks) == Some(id) {
+            Some(view.scroll)
+        } else {
+            view.scroller(id).map(|i| i.offset)
+        }
+    })?
+    .flatten();
+    let target = match (method, current) {
+        (GeoMethod::ScrollTo, Some(current)) => Some(scroll_args(args, current, false, context)?),
+        (GeoMethod::ScrollBy, Some(current)) => Some(scroll_args(args, current, true, context)?),
+        // Not a scroller: the arguments are still read (WebIDL), nothing
+        // moves.
+        (GeoMethod::ScrollTo | GeoMethod::ScrollBy, None) => {
+            scroll_args(args, (0.0, 0.0), false, context)?;
+            None
+        }
         _ => None,
     };
     let rects = with_layout(context, |view, doc, quirks| {
@@ -860,19 +1057,16 @@ fn geo_call(this: &JsValue, args: &[JsValue], method: &GeoMethod, context: &mut 
                 view.rects_of(doc, id).into_iter().map(|r| r.translate(-sx, -sy)).collect()
             }
             GeoMethod::ScrollIntoView => {
-                let r = view.bounding(doc, id);
-                let (vw, vh) = view.viewport;
-                let (sx, sy) = view.scroll;
-                let y = align(&block, r.y, r.bottom(), sy, vh);
-                let x = align(&inline, r.x, r.right(), sx, vw);
-                view.set_scroll(x, y);
+                scroll_into_view(view, doc, id, &block, &inline, nearest_only);
                 Vec::new()
             }
             GeoMethod::ScrollTo | GeoMethod::ScrollBy => {
-                if scrolling_element(doc, quirks) == Some(id)
-                    && let Some((x, y)) = target
-                {
-                    view.set_scroll(x, y);
+                if let Some((x, y)) = target {
+                    if scrolling_element(doc, quirks) == Some(id) {
+                        view.set_scroll(x, y);
+                    } else {
+                        view.set_element_scroll(id, x, y);
+                    }
                 }
                 Vec::new()
             }
@@ -1161,7 +1355,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
         )?;
     }
     vv.set(js_string!("scale"), 1, false, context)?;
-    crate::events::add_handler_properties(&vv, &["onresize", "onscroll"], context)?;
+    crate::events::add_handler_properties(&vv, &["onresize", "onscroll", "onscrollend"], context)?;
     dom(context)?.borrow_mut().plain_objects.insert(id, vv.clone());
     context.register_global_property(js_string!("visualViewport"), vv, Attribute::ENUMERABLE)?;
     Ok(())
