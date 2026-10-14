@@ -620,8 +620,8 @@ impl Fragment {
     }
 
     /// A `position: fixed` box: it stays put when a scroll container
-    /// above it scrolls.
-    pub(crate) fn is_fixed(&self) -> bool {
+    /// above it scrolls, and no overflow above it clips it.
+    pub fn is_fixed(&self) -> bool {
         self.node.is_some() && self.style.position == Position::Fixed && !matches!(self.content, FragmentContent::Inline { .. })
     }
 
@@ -770,6 +770,17 @@ impl LayoutTree {
     /// container's content is reachable through its scrollport only; a
     /// point on its scrollbars or border is the element itself.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        /// The fixed boxes in a clipped subtree are not clipped by it:
+        /// they are still hit.
+        fn visit_fixed(f: &Fragment, x: f32, y: f32, best: &mut Option<NodeId>, scrollers: &HashMap<NodeId, ScrollInfo>) {
+            for c in &f.children {
+                if c.is_fixed() {
+                    visit(c, x, y, best, scrollers);
+                } else {
+                    visit_fixed(c, x, y, best, scrollers);
+                }
+            }
+        }
         fn visit(f: &Fragment, x: f32, y: f32, best: &mut Option<NodeId>, scrollers: &HashMap<NodeId, ScrollInfo>) {
             let inside = f.rect.contains(x, y);
             if inside && f.node.is_some() {
@@ -777,9 +788,11 @@ impl LayoutTree {
             }
             if let Some(info) = f.node.filter(|_| f.is_scroll_container()).and_then(|n| scrollers.get(&n)) {
                 if !info.scrollport.contains(x, y) {
+                    visit_fixed(f, x, y, best, scrollers);
                     return;
                 }
             } else if !inside && f.clips_children() {
+                visit_fixed(f, x, y, best, scrollers);
                 return;
             }
             for c in &f.children {

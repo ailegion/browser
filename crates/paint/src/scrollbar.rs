@@ -11,11 +11,16 @@ use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Point, Rect as KRect};
 use vello::peniko::{Color, Fill};
 
-/// Which parts the pointer is on or holding, for the highlights.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which parts the pointer is on or holding, for the highlights, and the
+/// `scrollbar-color` (thumb, track) when the page set one: then the
+/// track, the buttons' background and the corner take the track colour
+/// and the thumb and the arrows the thumb colour, in every state (Blink
+/// keeps the shape and drops the hover and press shading).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ScrollbarState {
     pub hover: Option<ScrollbarPart>,
     pub pressed: Option<ScrollbarPart>,
+    pub colors: Option<(Color, Color)>,
 }
 
 const TRACK: Color = Color::from_rgb8(0xf1, 0xf1, 0xf1);
@@ -36,7 +41,8 @@ fn krect(r: &Rect) -> KRect {
 /// Draw one bar. `transform` maps the geometry's coordinates to the
 /// scene's.
 pub fn draw_scrollbar(scene: &mut Scene, transform: Affine, g: &ScrollbarGeometry, state: ScrollbarState) {
-    scene.fill(Fill::NonZero, transform, TRACK, None, &krect(&g.bar));
+    let track = state.colors.map_or(TRACK, |(_, t)| t);
+    scene.fill(Fill::NonZero, transform, track, None, &krect(&g.bar));
     let max = g.max_position();
     for (part, rect, enabled) in [
         (ScrollbarPart::ButtonStart, g.button_start_rect(), g.position > 0.0),
@@ -45,14 +51,12 @@ pub fn draw_scrollbar(scene: &mut Scene, transform: Affine, g: &ScrollbarGeometr
         let Some(rect) = rect else { continue };
         let pressed = state.pressed == Some(part);
         let hovered = state.hover == Some(part) && state.pressed.is_none_or(|p| p == part);
-        let (background, arrow) = if !enabled {
-            (None, ARROW_DISABLED)
-        } else if pressed {
-            (Some(BUTTON_PRESSED), ARROW_PRESSED)
-        } else if hovered {
-            (Some(BUTTON_HOVER), ARROW)
-        } else {
-            (None, ARROW)
+        let (background, arrow) = match state.colors {
+            Some((thumb, _)) => (None, thumb),
+            None if !enabled => (None, ARROW_DISABLED),
+            None if pressed => (Some(BUTTON_PRESSED), ARROW_PRESSED),
+            None if hovered => (Some(BUTTON_HOVER), ARROW),
+            None => (None, ARROW),
         };
         if let Some(bg) = background {
             scene.fill(Fill::NonZero, transform, bg, None, &krect(&rect));
@@ -61,20 +65,24 @@ pub fn draw_scrollbar(scene: &mut Scene, transform: Affine, g: &ScrollbarGeometr
     }
     if max > 0.0 {
         let thumb = g.thumb_rect();
-        let color = if state.pressed == Some(ScrollbarPart::Thumb) {
-            THUMB_PRESSED
-        } else if state.hover == Some(ScrollbarPart::Thumb) && state.pressed.is_none() {
-            THUMB_HOVER
-        } else {
-            THUMB
+        let color = match state.colors {
+            Some((thumb, _)) => thumb,
+            None if state.pressed == Some(ScrollbarPart::Thumb) => THUMB_PRESSED,
+            None if state.hover == Some(ScrollbarPart::Thumb) && state.pressed.is_none() => THUMB_HOVER,
+            None => THUMB,
         };
         scene.fill(Fill::NonZero, transform, color, None, &krect(&thumb));
     }
 }
 
-/// The square where a vertical and a horizontal bar meet.
+/// The square where a vertical and a horizontal bar meet (the track
+/// colour under `scrollbar-color`).
 pub fn draw_corner(scene: &mut Scene, transform: Affine, rect: &Rect) {
-    scene.fill(Fill::NonZero, transform, CORNER, None, &krect(rect));
+    draw_corner_colored(scene, transform, rect, None);
+}
+
+pub fn draw_corner_colored(scene: &mut Scene, transform: Affine, rect: &Rect, colors: Option<(Color, Color)>) {
+    scene.fill(Fill::NonZero, transform, colors.map_or(CORNER, |(_, t)| t), None, &krect(rect));
 }
 
 /// A button's arrow: a triangle pointing out of the bar, half the button
@@ -109,9 +117,10 @@ mod tests {
         let mut scene = Scene::new();
         for state in [
             ScrollbarState::default(),
-            ScrollbarState { hover: Some(ScrollbarPart::Thumb), pressed: None },
-            ScrollbarState { hover: Some(ScrollbarPart::ButtonEnd), pressed: Some(ScrollbarPart::ButtonEnd) },
-            ScrollbarState { hover: Some(ScrollbarPart::TrackAfter), pressed: Some(ScrollbarPart::Thumb) },
+            ScrollbarState { hover: Some(ScrollbarPart::Thumb), pressed: None, colors: None },
+            ScrollbarState { hover: Some(ScrollbarPart::ButtonEnd), pressed: Some(ScrollbarPart::ButtonEnd), colors: None },
+            ScrollbarState { hover: Some(ScrollbarPart::TrackAfter), pressed: Some(ScrollbarPart::Thumb), colors: None },
+            ScrollbarState { hover: None, pressed: None, colors: Some((Color::from_rgb8(1, 2, 3), Color::WHITE)) },
         ] {
             draw_scrollbar(&mut scene, Affine::IDENTITY, &g, state);
         }

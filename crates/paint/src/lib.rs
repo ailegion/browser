@@ -14,15 +14,17 @@ use std::sync::Arc;
 
 use browser_dom::NodeId;
 use browser_layout::{
-    Control, Decoration, DecorationLine, Fragment, FragmentContent, LayoutTree, Rect, SelectionRanges, TextFragment,
+    Control, Decoration, DecorationLine, Fragment, FragmentContent, LayoutTree, Rect, ScrollInfo, ScrollbarPart,
+    SelectionRanges, TextFragment,
 };
+use scrollbar::{ScrollbarState, draw_scrollbar};
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
 use browser_style::{
     BackgroundAttachment, BackgroundBox, BlendMode, BorderStyle, BoxDecorationBreak, ColorInterpolation,
     ComputedBackgroundSize, ComputedGradient, ComputedGradientItem, ComputedGradientPos, ComputedGradientShape,
     ComputedImage, ComputedLp, ComputedLpAuto, ComputedRadialSize, ComputedStyle, HueMethod, InterpolationSpace,
-    LinearDirection, PositionEdge, PositionOffset, RadialShape, Rgba, TextDecorationStyle, Visibility,
+    LinearDirection, PositionEdge, PositionOffset, RadialShape, Rgba, ScrollbarColor, TextDecorationStyle, Visibility,
 };
 use vello::peniko::color::{ColorSpaceTag, DynamicColor, HueDirection};
 use skrifa::instance::{LocationRef, NormalizedCoord, Size as FontSize};
@@ -173,6 +175,11 @@ pub struct PaintOptions {
     pub caret: Option<Rect>,
     /// The IME's composition text in the focused control, underlined.
     pub composition: SelectionRanges,
+    /// The element scrollbar part under the pointer and the one pressed
+    /// (the element, whether its vertical bar, the part), for the
+    /// highlights (roadmap 4a (4s)).
+    pub scrollbar_hover: Option<(NodeId, bool, ScrollbarPart)>,
+    pub scrollbar_pressed: Option<(NodeId, bool, ScrollbarPart)>,
 }
 
 /// The keyboard focus ring.
@@ -255,6 +262,11 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
             (&options.current_match, CURRENT_MATCH),
         ],
         composition: &options.composition,
+        scrollers: &tree.scrollers,
+        scrollbar_hover: options.scrollbar_hover,
+        scrollbar_pressed: options.scrollbar_pressed,
+        clip_depth: 0,
+        deferred_fixed: Vec::new(),
     };
     if let (Some(h), Some(style)) = (html, &canvas_layers) {
         painter.canvas_layers(style, h);
@@ -262,6 +274,7 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
     if let Some(html) = html {
         painter.fragment(html);
     }
+    painter.paint_deferred_fixed();
     if let Some(c) = &options.caret {
         painter
             .scene
@@ -285,6 +298,18 @@ struct Painter<'a> {
     highlights: [(&'a SelectionRanges, Color); 3],
     /// Composition text, underlined.
     composition: &'a SelectionRanges,
+    /// The scroll containers' state: their scrollports clip their
+    /// content, their offsets move `background-attachment: local`
+    /// layers, their bars are drawn over their content.
+    scrollers: &'a HashMap<NodeId, ScrollInfo>,
+    scrollbar_hover: Option<(NodeId, bool, ScrollbarPart)>,
+    scrollbar_pressed: Option<(NodeId, bool, ScrollbarPart)>,
+    /// How many overflow clips are open. A `position: fixed` box met
+    /// inside one is not clipped by any of them (CSS Positioned 3 §3.3:
+    /// its containing block is the viewport), so it waits in
+    /// `deferred_fixed` and paints once the outermost clip is closed.
+    clip_depth: usize,
+    deferred_fixed: Vec<&'a Fragment>,
 }
 
 fn color(c: Rgba) -> Color {
@@ -316,11 +341,15 @@ fn intersects(a: &Rect, b: &Rect) -> bool {
     a.x < b.right() && a.right() > b.x && a.y < b.bottom() && a.bottom() > b.y
 }
 
-impl Painter<'_> {
-    fn fragment(&mut self, f: &Fragment) {
+impl<'a> Painter<'a> {
+    fn fragment(&mut self, f: &'a Fragment) {
         if f.style.visibility != Visibility::Visible && !matches!(f.content, FragmentContent::Anonymous) {
             // Hidden elements do not paint; their children with an explicit
             // `visible` would, but that case is rare and handled later.
+            return;
+        }
+        if self.clip_depth > 0 && f.is_fixed() {
+            self.deferred_fixed.push(f);
             return;
         }
         let clips = f.clips_children();
@@ -375,22 +404,83 @@ impl Painter<'_> {
             }
         }
 
+        let scroller = f.node.filter(|_| f.is_scroll_container()).and_then(|n| self.scrollers.get(&n));
         if !f.children.is_empty() {
             if clips {
-                let clip = padding_box(&f.rect, &f.style);
+                // The overflow clip is the padding box with the padding
+                // edge's radii (CSS Backgrounds 3 §5.3: the outer radii less
+                // the border widths), and for a scroll container no more
+                // than its scrollport (the gutters hold the bars, a text
+                // input's padding stays put).
+                let geometry = BoxGeometry::new(&f.rect, &f.style, ALL_SIDES);
                 self.scene
-                    .push_clip_layer(Fill::NonZero, self.transform, &krect(&clip));
+                    .push_clip_layer(Fill::NonZero, self.transform, &geometry.inset_path(geometry.width));
+                self.clip_depth += 1;
+                if let Some(info) = scroller.filter(|i| i.scrollport != padding_box(&f.rect, &f.style)) {
+                    self.scene
+                        .push_clip_layer(Fill::NonZero, self.transform, &krect(&info.scrollport));
+                    self.clip_depth += 1;
+                }
             }
             for c in &f.children {
                 self.fragment(c);
             }
             if clips {
                 self.scene.pop_layer();
+                self.clip_depth -= 1;
+                if scroller.is_some_and(|i| i.scrollport != padding_box(&f.rect, &f.style)) {
+                    self.scene.pop_layer();
+                    self.clip_depth -= 1;
+                }
+                if self.clip_depth == 0 {
+                    self.paint_deferred_fixed();
+                }
             }
+        }
+        // The scroll container's bars and corner, over its content.
+        if let (Some(info), Some(node)) = (scroller, f.node)
+            && !offscreen
+        {
+            self.scrollbars(node, info, &f.style);
         }
 
         if translucent {
             self.scene.pop_layer();
+        }
+    }
+
+    /// The fixed boxes met inside overflow clips, painted now that none
+    /// is open.
+    fn paint_deferred_fixed(&mut self) {
+        while !self.deferred_fixed.is_empty() {
+            let pending = std::mem::take(&mut self.deferred_fixed);
+            for f in pending {
+                self.fragment(f);
+            }
+        }
+    }
+
+    /// A scroll container's scrollbars and corner (`browser_paint::
+    /// scrollbar`): the platform look, or the element's `scrollbar-color`
+    /// (inherited, so the viewport's bars take the root's).
+    fn scrollbars(&mut self, node: NodeId, info: &ScrollInfo, style: &ComputedStyle) {
+        let colors = match style.scrollbar_color {
+            ScrollbarColor::Auto => None,
+            ScrollbarColor::Colors { thumb, track } => Some((color(thumb), color(track))),
+        };
+        let state = |vertical: bool| ScrollbarState {
+            hover: self.scrollbar_hover.filter(|&(n, v, _)| n == node && v == vertical).map(|(_, _, p)| p),
+            pressed: self.scrollbar_pressed.filter(|&(n, v, _)| n == node && v == vertical).map(|(_, _, p)| p),
+            colors,
+        };
+        if let Some(g) = info.vertical_scrollbar() {
+            draw_scrollbar(self.scene, self.transform, &g, state(true));
+        }
+        if let Some(g) = info.horizontal_scrollbar() {
+            draw_scrollbar(self.scene, self.transform, &g, state(false));
+        }
+        if let Some(c) = info.corner() {
+            scrollbar::draw_corner_colored(self.scene, self.transform, &c, colors);
         }
     }
 
@@ -422,11 +512,20 @@ impl Painter<'_> {
             padding_box,
             [padding.top as f64, padding.right as f64, padding.bottom as f64, padding.left as f64],
         );
+        // `background-attachment: local` on a scroll container: the layer
+        // scrolls with the content, so its positioning area moves by the
+        // offset (CSS Backgrounds 3 §3.5); on anything else it is `scroll`.
+        let local = f
+            .node
+            .filter(|_| f.is_scroll_container())
+            .and_then(|n| self.scrollers.get(&n))
+            .map_or((0.0, 0.0), |i| (-f64::from(i.offset.0), -f64::from(i.offset.1)));
         let areas = Areas {
             border: border_box,
             padding: padding_box,
             content: content_box,
             fixed: krect(&self.visible),
+            local,
         };
         let content_inset = [
             geometry.width[0] + padding.top as f64,
@@ -459,6 +558,10 @@ impl Painter<'_> {
             padding: padding_box,
             content: content_box,
             fixed: krect(&self.visible),
+            // The canvas's scroll container is the viewport, whose
+            // scrolling the painter applies to everything: `local` is
+            // `scroll` here.
+            local: (0.0, 0.0),
         };
         let canvas = BezPath::from_vec(krect(&self.visible).path_elements(0.1).collect());
         let clip_for = |_: BackgroundBox| canvas.clone();
@@ -511,15 +614,18 @@ impl Painter<'_> {
                 ComputedImage::Gradient(g) => LayerSource::Gradient(g.clone()),
                 _ => continue,
             };
+            let by_origin = |areas: &Areas| match origin {
+                BackgroundBox::BorderBox => areas.border,
+                BackgroundBox::PaddingBox => areas.padding,
+                BackgroundBox::ContentBox | BackgroundBox::Text => areas.content,
+            };
             let area = match attachment {
                 BackgroundAttachment::Fixed => areas.fixed,
-                // Nothing but the page scrolls, so `local` is `scroll`
-                // (roadmap 4a (4s) adds scroll containers).
-                BackgroundAttachment::Scroll | BackgroundAttachment::Local => match origin {
-                    BackgroundBox::BorderBox => areas.border,
-                    BackgroundBox::PaddingBox => areas.padding,
-                    BackgroundBox::ContentBox | BackgroundBox::Text => areas.content,
-                },
+                BackgroundAttachment::Scroll => by_origin(areas),
+                // The layer scrolls with the box's content: the area moves
+                // by the scroll offset (zero for a box that does not
+                // scroll, where `local` is `scroll`).
+                BackgroundAttachment::Local => by_origin(areas) + vello::kurbo::Vec2::new(areas.local.0, areas.local.1),
             };
             let intrinsic = match &source {
                 LayerSource::Raster(img) => Some((img.width as f64, img.height as f64)),
@@ -920,6 +1026,10 @@ struct Areas {
     padding: KRect,
     content: KRect,
     fixed: KRect,
+    /// How far a `local` layer's area moves with the box's scrolled
+    /// content: minus the scroll offset for a scroll container, zero
+    /// otherwise.
+    local: (f64, f64),
 }
 
 /// What a background layer draws.
@@ -2308,6 +2418,124 @@ mod tests {
         let mut scene = Scene::new();
         paint(&tree, images, &options, &mut scene);
         (tree, render_offscreen(&scene, 300, 150, Color::WHITE))
+    }
+
+    /// Lay `html` out in the 300×150 viewport, let `adjust` scroll the
+    /// tree, paint it. `None` pixels when there is no GPU.
+    fn render_adjusted(
+        html: &str,
+        adjust: impl FnOnce(&browser_dom::Document, &mut browser_layout::LayoutTree),
+    ) -> (browser_dom::Document, browser_layout::LayoutTree, Option<Vec<u8>>) {
+        let doc = browser_dom::parse_html(html.as_bytes());
+        let mut stylist = browser_style::Stylist::new();
+        stylist.add_sheet(browser_style::ua::ua_stylesheet());
+        let vp = browser_style::Viewport {
+            width: 300.0,
+            height: 150.0,
+            scale_factor: 1.0,
+            prefers_dark: false,
+        };
+        let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+        let mut engine = browser_layout::LayoutEngine::new();
+        let images = ImageStore::new();
+        let mut tree = engine.layout(&doc, &styles, 300.0, 150.0, &images);
+        adjust(&doc, &mut tree);
+        let options = PaintOptions {
+            viewport_width: 300.0,
+            viewport_height: 150.0,
+            scale: 1.0,
+            ..PaintOptions::default()
+        };
+        let mut scene = Scene::new();
+        paint(&tree, &images, &options, &mut scene);
+        let pixels = render_offscreen(&scene, 300, 150, Color::WHITE);
+        (doc, tree, pixels)
+    }
+
+    fn node_by_id(doc: &browser_dom::Document, id: &str) -> NodeId {
+        doc.descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+            .unwrap_or_else(|| panic!("#{id}"))
+    }
+
+    #[test]
+    fn scroll_containers_clip_to_their_scrollport_scroll_and_show_their_bars() {
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        const HTML: &str = "<body style='margin:0'><div id=s style='overflow:auto;width:100px;height:50px'>\
+            <div style='height:100px;background:red'></div><div style='height:100px;background:blue'></div></div>\
+            <div style='height:50px;width:100px;background:lime'></div></body>";
+        let (_, _, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_red(px(&pixels, 50.0, 25.0)));
+        assert!(
+            is_green(px(&pixels, 50.0, 75.0)),
+            "the content past the box is clipped: {:?} at (50, 75); (50, 55) {:?}; (50, 110) {:?}",
+            px(&pixels, 50.0, 75.0),
+            px(&pixels, 50.0, 55.0),
+            px(&pixels, 50.0, 110.0)
+        );
+        if t > 0.0 {
+            let bar = px(&pixels, 100.0 - t / 2.0, 25.0);
+            assert!(!is_red(bar) && !is_white(bar), "the vertical bar covers its gutter: {bar:?}");
+        }
+        // Scrolled by 100: the blue block shows in the box, nothing below it.
+        let (_, _, pixels) = render_adjusted(HTML, |doc, tree| {
+            tree.set_scroll_offset(node_by_id(doc, "s"), (0.0, 100.0));
+        });
+        let Some(pixels) = pixels else { return };
+        assert!(is_blue(px(&pixels, 50.0, 25.0)));
+        assert!(is_green(px(&pixels, 50.0, 75.0)));
+        assert!(is_white(px(&pixels, 50.0, 125.0)));
+    }
+
+    #[test]
+    fn rounded_overflow_clips_and_fixed_children_escape_the_clip() {
+        const HTML: &str = "<body style='margin:0'><div style='overflow:hidden;width:100px;height:50px;border-radius:30px'>\
+            <div style='height:100px;background:red'></div>\
+            <div id=f style='position:fixed;top:100px;left:0;width:20px;height:20px;background:blue'></div></div></body>";
+        let (doc, tree, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_white(px(&pixels, 2.0, 2.0)), "the corner is outside the rounded clip");
+        assert!(is_red(px(&pixels, 50.0, 25.0)));
+        assert!(is_white(px(&pixels, 50.0, 75.0)), "the overflow is clipped");
+        assert!(is_blue(px(&pixels, 10.0, 110.0)), "the fixed box paints outside the clip");
+        assert_eq!(tree.hit_test(10.0, 110.0), Some(node_by_id(&doc, "f")), "and is hit there");
+    }
+
+    #[test]
+    fn local_backgrounds_scroll_with_the_content_and_scroll_ones_stay() {
+        const HTML: &str = "<body style='margin:0'>\
+            <div id=l style='overflow:auto;width:100px;height:50px;background:linear-gradient(red 50%, blue 50%) local'><div style='height:200px'></div></div>\
+            <div id=s style='overflow:auto;width:100px;height:50px;background:linear-gradient(red 50%, blue 50%) scroll'><div style='height:200px'></div></div></body>";
+        let (_, _, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_red(px(&pixels, 50.0, 10.0)));
+        assert!(is_red(px(&pixels, 50.0, 60.0)));
+        let (_, _, pixels) = render_adjusted(HTML, |doc, tree| {
+            tree.set_scroll_offset(node_by_id(doc, "l"), (0.0, 30.0));
+            tree.set_scroll_offset(node_by_id(doc, "s"), (0.0, 30.0));
+        });
+        let Some(pixels) = pixels else { return };
+        assert!(is_blue(px(&pixels, 50.0, 10.0)), "the local layer moved up with the content");
+        assert!(is_red(px(&pixels, 50.0, 60.0)), "the scroll layer stayed");
+    }
+
+    #[test]
+    fn scrollbar_color_paints_the_track_thumb_and_corner() {
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        if t == 0.0 {
+            return;
+        }
+        const HTML: &str = "<body style='margin:0'><div style='overflow:scroll;width:100px;height:50px;scrollbar-color: rgb(0,0,255) rgb(255,0,0)'>x</div></body>";
+        let (_, _, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_red(px(&pixels, 50.0, 50.0 - t / 2.0)), "the horizontal track");
+        assert!(
+            is_red(px(&pixels, 100.0 - t / 2.0, 50.0 - t / 2.0)),
+            "the corner: {:?}",
+            px(&pixels, 100.0 - t / 2.0, 50.0 - t / 2.0)
+        );
+        assert!(is_red(px(&pixels, 100.0 - t / 2.0, 25.0)), "the vertical track (no thumb: nothing scrolls)");
     }
 
     /// A store with `http://x/i.png`, a 2×2 image (red, green over blue,

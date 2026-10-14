@@ -9,7 +9,7 @@ use browser_ipc_types::{Cursor, Key, MouseButton, NetToTab, RequestId, ShellToTa
 use browser_layout::selection::{self, TextPos};
 use browser_layout::{LayoutEngine, LayoutTree, Rect, ScrollbarPart, SelectionRanges};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
-use browser_paint::scrollbar::{ScrollbarState, draw_corner, draw_scrollbar};
+use browser_paint::scrollbar::{ScrollbarState, draw_corner_colored, draw_scrollbar};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_script::{
     ConsoleLevel, ConsoleLine, EventTargetRef, HostRequest, ImageSizeMap, ModuleProgress, ModuleScript, ScriptHost, View,
@@ -3159,6 +3159,14 @@ impl TabState {
             focus_ring: self.focus_ring.clone(),
             caret: self.caret_rect,
             composition: self.composition_ranges(),
+            scrollbar_hover: match self.bar_hover {
+                Some((ScrollTarget::Element(n), v, p)) => Some((n, v, p)),
+                _ => None,
+            },
+            scrollbar_pressed: match self.bar_pressed {
+                Some((ScrollTarget::Element(n), v, p)) => Some((n, v, p)),
+                _ => None,
+            },
         };
         let started = std::time::Instant::now();
         paint(tree, &self.images, &options, &mut self.scene);
@@ -3172,9 +3180,23 @@ impl TabState {
             (page.vertical_scrollbar(), page.horizontal_scrollbar(), page.corner())
         };
         let transform = vello::kurbo::Affine::scale(f64::from(self.viewport.scale_factor));
+        // The viewport's bars take the root element's `scrollbar-color`.
+        let colors = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.document_element())
+            .and_then(|r| self.styles.get(r))
+            .and_then(|s| match s.scrollbar_color {
+                browser_style::ScrollbarColor::Auto => None,
+                browser_style::ScrollbarColor::Colors { thumb, track } => {
+                    let c = |c: browser_style::Rgba| vello::peniko::Color::new([c.r, c.g, c.b, c.a]);
+                    Some((c(thumb), c(track)))
+                }
+            });
         let state = |vertical: bool| ScrollbarState {
             hover: self.bar_hover.filter(|&(t, v, _)| t == ScrollTarget::Page && v == vertical).map(|(_, _, p)| p),
             pressed: self.bar_pressed.filter(|&(t, v, _)| t == ScrollTarget::Page && v == vertical).map(|(_, _, p)| p),
+            colors,
         };
         if let Some(g) = &vertical {
             draw_scrollbar(&mut self.scene, transform, g, state(true));
@@ -3183,7 +3205,7 @@ impl TabState {
             draw_scrollbar(&mut self.scene, transform, g, state(false));
         }
         if let Some(c) = &corner {
-            draw_corner(&mut self.scene, transform, c);
+            draw_corner_colored(&mut self.scene, transform, c, colors);
         }
         let scene = std::mem::take(&mut self.scene);
         (self.output)(self.id, TabOutput::Frame(scene));

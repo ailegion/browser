@@ -1696,7 +1696,33 @@ Work:
       dead zone, no pan on a link; focus, fragment and find reaching into
       a scroller with `scroll-padding` and `scroll-margin` and the page
       going as far as it can; the caret keeping a textarea and an input
-      scrolled to it), paint (the bars in every state). (5)
+      scrolled to it), paint (the bars in every state).
+      **Block 4 done 2026-10-14: paint.** `crates/paint`: every box that
+      clips its overflow clips its children to the padding box with the
+      padding edge's radii (CSS Backgrounds 3 §5.3: the outer radii less
+      the border widths; a plain rectangle before), and a scroll container
+      further to its scrollport (the gutters hold the bars; a text input's
+      padding stays outside); after its content a scroll container's
+      bars and corner are drawn with the shared classic look
+      (`scrollbar::draw_scrollbar`, hover and press parts from the tab
+      through `PaintOptions::scrollbar_hover`/`scrollbar_pressed`), or
+      with the element's `scrollbar-color` (thumb and arrows the thumb
+      colour, track, buttons and corner the track colour, no hover or
+      press shading, as Blink draws coloured bars; the viewport's bars
+      take the root's); `background-attachment: local` moves the layer's
+      positioning area with the box's scrolled content (`Areas::local`,
+      minus the offset; `scroll` on a box that is no scroll container,
+      and on the canvas, whose scroller is the viewport the painter
+      scrolls as a whole); a `position: fixed` box met inside an overflow
+      clip is held back and painted after the outermost clip closes
+      (CSS Positioned 3 §3.3: no overflow ancestor clips it), and
+      `LayoutTree::hit_test` reaches the fixed boxes of a clipped subtree
+      from outside it the same way. Tests: paint (a scroller's content
+      clipped to its box and scrolled by an offset with the bar over the
+      gutter, a rounded `overflow: hidden` corner left white, a fixed box
+      painted and hit outside its clipper, `local` moving with the
+      content beside `scroll` staying, `scrollbar-color` on the track,
+      corner and vertical track); snapshots unchanged. (5)
       `box-shadow`, `outline` (the focus ring becomes `outline: auto`),
       `cursor` (every keyword, `none`, `url()`), `pointer-events`,
       `user-select`; (6) `z-index` and `transform`/`transform-origin`
