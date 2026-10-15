@@ -1965,14 +1965,14 @@ mod tests {
         assert_eq!(
             s(&mut h, "var d = document.getElementById('d'), st = d.style; \
                        [st instanceof CSSStyleDeclaration, st === d.style, st.color, st.getPropertyValue('COLOR'), st['margin-top'], st.marginRight, st.margin, st.getPropertyValue('--x'), st.width, st.marginTop, \
-                        st.length, st.item(0), st[1], JSON.stringify(st.item(99)), st.cssText, String(st.parentRule), 'color' in st, 'backgroundColor' in st, 'cssFloat' in st, 'transform' in st, 0 in st, 7 in st, Object.keys(st).join(), [...st].length].join('|')").as_deref(),
+                        st.length, st.item(0), st[1], JSON.stringify(st.item(99)), st.cssText, String(st.parentRule), 'color' in st, 'backgroundColor' in st, 'cssFloat' in st, 'columnCount' in st, 0 in st, 7 in st, Object.keys(st).join(), [...st].length].join('|')").as_deref(),
             Ok("\"true|true|red|red|1px|2px|1px 2px|7|var(--w)|1px|7|color|margin-top|\\\"\\\"|color: red; margin: 1px 2px; --x: 7; width: var(--w);|null|true|true|true|false|true|false|0,1,2,3,4,5,6|7\"")
         );
         assert!(!h.take_dom_mutated(), "reading changes nothing");
         // Writes: normalized values, priorities, cssFloat, an unknown
         // property, an invalid value.
         assert_eq!(
-            s(&mut h, "st.backgroundColor = '#ff0000'; st.setProperty('padding-left', '3px', 'important'); st.cssFloat = 'left'; st.display = 'TABLE'; st.nope = 'x'; st.color = 'notacolor'; st.setProperty('color', 'blue', 'bogus'); st.setProperty('transform', 'rotate(1deg)'); \
+            s(&mut h, "st.backgroundColor = '#ff0000'; st.setProperty('padding-left', '3px', 'important'); st.cssFloat = 'left'; st.display = 'TABLE'; st.nope = 'x'; st.color = 'notacolor'; st.setProperty('color', 'blue', 'bogus'); st.setProperty('column-count', '2'); \
                        [d.getAttribute('style'), st.getPropertyPriority('padding-left'), st.getPropertyPriority('color'), st.float, st.display, st.color, st.nope, st.length].join('|')").as_deref(),
             Ok("\"color: red; margin: 1px 2px; --x: 7; width: var(--w); background-color: rgb(255, 0, 0); padding-left: 3px !important; float: left; display: table;|important||left|table|red|x|11\"")
         );

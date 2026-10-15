@@ -253,6 +253,23 @@ pub struct ComputedStyle {
     /// `none` under a parent whose used value is that, else `text`; never
     /// `auto`.
     pub user_select_used: UserSelect,
+    /// 4a block 6: stacking and transforms.
+    pub z_index: ZIndex,
+    pub isolation: Isolation,
+    pub will_change: WillChange,
+    pub transform: Vec<ComputedTransformFunction>,
+    /// `transform-origin`: the x and y as percentage + px of the box, z in px.
+    pub transform_origin: (PositionOffset, PositionOffset, f32),
+    pub transform_box: TransformBox,
+    pub transform_style: TransformStyle,
+    pub backface_visibility: BackfaceVisibility,
+    /// `perspective` in px, `None` for `none`.
+    pub perspective: Option<f32>,
+    pub perspective_origin: (PositionOffset, PositionOffset),
+    /// The individual transform properties, `None` for `none`.
+    pub translate: Option<(ComputedLp, ComputedLp, f32)>,
+    pub rotate: Option<(f32, f32, f32, f32)>,
+    pub scale: Option<(f32, f32, f32)>,
     /// Custom properties in effect, inherited; shared with the parent when
     /// this element declares none.
     pub custom: Arc<CustomMap>,
@@ -443,6 +460,23 @@ impl ComputedStyle {
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
             user_select_used: UserSelect::Text,
+            z_index: ZIndex::Auto,
+            isolation: Isolation::Auto,
+            will_change: WillChange::default(),
+            transform: Vec::new(),
+            transform_origin: (
+                PositionOffset { percent: 50.0, px: 0.0 },
+                PositionOffset { percent: 50.0, px: 0.0 },
+                0.0,
+            ),
+            transform_box: TransformBox::ViewBox,
+            transform_style: TransformStyle::Flat,
+            backface_visibility: BackfaceVisibility::Visible,
+            perspective: None,
+            perspective_origin: (PositionOffset { percent: 50.0, px: 0.0 }, PositionOffset { percent: 50.0, px: 0.0 }),
+            translate: None,
+            rotate: None,
+            scale: None,
             custom: Arc::new(CustomMap::new()),
         }
     }
@@ -515,6 +549,38 @@ impl ComputedStyle {
 
     pub fn is_positioned(&self) -> bool {
         self.position != Position::Static
+    }
+
+    /// Whether the box has a transform (`transform`, `translate`,
+    /// `rotate` or `scale`).
+    pub fn has_transform(&self) -> bool {
+        !self.transform.is_empty() || self.translate.is_some() || self.rotate.is_some() || self.scale.is_some()
+    }
+
+    /// Whether the box is the containing block of its `position: fixed`
+    /// descendants (a transform or a `will-change` promising one, CSS
+    /// Transforms 1 §3).
+    pub fn contains_fixed(&self) -> bool {
+        self.has_transform() || self.will_change.contains_fixed() || self.perspective.is_some()
+    }
+
+    /// Whether the box establishes a stacking context (CSS 2.1 §9.9.1,
+    /// Positioned 3, Compositing 1, Transforms 1, Will Change 1):
+    /// positioned with a `z-index`, `fixed` or `sticky` always, a flex or
+    /// grid item with a `z-index` (`flex_item`), opacity below 1, a
+    /// transform, `isolation: isolate`, a promising `will-change`. The
+    /// root element is one too (the caller's).
+    pub fn creates_stacking_context(&self, flex_item: bool) -> bool {
+        let z = self.z_index != ZIndex::Auto;
+        (self.is_positioned() && z)
+            || matches!(self.position, Position::Fixed | Position::Sticky)
+            || (flex_item && z)
+            || self.opacity < 1.0
+            || self.has_transform()
+            || self.isolation == Isolation::Isolate
+            || self.will_change.creates_stacking_context()
+            || self.perspective.is_some()
+            || self.transform_style == TransformStyle::Preserve3d
     }
 
     pub fn has_visible_border(&self) -> bool {
@@ -1087,6 +1153,71 @@ pub fn compute(
         },
         v => v,
     };
+
+    pick!(z_index, ZIndex, ZIndex, |v| *v);
+    pick!(isolation, Isolation, Isolation, |v| *v);
+    pick!(will_change, WillChange, WillChange, |v| v.clone());
+    pick!(transform, Transform, Transform, |v| v
+        .iter()
+        .map(|f| {
+            use ComputedTransformFunction as C;
+            use TransformFunction as T;
+            match f {
+                T::Matrix(a) => C::Matrix(*a),
+                T::Matrix3d(a) => C::Matrix3d(*a),
+                T::Translate(x, y) => C::Translate(lp(x), lp(y), 0.0),
+                T::TranslateX(x) => C::Translate(lp(x), ComputedLp::ZERO, 0.0),
+                T::TranslateY(y) => C::Translate(ComputedLp::ZERO, lp(y), 0.0),
+                T::TranslateZ(z) => C::Translate(ComputedLp::ZERO, ComputedLp::ZERO, z.to_px(&ctx)),
+                T::Translate3d(x, y, z) => C::Translate(lp(x), lp(y), z.to_px(&ctx)),
+                T::Scale(x, y) => C::Scale(*x, *y, 1.0),
+                T::ScaleX(x) => C::Scale(*x, 1.0, 1.0),
+                T::ScaleY(y) => C::Scale(1.0, *y, 1.0),
+                T::ScaleZ(z) => C::Scale(1.0, 1.0, *z),
+                T::Scale3d(x, y, z) => C::Scale(*x, *y, *z),
+                T::Rotate(a) | T::RotateZ(a) => C::Rotate(0.0, 0.0, 1.0, *a),
+                T::RotateX(a) => C::Rotate(1.0, 0.0, 0.0, *a),
+                T::RotateY(a) => C::Rotate(0.0, 1.0, 0.0, *a),
+                T::Rotate3d(x, y, z, a) => C::Rotate(*x, *y, *z, *a),
+                T::Skew(x, y) => C::Skew(*x, *y),
+                T::SkewX(x) => C::Skew(*x, 0.0),
+                T::SkewY(y) => C::Skew(0.0, *y),
+                T::Perspective(l) => C::Perspective(l.map(|l| l.to_px(&ctx))),
+            }
+        })
+        .collect());
+    pick!(transform_origin, TransformOrigin, TransformOrigin, |v| (
+        position_offset(&v.x, &ctx),
+        position_offset(&v.y, &ctx),
+        v.z.to_px(&ctx)
+    ));
+    pick!(transform_box, TransformBox, TransformBox, |v| *v);
+    pick!(transform_style, TransformStyle, TransformStyle, |v| *v);
+    pick!(backface_visibility, BackfaceVisibility, BackfaceVisibility, |v| *v);
+    pick!(perspective, Perspective, Perspective, |v| match v {
+        Perspective::None => None,
+        Perspective::Length(l) => Some(l.to_px(&ctx)),
+    });
+    pick!(perspective_origin, PerspectiveOrigin, PerspectiveOrigin, |v| (
+        position_offset(&v.x, &ctx),
+        position_offset(&v.y, &ctx)
+    ));
+    pick!(translate, Translate, Translate, |v| match v {
+        TranslateValue::None => None,
+        TranslateValue::Values(x, y, z) => Some((
+            lp(x),
+            y.as_ref().map_or(ComputedLp::ZERO, &lp),
+            z.map_or(0.0, |z| z.to_px(&ctx))
+        )),
+    });
+    pick!(rotate, Rotate, Rotate, |v| match v {
+        RotateValue::None => None,
+        RotateValue::Rotate(x, y, z, a) => Some((*x, *y, *z, *a)),
+    });
+    pick!(scale, Scale, Scale, |v| match v {
+        ScaleValue::None => None,
+        ScaleValue::Values(x, y, z) => Some((*x, *y, *z)),
+    });
 
     // Display fixups (CSS Display 3, "blockification").
     if is_root && !out.display.is_none() {

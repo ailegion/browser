@@ -152,15 +152,17 @@ impl TabState {
             .map_or(EventTargetRef::Document, EventTargetRef::Node)
     }
 
-    /// The viewport origin of the first box of `target`, for `offsetX/Y`.
-    fn box_origin(&self, target: EventTargetRef) -> (f32, f32) {
+    /// The page point relative to the first box of `target`, in that
+    /// box's own coordinates (through the transforms above it), for
+    /// `offsetX/Y`; the page point itself without a box.
+    fn box_offset(&self, target: EventTargetRef, page_x: f32, page_y: f32) -> (f32, f32) {
         match (target, &self.layout, &self.doc) {
-            (EventTargetRef::Node(t), Some(tree), Some(doc)) => tree
-                .first_rect(|n| n == t || doc.parent(n) == Some(t))
-                .map(|r| (r.x, r.y)),
+            (EventTargetRef::Node(t), Some(tree), Some(doc)) => {
+                tree.offset_in_first(|n| n == t || doc.parent(n) == Some(t), page_x, page_y)
+            }
             _ => None,
         }
-        .unwrap_or((0.0, 0.0))
+        .unwrap_or((page_x, page_y))
     }
 
     /// A mouse or pointer event's fields at viewport point `(x, y)`:
@@ -178,7 +180,7 @@ impl TabState {
         related: Option<NodeId>,
     ) -> UiEventInit {
         let (page_x, page_y) = (x + self.scroll_x, y + self.scroll_y);
-        let origin = self.box_origin(target);
+        let offset = self.box_offset(target, page_x, page_y);
         let m = self.modifiers;
         UiEventInit {
             class,
@@ -191,8 +193,8 @@ impl TabState {
             client_y: f64::from(y),
             page_x: f64::from(page_x),
             page_y: f64::from(page_y),
-            offset_x: f64::from(page_x - origin.0),
-            offset_y: f64::from(page_y - origin.1),
+            offset_x: f64::from(offset.0),
+            offset_y: f64::from(offset.1),
             button,
             buttons: self.buttons,
             related_target: related.filter(|&r| self.live(r)).map(EventTargetRef::Node),
@@ -303,8 +305,16 @@ impl TabState {
         if !self.wants_event(target, "contextmenu") {
             return true;
         }
-        let (ox, oy) = self.box_origin(target);
-        let (x, y) = (ox - self.scroll_x, oy - self.scroll_y);
+        // The element's box as it shows (through the transforms above
+        // it), in viewport coordinates.
+        let origin = match (target, &self.layout, &self.doc) {
+            (EventTargetRef::Node(t), Some(tree), Some(doc)) => {
+                tree.first_shown_rect(|n| n == t || doc.parent(n) == Some(t)).map(|r| (r.x, r.y))
+            }
+            _ => None,
+        }
+        .unwrap_or((0.0, 0.0));
+        let (x, y) = (origin.0 - self.scroll_x, origin.1 - self.scroll_y);
         let mut init = self.mouse_init(UiClass::Pointer, target, x, y, NO_BUTTON, 0, None);
         init.pointer_id = -1;
         init.pointer_type = String::new();

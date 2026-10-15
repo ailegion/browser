@@ -133,7 +133,115 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::Cursor(c) => c.to_css(),
         P::PointerEvents(p) => p.keyword().to_owned(),
         P::UserSelect(u) => u.keyword().to_owned(),
+        P::ZIndex(z) => z.to_css(),
+        P::Isolation(i) => match i {
+            Isolation::Auto => "auto".to_owned(),
+            Isolation::Isolate => "isolate".to_owned(),
+        },
+        P::WillChange(w) => w.to_css(),
+        P::Transform(list) => transform_list_css(list),
+        P::TransformOrigin(o) => {
+            let mut s = format!("{} {}", o.x.to_css(true), o.y.to_css(false));
+            if o.z != Length::ZERO {
+                s.push(' ');
+                s.push_str(&o.z.to_css());
+            }
+            s
+        }
+        P::TransformBox(b) => b.keyword().to_owned(),
+        P::TransformStyle(t) => match t {
+            TransformStyle::Flat => "flat".to_owned(),
+            TransformStyle::Preserve3d => "preserve-3d".to_owned(),
+        },
+        P::BackfaceVisibility(b) => match b {
+            BackfaceVisibility::Visible => "visible".to_owned(),
+            BackfaceVisibility::Hidden => "hidden".to_owned(),
+        },
+        P::Perspective(p) => match p {
+            Perspective::None => "none".to_owned(),
+            Perspective::Length(l) => l.to_css(),
+        },
+        P::PerspectiveOrigin(p) => format!("{} {}", p.x.to_css(true), p.y.to_css(false)),
+        P::Translate(t) => match t {
+            TranslateValue::None => "none".to_owned(),
+            TranslateValue::Values(x, y, z) => {
+                let mut parts = vec![x.to_css()];
+                if let Some(y) = y {
+                    parts.push(y.to_css());
+                }
+                if let Some(z) = z {
+                    parts.push(z.to_css());
+                }
+                parts.join(" ")
+            }
+        },
+        P::Rotate(r) => match r {
+            RotateValue::None => "none".to_owned(),
+            RotateValue::Rotate(x, y, z, a) => rotate_css(*x, *y, *z, *a),
+        },
+        P::Scale(s) => match s {
+            ScaleValue::None => "none".to_owned(),
+            ScaleValue::Values(x, y, z) => scale_css(*x, *y, *z),
+        },
     }
+}
+
+/// A `rotate` value: the angle alone about z, `x`/`y` for those axes,
+/// else the three numbers.
+fn rotate_css(x: f32, y: f32, z: f32, a: f32) -> String {
+    let deg = format!("{}deg", css_number(a));
+    match (x, y, z) {
+        (0.0, 0.0, 1.0) => deg,
+        (1.0, 0.0, 0.0) => format!("x {deg}"),
+        (0.0, 1.0, 0.0) => format!("y {deg}"),
+        _ => format!("{} {} {} {deg}", css_number(x), css_number(y), css_number(z)),
+    }
+}
+
+/// A `scale` value: one number when they agree, two when z is 1, else
+/// three.
+fn scale_css(x: f32, y: f32, z: f32) -> String {
+    if z == 1.0 {
+        if x == y { css_number(x) } else { format!("{} {}", css_number(x), css_number(y)) }
+    } else {
+        format!("{} {} {}", css_number(x), css_number(y), css_number(z))
+    }
+}
+
+/// A `transform` list as written (`none` when empty).
+fn transform_list_css(list: &[TransformFunction]) -> String {
+    use TransformFunction as T;
+    if list.is_empty() {
+        return "none".to_owned();
+    }
+    let deg = |a: f32| format!("{}deg", css_number(a));
+    list.iter()
+        .map(|f| match f {
+            T::Matrix(a) => format!("matrix({})", a.iter().map(|v| css_number(*v)).collect::<Vec<_>>().join(", ")),
+            T::Matrix3d(a) => format!("matrix3d({})", a.iter().map(|v| css_number(*v)).collect::<Vec<_>>().join(", ")),
+            T::Translate(x, y) => format!("translate({}, {})", x.to_css(), y.to_css()),
+            T::TranslateX(x) => format!("translateX({})", x.to_css()),
+            T::TranslateY(y) => format!("translateY({})", y.to_css()),
+            T::TranslateZ(z) => format!("translateZ({})", z.to_css()),
+            T::Translate3d(x, y, z) => format!("translate3d({}, {}, {})", x.to_css(), y.to_css(), z.to_css()),
+            T::Scale(x, y) => format!("scale({}, {})", css_number(*x), css_number(*y)),
+            T::ScaleX(x) => format!("scaleX({})", css_number(*x)),
+            T::ScaleY(y) => format!("scaleY({})", css_number(*y)),
+            T::ScaleZ(z) => format!("scaleZ({})", css_number(*z)),
+            T::Scale3d(x, y, z) => format!("scale3d({}, {}, {})", css_number(*x), css_number(*y), css_number(*z)),
+            T::Rotate(a) => format!("rotate({})", deg(*a)),
+            T::RotateX(a) => format!("rotateX({})", deg(*a)),
+            T::RotateY(a) => format!("rotateY({})", deg(*a)),
+            T::RotateZ(a) => format!("rotateZ({})", deg(*a)),
+            T::Rotate3d(x, y, z, a) => format!("rotate3d({}, {}, {}, {})", css_number(*x), css_number(*y), css_number(*z), deg(*a)),
+            T::Skew(x, y) => format!("skew({}, {})", deg(*x), deg(*y)),
+            T::SkewX(x) => format!("skewX({})", deg(*x)),
+            T::SkewY(y) => format!("skewY({})", deg(*y)),
+            T::Perspective(None) => "perspective(none)".to_owned(),
+            T::Perspective(Some(l)) => format!("perspective({})", l.to_css()),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Serialize a declared value: a specified value, a CSS-wide keyword, or
@@ -451,7 +559,8 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             }
             parts.join(" ")
         }
-        "place-items" | "word-wrap" | "-webkit-box-decoration-break" | "-webkit-user-select" => v(0).to_owned(),
+        "place-items" | "word-wrap" | "-webkit-box-decoration-break" | "-webkit-user-select" | "-webkit-transform"
+        | "-webkit-transform-origin" | "-webkit-backface-visibility" => v(0).to_owned(),
         "outline" => {
             // Chrome's order: colour, style, width; the initial parts left
             // out, `none` alone for the initial value.
@@ -832,6 +941,65 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::Cursor => style.cursor.to_css(),
         Id::PointerEvents => style.pointer_events.keyword().to_owned(),
         Id::UserSelect => style.user_select.keyword().to_owned(),
+        Id::ZIndex => style.z_index.to_css(),
+        Id::Isolation => match style.isolation {
+            Isolation::Auto => "auto".to_owned(),
+            Isolation::Isolate => "isolate".to_owned(),
+        },
+        Id::WillChange => style.will_change.to_css(),
+        // The resolved `transform` is the matrix, its percentages
+        // resolved against the box (CSSOM View; `none` without one).
+        Id::Transform => {
+            let (w, h) = rendered.map_or((0.0, 0.0), |u| (u.width, u.height));
+            match crate::transform::transform_matrix(style, w, h) {
+                Some(m) => m.to_css(),
+                None => "none".to_owned(),
+            }
+        }
+        Id::TransformOrigin => {
+            let (w, h) = rendered.map_or((0.0, 0.0), |u| (u.width, u.height));
+            let (x, y, z) = style.transform_origin;
+            let mut s = format!("{} {}", px(x.px + x.percent / 100.0 * w), px(y.px + y.percent / 100.0 * h));
+            if z != 0.0 {
+                s.push(' ');
+                s.push_str(&px(z));
+            }
+            s
+        }
+        Id::TransformBox => style.transform_box.keyword().to_owned(),
+        Id::TransformStyle => match style.transform_style {
+            TransformStyle::Flat => "flat".to_owned(),
+            TransformStyle::Preserve3d => "preserve-3d".to_owned(),
+        },
+        Id::BackfaceVisibility => match style.backface_visibility {
+            BackfaceVisibility::Visible => "visible".to_owned(),
+            BackfaceVisibility::Hidden => "hidden".to_owned(),
+        },
+        Id::Perspective => style.perspective.map_or("none".to_owned(), px),
+        Id::PerspectiveOrigin => {
+            let (w, h) = rendered.map_or((0.0, 0.0), |u| (u.width, u.height));
+            let (x, y) = style.perspective_origin;
+            format!("{} {}", px(x.px + x.percent / 100.0 * w), px(y.px + y.percent / 100.0 * h))
+        }
+        Id::Translate => match style.translate {
+            None => "none".to_owned(),
+            Some((x, y, z)) => {
+                let mut s = format!("{} {}", lp_css(x), lp_css(y));
+                if z != 0.0 {
+                    s.push(' ');
+                    s.push_str(&px(z));
+                }
+                s
+            }
+        },
+        Id::Rotate => match style.rotate {
+            None => "none".to_owned(),
+            Some((x, y, z, a)) => rotate_css(x, y, z, a),
+        },
+        Id::Scale => match style.scale {
+            None => "none".to_owned(),
+            Some((x, y, z)) => scale_css(x, y, z),
+        },
     }
 }
 
@@ -924,6 +1092,20 @@ mod tests {
             ("cursor: url(a.cur) 1 2, pointer", "cursor: url(\"a.cur\") 1 2, pointer;"),
             ("pointer-events: none", "pointer-events: none;"),
             ("-webkit-user-select: none", "user-select: none;"),
+            ("z-index: 03", "z-index: 3;"),
+            ("transform: translateX(10PX) rotate(45DEG) scale(2)", "transform: translateX(10px) rotate(45deg) scale(2, 2);"),
+            ("transform: none", "transform: none;"),
+            ("-webkit-transform: translate(1px)", "transform: translate(1px, 0px);"),
+            ("transform-origin: left top", "transform-origin: left top;"),
+            ("transform-origin: 10px 20px 5px", "transform-origin: 10px 20px 5px;"),
+            ("translate: 10px", "translate: 10px;"),
+            ("rotate: x 90deg", "rotate: x 90deg;"),
+            ("rotate: 1 0 0 90deg", "rotate: x 90deg;"),
+            ("scale: 2 2", "scale: 2;"),
+            ("scale: 1 2 3", "scale: 1 2 3;"),
+            ("will-change: transform, Opacity", "will-change: transform, opacity;"),
+            ("backface-visibility: hidden", "backface-visibility: hidden;"),
+            ("perspective: 50em", "perspective: 50em;"),
         ];
         for (input, expected) in cases {
             assert_eq!(block(input), expected, "for {input}");
@@ -1089,6 +1271,17 @@ mod tests {
         assert_eq!(resolved_value(&style, PropertyId::OutlineWidth, None), "1px");
         assert_eq!(resolved_value(&style, PropertyId::Cursor, None), "auto");
         assert_eq!(resolved_value(&style, PropertyId::UserSelect, None), "auto");
+        // Transforms resolve to the matrix (percentages against the
+        // box), the origin to px, the individual properties as written.
+        assert_eq!(resolved_value(&style, PropertyId::Transform, None), "none");
+        assert_eq!(resolved_value(&style, PropertyId::ZIndex, None), "auto");
+        style.z_index = ZIndex::Int(4);
+        style.transform = vec![
+            ComputedTransformFunction::Translate(ComputedLp::Percent(50.0), ComputedLp::Px(10.0), 0.0),
+            ComputedTransformFunction::Scale(2.0, 3.0, 1.0),
+        ];
+        assert_eq!(resolved_value(&style, PropertyId::ZIndex, None), "4");
+        assert_eq!(resolved_value(&style, PropertyId::Transform, None), "matrix(2, 0, 0, 3, 0, 10)", "unrendered: 0 for the percentage");
         // Rendered: used values.
         let used = UsedValues {
             width: 200.0,
@@ -1097,6 +1290,19 @@ mod tests {
             padding: Sides { top: 0.0, right: 0.0, bottom: 0.0, left: 40.0 },
             inset: Some(Sides { top: 5.0, right: 1.0, bottom: 2.0, left: 3.0 }),
         };
+        assert_eq!(resolved_value(&style, PropertyId::Transform, Some(&used)), "matrix(2, 0, 0, 3, 100, 10)");
+        assert_eq!(resolved_value(&style, PropertyId::TransformOrigin, Some(&used)), "100px 50px");
+        style.transform = vec![ComputedTransformFunction::Rotate(0.0, 1.0, 0.0, 90.0)];
+        assert!(resolved_value(&style, PropertyId::Transform, None).starts_with("matrix3d("), "a 3D function resolves to matrix3d()");
+        style.transform = Vec::new();
+        style.rotate = Some((0.0, 0.0, 1.0, 45.0));
+        style.scale = Some((2.0, 2.0, 1.0));
+        style.translate = Some((ComputedLp::Px(5.0), ComputedLp::Percent(10.0), 0.0));
+        assert_eq!(resolved_value(&style, PropertyId::Rotate, None), "45deg");
+        assert_eq!(resolved_value(&style, PropertyId::Scale, None), "2");
+        assert_eq!(resolved_value(&style, PropertyId::Translate, None), "5px 10%");
+        assert_eq!(resolved_value(&style, PropertyId::Perspective, None), "none");
+        assert_eq!(resolved_value(&style, PropertyId::BackfaceVisibility, None), "visible");
         assert_eq!(resolved_value(&style, PropertyId::Width, Some(&used)), "160px");
         style.box_sizing = BoxSizing::BorderBox;
         assert_eq!(resolved_value(&style, PropertyId::Width, Some(&used)), "200px");

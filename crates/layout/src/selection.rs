@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use browser_dom::NodeId;
 
-use crate::{Fragment, FragmentContent, LayoutTree, Rect, TextFragment};
+use crate::stacking::Space;
+use crate::{Fragment, FragmentContent, LayoutTree, Rect, TextFragment, affine_apply, affine_invert};
 
 /// A place between two characters of a text node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,11 +52,24 @@ impl SelectionRanges {
     }
 }
 
-/// A text fragment with a node, in tree order.
+/// A text fragment with a node, in tree order, and the space it shows
+/// in (the transforms above it; fixed content).
 struct TextRef<'a> {
     rect: Rect,
     node: NodeId,
     text: &'a TextFragment,
+    space: Space,
+}
+
+impl TextRef<'_> {
+    /// A page point in this text's own coordinates: back through the
+    /// transforms, and from viewport to page for fixed content.
+    fn local(&self, x: f32, y: f32, page_scroll: (f32, f32)) -> Option<(f32, f32)> {
+        let (px, py) = if self.space.fixed { (x - page_scroll.0, y - page_scroll.1) } else { (x, y) };
+        let inv = affine_invert(&self.space.transform)?;
+        let (lx, ly) = affine_apply(&inv, f64::from(px), f64::from(py));
+        Some((lx as f32, ly as f32))
+    }
 }
 
 fn texts(tree: &LayoutTree) -> Vec<TextRef<'_>> {
@@ -67,6 +81,7 @@ fn texts(tree: &LayoutTree) -> Vec<TextRef<'_>> {
                 rect: f.rect,
                 node,
                 text: t,
+                space: Space::ROOT,
             });
         }
         for c in &f.children {
@@ -75,6 +90,14 @@ fn texts(tree: &LayoutTree) -> Vec<TextRef<'_>> {
     }
     let mut out = Vec::new();
     visit(&tree.root, &mut out);
+    if out.iter().any(|t| t.text.selectable) {
+        let list = tree.paint_list();
+        for t in &mut out {
+            if let Some(s) = list.spaces.get(&t.node) {
+                t.space = *s;
+            }
+        }
+    }
     out
 }
 
@@ -108,26 +131,31 @@ fn offset_at_x(t: &TextRef<'_>, x: f32) -> usize {
 /// start of the document when the point is above all text.
 pub fn text_position_at(tree: &LayoutTree, x: f32, y: f32) -> Option<TextPos> {
     let texts = texts(tree);
-    if let Some(t) = texts.iter().find(|t| t.rect.contains(x, y)) {
+    let scroll = tree.viewport.offset;
+    // Each text sees the point in its own coordinates (through the
+    // transforms above it); a text whose transform is singular is not
+    // shown and not reached.
+    let located: Vec<(&TextRef<'_>, (f32, f32))> = texts.iter().filter_map(|t| Some((t, t.local(x, y, scroll)?))).collect();
+    if let Some((t, (lx, _))) = located.iter().find(|(t, (lx, ly))| t.rect.contains(*lx, *ly)) {
         return Some(TextPos {
             node: t.node,
-            offset: offset_at_x(t, x),
+            offset: offset_at_x(t, *lx),
         });
     }
-    let same_line = texts
+    let same_line = located
         .iter()
-        .filter(|t| y >= t.rect.y && y < t.rect.bottom())
-        .min_by(|a, b| {
-            let d = |t: &TextRef<'_>| if x < t.rect.x { t.rect.x - x } else { x - t.rect.right() };
-            d(a).total_cmp(&d(b))
+        .filter(|(t, (_, ly))| *ly >= t.rect.y && *ly < t.rect.bottom())
+        .min_by(|(a, (ax, _)), (b, (bx, _))| {
+            let d = |t: &TextRef<'_>, x: f32| if x < t.rect.x { t.rect.x - x } else { x - t.rect.right() };
+            d(a, *ax).total_cmp(&d(b, *bx))
         });
-    if let Some(t) = same_line {
+    if let Some((t, (lx, _))) = same_line {
         return Some(TextPos {
             node: t.node,
-            offset: offset_at_x(t, x),
+            offset: offset_at_x(t, *lx),
         });
     }
-    if let Some(t) = texts.iter().rev().find(|t| t.rect.bottom() <= y) {
+    if let Some((t, _)) = located.iter().rev().find(|(t, (_, ly))| t.rect.bottom() <= *ly) {
         return Some(TextPos {
             node: t.node,
             offset: t.text.range.end,
@@ -230,7 +258,8 @@ pub fn position_keys(tree: &LayoutTree, positions: &[TextPos]) -> Vec<Option<(us
 }
 
 /// The page rectangle of the first highlighted run between two
-/// positions, for scrolling it into view.
+/// positions, as it shows (through the transforms above it), for
+/// scrolling it into view.
 pub fn first_rect(tree: &LayoutTree, a: TextPos, b: TextPos) -> Option<Rect> {
     let texts = texts(tree);
     let first = first_index(&texts);
@@ -244,7 +273,8 @@ pub fn first_rect(tree: &LayoutTree, a: TextPos, b: TextPos) -> Option<Rect> {
                 x1 = x1.max(c.x + c.advance);
             }
             if x0 <= x1 {
-                return Some(Rect::new(t.rect.x + x0, t.rect.y, x1 - x0, t.rect.height));
+                let r = Rect::new(t.rect.x + x0, t.rect.y, x1 - x0, t.rect.height);
+                return Some(tree.shown_rect(&t.space, &r));
             }
         }
     }

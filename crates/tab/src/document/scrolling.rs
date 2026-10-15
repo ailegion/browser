@@ -273,8 +273,10 @@ fn reveal_delta(how: Reveal, rect: Rect, port: Rect) -> (f32, f32) {
 }
 
 /// The smallest rectangle around every fragment of an element (its own
-/// boxes, or its content's for an inline element), in page coordinates.
+/// boxes, or its content's for an inline element), in page coordinates,
+/// as they show (through the transforms above them).
 pub(super) fn element_rect(tree: &LayoutTree, doc: &Document, node: NodeId) -> Option<Rect> {
+    let list = tree.paint_list();
     let mut out: Option<Rect> = None;
     tree.root.walk(&mut |f| {
         let Some(n) = f.node else { return };
@@ -287,7 +289,9 @@ pub(super) fn element_rect(tree: &LayoutTree, doc: &Document, node: NodeId) -> O
             }
         };
         if inside && f.rect.width > 0.0 && f.rect.height > 0.0 {
-            out = Some(out.map_or(f.rect, |o| o.union(&f.rect)));
+            let space = list.spaces.get(&n).copied().unwrap_or(browser_layout::Space::ROOT);
+            let r = tree.shown_rect(&space, &f.rect);
+            out = Some(out.map_or(r, |o| o.union(&r)));
         }
     });
     out

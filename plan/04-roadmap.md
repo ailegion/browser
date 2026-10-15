@@ -1867,7 +1867,106 @@ Work:
       the link under a `pointer-events: none` box hovered with the
       pointer cursor, select-all leaving `none` text out, a press
       selecting a `user-select: all` element, a drag kept inside a
-      `contain` one). (6) `z-index` and `transform`/`transform-origin`
+      `contain` one).
+      **Block 6 done 2026-10-16: `z-index`, `transform`, stacking
+      contexts, paint order, hit testing through transforms, `position:
+      fixed` against the viewport.** Style (`crates/style`): `z-index`
+      (`auto` or an integer), `transform` (`none` or a list of every CSS
+      Transforms 1/2 function: `matrix`/`matrix3d`, `translate`/`X`/`Y`/
+      `Z`/`3d`, `scale`/`X`/`Y`/`Z`/`3d`, `rotate`/`X`/`Y`/`Z`/`3d`,
+      `skew`/`X`/`Y`, `perspective`; one bad function drops the
+      declaration; `-webkit-transform` alias), `transform-origin` (a one-
+      or two-value position without edge offsets plus a z length;
+      `-webkit-` alias), `transform-box`, `transform-style`,
+      `backface-visibility` (`-webkit-` alias), `perspective`,
+      `perspective-origin`, `translate`/`rotate`/`scale` (CSS Transforms
+      2 §6, every form), `isolation`, `will-change` (idents; the ones
+      that make a stacking context or contain fixed boxes recognized).
+      Computed values keep the functions (`ComputedTransformFunction`,
+      percentages unresolved); `transform.rs` holds the 4×4 column-major
+      `Matrix4`: the list composed in order after `translate`, `rotate`,
+      `scale` (§6), about the origin, serialized by the CSSOM rule
+      (`matrix()` when 2D, else `matrix3d()`; the resolved `transform`
+      resolves percentages against the box, `none` without one),
+      flattened orthographically to the affine the painter uses. `rotate`
+      serializes `x`/`y` axes as keywords, `scale` drops equal
+      components, as Chrome does. `ComputedStyle::creates_stacking_context
+      (flex_item)` is the full trigger list (root; positioned with a
+      `z-index`; `fixed`/`sticky`; a flex item with a `z-index`; opacity
+      below 1; a transform or individual property; `isolation: isolate`;
+      `will-change` of a trigger; `perspective`; `preserve-3d`);
+      `contains_fixed` names the ancestors that become a fixed box's
+      containing block (a transform, `perspective`, `will-change` of one).
+      Layout (`crates/layout`): `Fragment::transform` (the box's `Matrix4`
+      about its `transform-origin` in its `transform-box`, relative to the
+      border box's corner, with `preserve-3d` and `hide_backface`) and
+      `Fragment::fixed`; `stacking.rs` flattens the tree into the paint
+      order of CSS 2.1 Appendix E (`LayoutTree::paint_list`): per stacking
+      context its own decoration, the negative `z-index` contexts, the
+      in-flow block backgrounds, the floats (atomic), the inline content
+      with atomic inline-levels and flex items (atomic), the descendants'
+      outlines then its own, Blink's self-painting normal-flow layers (a
+      scroll container whose content overflows a scrollable axis,
+      `backface-visibility: hidden`), the positioned `z-index: auto`
+      boxes and the `z-index: 0` contexts in tree order, the positive
+      contexts by value, a self-painting scroller's bars last; an inline
+      element's line fragments stack together; pseudo-contexts hand their
+      stacked descendants to the enclosing real context. Every item
+      carries its `Space`: the accumulated transform (3D chains under
+      `preserve-3d` multiply before flattening; a box showing its hidden
+      back, or with a singular transform, is left out with everything in
+      it), the overflow clip chain (rounded padding boxes and scrollports,
+      by DOM ancestry, none for fixed content) and the fixed flag.
+      `hit_test` walks the list and keeps the last box under the point
+      through the inverse transforms, the clips and the rounded corners
+      (`pointer-events: none` passed over), so it is the painted order
+      exactly; `shown_rect`/`first_shown_rect`/`offset_in_first` map
+      layout rectangles and points through the spaces. Scrollable
+      overflow counts transformed bounds (CSS Overflow 3 §2.2).
+      `position: fixed` boxes with no `contains_fixed` ancestor hang from
+      the viewport's taffy node (its gutters are now its border, so they
+      sit against the scrollport as browsers keep them off the page
+      scrollbar), a zero-size placeholder in their parent giving the
+      static position of an axis with both insets `auto`; inside an
+      atomic they hang from a viewport-sized wrapper (the atomic laid out
+      again when the page's gutters change its containing block);
+      `Fragment::translate` moves a fixed box along its static axes only;
+      a fixed box under a transformed ancestor lays out as `absolute`
+      there and moves with the page. Paint (`crates/paint`): the painter
+      consumes the list: per item the transform (over the page's, or the
+      viewport's for fixed content), the visible area in its coordinates
+      for culling and tiling, `background-attachment: fixed` as `scroll`
+      inside a transform (Transforms 1 §3), the clip chain opened and
+      closed lazily (clips live inside compositing groups, so fixed
+      content escapes them), an opacity group bounded by what it holds
+      (shadows, outlines and glyph overhang counted; the old group was
+      the border box and clipped them), the caret in its control's space
+      (`PaintOptions::caret_node`). Script (`crates/script`):
+      `getBoundingClientRect`/`getClientRects`, `scrollIntoView` and
+      `scrollWidth`/`Height` of non-scrollers use the shown rectangles
+      (transformed; fixed in page coordinates), `offset*`/`client*` the
+      layout ones (a fixed box's `offsetTop` is viewport-relative, no
+      scroller added); the resolved `transform` is the matrix. Tab: hover
+      and clicks through transforms and under fixed boxes at any page
+      scroll, `offsetX`/`offsetY` in the target's own coordinates, the
+      reveal of anchors, focus and find matches by shown rectangles, text
+      selection by mouse through transforms (`text_position_at`). Tests:
+      style (every form and refusal, aliases, serialization, resolved
+      matrices), layout (Appendix E order of 10 boxes and a flex item,
+      hit testing by paint order and through `pointer-events: none`,
+      transforms moving the painting, hit testing and the scroll extents,
+      singular transforms, the individual properties' composition, fixed
+      boxes against the scrollport and at their static position inside a
+      scroller and an inline-block, fixed under a transformed ancestor,
+      hidden back faces flat and under `preserve-3d`), paint (z-index
+      order over tree order, a rotated and a translated box, a shadow
+      outside an opacity group, a fixed box after a page scroll), tab
+      (hover by z-index, hover and client rectangle of a translated box,
+      a fixed box hovered after a page scroll). SKIPPED, recorded as
+      `05-risks` O22 for the owner: `perspective`/`perspective()`
+      (projective rendering; vello draws affine only) and depth sorting
+      inside a `preserve-3d` context (painted in stacking order).
+      (6) `z-index` and `transform`/`transform-origin`
       with stacking contexts, paint order and hit testing through
       transforms; (7) `grid-*` through taffy grid; (8) `transition-*`,
       `animation-*`, `@keyframes` with the tab's animation clock and

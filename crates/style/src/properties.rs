@@ -1170,6 +1170,173 @@ impl UserSelect {
     }
 }
 
+// ----- z-index, transforms, stacking (4a block 6) -----
+
+/// `z-index`: `auto` or an integer (CSS 2.1 §9.9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZIndex {
+    #[default]
+    Auto,
+    Int(i32),
+}
+
+impl ZIndex {
+    pub fn to_css(self) -> String {
+        match self {
+            ZIndex::Auto => "auto".to_owned(),
+            ZIndex::Int(i) => i.to_string(),
+        }
+    }
+}
+
+/// `isolation` (Compositing 1 §4): `isolate` makes a stacking context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    #[default]
+    Auto,
+    Isolate,
+}
+
+/// `will-change` (CSS Will Change 1): `auto` or a list of property names
+/// (and `scroll-position`, `contents`); naming a property that makes a
+/// stacking context when set makes one now.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WillChange(pub Vec<Arc<str>>);
+
+impl WillChange {
+    pub fn to_css(&self) -> String {
+        if self.0.is_empty() { "auto".to_owned() } else { self.0.join(", ") }
+    }
+
+    /// CSS Will Change 1 §3: a stacking context for any named property
+    /// that would create one.
+    pub fn creates_stacking_context(&self) -> bool {
+        self.0.iter().any(|p| {
+            matches!(
+                &**p,
+                "transform" | "translate" | "rotate" | "scale" | "opacity" | "filter" | "backdrop-filter" | "perspective"
+                    | "clip-path" | "mask" | "mix-blend-mode" | "isolation" | "z-index" | "offset-path" | "position"
+                    | "transform-style" | "contain"
+            )
+        })
+    }
+
+    /// Whether a fixed descendant's containing block is this box, as a
+    /// transform would make it (`will-change: transform` and friends).
+    pub fn contains_fixed(&self) -> bool {
+        self.0.iter().any(|p| matches!(&**p, "transform" | "translate" | "rotate" | "scale" | "perspective" | "filter" | "backdrop-filter"))
+    }
+}
+
+/// `transform-style`, `backface-visibility`, `transform-box` (CSS
+/// Transforms 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransformStyle {
+    #[default]
+    Flat,
+    Preserve3d,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackfaceVisibility {
+    #[default]
+    Visible,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransformBox {
+    ContentBox,
+    BorderBox,
+    FillBox,
+    StrokeBox,
+    #[default]
+    ViewBox,
+}
+
+impl TransformBox {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            TransformBox::ContentBox => "content-box",
+            TransformBox::BorderBox => "border-box",
+            TransformBox::FillBox => "fill-box",
+            TransformBox::StrokeBox => "stroke-box",
+            TransformBox::ViewBox => "view-box",
+        }
+    }
+}
+
+/// `perspective`: `none` or a length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Perspective {
+    None,
+    Length(Length),
+}
+
+/// One `<transform-function>` as written (CSS Transforms 1 §8, 2 §13):
+/// angles in degrees, lengths kept for computation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformFunction {
+    Matrix([f32; 6]),
+    Matrix3d([f32; 16]),
+    Translate(LengthPercentage, LengthPercentage),
+    TranslateX(LengthPercentage),
+    TranslateY(LengthPercentage),
+    TranslateZ(Length),
+    Translate3d(LengthPercentage, LengthPercentage, Length),
+    Scale(f32, f32),
+    ScaleX(f32),
+    ScaleY(f32),
+    ScaleZ(f32),
+    Scale3d(f32, f32, f32),
+    Rotate(f32),
+    RotateX(f32),
+    RotateY(f32),
+    RotateZ(f32),
+    Rotate3d(f32, f32, f32, f32),
+    Skew(f32, f32),
+    SkewX(f32),
+    SkewY(f32),
+    Perspective(Option<Length>),
+}
+
+/// A transform function computed: lengths in px or percentages (of the
+/// reference box, resolved where the box is known).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComputedTransformFunction {
+    Matrix([f32; 6]),
+    Matrix3d([f32; 16]),
+    Translate(ComputedLp, ComputedLp, f32),
+    Scale(f32, f32, f32),
+    Rotate(f32, f32, f32, f32),
+    Skew(f32, f32),
+    Perspective(Option<f32>),
+}
+
+/// The individual `translate` property: `none` or two length-percentages
+/// and a length (CSS Transforms 2 §5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranslateValue {
+    None,
+    Values(LengthPercentage, Option<LengthPercentage>, Option<Length>),
+}
+
+/// The individual `rotate` property: `none`, an angle, or an axis and an
+/// angle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RotateValue {
+    None,
+    /// The axis (x, y, z) and the angle in degrees.
+    Rotate(f32, f32, f32, f32),
+}
+
+/// The individual `scale` property: `none` or one to three numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScaleValue {
+    None,
+    Values(f32, f32, f32),
+}
+
 // ----- scroll container properties (roadmap 4a (4s)) -----
 
 /// `scrollbar-width` (CSS Scrollbars 1 §3): the thickness of a scroll
@@ -2285,6 +2452,28 @@ longhands! {
     Cursor: "cursor" => CursorValue, true;
     PointerEvents: "pointer-events" => PointerEvents, true;
     UserSelect: "user-select" => UserSelect, false;
+    ZIndex: "z-index" => ZIndex, false;
+    Isolation: "isolation" => Isolation, false;
+    WillChange: "will-change" => WillChange, false;
+    Transform: "transform" => Vec<TransformFunction>, false;
+    TransformOrigin: "transform-origin" => TransformOriginValue, false;
+    TransformBox: "transform-box" => TransformBox, false;
+    TransformStyle: "transform-style" => TransformStyle, false;
+    BackfaceVisibility: "backface-visibility" => BackfaceVisibility, false;
+    Perspective: "perspective" => Perspective, false;
+    PerspectiveOrigin: "perspective-origin" => BackgroundPosition, false;
+    Translate: "translate" => TranslateValue, false;
+    Rotate: "rotate" => RotateValue, false;
+    Scale: "scale" => ScaleValue, false;
+}
+
+/// `transform-origin` as written: the horizontal and vertical position
+/// and a z offset.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransformOriginValue {
+    pub x: PositionComponent,
+    pub y: PositionComponent,
+    pub z: Length,
 }
 
 /// The declared value of a custom property.
@@ -2369,9 +2558,12 @@ pub fn is_shorthand(name: &str) -> bool {
 /// `-webkit-background-*` names are the legacy aliases of `gap`,
 /// `overflow-wrap`, `box-decoration-break`, `background-clip`,
 /// `background-origin` and `background-size`, never written).
-pub const SHORTHANDS: [&str; 34] = [
+pub const SHORTHANDS: [&str; 37] = [
     "outline",
     "-webkit-user-select",
+    "-webkit-transform",
+    "-webkit-transform-origin",
+    "-webkit-backface-visibility",
     "border",
     "border-width",
     "border-style",
@@ -2621,7 +2813,237 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "stroke" => PointerEvents::Stroke, "bounding-box" => PointerEvents::BoundingBox, "all" => PointerEvents::All,
             _ => return None }))?),
         PropertyId::UserSelect => P::UserSelect(parse_user_select(input)?),
+        PropertyId::ZIndex => P::ZIndex(parse_z_index(input)?),
+        PropertyId::Isolation => P::Isolation(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "auto" => Isolation::Auto, "isolate" => Isolation::Isolate, _ => return None }))?),
+        PropertyId::WillChange => P::WillChange(parse_will_change(input)?),
+        PropertyId::Transform => P::Transform(parse_transform_list(input)?),
+        PropertyId::TransformOrigin => P::TransformOrigin(parse_transform_origin(input)?),
+        PropertyId::TransformBox => P::TransformBox(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "content-box" => TransformBox::ContentBox, "border-box" => TransformBox::BorderBox,
+            "fill-box" => TransformBox::FillBox, "stroke-box" => TransformBox::StrokeBox,
+            "view-box" => TransformBox::ViewBox, _ => return None }))?),
+        PropertyId::TransformStyle => P::TransformStyle(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "flat" => TransformStyle::Flat, "preserve-3d" => TransformStyle::Preserve3d, _ => return None }))?),
+        PropertyId::BackfaceVisibility => P::BackfaceVisibility(parse_backface_visibility(input)?),
+        PropertyId::Perspective => P::Perspective(if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+            Perspective::None
+        } else {
+            let l = parse_length(input)?;
+            if l.parts().0 < 0.0 { return Err(input.new_custom_error(())); }
+            Perspective::Length(l)
+        }),
+        PropertyId::PerspectiveOrigin => P::PerspectiveOrigin(parse_background_position(input)?),
+        PropertyId::Translate => P::Translate(parse_translate(input)?),
+        PropertyId::Rotate => P::Rotate(parse_rotate(input)?),
+        PropertyId::Scale => P::Scale(parse_scale(input)?),
     })
+}
+
+// ----- transform parsers -----
+
+fn parse_z_index<'i>(input: &mut Parser<'i, '_>) -> Result<ZIndex, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        return Ok(ZIndex::Auto);
+    }
+    Ok(ZIndex::Int(input.expect_integer()?))
+}
+
+fn parse_will_change<'i>(input: &mut Parser<'i, '_>) -> Result<WillChange, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        return Ok(WillChange(Vec::new()));
+    }
+    let names = input.parse_comma_separated(|i| {
+        let location = i.current_source_location();
+        let ident = i.expect_ident()?.clone();
+        let lower = ident.to_ascii_lowercase();
+        // The CSS-wide keywords and `will-change` itself are not allowed.
+        if matches!(lower.as_str(), "auto" | "will-change" | "none" | "all" | "default" | "initial" | "inherit" | "unset" | "revert" | "revert-layer") {
+            return Err(location.new_unexpected_token_error(Token::Ident(ident)));
+        }
+        Ok(Arc::from(lower.as_str()))
+    })?;
+    Ok(WillChange(names))
+}
+
+fn parse_backface_visibility<'i>(input: &mut Parser<'i, '_>) -> Result<BackfaceVisibility, ParseErr<'i>> {
+    keyword(input, |k| Some(match_ignore_ascii_case! { k,
+        "visible" => BackfaceVisibility::Visible, "hidden" => BackfaceVisibility::Hidden, _ => return None }))
+}
+
+/// `none | <transform-function>+`.
+fn parse_transform_list<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<TransformFunction>, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    loop {
+        match input.try_parse(parse_transform_function) {
+            Ok(f) => out.push(f),
+            Err(_) => break,
+        }
+    }
+    if out.is_empty() {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(out)
+}
+
+fn parse_transform_function<'i>(input: &mut Parser<'i, '_>) -> Result<TransformFunction, ParseErr<'i>> {
+    let location = input.current_source_location();
+    let name = input.expect_function()?.clone();
+    let lower = name.to_ascii_lowercase();
+    input.parse_nested_block(|i| {
+        let num = |i: &mut Parser<'i, '_>| i.expect_number();
+        let comma_num = |i: &mut Parser<'i, '_>| -> Result<f32, ParseErr<'i>> {
+            i.expect_comma()?;
+            Ok(i.expect_number()?)
+        };
+        let comma_lp = |i: &mut Parser<'i, '_>| -> Result<LengthPercentage, ParseErr<'i>> {
+            i.expect_comma()?;
+            parse_length_percentage(i)
+        };
+        Ok(match lower.as_str() {
+            "matrix" => {
+                let mut v = [0.0f32; 6];
+                v[0] = num(i)?;
+                for slot in v.iter_mut().skip(1) {
+                    *slot = comma_num(i)?;
+                }
+                TransformFunction::Matrix(v)
+            }
+            "matrix3d" => {
+                let mut v = [0.0f32; 16];
+                v[0] = num(i)?;
+                for slot in v.iter_mut().skip(1) {
+                    *slot = comma_num(i)?;
+                }
+                TransformFunction::Matrix3d(v)
+            }
+            "translate" => {
+                let x = parse_length_percentage(i)?;
+                let y = i.try_parse(comma_lp).unwrap_or(LengthPercentage::ZERO);
+                TransformFunction::Translate(x, y)
+            }
+            "translatex" => TransformFunction::TranslateX(parse_length_percentage(i)?),
+            "translatey" => TransformFunction::TranslateY(parse_length_percentage(i)?),
+            "translatez" => TransformFunction::TranslateZ(parse_length(i)?),
+            "translate3d" => {
+                let x = parse_length_percentage(i)?;
+                let y = comma_lp(i)?;
+                i.expect_comma()?;
+                let z = parse_length(i)?;
+                TransformFunction::Translate3d(x, y, z)
+            }
+            "scale" => {
+                let x = num(i)?;
+                let y = i.try_parse(comma_num).unwrap_or(x);
+                TransformFunction::Scale(x, y)
+            }
+            "scalex" => TransformFunction::ScaleX(num(i)?),
+            "scaley" => TransformFunction::ScaleY(num(i)?),
+            "scalez" => TransformFunction::ScaleZ(num(i)?),
+            "scale3d" => {
+                let x = num(i)?;
+                let y = comma_num(i)?;
+                let z = comma_num(i)?;
+                TransformFunction::Scale3d(x, y, z)
+            }
+            "rotate" => TransformFunction::Rotate(crate::image::parse_angle(i)?),
+            "rotatex" => TransformFunction::RotateX(crate::image::parse_angle(i)?),
+            "rotatey" => TransformFunction::RotateY(crate::image::parse_angle(i)?),
+            "rotatez" => TransformFunction::RotateZ(crate::image::parse_angle(i)?),
+            "rotate3d" => {
+                let x = num(i)?;
+                let y = comma_num(i)?;
+                let z = comma_num(i)?;
+                i.expect_comma()?;
+                let a = crate::image::parse_angle(i)?;
+                TransformFunction::Rotate3d(x, y, z, a)
+            }
+            "skew" => {
+                let x = crate::image::parse_angle(i)?;
+                let y = i
+                    .try_parse(|i| {
+                        i.expect_comma()?;
+                        crate::image::parse_angle(i)
+                    })
+                    .unwrap_or(0.0);
+                TransformFunction::Skew(x, y)
+            }
+            "skewx" => TransformFunction::SkewX(crate::image::parse_angle(i)?),
+            "skewy" => TransformFunction::SkewY(crate::image::parse_angle(i)?),
+            "perspective" => {
+                if i.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+                    TransformFunction::Perspective(None)
+                } else {
+                    let l = parse_length(i)?;
+                    if l.parts().0 < 0.0 {
+                        return Err(i.new_custom_error(()));
+                    }
+                    TransformFunction::Perspective(Some(l))
+                }
+            }
+            _ => return Err(location.new_unexpected_token_error(Token::Function(name.clone()))),
+        })
+    })
+}
+
+/// `<position> <length>?`: a one- or two-value position (no edge
+/// offsets, CSS Transforms 1 §7) and the z offset.
+fn parse_transform_origin<'i>(input: &mut Parser<'i, '_>) -> Result<TransformOriginValue, ParseErr<'i>> {
+    let p = parse_position_n(input, 2)?;
+    let z = input.try_parse(parse_length).unwrap_or(Length::ZERO);
+    Ok(TransformOriginValue { x: p.x, y: p.y, z })
+}
+
+fn parse_translate<'i>(input: &mut Parser<'i, '_>) -> Result<TranslateValue, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+        return Ok(TranslateValue::None);
+    }
+    let x = parse_length_percentage(input)?;
+    let y = input.try_parse(parse_length_percentage).ok();
+    let z = if y.is_some() { input.try_parse(parse_length).ok() } else { None };
+    Ok(TranslateValue::Values(x, y, z))
+}
+
+fn parse_rotate<'i>(input: &mut Parser<'i, '_>) -> Result<RotateValue, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+        return Ok(RotateValue::None);
+    }
+    // `<angle>`, `x|y|z <angle>`, `<number>{3} <angle>`, the axis on
+    // either side of the angle.
+    let axis_kw = |i: &mut Parser<'i, '_>| {
+        keyword(i, |k| Some(match_ignore_ascii_case! { k, "x" => (1.0, 0.0, 0.0), "y" => (0.0, 1.0, 0.0), "z" => (0.0, 0.0, 1.0), _ => return None }))
+    };
+    let axis_nums = |i: &mut Parser<'i, '_>| -> Result<(f32, f32, f32), ParseErr<'i>> {
+        Ok((i.expect_number()?, i.expect_number()?, i.expect_number()?))
+    };
+    let mut axis = input.try_parse(axis_kw).or_else(|_| input.try_parse(axis_nums)).ok();
+    let angle = crate::image::parse_angle(input)?;
+    if axis.is_none() {
+        axis = input.try_parse(axis_kw).or_else(|_| input.try_parse(axis_nums)).ok();
+    }
+    let (x, y, z) = axis.unwrap_or((0.0, 0.0, 1.0));
+    Ok(RotateValue::Rotate(x, y, z, angle))
+}
+
+fn parse_scale<'i>(input: &mut Parser<'i, '_>) -> Result<ScaleValue, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("none")).is_ok() {
+        return Ok(ScaleValue::None);
+    }
+    let one = |i: &mut Parser<'i, '_>| -> Result<f32, ParseErr<'i>> {
+        let location = i.current_source_location();
+        match i.next()?.clone() {
+            Token::Number { value, .. } => Ok(value),
+            Token::Percentage { unit_value, .. } => Ok(unit_value),
+            t => Err(location.new_unexpected_token_error(t)),
+        }
+    };
+    let x = one(input)?;
+    let y = input.try_parse(one).unwrap_or(x);
+    let z = input.try_parse(one).unwrap_or(1.0);
+    Ok(ScaleValue::Values(x, y, z))
 }
 
 // ----- box-shadow, outline, cursor, user-select parsers -----
@@ -2952,6 +3374,12 @@ fn parse_blend_mode<'i>(input: &mut Parser<'i, '_>) -> Result<BlendMode, ParseEr
 
 /// `<bg-position>`: one to four values.
 pub(crate) fn parse_background_position<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundPosition, ParseErr<'i>> {
+    parse_position_n(input, 4)
+}
+
+/// A `<position>` of at most `max` components: 4 for backgrounds (the
+/// edge offsets), 2 for `transform-origin`, whose grammar has none.
+fn parse_position_n<'i>(input: &mut Parser<'i, '_>, max: usize) -> Result<BackgroundPosition, ParseErr<'i>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Kw {
         Left,
@@ -2965,7 +3393,7 @@ pub(crate) fn parse_background_position<'i>(input: &mut Parser<'i, '_>) -> Resul
         Lp(LengthPercentage),
     }
     let mut items = Vec::new();
-    while items.len() < 4 {
+    while items.len() < max {
         if let Ok(kw) = input.try_parse(|i| {
             keyword(i, |k| Some(match_ignore_ascii_case! { k,
                 "left" => Kw::Left, "right" => Kw::Right, "top" => Kw::Top, "bottom" => Kw::Bottom,
@@ -3410,6 +3838,9 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "inset" => &[Top, Right, Bottom, Left],
         "outline" => &[OutlineWidth, OutlineStyle, OutlineColor],
         "-webkit-user-select" => &[UserSelect],
+        "-webkit-transform" => &[Transform],
+        "-webkit-transform-origin" => &[TransformOrigin],
+        "-webkit-backface-visibility" => &[BackfaceVisibility],
         "scroll-margin" => &[ScrollMarginTop, ScrollMarginRight, ScrollMarginBottom, ScrollMarginLeft],
         "scroll-padding" => &[ScrollPaddingTop, ScrollPaddingRight, ScrollPaddingBottom, ScrollPaddingLeft],
         "overscroll-behavior" => &[OverscrollBehaviorX, OverscrollBehaviorY],
@@ -3489,6 +3920,9 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
             ]
         },
         "-webkit-user-select" => vec![P::UserSelect(parse_user_select(input)?)],
+        "-webkit-transform" => vec![P::Transform(parse_transform_list(input)?)],
+        "-webkit-transform-origin" => vec![P::TransformOrigin(parse_transform_origin(input)?)],
+        "-webkit-backface-visibility" => vec![P::BackfaceVisibility(parse_backface_visibility(input)?)],
         "scroll-margin" => {
             let s = parse_sides(input, parse_scroll_margin)?;
             vec![P::ScrollMarginTop(s.top), P::ScrollMarginRight(s.right), P::ScrollMarginBottom(s.bottom), P::ScrollMarginLeft(s.left)]
@@ -4293,6 +4727,65 @@ mod tests {
         assert_eq!(one("user-select", "contain"), Some(D::Value(P::UserSelect(UserSelect::Contain))));
         assert_eq!(parse("-webkit-user-select", "none"), vec![D::Value(P::UserSelect(UserSelect::None))]);
         assert_eq!(one("user-select", "element"), None);
+    }
+
+    #[test]
+    fn z_index_transforms_and_their_friends_parse() {
+        let one = |name: &str, s: &str| parse(name, s).pop();
+        use DeclaredValue as D;
+        use PropertyDeclaration as P;
+        assert_eq!(one("z-index", "auto"), Some(D::Value(P::ZIndex(ZIndex::Auto))));
+        assert_eq!(one("z-index", "-3"), Some(D::Value(P::ZIndex(ZIndex::Int(-3)))));
+        assert_eq!(one("z-index", "1.5"), None, "an integer");
+        let transform = |s: &str| match one("transform", s) {
+            Some(D::Value(P::Transform(v))) => Some(v),
+            _ => None,
+        };
+        assert_eq!(transform("none").map(|v| v.len()), Some(0));
+        let v = transform("translate(10px, 5%) rotate(0.5turn) scale(2) skewX(10deg) matrix(1,0,0,1,0,0) translate3d(1px,2px,3px) perspective(none)").expect("list");
+        assert_eq!(v.len(), 7);
+        assert_eq!(v[0], TransformFunction::Translate(LengthPercentage::Length(Length::Px(10.0)), LengthPercentage::Percent(5.0)));
+        assert_eq!(v[1], TransformFunction::Rotate(180.0));
+        assert_eq!(v[2], TransformFunction::Scale(2.0, 2.0));
+        assert_eq!(v[6], TransformFunction::Perspective(None));
+        assert!(transform("translate(10px) rotate(1)").is_none(), "a bad function fails the list");
+        assert!(transform("rotate(45deg),rotate(1deg)").is_none(), "no commas between functions");
+        assert!(transform("matrix(1,0,0,1,0)").is_none(), "six numbers");
+        assert!(transform("perspective(-1px)").is_none(), "no negative perspective");
+        assert_eq!(parse("-webkit-transform", "scale(1)").len(), 1);
+        // transform-origin: a position plus an optional z length.
+        let origin = |s: &str| match one("transform-origin", s) {
+            Some(D::Value(P::TransformOrigin(o))) => Some(o),
+            _ => None,
+        };
+        assert!(origin("left top 5px").is_some_and(|o| o.z == Length::Px(5.0)));
+        assert!(origin("50%").is_some_and(|o| o.z == Length::ZERO));
+        assert!(origin("left 5px").is_some(), "a keyword and a length");
+        assert!(origin("5px 5px 5%").is_none(), "no percentage z");
+        assert!(origin("left 10px top").is_none(), "no edge offsets");
+        // The individual properties.
+        assert_eq!(one("translate", "none"), Some(D::Value(P::Translate(TranslateValue::None))));
+        assert!(matches!(one("translate", "10px 20% 3px"), Some(D::Value(P::Translate(TranslateValue::Values(_, Some(_), Some(Length::Px(3.0))))))));
+        assert_eq!(one("translate", "10px 5px 2%"), None, "z takes a length");
+        assert_eq!(one("rotate", "45deg"), Some(D::Value(P::Rotate(RotateValue::Rotate(0.0, 0.0, 1.0, 45.0)))));
+        assert_eq!(one("rotate", "x 90deg"), Some(D::Value(P::Rotate(RotateValue::Rotate(1.0, 0.0, 0.0, 90.0)))));
+        assert_eq!(one("rotate", "90deg y"), Some(D::Value(P::Rotate(RotateValue::Rotate(0.0, 1.0, 0.0, 90.0)))));
+        assert_eq!(one("rotate", "1 1 0 30deg"), Some(D::Value(P::Rotate(RotateValue::Rotate(1.0, 1.0, 0.0, 30.0)))));
+        assert_eq!(one("scale", "2"), Some(D::Value(P::Scale(ScaleValue::Values(2.0, 2.0, 1.0)))));
+        assert_eq!(one("scale", "50% 2 3"), Some(D::Value(P::Scale(ScaleValue::Values(0.5, 2.0, 3.0)))));
+        // The rest.
+        assert_eq!(one("isolation", "isolate"), Some(D::Value(P::Isolation(Isolation::Isolate))));
+        assert_eq!(one("will-change", "transform, opacity").map(|d| match d { D::Value(P::WillChange(w)) => w.creates_stacking_context(), _ => false }), Some(true));
+        assert_eq!(one("will-change", "will-change"), None);
+        assert_eq!(one("will-change", "top").map(|d| match d { D::Value(P::WillChange(w)) => w.creates_stacking_context(), _ => true }), Some(false));
+        assert_eq!(one("transform-box", "content-box"), Some(D::Value(P::TransformBox(TransformBox::ContentBox))));
+        assert_eq!(one("transform-style", "preserve-3d"), Some(D::Value(P::TransformStyle(TransformStyle::Preserve3d))));
+        assert_eq!(parse("-webkit-backface-visibility", "hidden"), vec![D::Value(P::BackfaceVisibility(BackfaceVisibility::Hidden))]);
+        assert_eq!(one("perspective", "none"), Some(D::Value(P::Perspective(Perspective::None))));
+        assert_eq!(one("perspective", "500px"), Some(D::Value(P::Perspective(Perspective::Length(Length::Px(500.0))))));
+        assert_eq!(one("perspective", "-5px"), None);
+        assert!(one("perspective-origin", "left bottom").is_some());
+        assert!(!PropertyId::Transform.is_inherited() && !PropertyId::ZIndex.is_inherited());
     }
 
     #[test]

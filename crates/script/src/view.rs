@@ -24,7 +24,9 @@ use boa_engine::{
 };
 use boa_gc::{Finalize, Trace};
 use browser_dom::{Document, NodeId};
-use browser_layout::{Fragment, ImageSizes, LayoutEngine, LayoutTree, Rect};
+use browser_layout::{
+    Fragment, IDENTITY, ImageSizes, LayoutEngine, LayoutTree, Rect, Space, affine_bounds, affine_invert, affine_mul,
+};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
@@ -100,13 +102,24 @@ pub struct View {
 }
 
 /// One fragment of an element in the current layout: its border box
-/// and the used padding and margin layout gave it.
+/// and the used padding and margin layout gave it, and the space it
+/// shows in (the transforms above it; fixed content).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FragmentBox {
     order: u32,
     pub(crate) rect: Rect,
     pub(crate) padding: Sides<f32>,
     pub(crate) margin: Sides<f32>,
+    pub(crate) space: Space,
+}
+
+impl FragmentBox {
+    /// Where the box shows, in page coordinates: its bounds through the
+    /// transforms, and for fixed content moved by the page scroll.
+    fn shown(&self, scroll: (f32, f32)) -> Rect {
+        let r = affine_bounds(&self.space.transform, &self.rect);
+        if self.space.fixed { r.translate(scroll.0, scroll.1) } else { r }
+    }
 }
 
 fn hash_text(text: &str) -> u64 {
@@ -329,55 +342,80 @@ impl View {
         if self.rect_index.is_none() {
             let mut index: HashMap<NodeId, Vec<FragmentBox>> = HashMap::new();
             let mut order = 0u32;
-            fn visit(f: &Fragment, order: &mut u32, index: &mut HashMap<NodeId, Vec<FragmentBox>>) {
+            fn visit(
+                f: &Fragment,
+                order: &mut u32,
+                index: &mut HashMap<NodeId, Vec<FragmentBox>>,
+                spaces: &HashMap<NodeId, Space>,
+            ) {
                 if let Some(n) = f.node {
                     index.entry(n).or_default().push(FragmentBox {
                         order: *order,
                         rect: f.rect,
                         padding: f.padding,
                         margin: f.margin,
+                        space: spaces.get(&n).copied().unwrap_or(Space::ROOT),
                     });
                     *order += 1;
                 }
                 for c in &f.children {
-                    visit(c, order, index);
+                    visit(c, order, index, spaces);
                 }
             }
             if let Some(tree) = &self.layout {
-                visit(&tree.root, &mut order, &mut index);
+                let spaces = tree.paint_list().spaces;
+                visit(&tree.root, &mut order, &mut index, &spaces);
             }
             self.rect_index = Some(index);
         }
         self.rect_index.as_ref().expect("built")
     }
 
-    /// The boxes of `id` in page coordinates, in tree order: its own
-    /// fragments, or, for an inline element (which has no box of its
-    /// own), the fragments of what it contains, one per line.
-    pub fn rects_of(&mut self, doc: &Document, id: NodeId) -> Vec<Rect> {
+    /// The boxes of `id`, in tree order: its own fragments, or, for an
+    /// inline element (which has no box of its own), the fragments of
+    /// what it contains, one per line.
+    fn boxes_of(&mut self, doc: &Document, id: NodeId) -> Vec<FragmentBox> {
         let index = self.index();
         if let Some(own) = index.get(&id) {
-            return own.iter().map(|b| b.rect).collect();
+            return own.clone();
         }
         if !doc.contains(id) {
             return Vec::new();
         }
-        let mut found: Vec<(u32, Rect)> = Vec::new();
+        let mut found: Vec<FragmentBox> = Vec::new();
         for d in doc.descendants(id) {
             if let Some(boxes) = index.get(&d) {
-                found.extend(boxes.iter().map(|b| (b.order, b.rect)));
+                found.extend(boxes.iter().copied());
             }
         }
-        found.sort_by_key(|&(o, _)| o);
+        found.sort_by_key(|b| b.order);
         // A box fragment covers the fragments inside it: keep the outer.
-        let mut out: Vec<Rect> = Vec::new();
-        for (_, r) in found {
-            if out.iter().any(|o| o.x <= r.x && o.y <= r.y && o.right() >= r.right() && o.bottom() >= r.bottom()) {
+        let mut out: Vec<FragmentBox> = Vec::new();
+        for b in found {
+            let r = b.rect;
+            if out
+                .iter()
+                .any(|o| o.rect.x <= r.x && o.rect.y <= r.y && o.rect.right() >= r.right() && o.rect.bottom() >= r.bottom())
+            {
                 continue;
             }
-            out.push(r);
+            out.push(b);
         }
         out
+    }
+
+    /// The boxes of `id` in page coordinates as they show (through the
+    /// transforms above them; CSSOM View's client rectangles), in tree
+    /// order.
+    pub fn rects_of(&mut self, doc: &Document, id: NodeId) -> Vec<Rect> {
+        let scroll = self.scroll;
+        self.boxes_of(doc, id).iter().map(|b| b.shown(scroll)).collect()
+    }
+
+    /// The boxes of `id` as layout placed them (no transforms; fixed
+    /// content in viewport coordinates), for the `offset*` geometry.
+    fn layout_rects_of(&mut self, doc: &Document, id: NodeId) -> Vec<Rect> {
+        self.boxes_of(doc, id).iter().map(|b| b.rect).collect()
     }
 
     /// The first box of `id`, if it has one.
@@ -391,22 +429,34 @@ impl View {
         self.index().get(&id).and_then(|v| v.first()).copied()
     }
 
-    /// The smallest rectangle around all of an element's boxes; zero
-    /// when it has none (not rendered).
+    /// The smallest rectangle around all of an element's boxes as they
+    /// show; zero when it has none (not rendered).
     pub fn bounding(&mut self, doc: &Document, id: NodeId) -> Rect {
         union(&self.rects_of(doc, id))
     }
 
+    /// The smallest rectangle around all of an element's boxes as layout
+    /// placed them.
+    fn layout_bounding(&mut self, doc: &Document, id: NodeId) -> Rect {
+        union(&self.layout_rects_of(doc, id))
+    }
+
     /// How far the boxes inside `id` reach past its padding box origin:
-    /// `scrollWidth`/`scrollHeight` without a scroll container.
+    /// `scrollWidth`/`scrollHeight` without a scroll container. A
+    /// transformed box inside reaches as far as its transformed bounds,
+    /// taken in `id`'s own coordinates.
     fn content_extent(&mut self, doc: &Document, id: NodeId, padding_box: Rect) -> (f32, f32) {
+        let own = self.own_box(id).map(|b| b.space).unwrap_or(Space::ROOT);
         let index = self.index();
         let (mut w, mut h) = (padding_box.width, padding_box.height);
+        let inv = affine_invert(&own.transform).unwrap_or(IDENTITY);
         for d in doc.descendants(id) {
             if let Some(boxes) = index.get(&d) {
                 for b in boxes {
-                    w = w.max(b.rect.right() - padding_box.x);
-                    h = h.max(b.rect.bottom() - padding_box.y);
+                    let relative = affine_mul(&inv, &b.space.transform);
+                    let r = affine_bounds(&relative, &b.rect);
+                    w = w.max(r.right() - padding_box.x);
+                    h = h.max(r.bottom() - padding_box.y);
                 }
             }
         }
@@ -777,7 +827,9 @@ fn offset_parent(view: &mut View, doc: &Document, id: NodeId) -> Option<NodeId> 
 
 fn geometry(view: &mut View, doc: &Document, quirks: bool, id: NodeId, prop: &GeoProp) -> Geo {
     let scroller = scrolling_element(doc, quirks) == Some(id);
-    let rect = view.bounding(doc, id);
+    // The `offset*` and `client*` geometry is layout's, before any
+    // transform (CSSOM View §8).
+    let rect = view.layout_bounding(doc, id);
     let style = view.styles.get(id).cloned();
     let pad_box = style.as_ref().map_or(rect, |s| padding_box(rect, s));
     let num = |v: f32| Geo::Num(f64::from(v.round()));
@@ -793,7 +845,7 @@ fn geometry(view: &mut View, doc: &Document, quirks: bool, id: NodeId, prop: &Ge
             let parent = offset_parent(view, doc, id);
             let origin = match parent {
                 Some(p) => {
-                    let pr = view.bounding(doc, p);
+                    let pr = view.layout_bounding(doc, p);
                     view.styles.get(p).map_or(pr, |s| padding_box(pr, s))
                 }
                 None => Rect::default(),
@@ -801,8 +853,10 @@ fn geometry(view: &mut View, doc: &Document, quirks: bool, id: NodeId, prop: &Ge
             // Layout positions, not scrolled ones: the offsets of the
             // scrollers between the element and its offsetParent (that one
             // included) are added back, since the page coordinates have
-            // them taken off.
-            let (sx, sy) = view.ancestor_scroll(doc, id, parent);
+            // them taken off. A fixed box is placed by the viewport: no
+            // scroller moves it.
+            let fixed = view.own_box(id).is_some_and(|b| b.space.fixed);
+            let (sx, sy) = if fixed { (0.0, 0.0) } else { view.ancestor_scroll(doc, id, parent) };
             if matches!(prop, GeoProp::OffsetLeft) { num(rect.x + sx - origin.x) } else { num(rect.y + sy - origin.y) }
         }
         GeoProp::OffsetParent => Geo::Node(offset_parent(view, doc, id)),

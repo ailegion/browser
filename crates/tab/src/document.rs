@@ -1678,7 +1678,7 @@ impl TabState {
             // of the viewport, its `scroll-margin` counted.
             Some(t) => self.reveal(
                 t,
-                &|tree, doc| tree.first_rect(|n| n == t || doc.parent(n) == Some(t)),
+                &|tree, doc| tree.first_shown_rect(|n| n == t || doc.parent(n) == Some(t)),
                 Reveal::Start,
                 true,
                 true,
@@ -3276,6 +3276,7 @@ impl TabState {
             matches: self.find.as_ref().map(|f| f.ranges.clone()).unwrap_or_default(),
             current_match: self.find.as_ref().map(|f| f.current_ranges.clone()).unwrap_or_default(),
             caret: self.caret_rect,
+            caret_node: self.focus,
             composition: self.composition_ranges(),
             scrollbar_hover: match self.bar_hover {
                 Some((ScrollTarget::Element(n), v, p)) => Some((n, v, p)),
@@ -6246,6 +6247,43 @@ mod tests {
         h.send(ShellToTab::MouseMove { x: after.right() - 2.0, y: after.y + after.height / 2.0 });
         assert_eq!(h.selected().as_deref(), Some("inside contain"));
         h.send(ShellToTab::MouseUp { x: after.right() - 2.0, y: after.y + after.height / 2.0, button: MouseButton::Left });
+    }
+
+    #[test]
+    fn stacking_and_transforms_reach_hover_clicks_and_geometry() {
+        let mut h = Harness::load(
+            "<style>body { margin: 0 } #base { position: absolute; top: 0; left: 0; width: 100px; height: 100px; z-index: 2 } \
+             #over { position: absolute; top: 0; left: 0; width: 100px; height: 100px; z-index: 1; cursor: pointer } \
+             #moved { position: absolute; top: 200px; left: 0; width: 100px; height: 50px; transform: translateX(300px) } \
+             #fixed { position: fixed; top: 20px; left: 400px; width: 50px; height: 50px } \
+             #tall { height: 3000px }</style>\
+             <div id=base></div><div id=over></div><div id=moved>text</div><div id=fixed></div><div id=tall></div>",
+        );
+        // The box with the higher z-index is hovered though it comes
+        // first in the tree.
+        h.send(ShellToTab::MouseMove { x: 50.0, y: 50.0 });
+        assert_eq!(h.state.hover, Some(h.by_id("base")));
+        // A translated box is hovered where it shows, not where layout
+        // put it; its client rectangle says so, offsetLeft does not.
+        h.send(ShellToTab::MouseMove { x: 350.0, y: 225.0 });
+        assert_eq!(h.state.hover, Some(h.by_id("moved")));
+        h.send(ShellToTab::MouseMove { x: 50.0, y: 225.0 });
+        assert_ne!(h.state.hover, Some(h.by_id("moved")));
+        assert_eq!(
+            run_js(&mut h, "var m = document.getElementById('moved'), r = m.getBoundingClientRect(); [r.left, r.top, m.offsetLeft].join('|')"),
+            "\"300|200|0\""
+        );
+        // A fixed box stays under the pointer when the page scrolls;
+        // its client rectangle is viewport-relative throughout.
+        h.send(ShellToTab::MouseMove { x: 425.0, y: 45.0 });
+        assert_eq!(h.state.hover, Some(h.by_id("fixed")));
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 500.0 });
+        assert_eq!(h.state.scroll_y, 500.0);
+        h.send(ShellToTab::MouseMove { x: 425.0, y: 46.0 });
+        assert_eq!(h.state.hover, Some(h.by_id("fixed")));
+        assert_eq!(run_js(&mut h, "var f = document.getElementById('fixed').getBoundingClientRect(); [f.left, f.top, document.getElementById('fixed').offsetTop].join('|')"), "\"400|20|20\"");
+        // The resolved transform is the matrix.
+        assert_eq!(run_js(&mut h, "getComputedStyle(document.getElementById('moved')).transform"), "\"matrix(1, 0, 0, 1, 300, 0)\"");
     }
 
     #[test]

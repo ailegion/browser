@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use browser_dom::NodeId;
 use browser_layout::{
-    Control, Decoration, DecorationLine, Fragment, FragmentContent, LayoutTree, Rect, ScrollInfo, ScrollbarPart,
-    SelectionRanges, TextFragment,
+    ClipNode, Control, Decoration, DecorationLine, Fragment, FragmentContent, LayoutTree, Op, Placed, Rect, ScrollInfo,
+    ScrollbarPart, SelectionRanges, Space, TextFragment,
 };
 use scrollbar::{ScrollbarState, draw_scrollbar};
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
@@ -25,7 +25,6 @@ use browser_style::{
     ComputedBackgroundSize, ComputedGradient, ComputedGradientItem, ComputedGradientPos, ComputedGradientShape,
     ComputedImage, ComputedLp, ComputedLpAuto, ComputedRadialSize, ComputedStyle, HueMethod, InterpolationSpace,
     LinearDirection, OutlineStyle, PositionEdge, PositionOffset, RadialShape, Rgba, ScrollbarColor, TextDecorationStyle,
-    Visibility,
 };
 use vello::peniko::color::{ColorSpaceTag, DynamicColor, HueDirection};
 use skrifa::instance::{LocationRef, NormalizedCoord, Size as FontSize};
@@ -169,8 +168,11 @@ pub struct PaintOptions {
     /// Find-in-page matches, and the current one, drawn over the selection.
     pub matches: SelectionRanges,
     pub current_match: SelectionRanges,
-    /// The text caret of the focused control, in page coordinates.
+    /// The text caret of the focused control, in page coordinates, and
+    /// the control, whose transforms and fixed placement the caret
+    /// follows.
     pub caret: Option<Rect>,
+    pub caret_node: Option<NodeId>,
     /// The IME's composition text in the focused control, underlined.
     pub composition: SelectionRanges,
     /// The element scrollbar part under the pointer and the one pressed
@@ -236,18 +238,26 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         &KRect::new(0.0, 0.0, options.viewport_width as f64, options.viewport_height as f64),
     );
 
-    let transform = base * Affine::translate((-options.scroll_x as f64, -options.scroll_y as f64));
+    let page = base * Affine::translate((-options.scroll_x as f64, -options.scroll_y as f64));
     let visible = Rect::new(
         options.scroll_x,
         options.scroll_y,
         options.viewport_width,
         options.viewport_height,
     );
+    let viewport = Rect::new(0.0, 0.0, options.viewport_width, options.viewport_height);
+    let list = tree.paint_list();
     let mut painter = Painter {
         scene,
         images,
         visible,
-        transform,
+        viewport,
+        local_visible: visible,
+        fixed_area: visible,
+        base,
+        page,
+        transform: page,
+        in_transform: false,
         scale: options.scale.max(0.01),
         skip_background_of,
         highlights: [
@@ -259,32 +269,52 @@ pub fn paint(tree: &LayoutTree, images: &ImageStore, options: &PaintOptions, sce
         scrollers: &tree.scrollers,
         scrollbar_hover: options.scrollbar_hover,
         scrollbar_pressed: options.scrollbar_pressed,
-        clip_depth: 0,
-        deferred_fixed: Vec::new(),
-        outlines: Vec::new(),
+        clips: &list.clips,
+        clip_stack: Vec::new(),
     };
     if let (Some(h), Some(style)) = (html, &canvas_layers) {
         painter.canvas_layers(style, h);
     }
-    if let Some(html) = html {
-        painter.fragment(html);
+    for i in 0..list.items.len() {
+        painter.item(i, &list.items);
     }
-    painter.paint_deferred_fixed();
-    // Outlines come after all content (Blink's outline phase), so a box's
-    // outline is not covered by what follows it.
-    painter.paint_outlines();
+    painter.pop_clips_to(0);
     if let Some(c) = &options.caret {
+        // The caret in its control's space (the page's when the control
+        // has no box).
+        let space = options
+            .caret_node
+            .and_then(|n| list.spaces.get(&n).copied())
+            .unwrap_or(Space::ROOT);
+        painter.enter_space(&space);
         painter
             .scene
             .fill(Fill::NonZero, painter.transform, CONTROL_MARK, None, &krect(c));
+        painter.pop_clips_to(0);
     }
 }
 
 struct Painter<'a> {
     scene: &'a mut Scene,
     images: &'a ImageStore,
+    /// The viewport in page coordinates (what the page scroll shows) and
+    /// in its own (what fixed content is placed in).
     visible: Rect,
+    viewport: Rect,
+    /// The visible area in the current item's coordinates: the viewport
+    /// taken back through the item's transform, for culling and tiling.
+    local_visible: Rect,
+    /// The positioning area of `background-attachment: fixed` layers in
+    /// the current item's coordinates.
+    fixed_area: Rect,
+    /// Device scale alone; with the page scroll; and the current item's
+    /// transform on top of one of them.
+    base: Affine,
+    page: Affine,
     transform: Affine,
+    /// The current item is inside a transformed box: `fixed` backgrounds
+    /// behave as `scroll` there (CSS Transforms 1 §3).
+    in_transform: bool,
     /// Device pixels per CSS pixel: what `image-set()` chooses by.
     scale: f32,
     /// Elements whose background the canvas already painted.
@@ -299,16 +329,10 @@ struct Painter<'a> {
     scrollers: &'a HashMap<NodeId, ScrollInfo>,
     scrollbar_hover: Option<(NodeId, bool, ScrollbarPart)>,
     scrollbar_pressed: Option<(NodeId, bool, ScrollbarPart)>,
-    /// How many overflow clips are open. A `position: fixed` box met
-    /// inside one is not clipped by any of them (CSS Positioned 3 §3.3:
-    /// its containing block is the viewport), so it waits in
-    /// `deferred_fixed` and paints once the outermost clip is closed.
-    clip_depth: usize,
-    deferred_fixed: Vec<&'a Fragment>,
-    /// The boxes with an outline, by element, with every fragment's
-    /// border box (an inline element has one per line): painted after
-    /// everything else.
-    outlines: Vec<(NodeId, Arc<ComputedStyle>, Vec<Rect>)>,
+    /// The overflow clips of the paint list and the ones open in the
+    /// scene, outermost first, each with how many clip layers it took.
+    clips: &'a [ClipNode<'a>],
+    clip_stack: Vec<(usize, usize)>,
 }
 
 fn color(c: Rgba) -> Color {
@@ -341,143 +365,211 @@ fn intersects(a: &Rect, b: &Rect) -> bool {
 }
 
 impl<'a> Painter<'a> {
-    fn fragment(&mut self, f: &'a Fragment) {
-        if f.style.visibility != Visibility::Visible && !matches!(f.content, FragmentContent::Anonymous) {
-            // Hidden elements do not paint; their children with an explicit
-            // `visible` would, but that case is rare and handled later.
-            return;
+    /// Item `i` of the paint list.
+    fn item(&mut self, i: usize, items: &'a [Placed<'a>]) {
+        let p = &items[i];
+        match &p.op {
+            // A stacking context's compositing group sits above any open
+            // clip (the items inside re-open the clips they need, and a
+            // fixed box inside escapes them), bounding what it holds.
+            Op::PushGroup { opacity } => {
+                self.pop_clips_to(0);
+                let bounds = self.group_bounds(i, items);
+                self.scene
+                    .push_layer(Fill::NonZero, Mix::Normal, *opacity, Affine::IDENTITY, &bounds);
+            }
+            Op::PopGroup => {
+                self.pop_clips_to(0);
+                self.scene.pop_layer();
+            }
+            Op::Decoration { fragment, sides } => {
+                self.enter_space(&p.space);
+                if self.on_screen(&fragment.rect) {
+                    self.decoration(fragment, *sides);
+                }
+            }
+            Op::Content(f) => {
+                self.enter_space(&p.space);
+                if self.on_screen(&f.rect) {
+                    match &f.content {
+                        FragmentContent::Text(t) => self.text(&f.rect, t, f.node),
+                        FragmentContent::Control(c) => self.control(&f.rect, *c),
+                        FragmentContent::Image(url) => self.image(&f.rect, &f.style, url),
+                        _ => {}
+                    }
+                }
+            }
+            Op::Scrollbars(f) => {
+                self.enter_space(&p.space);
+                if let (Some(node), Some(info)) = (f.node, f.node.and_then(|n| self.scrollers.get(&n)))
+                    && self.on_screen(&f.rect)
+                {
+                    self.scrollbars(node, info, &f.style);
+                }
+            }
+            Op::Outline { style, rects, .. } => {
+                self.enter_space(&p.space);
+                let grown = rects.iter().any(|r| intersects(&r.inset(-64.0, -64.0, -64.0, -64.0), &self.local_visible));
+                if grown {
+                    self.outline(style, rects);
+                }
+            }
         }
-        if self.clip_depth > 0 && f.is_fixed() {
-            self.deferred_fixed.push(f);
-            return;
-        }
-        let clips = f.clips_children();
-        // Cull whole subtrees that clip and are off-screen, and off-screen leaves.
-        let offscreen = !intersects(&f.rect, &self.visible);
-        if offscreen && (clips || f.children.is_empty()) {
-            return;
-        }
+    }
 
-        let opacity = f.style.opacity.clamp(0.0, 1.0);
-        let translucent = opacity < 1.0 && !matches!(f.content, FragmentContent::Anonymous);
-        if translucent {
-            self.scene
-                .push_layer(Fill::NonZero, Mix::Normal, opacity, self.transform, &krect(&f.rect));
-        }
+    /// Whether a rectangle in the current item's coordinates reaches the
+    /// viewport.
+    fn on_screen(&self, r: &Rect) -> bool {
+        intersects(r, &self.local_visible)
+    }
 
-        // An element's box: outer shadows under it, inset shadows over
-        // its background, its outline later.
-        let own_box = f.node.is_some()
-            && matches!(f.content, FragmentContent::Box | FragmentContent::Control(_) | FragmentContent::Image(_) | FragmentContent::Inline { .. });
-        let sides = match &f.content {
-            FragmentContent::Inline { left, right, .. } => [true, *right, true, *left],
-            _ => ALL_SIDES,
+    /// The device rectangle around everything the group opened at item
+    /// `i` draws, up to its `PopGroup`: each item's box grown by what
+    /// paints outside it (shadows, outlines, glyph overhang), through
+    /// its space. The group's layer is this rectangle, within the
+    /// viewport.
+    fn group_bounds(&self, i: usize, items: &[Placed<'_>]) -> KRect {
+        let mut depth = 0usize;
+        let mut bounds: Option<KRect> = None;
+        for p in &items[i + 1..] {
+            let (rect, grow) = match &p.op {
+                Op::PushGroup { .. } => {
+                    depth += 1;
+                    continue;
+                }
+                Op::PopGroup => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    continue;
+                }
+                Op::Decoration { fragment, .. } => {
+                    let spread = fragment
+                        .style
+                        .box_shadow
+                        .iter()
+                        .map(|s| s.x.abs() + s.y.abs() + s.spread.max(0.0) + 1.5 * s.blur)
+                        .fold(0.0f32, f32::max);
+                    (fragment.rect, spread)
+                }
+                Op::Content(f) => match &f.content {
+                    FragmentContent::Text(t) => (f.rect, t.font_size),
+                    _ => (f.rect, 0.0),
+                },
+                Op::Scrollbars(f) => (f.rect, 0.0),
+                Op::Outline { style, rects, .. } => {
+                    let union = rects.iter().skip(1).fold(rects[0], |u, r| u.union(r));
+                    let ring = match style.outline_style {
+                        OutlineStyle::Auto => 2.0,
+                        _ => style.outline_width,
+                    };
+                    (union, ring + style.outline_offset.max(0.0))
+                }
+            };
+            let grown = rect.inset(-grow, -grow, -grow, -grow);
+            let page = browser_layout::affine_bounds(&p.space.transform, &grown);
+            let root = if p.space.fixed { self.base } else { self.page };
+            let device = root.transform_rect_bbox(krect(&page));
+            bounds = Some(bounds.map_or(device, |b| b.union(device)));
+        }
+        let viewport = self.base.transform_rect_bbox(krect(&self.viewport));
+        match bounds {
+            Some(b) => b.inflate(1.0, 1.0).intersect(viewport),
+            None => KRect::ZERO,
+        }
+    }
+
+    /// Make `space` current: its transform over the page's (or the
+    /// viewport's, for fixed content), the visible area in its
+    /// coordinates, and its clips open in the scene.
+    fn enter_space(&mut self, space: &Space) {
+        let root = if space.fixed { self.base } else { self.page };
+        let t = &space.transform;
+        let item = Affine::new(*t);
+        self.transform = root * item;
+        self.in_transform = *t != browser_layout::IDENTITY;
+        let shown = if space.fixed { self.viewport } else { self.visible };
+        self.local_visible = match browser_layout::affine_invert(t) {
+            Some(inv) => browser_layout::affine_bounds(&inv, &shown),
+            None => Rect::default(),
         };
-        if own_box && !f.style.box_shadow.is_empty() {
+        self.fixed_area = shown;
+        self.open_clips(space.clip);
+    }
+
+    /// Open the clip chain ending at `leaf`, closing the open clips that
+    /// are not on it.
+    fn open_clips(&mut self, leaf: Option<usize>) {
+        let mut chain = Vec::new();
+        let mut cur = leaf;
+        while let Some(i) = cur {
+            chain.push(i);
+            cur = self.clips[i].parent;
+        }
+        chain.reverse();
+        let common = self
+            .clip_stack
+            .iter()
+            .zip(&chain)
+            .take_while(|((open, _), want)| *open == **want)
+            .count();
+        self.pop_clips_to(common);
+        for &i in &chain[common..] {
+            let c = &self.clips[i];
+            let root = if c.fixed { self.base } else { self.page };
+            let t = root * Affine::new(c.transform);
+            // The overflow clip is the padding box with the padding
+            // edge's radii (CSS Backgrounds 3 §5.3: the outer radii less
+            // the border widths), and for a scroll container no more
+            // than its scrollport (the gutters hold the bars, a text
+            // input's padding stays put).
+            let geometry = BoxGeometry::new(&c.fragment.rect, &c.fragment.style, ALL_SIDES);
+            self.scene
+                .push_clip_layer(Fill::NonZero, t, &geometry.inset_path(geometry.width));
+            let mut layers = 1;
+            if let Some(port) = &c.scrollport {
+                self.scene.push_clip_layer(Fill::NonZero, t, &krect(port));
+                layers += 1;
+            }
+            self.clip_stack.push((i, layers));
+        }
+    }
+
+    /// Close the open clips down to `depth` of them.
+    fn pop_clips_to(&mut self, depth: usize) {
+        while self.clip_stack.len() > depth {
+            let (_, layers) = self.clip_stack.pop().expect("deeper");
+            for _ in 0..layers {
+                self.scene.pop_layer();
+            }
+        }
+    }
+
+    /// A box's own decoration: its outer shadows under it, its
+    /// background and border, its inset shadows over the background.
+    fn decoration(&mut self, f: &Fragment, sides: [bool; 4]) {
+        if !f.style.box_shadow.is_empty() {
             self.box_shadows(f, sides, false);
         }
         match &f.content {
             FragmentContent::Box => {
-                if !offscreen && !f.node.is_some_and(|n| self.skip_background_of.contains(&n)) {
+                if !f.node.is_some_and(|n| self.skip_background_of.contains(&n)) {
                     self.background_and_border(f, ALL_SIDES);
-                } else if !offscreen {
+                } else {
                     self.border(&f.rect, &f.style, ALL_SIDES);
-                }
-            }
-            FragmentContent::Control(c) => {
-                if !offscreen {
-                    self.background_and_border(f, ALL_SIDES);
-                    self.control(&f.rect, *c);
-                }
-            }
-            FragmentContent::Anonymous | FragmentContent::Marker => {}
-            FragmentContent::Text(t) => {
-                if !offscreen {
-                    self.text(&f.rect, t, f.node);
-                }
-            }
-            FragmentContent::Image(url) => {
-                if !offscreen {
-                    self.background_and_border(f, ALL_SIDES);
-                    self.image(&f.rect, &f.style, url);
                 }
             }
             // A line fragment of an inline element: its background and the
             // edges it carries (the top and bottom on every fragment, the
             // left and right where the element starts and ends; CSS 2.1
             // §9.4.2). Corners at a missing side have no radius.
-            FragmentContent::Inline { .. } => {
-                if !offscreen {
-                    self.background_and_border(f, sides);
-                }
-            }
+            FragmentContent::Inline { .. } => self.background_and_border(f, sides),
+            FragmentContent::Control(_) | FragmentContent::Image(_) => self.background_and_border(f, ALL_SIDES),
+            FragmentContent::Anonymous | FragmentContent::Marker | FragmentContent::Text(_) => {}
         }
-        if own_box && !f.style.box_shadow.is_empty() {
+        if !f.style.box_shadow.is_empty() {
             self.box_shadows(f, sides, true);
-        }
-        if own_box
-            && f.style.outline_style.is_visible()
-            && let Some(n) = f.node
-        {
-            match self.outlines.iter_mut().find(|(node, _, _)| *node == n) {
-                Some((_, _, rects)) => rects.push(f.rect),
-                None => self.outlines.push((n, f.style.clone(), vec![f.rect])),
-            }
-        }
-
-        let scroller = f.node.filter(|_| f.is_scroll_container()).and_then(|n| self.scrollers.get(&n));
-        if !f.children.is_empty() {
-            if clips {
-                // The overflow clip is the padding box with the padding
-                // edge's radii (CSS Backgrounds 3 §5.3: the outer radii less
-                // the border widths), and for a scroll container no more
-                // than its scrollport (the gutters hold the bars, a text
-                // input's padding stays put).
-                let geometry = BoxGeometry::new(&f.rect, &f.style, ALL_SIDES);
-                self.scene
-                    .push_clip_layer(Fill::NonZero, self.transform, &geometry.inset_path(geometry.width));
-                self.clip_depth += 1;
-                if let Some(info) = scroller.filter(|i| i.scrollport != padding_box(&f.rect, &f.style)) {
-                    self.scene
-                        .push_clip_layer(Fill::NonZero, self.transform, &krect(&info.scrollport));
-                    self.clip_depth += 1;
-                }
-            }
-            for c in &f.children {
-                self.fragment(c);
-            }
-            if clips {
-                self.scene.pop_layer();
-                self.clip_depth -= 1;
-                if scroller.is_some_and(|i| i.scrollport != padding_box(&f.rect, &f.style)) {
-                    self.scene.pop_layer();
-                    self.clip_depth -= 1;
-                }
-                if self.clip_depth == 0 {
-                    self.paint_deferred_fixed();
-                }
-            }
-        }
-        // The scroll container's bars and corner, over its content.
-        if let (Some(info), Some(node)) = (scroller, f.node)
-            && !offscreen
-        {
-            self.scrollbars(node, info, &f.style);
-        }
-
-        if translucent {
-            self.scene.pop_layer();
-        }
-    }
-
-    /// The fixed boxes met inside overflow clips, painted now that none
-    /// is open.
-    fn paint_deferred_fixed(&mut self) {
-        while !self.deferred_fixed.is_empty() {
-            let pending = std::mem::take(&mut self.deferred_fixed);
-            for f in pending {
-                self.fragment(f);
-            }
         }
     }
 
@@ -545,7 +637,7 @@ impl<'a> Painter<'a> {
             border: border_box,
             padding: padding_box,
             content: content_box,
-            fixed: krect(&self.visible),
+            fixed: krect(&self.fixed_area),
             local,
         };
         let content_inset = [
@@ -641,8 +733,10 @@ impl<'a> Painter<'a> {
                 BackgroundBox::ContentBox | BackgroundBox::Text => areas.content,
             };
             let area = match attachment {
-                BackgroundAttachment::Fixed => areas.fixed,
-                BackgroundAttachment::Scroll => by_origin(areas),
+                // Inside a transformed box `fixed` is `scroll` (CSS
+                // Transforms 1 §3).
+                BackgroundAttachment::Fixed if !self.in_transform => areas.fixed,
+                BackgroundAttachment::Fixed | BackgroundAttachment::Scroll => by_origin(areas),
                 // The layer scrolls with the box's content: the area moves
                 // by the scroll offset (zero for a box that does not
                 // scroll, where `local` is `scroll`).
@@ -658,7 +752,7 @@ impl<'a> Painter<'a> {
                 continue;
             }
             // Only the tiles that reach the visible part of the clip.
-            let region = clip.bounding_box().intersect(krect(&self.visible));
+            let region = clip.bounding_box().intersect(krect(&self.local_visible));
             if region.is_zero_area() {
                 continue;
             }
@@ -980,38 +1074,32 @@ impl<'a> Painter<'a> {
     /// complex outline). `auto` is the platform focus ring: a 2px ring of
     /// the outline colour with a 1px white ring inside it, as Chrome
     /// draws it.
-    fn paint_outlines(&mut self) {
-        let outlines = std::mem::take(&mut self.outlines);
-        for (_, style, rects) in &outlines {
-            if !rects.iter().any(|r| intersects(&r.inset(-64.0, -64.0, -64.0, -64.0), &self.visible)) {
-                continue;
-            }
-            let offset = f64::from(style.outline_offset);
-            match style.outline_style {
-                OutlineStyle::Auto => self.focus_ring(style, rects, offset),
-                OutlineStyle::Border(border) if rects.len() == 1 => {
-                    let w = f64::from(style.outline_width);
-                    let r = rects[0];
-                    let outer = Rect::new(
-                        r.x - (offset + w) as f32,
-                        r.y - (offset + w) as f32,
-                        r.width + 2.0 * (offset + w) as f32,
-                        r.height + 2.0 * (offset + w) as f32,
-                    );
-                    if outer.width <= 0.0 || outer.height <= 0.0 {
-                        continue;
-                    }
-                    let mut g = BoxGeometry::new(&r, style, ALL_SIDES);
-                    g.rect = krect(&outer);
-                    g.width = [w; 4];
-                    g.radii = g.radii.map(|(x, y)| ((x + offset + w).max(0.0), (y + offset + w).max(0.0)));
-                    self.ring_with(&g, [border; 4], [style.outline_color; 4]);
+    fn outline(&mut self, style: &ComputedStyle, rects: &[Rect]) {
+        let offset = f64::from(style.outline_offset);
+        match style.outline_style {
+            OutlineStyle::Auto => self.focus_ring(style, rects, offset),
+            OutlineStyle::Border(border) if rects.len() == 1 => {
+                let w = f64::from(style.outline_width);
+                let r = rects[0];
+                let outer = Rect::new(
+                    r.x - (offset + w) as f32,
+                    r.y - (offset + w) as f32,
+                    r.width + 2.0 * (offset + w) as f32,
+                    r.height + 2.0 * (offset + w) as f32,
+                );
+                if outer.width <= 0.0 || outer.height <= 0.0 {
+                    return;
                 }
-                OutlineStyle::Border(border) => {
-                    self.complex_outline(rects, offset, f64::from(style.outline_width), border, style.outline_color);
-                }
-                OutlineStyle::None => {}
+                let mut g = BoxGeometry::new(&r, style, ALL_SIDES);
+                g.rect = krect(&outer);
+                g.width = [w; 4];
+                g.radii = g.radii.map(|(x, y)| ((x + offset + w).max(0.0), (y + offset + w).max(0.0)));
+                self.ring_with(&g, [border; 4], [style.outline_color; 4]);
             }
+            OutlineStyle::Border(border) => {
+                self.complex_outline(rects, offset, f64::from(style.outline_width), border, style.outline_color);
+            }
+            OutlineStyle::None => {}
         }
     }
 
@@ -2970,6 +3058,48 @@ mod tests {
             }
         }
         assert!(blue > 40, "an outline around the broken inline: {blue} blue pixels");
+    }
+
+    #[test]
+    fn z_index_transforms_and_opacity_groups_paint_in_order() {
+        // Red z-index 2 over blue z-index 1 over the green in-flow box
+        // (though the green comes last in the tree); a box rotated a
+        // quarter turn about its top-left paints to the left of where it
+        // was; a translated box paints where it lands; an opacity group
+        // keeps the box's shadow outside it.
+        const HTML: &str = "<body style='margin:0'>\
+            <div style='position:absolute;top:0;left:0;width:60px;height:60px;background:blue;z-index:1'></div>\
+            <div style='position:absolute;top:0;left:0;width:30px;height:30px;background:red;z-index:2'></div>\
+            <div style='position:absolute;top:0;left:0;width:100px;height:100px;background:lime'></div>\
+            <div style='position:absolute;top:100px;left:60px;width:40px;height:10px;background:blue;transform:rotate(90deg);transform-origin:0 0'></div>\
+            <div style='position:absolute;top:100px;left:120px;width:20px;height:20px;background:red;transform:translate(40px, 20px)'></div>\
+            <div style='position:absolute;top:100px;left:220px;width:30px;height:30px;background:blue;opacity:0.5;box-shadow:0 0 0 10px lime'></div>\
+            </body>";
+        let (_, _, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_red(px(&pixels, 15.0, 15.0)), "z-index 2 on top");
+        assert!(is_blue(px(&pixels, 45.0, 45.0)), "z-index 1 over the in-flow box painted later");
+        assert!(is_green(px(&pixels, 80.0, 80.0)), "the in-flow box where nothing stacked covers it");
+        assert!(is_blue(px(&pixels, 55.0, 120.0)), "the rotated box: {:?}", px(&pixels, 55.0, 120.0));
+        assert!(is_white(px(&pixels, 80.0, 105.0)), "not where it was");
+        assert!(is_red(px(&pixels, 170.0, 130.0)), "the translated box where it lands");
+        assert!(is_white(px(&pixels, 130.0, 110.0)), "and not where it was");
+        let shadow = px(&pixels, 215.0, 115.0);
+        assert!(shadow[1] > 200 && shadow[0] > 100 && shadow[2] > 100, "the half-transparent shadow outside the group's box: {shadow:?}");
+        let body = px(&pixels, 235.0, 115.0);
+        assert!(body[2] > 200 && body[0] > 100 && body[0] < 200, "the half-transparent box: {body:?}");
+    }
+
+    #[test]
+    fn fixed_boxes_stay_put_when_the_page_scrolls() {
+        const HTML: &str = "<body style='margin:0'><div style='height:2000px'>\
+            <div style='position:fixed;top:10px;left:10px;width:30px;height:30px;background:red'></div></div></body>";
+        let (_, _, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_red(px(&pixels, 25.0, 25.0)));
+        let (_, pixels) = render_with(HTML, &ImageStore::default(), 500.0, 1.0);
+        let Some(pixels) = pixels else { return };
+        assert!(is_red(px(&pixels, 25.0, 25.0)), "still at the viewport's top after a page scroll of 500");
     }
 
     #[test]

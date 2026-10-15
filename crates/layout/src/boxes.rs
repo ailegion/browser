@@ -7,8 +7,8 @@ use std::sync::Arc;
 use browser_dom::{Directionality, Document, NodeId, NodeKind, strong_direction};
 use browser_style::{
     BoxDecorationBreak, ComputedLp, ComputedLpAuto, ComputedStyle, Direction, Display, Float, FontVariant,
-    LetterSpacing, ListStylePosition, ListStyleType, Overflow, Rgba, Sides, StyleMap, TextTransform, UnicodeBidi,
-    WhiteSpace,
+    LetterSpacing, ListStylePosition, ListStyleType, Overflow, Position, Rgba, Sides, StyleMap, TextTransform,
+    UnicodeBidi, WhiteSpace,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -141,6 +141,12 @@ pub(crate) struct BoxNode {
     /// line); its fragment is moved left of the content edge by its
     /// width.
     pub hangs: bool,
+    /// A `position: fixed` box whose containing block is the viewport
+    /// (no ancestor with a transform or the like, CSS Transforms 1 §3):
+    /// laid out as a child of the viewport's node (4a block 6), a
+    /// zero-size placeholder left in its place for its static position.
+    pub fixed: bool,
+    pub placeholder: Option<TaffyId>,
 }
 
 impl BoxNode {
@@ -156,6 +162,8 @@ impl BoxNode {
             scroll: None,
             marker: None,
             hangs: false,
+            fixed: false,
+            placeholder: None,
         }
     }
 
@@ -1044,8 +1052,22 @@ impl BoxBuilder<'_> {
         b
     }
 
+    /// Whether a `position: fixed` element's containing block is the
+    /// viewport: no ancestor has a transform, a `perspective` or a
+    /// `will-change` promising one (CSS Transforms 1 §3).
+    fn fixed_to_viewport(&self, id: NodeId, style: &ComputedStyle) -> bool {
+        style.position == Position::Fixed
+            && !self.doc.ancestors(id).any(|a| self.styles.get(a).is_some_and(|s| s.contains_fixed()))
+    }
+
     /// Build a block-level or atomic box for an element.
     fn build_element(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
+        let mut b = self.build_element_box(id, style, depth);
+        b.fixed = self.fixed_to_viewport(id, &b.style);
+        b
+    }
+
+    fn build_element_box(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
         let style = if self.viewport_source == Some(id) { visible_overflow(&style) } else { style };
         if let Some(kind) = self.control_kind(id) {
             let mut b = self.build_control(id, style, kind);

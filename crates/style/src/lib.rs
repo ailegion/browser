@@ -19,6 +19,7 @@ pub mod selector_impl;
 pub mod serialize;
 pub mod state;
 pub mod stylesheet;
+pub mod transform;
 pub mod ua;
 pub mod values;
 

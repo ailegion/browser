@@ -16,17 +16,20 @@ mod decor;
 mod engine;
 mod lines;
 pub mod selection;
+pub mod stacking;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use browser_dom::NodeId;
+use browser_style::transform::Matrix4;
 use browser_style::{ComputedStyle, Overflow, Position, Rgba, ScrollbarWidth, Sides, TextDecorationStyle, ViewportOverflow};
 use url::Url;
 
 pub use engine::{LayoutEngine, layout_document};
 pub use parley::FontData;
 pub use selection::{SelectionRanges, TextPos};
+pub use stacking::{ClipNode, Op, PaintList, Placed, Space};
 
 /// Axis-aligned rectangle in page pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -582,6 +585,76 @@ pub enum FragmentContent {
     },
 }
 
+/// The transform of a box (CSS Transforms 1 §6, 2 §13): its matrix
+/// about its `transform-origin`, relative to the border box's top-left
+/// corner (so it is unchanged when the box is moved), and how it
+/// combines with the boxes inside it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoxTransform {
+    pub matrix: Matrix4,
+    /// `transform-style: preserve-3d`: the children's matrices multiply
+    /// into this one in 3D rather than onto its flattened projection.
+    pub preserve_3d: bool,
+    /// `backface-visibility: hidden`: the box and everything in it is not
+    /// drawn (nor hit) while its accumulated matrix shows its back.
+    pub hide_backface: bool,
+}
+
+/// A 2D affine `[a, b, c, d, e, f]` (kurbo's order): `x' = a·x + c·y +
+/// e`, `y' = b·x + d·y + f`. Page coordinates to page coordinates.
+pub type Affine2 = [f64; 6];
+
+pub const IDENTITY: Affine2 = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `a ∘ b`: `b` applied first.
+pub fn affine_mul(a: &Affine2, b: &Affine2) -> Affine2 {
+    [
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    ]
+}
+
+pub fn affine_apply(a: &Affine2, x: f64, y: f64) -> (f64, f64) {
+    (a[0] * x + a[2] * y + a[4], a[1] * x + a[3] * y + a[5])
+}
+
+/// The inverse, or `None` when the affine is singular (`scale(0)`): a
+/// box that is not drawn and can not be hit.
+pub fn affine_invert(a: &Affine2) -> Option<Affine2> {
+    let det = a[0] * a[3] - a[1] * a[2];
+    if det == 0.0 || !det.is_finite() {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let (ia, ib, ic, id) = (a[3] * inv, -a[1] * inv, -a[2] * inv, a[0] * inv);
+    Some([ia, ib, ic, id, -(ia * a[4] + ic * a[5]), -(ib * a[4] + id * a[5])])
+}
+
+/// The smallest rectangle around `r` transformed by `a`.
+pub fn affine_bounds(a: &Affine2, r: &Rect) -> Rect {
+    if *a == IDENTITY {
+        return *r;
+    }
+    let corners = [
+        affine_apply(a, f64::from(r.x), f64::from(r.y)),
+        affine_apply(a, f64::from(r.right()), f64::from(r.y)),
+        affine_apply(a, f64::from(r.x), f64::from(r.bottom())),
+        affine_apply(a, f64::from(r.right()), f64::from(r.bottom())),
+    ];
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for (x, y) in corners {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32)
+}
+
 /// A positioned box. `rect` is the border box in page coordinates.
 #[derive(Debug, Clone)]
 pub struct Fragment {
@@ -594,6 +667,17 @@ pub struct Fragment {
     /// `getComputedStyle` reports); zero for text and anonymous boxes.
     pub padding: browser_style::Sides<f32>,
     pub margin: browser_style::Sides<f32>,
+    /// The box's own transform, if it has one (4a block 6). `rect` is the
+    /// box before it; the painter and hit testing apply it, and the
+    /// transforms of the boxes above, to the box and everything in it.
+    pub transform: Option<Arc<BoxTransform>>,
+    /// A `position: fixed` box whose containing block is the viewport
+    /// (no transformed ancestor): `rect` is in viewport coordinates,
+    /// which no scroll moves, and no overflow above it clips it. The pair
+    /// says whether its horizontal and vertical positions are static
+    /// ones (both insets of the axis `auto`), decided from where it would
+    /// have been in flow.
+    pub fixed: Option<(bool, bool)>,
 }
 
 impl Fragment {
@@ -606,11 +690,37 @@ impl Fragment {
                 || !matches!(self.style.overflow_y, Overflow::Visible))
     }
 
+    /// Move this box and its descendants as layout places it (an atomic
+    /// into its line): a fixed box inside moves only along the axes
+    /// where it sits at its static position, which moves with the flow.
     fn translate(&mut self, dx: f32, dy: f32) {
+        let (dx, dy) = match self.fixed {
+            Some((sx, sy)) => (if sx { dx } else { 0.0 }, if sy { dy } else { 0.0 }),
+            None => (dx, dy),
+        };
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
         self.rect = self.rect.translate(dx, dy);
         for c in &mut self.children {
             c.translate(dx, dy);
         }
+    }
+
+    /// The box's transform in page coordinates, flattened: `None` when it
+    /// has none. `parent_3d` is the accumulated 3D matrix of a
+    /// `preserve-3d` parent, which this box's matrix multiplies into.
+    /// Returns the accumulated 3D matrix (for this box's own `preserve-3d`
+    /// children) and its flattened affine, and whether its back shows.
+    pub fn page_matrix(&self, parent_3d: Option<&Matrix4>) -> Option<(Matrix4, Affine2, bool)> {
+        let t = self.transform.as_ref()?;
+        let (x, y) = (f64::from(self.rect.x), f64::from(self.rect.y));
+        let own = Matrix4::translate(x, y, 0.0).mul(&t.matrix).mul(&Matrix4::translate(-x, -y, 0.0));
+        let acc = match parent_3d {
+            Some(p) => p.mul(&own),
+            None => own,
+        };
+        Some((acc, acc.to_affine(), acc.backface_turned()))
     }
 
     /// Whether this is an element's scroll container box: `overflow`
@@ -623,11 +733,101 @@ impl Fragment {
             && (scrolls(self.style.overflow_x) || scrolls(self.style.overflow_y))
     }
 
-    /// A `position: fixed` box: it stays put when a scroll container
-    /// above it scrolls, and no overflow above it clips it.
+    /// A `position: fixed` box whose containing block is the viewport: it
+    /// stays put when anything scrolls, and no overflow above it clips it.
     pub fn is_fixed(&self) -> bool {
-        self.node.is_some() && self.style.position == Position::Fixed && !matches!(self.content, FragmentContent::Inline { .. })
+        self.fixed.is_some()
     }
+
+    /// Whether the point (in this box's coordinates) is inside the border
+    /// box, its corners rounded by `border-radius` (CSS Backgrounds 3
+    /// §5): a point outside a rounded corner is not on the box.
+    pub fn contains_rounded(&self, x: f32, y: f32) -> bool {
+        rounded_contains(&self.rect, &self.style, x, y)
+    }
+}
+
+/// Whether `(x, y)` is inside `rect` with the corners of `style`'s
+/// `border-radius` (resolved against the box and scaled down together so
+/// no side's corners overlap, §5.5).
+pub fn rounded_contains(rect: &Rect, style: &ComputedStyle, x: f32, y: f32) -> bool {
+    rounded_contains_inset(rect, style, [0.0; 4], x, y)
+}
+
+/// `rounded_contains` for the box inset by `[top, right, bottom, left]`
+/// (the padding box when the insets are the border widths), whose
+/// corner radii are the outer ones less the adjacent insets (§5.3).
+pub fn rounded_contains_inset(rect: &Rect, style: &ComputedStyle, inset: [f32; 4], x: f32, y: f32) -> bool {
+    let outer = *rect;
+    let rect = &outer.inset(inset[0], inset[1], inset[2], inset[3]);
+    if !rect.contains(x, y) {
+        return false;
+    }
+    let (w, h) = (outer.width.max(0.0), outer.height.max(0.0));
+    let radius = |v: browser_style::ComputedLp| -> (f32, f32) {
+        match v {
+            browser_style::ComputedLp::Px(px) => (px.max(0.0), px.max(0.0)),
+            browser_style::ComputedLp::Percent(p) => {
+                let p = p.max(0.0) / 100.0;
+                (p * w, p * h)
+            }
+        }
+    };
+    let mut radii = [
+        radius(style.border_radius.top),
+        radius(style.border_radius.right),
+        radius(style.border_radius.bottom),
+        radius(style.border_radius.left),
+    ];
+    if radii.iter().all(|r| r.0 <= 0.0 || r.1 <= 0.0) {
+        return true;
+    }
+    let fit = |len: f32, sum: f32| if sum > len && sum > 0.0 { len / sum } else { 1.0 };
+    let f = fit(w, radii[0].0 + radii[1].0)
+        .min(fit(w, radii[3].0 + radii[2].0))
+        .min(fit(h, radii[0].1 + radii[3].1))
+        .min(fit(h, radii[1].1 + radii[2].1));
+    if f < 1.0 {
+        for r in &mut radii {
+            r.0 *= f;
+            r.1 *= f;
+        }
+    }
+    // The inner radii: each less the inset on its two sides.
+    let (t, r, b, l) = (inset[0], inset[1], inset[2], inset[3]);
+    radii[0] = ((radii[0].0 - l).max(0.0), (radii[0].1 - t).max(0.0));
+    radii[1] = ((radii[1].0 - r).max(0.0), (radii[1].1 - t).max(0.0));
+    radii[2] = ((radii[2].0 - r).max(0.0), (radii[2].1 - b).max(0.0));
+    radii[3] = ((radii[3].0 - l).max(0.0), (radii[3].1 - b).max(0.0));
+    if radii.iter().all(|r| r.0 <= 0.0 || r.1 <= 0.0) {
+        return true;
+    }
+    // Corner centres: top-left, top-right, bottom-right, bottom-left.
+    let centres = [
+        (rect.x + radii[0].0, rect.y + radii[0].1),
+        (rect.right() - radii[1].0, rect.y + radii[1].1),
+        (rect.right() - radii[2].0, rect.bottom() - radii[2].1),
+        (rect.x + radii[3].0, rect.bottom() - radii[3].1),
+    ];
+    for (i, ((cx, cy), (rx, ry))) in centres.iter().zip(radii).enumerate() {
+        if rx <= 0.0 || ry <= 0.0 {
+            continue;
+        }
+        let (dx, dy) = (x - cx, y - cy);
+        let in_corner = match i {
+            0 => dx < 0.0 && dy < 0.0,
+            1 => dx > 0.0 && dy < 0.0,
+            2 => dx > 0.0 && dy > 0.0,
+            _ => dx < 0.0 && dy > 0.0,
+        };
+        if in_corner && (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) > 1.0 {
+            return false;
+        }
+    }
+    true
+}
+
+impl Fragment {
 
     /// Move this fragment and its descendants by `(dx, dy)` as a scroll
     /// does: fixed boxes stay, and the scroll containers inside keep
@@ -770,44 +970,68 @@ impl LayoutTree {
         found
     }
 
-    /// The innermost fragment with a node at the point, if any. A scroll
+    /// The topmost fragment with a node at the page point, if any: the
+    /// last one in paint order (`paint_list`) whose box is under the
+    /// point, through the transforms and clips above it. A scroll
     /// container's content is reachable through its scrollport only; a
-    /// point on its scrollbars or border is the element itself.
+    /// point on its scrollbars or border is the element itself. A fixed
+    /// box is where it shows for the page scroll last set
+    /// (`set_page_scroll`).
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
-        /// The fixed boxes in a clipped subtree are not clipped by it:
-        /// they are still hit.
-        fn visit_fixed(f: &Fragment, x: f32, y: f32, best: &mut Option<NodeId>, scrollers: &HashMap<NodeId, ScrollInfo>) {
-            for c in &f.children {
-                if c.is_fixed() {
-                    visit(c, x, y, best, scrollers);
-                } else {
-                    visit_fixed(c, x, y, best, scrollers);
-                }
+        self.paint_list().hit_test(x, y, self.viewport.offset)
+    }
+
+    /// Everything to paint, in paint order (CSS 2.1 Appendix E with the
+    /// stacking contexts, transforms and clips of 4a block 6).
+    pub fn paint_list(&self) -> PaintList<'_> {
+        stacking::build(self)
+    }
+
+    /// Where a layout rectangle in `space` shows, in page coordinates:
+    /// the bounds of the rectangle through the space's transform, and
+    /// for fixed content moved by the page scroll last set.
+    pub fn shown_rect(&self, space: &Space, rect: &Rect) -> Rect {
+        let r = affine_bounds(&space.transform, rect);
+        if space.fixed { r.translate(self.viewport.offset.0, self.viewport.offset.1) } else { r }
+    }
+
+    /// `first_rect`, as the box shows (`shown_rect`).
+    pub fn first_shown_rect(&self, matches: impl Fn(NodeId) -> bool) -> Option<Rect> {
+        let mut found = None;
+        self.root.walk(&mut |f| {
+            if found.is_none()
+                && let Some(n) = f.node
+                && matches(n)
+            {
+                found = Some((n, f.rect));
             }
-        }
-        fn visit(f: &Fragment, x: f32, y: f32, best: &mut Option<NodeId>, scrollers: &HashMap<NodeId, ScrollInfo>) {
-            let inside = f.rect.contains(x, y);
-            // `pointer-events: none`: the box is not hit; what it contains
-            // still is where it says otherwise (the value inherits).
-            if inside && f.node.is_some() && f.style.pointer_events != browser_style::PointerEvents::None {
-                *best = f.node;
+        });
+        let (n, rect) = found?;
+        let list = self.paint_list();
+        let space = list.spaces.get(&n).copied().unwrap_or(Space::ROOT);
+        Some(self.shown_rect(&space, &rect))
+    }
+
+    /// The page point `(x, y)` relative to the top-left corner of the
+    /// first box whose node `matches`, in that box's own coordinates
+    /// (through the transforms above it), for `offsetX`/`offsetY`.
+    pub fn offset_in_first(&self, matches: impl Fn(NodeId) -> bool, x: f32, y: f32) -> Option<(f32, f32)> {
+        let mut found = None;
+        self.root.walk(&mut |f| {
+            if found.is_none()
+                && let Some(n) = f.node
+                && matches(n)
+            {
+                found = Some((n, f.rect));
             }
-            if let Some(info) = f.node.filter(|_| f.is_scroll_container()).and_then(|n| scrollers.get(&n)) {
-                if !info.scrollport.contains(x, y) {
-                    visit_fixed(f, x, y, best, scrollers);
-                    return;
-                }
-            } else if !inside && f.clips_children() {
-                visit_fixed(f, x, y, best, scrollers);
-                return;
-            }
-            for c in &f.children {
-                visit(c, x, y, best, scrollers);
-            }
-        }
-        let mut best = None;
-        visit(&self.root, x, y, &mut best, &self.scrollers);
-        best
+        });
+        let (n, rect) = found?;
+        let list = self.paint_list();
+        let space = list.spaces.get(&n).copied().unwrap_or(Space::ROOT);
+        let (px, py) = if space.fixed { (x - self.viewport.offset.0, y - self.viewport.offset.1) } else { (x, y) };
+        let inv = affine_invert(&space.transform)?;
+        let (lx, ly) = affine_apply(&inv, f64::from(px), f64::from(py));
+        Some((lx as f32 - rect.x, ly as f32 - rect.y))
     }
 }
 
