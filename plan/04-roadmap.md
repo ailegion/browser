@@ -1868,7 +1868,8 @@ Work:
       pointer cursor, select-all leaving `none` text out, a press
       selecting a `user-select: all` element, a drag kept inside a
       `contain` one).
-      **Block 6 done 2026-10-16: `z-index`, `transform`, stacking
+      **Block 6 NOT DONE 2026-10-16 (built with two SKIPPED parts, see
+      the end of this record): `z-index`, `transform`, stacking
       contexts, paint order, hit testing through transforms, `position:
       fixed` against the viewport.** Style (`crates/style`): `z-index`
       (`auto` or an integer), `transform` (`none` or a list of every CSS
@@ -1962,10 +1963,11 @@ Work:
       order over tree order, a rotated and a translated box, a shadow
       outside an opacity group, a fixed box after a page scroll), tab
       (hover by z-index, hover and client rectangle of a translated box,
-      a fixed box hovered after a page scroll). SKIPPED, recorded as
-      `05-risks` O22 for the owner: `perspective`/`perspective()`
-      (projective rendering; vello draws affine only) and depth sorting
-      inside a `preserve-3d` context (painted in stacking order).
+      a fixed box hovered after a page scroll). SKIPPED, to be built
+      before the block counts: `perspective`/`perspective()` (projective
+      rendering; vello draws affine only, so the projection is dropped
+      today) and depth sorting inside a `preserve-3d` context (painted in
+      stacking order today).
       (6) `z-index` and `transform`/`transform-origin`
       with stacking contexts, paint order and hit testing through
       transforms; (7) `grid-*` through taffy grid; (8) `transition-*`,
