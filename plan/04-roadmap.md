@@ -5,6 +5,45 @@ there are no time estimates. Do not start a phase until the previous one's
 criteria pass. Within a phase, the order of the work list is the recommended
 build order.
 
+## Working sites first (2026-10-16, owner's direction)
+
+Start here, in order, one line per turn, before anything else in this
+file. Each line names the plan entry it comes from and the part to
+build now; the rest of that entry stays there for later. The usual flow
+holds per line: build, test, report with the per-item lines, stop. Tick
+a line when done. After line 8, continue at 4a block 7 and the
+remaining lists as they stand.
+
+- [ ] 1. From Phase 1 item 1 (net), O2 and O16: TLS checked and fixed on
+      real hosts; gzip, brotli, redirects verified live; cookies sent
+      and stored, `document.cookie`. Later: SameSite with initiator,
+      public suffix list (O16 a, b).
+- [ ] 2. From O1: JPEG decoded and shown. Later: decoder choice.
+- [ ] 3. Tables (new 4a entry): table/row/cell boxes, colspan/rowspan,
+      auto column widths, borders and padding. Later: captions,
+      border-collapse, table-layout: fixed, column groups.
+- [ ] 4. Positioned containing block (new 4a entry; the deviation is
+      noted in the 4a block 6 record): absolute and fixed boxes sized
+      and placed against the nearest positioned or transformed
+      ancestor's padding box, static position kept. Later: nothing.
+- [ ] 5. From 4a block 7 (grid): grid-template-rows/columns with
+      lengths, fr, repeat, minmax, auto; gap; auto placement; line
+      spans. Later: named areas, auto-fill/fit, alignment keywords,
+      subgrid.
+- [ ] 6. Web fonts (new 4a entry): `@font-face` with url()+format,
+      fetched through net, used by parley, system fallback until loaded.
+      Later: unicode-range, font-display, local().
+- [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
+      `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
+      `history.pushState`/`popstate`, `MutationObserver`,
+      `IntersectionObserver`; plus `document.elementFromPoint`/
+      `elementsFromPoint` (new, next to the 3.3.4 geometry).
+      `requestAnimationFrame` exists (Phase 3 item 1). Later: streams,
+      AbortController, ResizeObserver, custom elements and shadow DOM.
+- [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
+      the encodings, control values, form events, navigation on submit.
+      Later: validation UI, file inputs, the owner's 2026-10-09 additions.
+
 ## Phase 0: Skeleton, policy, one resolved crate set
 
 **Status: done 2026-09-26.** Workspace builds on Windows (x86_64-pc-windows-gnu),
