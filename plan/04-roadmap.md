@@ -18,6 +18,25 @@ remaining lists as they stand.
       real hosts; gzip, brotli, redirects verified live; cookies sent
       and stored, `document.cookie`. Later: SameSite with initiator,
       public suffix list (O16 a, b).
+      Built 2026-10-16, not ticked (one SKIPPED part). Live run
+      (`cargo test -p browser-net -- --ignored live_sites`): TLS with the
+      pure-Rust provider handshakes with google, youtube, wikipedia,
+      github, bbc, cloudflare, iana, amazon, reddit, stackoverflow; gzip
+      and brotli bodies decode; `http://github.com` redirects to https
+      and is followed; the sites' cookies land in the jar. `User-Agent`
+      is now Chrome's frozen format per platform (`net::USER_AGENT`;
+      google served a 86 KB page to the bare token and the full 220 KB
+      one to it; Edge/Brave/Opera do the same). `document.cookie`
+      (`script::CookieAccess`, `tab::TabCookies`, `CookieJar::
+      script_cookie_string`/`store_from_script`): reads leave HttpOnly
+      cookies out, writes cannot set or replace an HttpOnly cookie,
+      `data:`/`about:` documents throw SecurityError as Chrome does.
+      SKIPPED: amazon.com answers 202 and stackoverflow.com 403 with bot
+      challenge pages that Chrome does not get; their detection keys on
+      the TLS ClientHello and HTTP/2 fingerprint (cipher and extension
+      order, GREASE), which rustls does not let a client shape. Passing
+      needs a crate decision (a vendored rustls hello builder) under
+      `03-crates.md`; owner to rule.
 - [ ] 2. From O1: JPEG decoded and shown. Later: decoder choice.
 - [ ] 3. Tables (new 4a entry): table/row/cell boxes, colspan/rowspan,
       auto column widths, borders and padding. Later: captions,

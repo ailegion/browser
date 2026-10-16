@@ -9,6 +9,20 @@ use browser_ipc_types::{Cursor, Key, MouseButton, NetToTab, RequestId, ShellToTa
 use browser_layout::selection::{self, TextPos};
 use browser_layout::{LayoutEngine, LayoutTree, Rect, ScrollbarPart, SelectionRanges};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
+
+/// `document.cookie` over the browser's jar (HTML §7.9.2): reads leave
+/// `HttpOnly` cookies out, writes go through the jar's non-HTTP rules.
+struct TabCookies(Arc<NetService>);
+
+impl browser_script::CookieAccess for TabCookies {
+    fn cookie_string(&self, url: &Url) -> String {
+        self.0.cookies().script_cookie_string(url, std::time::SystemTime::now())
+    }
+
+    fn set_cookie(&self, url: &Url, value: &str) {
+        self.0.cookies().store_from_script(url, value, std::time::SystemTime::now());
+    }
+}
 use browser_paint::scrollbar::{ScrollbarState, draw_corner_colored, draw_scrollbar};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_script::{
@@ -2410,14 +2424,20 @@ impl TabState {
     const FRAME: std::time::Duration = std::time::Duration::from_micros(16_667);
 
     /// A new document gets a new context; the old one's timers, frames
-    /// and waiting scripts die with it.
+    /// and waiting scripts die with it. `document.cookie` reads and
+    /// writes the browser's jar directly (`TabCookies`), so a cookie a
+    /// script sets goes on the next request and a cookie a response set
+    /// is readable at once.
     fn new_script_host(&mut self) {
         self.frame_due = None;
         self.doc_started = std::time::Instant::now();
         self.scripts = Scripts::default();
         self.lifecycle = Lifecycle::Loading;
         self.script = match ScriptHost::new(self.url.clone(), browser_net::USER_AGENT) {
-            Ok(host) => Some(host),
+            Ok(mut host) => {
+                host.set_cookie_access(std::rc::Rc::new(TabCookies(self.net.clone())));
+                Some(host)
+            }
             Err(e) => {
                 tracing::error!(tab = self.id.0, "script context: {e}");
                 None
@@ -2427,7 +2447,7 @@ impl TabState {
 
     /// Run `f` on the script host with the document lent to it, so the
     /// DOM bindings can read and write it, and take the document back
-    /// after. The document is moved, not borrowed: it comes out of the
+    /// after. (See `TabCookies` for what `document.cookie` reaches.) The document is moved, not borrowed: it comes out of the
     /// blocked parser while the page parses and out of `doc` after, and
     /// goes back to the same place. Nothing else touches it meanwhile,
     /// since `f` only sees the host.
@@ -6284,6 +6304,27 @@ mod tests {
         assert_eq!(run_js(&mut h, "var f = document.getElementById('fixed').getBoundingClientRect(); [f.left, f.top, document.getElementById('fixed').offsetTop].join('|')"), "\"400|20|20\"");
         // The resolved transform is the matrix.
         assert_eq!(run_js(&mut h, "getComputedStyle(document.getElementById('moved')).transform"), "\"matrix(1, 0, 0, 1, 300, 0)\"");
+    }
+
+    #[test]
+    fn document_cookie_reads_and_writes_the_jar_and_is_disabled_on_data_urls() {
+        let server = Server::start(&[("/page", "text/html; charset=utf-8", "<p>cookies</p>")], &[]);
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| !h.state.is_loading());
+        assert_eq!(run_js(&mut h, "document.cookie"), "\"\"");
+        assert_eq!(
+            run_js(&mut h, "document.cookie = 'a=1'; document.cookie = 'b=2; path=/'; document.cookie = 'h=3; HttpOnly'; document.cookie"),
+            "\"a=1; b=2\""
+        );
+        // The jar has them; the next request to the server carries them.
+        assert_eq!(h.state.net.cookies().len(), 2);
+        assert_eq!(run_js(&mut h, "document.cookie = 'a=; max-age=0'; document.cookie"), "\"b=2\"");
+        // A `data:` document has an opaque origin: SecurityError.
+        let mut d = Harness::load("<p>x</p>");
+        assert_eq!(
+            run_js(&mut d, "try { document.cookie } catch (e) { e.name + ': ' + e.message }"),
+            "\"SecurityError: Failed to read the 'cookie' property from 'Document': Cookies are disabled inside 'data:' URLs.\""
+        );
     }
 
     #[test]

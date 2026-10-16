@@ -31,7 +31,21 @@ pub use cookies::{CookieJar, SameSite, StoredCookie};
 use decode::Decoder;
 
 /// The user agent string sent with every request.
-pub const USER_AGENT: &str = concat!("browser/", env!("CARGO_PKG_VERSION"));
+/// The `User-Agent` sent and reported (`navigator.userAgent`): Chrome's
+/// frozen format for the platform, as every Chromium-family browser
+/// (Edge, Brave, Opera) presents itself, because sites serve unknown
+/// agents degraded or blocked pages (Stack Overflow's front answers 403
+/// to a bare token; see the live test). The major version is a fixed
+/// token to bump with releases.
+#[cfg(target_os = "windows")]
+pub const USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+#[cfg(target_os = "macos")]
+pub const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub const USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
 /// Redirects followed before giving up.
 const MAX_REDIRECTS: usize = 20;
@@ -561,6 +575,74 @@ mod tests {
 
     fn has_header(headers: &[(String, String)], name: &str) -> bool {
         headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    }
+
+    /// Real hosts over TLS with the pure-Rust provider: the handshake,
+    /// the cipher suites they pick, compressed bodies, redirects and
+    /// cookies. Needs the network: `cargo test -p browser-net -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_sites_load_over_tls_with_compression_redirects_and_cookies() {
+        let svc = NetService::new().unwrap();
+        let sites = [
+            "https://www.google.com/",
+            "https://www.youtube.com/",
+            "https://www.wikipedia.org/",
+            "https://github.com/",
+            "https://www.bbc.com/",
+            "https://www.cloudflare.com/",
+            "https://www.iana.org/",
+            "https://www.amazon.com/",
+            "https://www.reddit.com/",
+            "https://stackoverflow.com/",
+        ];
+        let mut failures = Vec::new();
+        for site in sites {
+            let request = FetchRequest::get(Url::parse(site).unwrap());
+            match fetch_live(&svc, request) {
+                Ok(f) => {
+                    let text = String::from_utf8_lossy(&f.body).to_ascii_lowercase();
+                    let encoding = f.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-encoding")).map(|(_, v)| v.clone());
+                    eprintln!("{site}: {} {} bytes, encoding {encoding:?}", f.status, f.body.len());
+                    if f.status >= 400 || !text.contains("<html") {
+                        failures.push(format!("{site}: status {} body {} bytes without <html", f.status, f.body.len()));
+                    }
+                }
+                Err(e) => failures.push(format!("{site}: {e}")),
+            }
+        }
+        // Plain http redirects to https and is followed.
+        match fetch_live(&svc, FetchRequest::get(Url::parse("http://github.com/").unwrap())) {
+            Ok(f) if f.status == 200 => {}
+            Ok(f) => failures.push(format!("http://github.com/: status {}", f.status)),
+            Err(e) => failures.push(format!("http://github.com/: {e}")),
+        }
+        assert!(!svc.cookies().is_empty(), "the sites set cookies");
+        assert!(failures.is_empty(), "live failures:\n{}", failures.join("\n"));
+    }
+
+    fn fetch_live(svc: &NetService, request: FetchRequest) -> Result<Fetched, String> {
+        let (tx, rx): (_, Receiver<NetToTab>) = channel();
+        let sink: Sink = Arc::new(move |ev| {
+            let _ = tx.send(ev);
+        });
+        svc.fetch(RequestId(1), request, sink);
+        let mut out = Fetched {
+            status: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        loop {
+            match rx.recv_timeout(Duration::from_secs(40)).map_err(|_| "no answer in 40 s".to_owned())? {
+                NetToTab::ResponseStart { status, headers, .. } => {
+                    out.status = status;
+                    out.headers = headers;
+                }
+                NetToTab::ResponseChunk { bytes, .. } => out.body.extend(bytes),
+                NetToTab::ResponseEnd { .. } => return Ok(out),
+                NetToTab::Failed { error, .. } => return Err(error),
+            }
+        }
     }
 
     #[test]

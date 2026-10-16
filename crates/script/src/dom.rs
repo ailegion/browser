@@ -606,6 +606,9 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     );
     let set_domain = setter(class.context(), "domain", NativeFunction::from_fn_ptr(document_set_domain));
     class.accessor(js_string!("domain"), Some(get_domain), Some(set_domain), ATTR);
+    let get_cookie = getter(class.context(), "cookie", NativeFunction::from_fn_ptr(crate::document_get_cookie));
+    let set_cookie = setter(class.context(), "cookie", NativeFunction::from_fn_ptr(crate::document_set_cookie));
+    class.accessor(js_string!("cookie"), Some(get_cookie), Some(set_cookie), ATTR);
 
     let context = class.context();
     let global = context.global_object();

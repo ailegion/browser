@@ -477,10 +477,22 @@ pub enum HostRequest {
     SetTitle(String),
 }
 
+/// The browser's cookie jar as `document.cookie` sees it (HTML §7.9.2,
+/// "cookie-string" and "set-cookie-string" of the non-HTTP API): the
+/// tab implements it over the net crate's jar.
+pub trait CookieAccess {
+    /// The cookies for `url` a script may read, `; `-separated; empty
+    /// when none.
+    fn cookie_string(&self, url: &Url) -> String;
+    /// Store a cookie a script set for `url`.
+    fn set_cookie(&self, url: &Url, value: &str);
+}
+
 #[derive(Default)]
 struct HostState {
     info: DocumentInfo,
     requests: Vec<HostRequest>,
+    cookies: Option<Rc<dyn CookieAccess>>,
 }
 
 type SharedHost = Rc<RefCell<HostState>>;
@@ -597,6 +609,45 @@ pub(crate) fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut 
 /// origin per document and no frames to relax it against.
 pub(crate) fn document_set_domain(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
+}
+
+/// `document.cookie` (HTML §7.9.2): the jar's cookies for the document's
+/// URL, `HttpOnly` ones left out. A document whose origin is opaque
+/// (`data:`, `about:`) throws a `SecurityError`, as Chrome does
+/// ("Cookies are disabled inside 'data:' URLs").
+pub(crate) fn document_get_cookie(_: &JsValue, _: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let host = host_state(context)?;
+    let (url, cookies) = {
+        let state = host.borrow();
+        (current_url(&state.info), state.cookies.clone())
+    };
+    let url = cookie_url(url, "read", context)?;
+    Ok(js_str(&cookies.map(|c| c.cookie_string(&url)).unwrap_or_default()))
+}
+
+pub(crate) fn document_set_cookie(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let value = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let host = host_state(context)?;
+    let (url, cookies) = {
+        let state = host.borrow();
+        (current_url(&state.info), state.cookies.clone())
+    };
+    let url = cookie_url(url, "set", context)?;
+    if let Some(c) = cookies {
+        c.set_cookie(&url, &value);
+    }
+    Ok(JsValue::undefined())
+}
+
+fn cookie_url(url: Url, what: &str, context: &mut Context) -> JsResult<Url> {
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        scheme => Err(crate::dom::dom_exception(
+            "SecurityError",
+            &format!("Failed to {what} the 'cookie' property from 'Document': Cookies are disabled inside '{scheme}:' URLs."),
+            context,
+        )),
+    }
 }
 
 fn string_list_item(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
@@ -774,6 +825,7 @@ impl ScriptHost {
                 quirks: false,
             },
             requests: Vec::new(),
+            cookies: None,
         }));
         let mut context = ContextBuilder::new()
             .job_executor(executor.clone())
@@ -936,6 +988,11 @@ impl ScriptHost {
     /// Keep what `location` and `document` report current. `charset` is
     /// the encoding's standard name; `quirks` whether the parser put the
     /// document in quirks mode.
+    /// Give `document.cookie` the browser's jar.
+    pub fn set_cookie_access(&mut self, access: Rc<dyn CookieAccess>) {
+        self.host.borrow_mut().cookies = Some(access);
+    }
+
     pub fn set_document_info(&mut self, url: Option<Url>, title: String, ready_state: &str, charset: &str, quirks: bool) {
         let mut state = self.host.borrow_mut();
         state.info.url = url;

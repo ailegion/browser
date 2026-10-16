@@ -85,10 +85,48 @@ impl CookieJar {
     /// Store one `Set-Cookie` header value received from `url`. Returns
     /// whether the cookie was accepted.
     pub fn store(&mut self, url: &Url, set_cookie: &str, now: SystemTime) -> bool {
+        self.store_with(url, set_cookie, now, true)
+    }
+
+    /// Store a cookie set by a script (`document.cookie = `, RFC 6265
+    /// §5.3 steps 10 and 11.2 for the non-HTTP API): a cookie carrying
+    /// `HttpOnly` is ignored, and an existing `HttpOnly` cookie of the
+    /// same name, domain and path is left alone.
+    pub fn store_from_script(&mut self, url: &Url, set_cookie: &str, now: SystemTime) -> bool {
+        self.store_with(url, set_cookie, now, false)
+    }
+
+    /// The `Cookie` string a script reads (`document.cookie`): every
+    /// cookie that would go on a request to `url`, `HttpOnly` ones left
+    /// out, in the request order. Empty when none applies.
+    pub fn script_cookie_string(&mut self, url: &Url, now: SystemTime) -> String {
+        let http_only: Vec<(String, String)> = self
+            .iter()
+            .filter(|c| c.http_only)
+            .map(|c| (c.name.clone(), c.value.clone()))
+            .collect();
+        let Some(header) = self.cookie_header(url, now) else { return String::new() };
+        if http_only.is_empty() {
+            return header;
+        }
+        header
+            .split("; ")
+            .filter(|pair| {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                !http_only.iter().any(|(n, v)| n == name && v == value)
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn store_with(&mut self, url: &Url, set_cookie: &str, now: SystemTime, from_http: bool) -> bool {
         let Some(host) = request_host(url) else { return false };
         let Ok(parsed) = cookie::Cookie::parse(set_cookie.to_owned()) else {
             return false;
         };
+        if !from_http && parsed.http_only().unwrap_or(false) {
+            return false;
+        }
         if parsed.name().len() + parsed.value().len() > MAX_COOKIE_BYTES {
             return false;
         }
@@ -191,6 +229,9 @@ impl CookieJar {
             .iter()
             .position(|c| c.name == cookie.name && c.path == cookie.path)
         {
+            if !from_http && list[pos].http_only {
+                return false;
+            }
             cookie.created = list[pos].created;
             list.remove(pos);
             self.total -= 1;
@@ -355,6 +396,26 @@ mod tests {
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    #[test]
+    fn scripts_see_no_http_only_cookies_and_cannot_set_or_replace_them() {
+        let mut jar = CookieJar::new();
+        let u = url("https://example.test/a/b");
+        assert!(jar.store(&u, "sid=secret; HttpOnly; Path=/", now()));
+        assert!(jar.store(&u, "theme=dark; Path=/", now()));
+        assert_eq!(jar.script_cookie_string(&u, now()), "theme=dark");
+        // A script may add a plain cookie, not an HttpOnly one, and may
+        // not overwrite the server's HttpOnly cookie.
+        assert!(jar.store_from_script(&u, "pref=1", now()));
+        assert!(!jar.store_from_script(&u, "x=1; HttpOnly", now()));
+        assert!(!jar.store_from_script(&u, "sid=forged; Path=/", now()));
+        assert_eq!(jar.cookie_header(&u, now()).as_deref(), Some("pref=1; sid=secret; theme=dark"));
+        assert_eq!(jar.script_cookie_string(&u, now()), "pref=1; theme=dark");
+        // The script's cookie has the document's default path.
+        assert!(jar.iter().any(|c| c.name == "pref" && c.path == "/a"));
+        // Nothing for another host.
+        assert_eq!(jar.script_cookie_string(&url("https://other.test/"), now()), "");
     }
 
     #[test]
