@@ -37,7 +37,13 @@ remaining lists as they stand.
       order, GREASE), which rustls does not let a client shape. Passing
       needs a crate decision (a vendored rustls hello builder) under
       `03-crates.md`; owner to rule.
-- [ ] 2. From O1: JPEG decoded and shown. Later: decoder choice.
+- [x] 2. From O1: JPEG decoded and shown. Later: decoder choice.
+      Done 2026-10-16: JPEG was already wired through `image` with
+      `zune-jpeg`; O1 resolved as "keep it" (see `05-risks`).
+      `paint::decode_image` now sniffs the format and applies the EXIF
+      orientation of JPEG and WebP (Chrome and Firefox display images
+      rotated per EXIF). Tests: a JPEG decoded, the same JPEG with an
+      EXIF orientation 6 segment shown rotated, an `<img>` painting it.
 - [ ] 3. Tables (new 4a entry): table/row/cell boxes, colspan/rowspan,
       auto column widths, borders and padding. Later: captions,
       border-collapse, table-layout: fixed, column groups.

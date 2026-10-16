@@ -47,7 +47,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `boa_engine` | 0.22.0 | JavaScript | Interpreter, no JIT; accepted |
 | `boa_gc` | 0.22.0 | GC traits for DOM wrappers | |
 | `boa_runtime` | 0.22.0 | `console` and basics | Starting point for bindings |
-| `image` | 0.25.10 | Image decoding | `default-features = false`, features `png`, `jpeg`, `gif`, `webp`. Decoders: `png` 0.18.1, `zune-jpeg` 0.5.15, `gif` 0.14.2, `image-webp` 0.2.4. Final selection after the unsafe audit (O1) |
+| `image` | 0.25.10 | Image decoding | `default-features = false`, features `png`, `jpeg`, `gif`, `webp`. Decoders: `png` 0.18.1, `zune-jpeg` 0.5.15, `gif` 0.14.2, `image-webp` 0.2.4. Final: `zune-jpeg` kept for speed (O1 resolved 2026-10-16) |
 | `usvg` | not added | SVG parse to a tree we paint with vello | Phase 5; never pull `resvg`'s raster path |
 | `url` | 2.5.8 | URL parsing (with `idna`) | `serde` feature on in `ipc-types` |
 | `encoding_rs` | 0.8.42 | Legacy encodings | |

@@ -8,7 +8,7 @@ owner if resolving one would contradict a decision in `01-decisions.md`.
 
 | # | Item | Resolve by |
 |---|------|-----------|
-| O1 | JPEG decoder. Baseline shows `png`, `gif`, `image-webp` are unsafe-free and `zune-jpeg` has about 1100 unsafe expressions (SIMD). Options: keep `zune-jpeg` for speed, or use an unsafe-free JPEG decoder at a speed cost. Decide when Phase 1 wires image decoding. | Phase 1 |
+| O1 | **Resolved 2026-10-16 ("Working sites first" line 2): `zune-jpeg` stays.** Baseline shows `png`, `gif`, `image-webp` are unsafe-free and `zune-jpeg` has about 1100 unsafe expressions (SIMD colour conversion and IDCT). The crate rule bans native code, not unsafe inside a pure-Rust dependency, the unsafe is recorded in `06-unsafe-baseline.md`, and photos are most of a page's bytes, so the fast decoder is the right one. `decode_image` sniffs the format and applies the EXIF orientation (JPEG, WebP) as browsers do. Revisit only if a JPEG decoder as fast as zune's becomes unsafe-free. | done |
 | O2 | Whether `rustls-rustcrypto` supports every cipher suite and key exchange needed for common sites (TLS 1.3 with X25519 and P-256, TLS 1.2 ECDHE fallbacks). | Phase 1, first real fetches |
 | O3 | **Resolved 2026-09-26.** Linux OS bindings (`wayland-*`, `khronos-egl`, `x11-dl`, `yeslogic-fontconfig-sys`) compile no C with the features we resolve; they load system libraries at runtime. Recorded in `03-crates.md`, "OS bindings on Linux", and enforced through `wrappers` in `deny.toml`. | done |
 | O9 | Open-source license for the repository. Owner to pick (MIT, Apache-2.0, MPL-2.0, GPL family). Until chosen, `Cargo.toml` has no `license` field. | Owner picks before first public push |

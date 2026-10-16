@@ -93,9 +93,17 @@ impl browser_layout::ImageSizes for ImageStore {
 }
 
 /// Decode PNG, JPEG, GIF or WebP bytes into straight-alpha RGBA8.
-/// Any failure yields `None`; a bad image never panics.
+/// Any failure yields `None`; a bad image never panics. The format is
+/// sniffed from the bytes (PNG, JPEG, GIF, WebP), and the EXIF
+/// orientation of a JPEG or WebP is applied, as browsers display images
+/// (`image-orientation: from-image`).
 pub fn decode_image(bytes: &[u8]) -> Option<ImageData> {
-    let img = image::load_from_memory(bytes).ok()?;
+    use image::ImageDecoder as _;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
     let rgba = img.into_rgba8();
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
@@ -3496,5 +3504,62 @@ mod tests {
         assert!(decode_image(b"not an image").is_none());
         assert!(decode_image(&[0x89, b'P', b'N', b'G', 0, 0, 0, 0, 0xff, 0xff]).is_none());
         assert!(decode_image(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00]).is_none());
+    }
+
+    /// A 16×16 JPEG, left half red and right half blue, at quality 100.
+    fn test_jpeg() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(16, 16, |x, _| if x < 8 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+        let mut jpeg = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100);
+        image::ImageEncoder::write_image(enc, &img, 16, 16, image::ExtendedColorType::Rgb8).expect("jpeg encoded");
+        jpeg
+    }
+
+    /// The same JPEG with an EXIF APP1 segment saying orientation 6
+    /// (rotate 90° clockwise to display).
+    fn exif_rotated(jpeg: &[u8]) -> Vec<u8> {
+        let mut out = jpeg[..2].to_vec();
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(b"II\x2a\x00\x08\x00\x00\x00");
+        payload.extend_from_slice(&[0x01, 0x00]);
+        payload.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&[0xff, 0xe1]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    fn pixel(img: &ImageData, x: u32, y: u32) -> [u8; 3] {
+        let i = ((y * img.width + x) * 4) as usize;
+        let d = img.data.data();
+        [d[i], d[i + 1], d[i + 2]]
+    }
+
+    #[test]
+    fn decodes_jpeg_applies_its_exif_orientation_and_paints_it() {
+        let jpeg = test_jpeg();
+        let decoded = decode_image(&jpeg).expect("jpeg");
+        assert_eq!((decoded.width, decoded.height), (16, 16));
+        assert!(is_red(pixel(&decoded, 3, 8)), "{:?}", pixel(&decoded, 3, 8));
+        assert!(is_blue(pixel(&decoded, 12, 8)), "{:?}", pixel(&decoded, 12, 8));
+        // Orientation 6: the left half shows as the top half.
+        let rotated = decode_image(&exif_rotated(&jpeg)).expect("rotated jpeg");
+        assert_eq!((rotated.width, rotated.height), (16, 16));
+        assert!(is_red(pixel(&rotated, 8, 3)), "{:?}", pixel(&rotated, 8, 3));
+        assert!(is_blue(pixel(&rotated, 8, 12)), "{:?}", pixel(&rotated, 8, 12));
+        // Shown by an <img>, scaled to its box.
+        let mut store = ImageStore::new();
+        store.insert(Url::parse("http://x/p.jpg").expect("url"), decoded);
+        let (_, pixels) = render_with(
+            "<body style='margin:0'><img src='http://x/p.jpg' style='display:block;width:64px;height:64px'></body>",
+            &store,
+            0.0,
+            1.0,
+        );
+        let Some(pixels) = pixels else { return };
+        assert!(is_red(px(&pixels, 10.0, 32.0)));
+        assert!(is_blue(px(&pixels, 54.0, 32.0)));
     }
 }
