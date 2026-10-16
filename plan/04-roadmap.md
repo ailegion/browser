@@ -47,6 +47,49 @@ remaining lists as they stand.
 - [ ] 3. Tables (new 4a entry): table/row/cell boxes, colspan/rowspan,
       auto column widths, borders and padding. Later: captions,
       border-collapse, table-layout: fixed, column groups.
+      Built 2026-10-16, not ticked (one SKIPPED part, at the end of this
+      record). Style: `Display` gained the table types
+      (`table`, `inline-table`, row groups, `table-row`, `table-cell`,
+      `table-caption`; columns make no box), `border-spacing`,
+      `border-collapse` (kept, the separated model always), `empty-cells`;
+      the UA sheet's table rules (cells inherit `vertical-align: middle`
+      from the row groups, as Chrome's); the HTML attributes `border`
+      (1px outset on the table, 1px inset on its cells), `cellspacing`,
+      `cellpadding`, `align`, `valign`, `nowrap` as presentational hints.
+      Layout (`crates/layout/src/table.rs`, `boxes.rs`): the box builder
+      makes the table box with anonymous rows, cells and row groups per
+      CSS 2.1 §17.2.1 (table parts outside a table get an anonymous
+      table; inside an inline an inline-table atomic), header groups
+      first and footer groups last; a table is a leaf to taffy
+      (`item_is_table`) measured by the automatic layout: cells placed on
+      the grid (HTML's algorithm, `rowspan` 0 to the group's end), column
+      constraints from the cells' min/max-content widths with fixed and
+      percentage widths and spanning cells shared out, Blink's
+      distribution of the target width, rows from the cells' heights with
+      baseline alignment and `vertical-align`, row spans shared out in
+      proportion, a specified or stretched table height shared out, the
+      wrapper's captions above the table box (`caption-side: top`;
+      `bottom` is not parsed yet). Row and row group borders are ignored
+      and their backgrounds painted behind each cell, so the spacing
+      shows the table's background; `empty-cells: hide` paints nothing
+      for an empty cell. The engine's working state is now `Engine` (the
+      fields by reference) so a table lays its cells out from inside
+      taffy's measure callback; `layout_subtree` is the one independent
+      layout for atomics, cells and captions. Tests: layout (grid with
+      spacing, borders, padding and a colspan; fixed, percent and auto
+      columns; row spans and the four alignments; anonymous tables,
+      inline-table in a line, group order), paint (row background behind
+      cells with the table's in the spacing, a hidden empty cell, a
+      caption above the table box), style (the display mapping).
+      SKIPPED: a cell's min-content width counts an inline-block inside
+      it at its shrink-to-fit width for the table's available width, not
+      at the inline-block's own min-content width, because atomics are
+      laid out once before measurement (the same model as for atomics in
+      floats and other shrink-to-fit boxes); a cell holding only an
+      inline-block that could wrap narrower gets a wider minimum than
+      Chrome gives it. The fix is per-mode measurement of atomics
+      (min-content, max-content, final), which touches the atomic
+      pipeline for every container, not only tables.
 - [ ] 4. Positioned containing block (new 4a entry; the deviation is
       noted in the 4a block 6 record): absolute and fixed boxes sized
       and placed against the nearest positioned or transformed

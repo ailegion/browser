@@ -27,6 +27,64 @@ pub(crate) enum BoxKind {
         url: Option<Url>,
         intrinsic: Option<(f32, f32)>,
     },
+    /// A table (CSS 2.1 §17; "Working sites first" line 3): laid out by
+    /// `table.rs`, a leaf to taffy like an inline root.
+    Table(Box<TableBox>),
+}
+
+/// The table wrapper's content: its captions (above the table box) and
+/// the table box's row groups, header groups first and footer groups
+/// last as browsers order them, with the rows and cells inside. The
+/// grid and the layouts are the engine's caches (`table.rs`).
+pub(crate) struct TableBox {
+    /// The table element's style (the wrapper node's), for the table
+    /// box's border, padding, spacing and sizes.
+    pub style: Arc<ComputedStyle>,
+    pub captions: Vec<BoxNode>,
+    pub groups: Vec<RowGroupBox>,
+    /// Columns and rows of the grid once the cells are placed.
+    pub columns: usize,
+    pub row_count: usize,
+    pub placed: bool,
+    /// The column constraints from the cells' intrinsic sizes.
+    pub constraints: Option<Vec<crate::table::ColumnConstraint>>,
+    /// The layouts computed so far, by target width and height.
+    pub layouts: Vec<crate::table::TableLayout>,
+    /// The width the table's containing block offered last, which the
+    /// atomics inside the cells are measured against.
+    pub available_width: f32,
+}
+
+pub(crate) struct RowGroupBox {
+    pub node: Option<NodeId>,
+    pub style: Arc<ComputedStyle>,
+    pub rows: Vec<RowBox>,
+}
+
+pub(crate) struct RowBox {
+    pub node: Option<NodeId>,
+    pub style: Arc<ComputedStyle>,
+    pub cells: Vec<CellBox>,
+}
+
+pub(crate) struct CellBox {
+    /// The cell's block container (its node is the cell element, or none
+    /// for an anonymous cell).
+    pub node: BoxNode,
+    pub colspan: usize,
+    /// The `rowspan` attribute; 0 means to the end of the row group.
+    pub rowspan: usize,
+    /// Set by the grid: the first column, the rows actually spanned and
+    /// the cell's row index in the whole table.
+    pub col: usize,
+    pub rows: usize,
+    pub row: usize,
+    /// No content at all (`empty-cells` applies).
+    pub empty: bool,
+    /// The cell's min- and max-content border-box widths, once measured.
+    pub min_content: f32,
+    pub max_content: f32,
+    pub measured: bool,
 }
 
 /// How a scroll container's box is laid out (roadmap 4a (4s)): which
@@ -1090,6 +1148,10 @@ impl BoxBuilder<'_> {
             return BoxNode::new(BoxKind::Image { url, intrinsic }, Some(id), style);
         }
 
+        if style.display.is_table() {
+            let children: Vec<NodeId> = self.doc.children(id).collect();
+            return self.build_table(Some(id), style, children, depth);
+        }
         let kind = match style.display {
             Display::Flex | Display::InlineFlex => BoxKind::Flex,
             _ => BoxKind::Block,
@@ -1129,6 +1191,16 @@ impl BoxBuilder<'_> {
     /// Children of a block or flex container: block-level children become
     /// boxes; runs of inline-level content become anonymous inline roots.
     fn build_children(&self, id: NodeId, container: &Arc<ComputedStyle>, depth: usize) -> Vec<BoxNode> {
+        let children: Vec<NodeId> = self.doc.children(id).collect();
+        self.build_children_from(&children, container, depth)
+    }
+
+    /// `build_children` over a given list of nodes (a parent's children,
+    /// or the nodes an anonymous table cell wraps). A run of table parts
+    /// (rows, row groups, cells, captions) outside a table gets an
+    /// anonymous table around it (CSS 2.1 §17.2.1), whitespace between
+    /// them dropped.
+    fn build_children_from(&self, children: &[NodeId], container: &Arc<ComputedStyle>, depth: usize) -> Vec<BoxNode> {
         let mut out = Vec::new();
         let mut pending: Option<InlineContent> = None;
         let mut ws = WsState {
@@ -1155,7 +1227,10 @@ impl BoxBuilder<'_> {
             ws.at_line_start = true;
         };
 
-        for child in self.doc.children(id) {
+        let mut i = 0;
+        while i < children.len() {
+            let child = children[i];
+            i += 1;
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
                     let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
@@ -1164,6 +1239,22 @@ impl BoxBuilder<'_> {
                 NodeKind::Element(_) => {
                     let Some(style) = self.style_of(child) else { continue };
                     if style.display.is_none() {
+                        continue;
+                    }
+                    if is_table_part(style.display) {
+                        // The run of table parts from here, whitespace
+                        // between them left out.
+                        let mut run = vec![child];
+                        while i < children.len() {
+                            match self.table_part_or_space(children[i]) {
+                                Some(true) => run.push(children[i]),
+                                Some(false) => {}
+                                None => break,
+                            }
+                            i += 1;
+                        }
+                        flush(&mut pending, &mut out, &mut ws);
+                        out.push(self.build_table(None, anon_style(container, Display::Table), run, depth));
                         continue;
                     }
                     // Children of a flex container are blockified: each
@@ -1183,6 +1274,266 @@ impl BoxBuilder<'_> {
         out
     }
 
+    /// Whether a node continues a run of table parts: `Some(true)` for a
+    /// displayed table part, `Some(false)` for whitespace-only text or a
+    /// node without a box (skipped), `None` for anything else.
+    fn table_part_or_space(&self, id: NodeId) -> Option<bool> {
+        match &self.doc.get(id).kind {
+            NodeKind::Text(t) => t.chars().all(char::is_whitespace).then_some(false),
+            NodeKind::Element(_) => match self.style_of(id) {
+                Some(s) if s.display.is_none() => Some(false),
+                Some(s) if is_table_part(s.display) => Some(true),
+                _ => None,
+            },
+            _ => Some(false),
+        }
+    }
+
+    // ----- tables (CSS 2.1 §17.2; "Working sites first" line 3) -----
+
+    /// The table box for an element with `display: table`/`inline-table`
+    /// (`node`), or an anonymous one around `children`. Children that are
+    /// not table parts get the anonymous rows and cells of §17.2.1; the
+    /// header groups come first and the footer groups last.
+    fn build_table(&self, node: Option<NodeId>, style: Arc<ComputedStyle>, children: Vec<NodeId>, depth: usize) -> BoxNode {
+        let mut table = TableBox {
+            style: style.clone(),
+            captions: Vec::new(),
+            groups: Vec::new(),
+            columns: 0,
+            row_count: 0,
+            placed: false,
+            constraints: None,
+            layouts: Vec::new(),
+            available_width: 0.0,
+        };
+        let mut headers = Vec::new();
+        let mut bodies = Vec::new();
+        let mut footers = Vec::new();
+        let mut anon = AnonTable::default();
+        for child in children {
+            match &self.doc.get(child).kind {
+                NodeKind::Text(t) => {
+                    if !t.chars().all(char::is_whitespace) {
+                        anon.misc.push(child);
+                    }
+                }
+                NodeKind::Element(_) => {
+                    let Some(cs) = self.style_of(child) else { continue };
+                    match cs.display {
+                        Display::None => {}
+                        Display::TableCaption => {
+                            anon.flush_all(self, &style, depth, &mut bodies);
+                            let mut caption = self.build_element(child, cs, depth + 1);
+                            if let BoxKind::Table(_) = caption.kind {
+                                caption = BoxNode::new(BoxKind::Block, Some(child), caption.style.clone());
+                            }
+                            table.captions.push(caption);
+                        }
+                        d if d.is_table_row_group() => {
+                            anon.flush_all(self, &style, depth, &mut bodies);
+                            let group = self.build_row_group(child, cs, depth);
+                            match d {
+                                Display::TableHeaderGroup => headers.push(group),
+                                Display::TableFooterGroup => footers.push(group),
+                                _ => bodies.push(group),
+                            }
+                        }
+                        Display::TableRow => {
+                            anon.flush_row(self, &style, depth);
+                            anon.rows.push(self.build_row(child, cs, depth));
+                        }
+                        Display::TableCell => {
+                            anon.flush_misc(self, &style, depth);
+                            anon.cells.push(self.build_cell(child, cs, depth));
+                        }
+                        _ => anon.misc.push(child),
+                    }
+                }
+                _ => {}
+            }
+        }
+        anon.flush_all(self, &style, depth, &mut bodies);
+        table.groups = headers;
+        table.groups.extend(bodies);
+        table.groups.extend(footers);
+        let mut b = BoxNode::new(BoxKind::Table(Box::new(table)), node, style);
+        b.anonymous = node.is_none();
+        b
+    }
+
+    /// A row group's rows; cells and other content directly in the group
+    /// get anonymous rows (and cells).
+    fn build_row_group(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> RowGroupBox {
+        let mut anon = AnonTable::default();
+        for child in self.doc.children(id) {
+            match &self.doc.get(child).kind {
+                NodeKind::Text(t) => {
+                    if !t.chars().all(char::is_whitespace) {
+                        anon.misc.push(child);
+                    }
+                }
+                NodeKind::Element(_) => {
+                    let Some(cs) = self.style_of(child) else { continue };
+                    match cs.display {
+                        Display::None => {}
+                        Display::TableRow => {
+                            anon.flush_row(self, &style, depth);
+                            anon.rows.push(self.build_row(child, cs, depth));
+                        }
+                        Display::TableCell => {
+                            anon.flush_misc(self, &style, depth);
+                            anon.cells.push(self.build_cell(child, cs, depth));
+                        }
+                        _ => anon.misc.push(child),
+                    }
+                }
+                _ => {}
+            }
+        }
+        anon.flush_row(self, &style, depth);
+        RowGroupBox {
+            node: Some(id),
+            style,
+            rows: anon.rows,
+        }
+    }
+
+    /// A row's cells; other content in the row gets an anonymous cell
+    /// per run.
+    fn build_row(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> RowBox {
+        let mut anon = AnonTable::default();
+        for child in self.doc.children(id) {
+            match &self.doc.get(child).kind {
+                NodeKind::Text(t) => {
+                    if !t.chars().all(char::is_whitespace) {
+                        anon.misc.push(child);
+                    }
+                }
+                NodeKind::Element(_) => {
+                    let Some(cs) = self.style_of(child) else { continue };
+                    match cs.display {
+                        Display::None => {}
+                        Display::TableCell => {
+                            anon.flush_misc(self, &style, depth);
+                            anon.cells.push(self.build_cell(child, cs, depth));
+                        }
+                        _ => anon.misc.push(child),
+                    }
+                }
+                _ => {}
+            }
+        }
+        anon.flush_misc(self, &style, depth);
+        RowBox {
+            node: Some(id),
+            style,
+            cells: anon.cells,
+        }
+    }
+
+    /// A cell: a block container with the element's children, its spans
+    /// from the HTML attributes (`colspan` 1..=1000, `rowspan` 0..=65534
+    /// with 0 reaching the end of the row group, HTML §4.9.11).
+    fn build_cell(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> CellBox {
+        let children: Vec<NodeId> = self.doc.children(id).collect();
+        let span = |name: &str, default: usize, max: usize| {
+            self.doc
+                .element(id)
+                .and_then(|e| e.attr(name))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map_or(default, |n| n.min(max))
+        };
+        let colspan = span("colspan", 1, 1000).max(1);
+        let rowspan = span("rowspan", 1, 65534);
+        let mut cell = self.cell_box(Some(id), style, &children, depth);
+        cell.colspan = colspan;
+        cell.rowspan = rowspan;
+        cell
+    }
+
+    fn cell_box(&self, node: Option<NodeId>, style: Arc<ComputedStyle>, children: &[NodeId], depth: usize) -> CellBox {
+        let mut b = BoxNode::new(BoxKind::Block, node, style.clone());
+        b.children = if depth < MAX_DEPTH { self.build_children_from(children, &style, depth + 1) } else { Vec::new() };
+        b.anonymous = node.is_none();
+        b.plan_scrolling();
+        let empty = b.children.is_empty();
+        CellBox {
+            node: b,
+            colspan: 1,
+            rowspan: 1,
+            col: 0,
+            rows: 1,
+            row: 0,
+            empty,
+            min_content: 0.0,
+            max_content: 0.0,
+            measured: false,
+        }
+    }
+}
+
+/// The table parts that call for an anonymous table around them when
+/// met outside one: the internal table boxes and captions.
+fn is_table_part(d: Display) -> bool {
+    d.is_table_internal() || d == Display::TableCaption
+}
+
+/// An anonymous box's style with the given display.
+fn anon_style(parent: &ComputedStyle, display: Display) -> Arc<ComputedStyle> {
+    let mut s = ComputedStyle::anonymous_from(parent);
+    s.display = display;
+    Arc::new(s)
+}
+
+/// The anonymous rows and cells being gathered while a table, row group
+/// or row is built: `misc` are consecutive non-cell children (one
+/// anonymous cell), `cells` the cells of an anonymous row, `rows` the
+/// rows of an anonymous row group.
+#[derive(Default)]
+struct AnonTable {
+    misc: Vec<NodeId>,
+    cells: Vec<CellBox>,
+    rows: Vec<RowBox>,
+}
+
+impl AnonTable {
+    fn flush_misc(&mut self, b: &BoxBuilder<'_>, parent: &Arc<ComputedStyle>, depth: usize) {
+        if self.misc.is_empty() {
+            return;
+        }
+        let misc = std::mem::take(&mut self.misc);
+        let style = anon_style(parent, Display::TableCell);
+        self.cells.push(b.cell_box(None, style, &misc, depth));
+    }
+
+    fn flush_row(&mut self, b: &BoxBuilder<'_>, parent: &Arc<ComputedStyle>, depth: usize) {
+        self.flush_misc(b, parent, depth);
+        if self.cells.is_empty() {
+            return;
+        }
+        self.rows.push(RowBox {
+            node: None,
+            style: anon_style(parent, Display::TableRow),
+            cells: std::mem::take(&mut self.cells),
+        });
+    }
+
+    fn flush_all(&mut self, b: &BoxBuilder<'_>, parent: &Arc<ComputedStyle>, depth: usize, groups: &mut Vec<RowGroupBox>) {
+        self.flush_row(b, parent, depth);
+        if self.rows.is_empty() {
+            return;
+        }
+        groups.push(RowGroupBox {
+            node: None,
+            style: anon_style(parent, Display::TableRowGroup),
+            rows: std::mem::take(&mut self.rows),
+        });
+    }
+}
+
+impl BoxBuilder<'_> {
+
     /// What an inline-level element contributes to its inline root.
     fn inline_kind(&self, id: NodeId, style: &ComputedStyle) -> InlineKind {
         let element = self.doc.element(id);
@@ -1190,7 +1541,7 @@ impl BoxBuilder<'_> {
             return InlineKind::Break;
         }
         let atomic = self.is_image(id)
-            || matches!(style.display, Display::InlineBlock | Display::InlineFlex)
+            || matches!(style.display, Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
             || element.is_some_and(|e| {
                 e.name.ns == ns!(html)
                     && matches!(
@@ -1293,7 +1644,11 @@ impl BoxBuilder<'_> {
                 style: control_style(&style),
             });
         }
-        for child in self.doc.children(id) {
+        let children: Vec<NodeId> = self.doc.children(id).collect();
+        let mut i = 0;
+        while i < children.len() {
+            let child = children[i];
+            i += 1;
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
                     append_text(content, text, style.clone(), Some(child), ws, me);
@@ -1301,6 +1656,31 @@ impl BoxBuilder<'_> {
                 NodeKind::Element(_) => {
                     let Some(cs) = self.style_of(child) else { continue };
                     if cs.display.is_none() {
+                        continue;
+                    }
+                    if is_table_part(cs.display) {
+                        // Table parts inside an inline: an anonymous
+                        // inline-table around the run, placed as an atomic.
+                        let mut run = vec![child];
+                        while i < children.len() {
+                            match self.table_part_or_space(children[i]) {
+                                Some(true) => run.push(children[i]),
+                                Some(false) => {}
+                                None => break,
+                            }
+                            i += 1;
+                        }
+                        let node = self.build_table(None, anon_style(&style, Display::InlineTable), run, depth + 1);
+                        let seq = content.seq();
+                        content.atomics.push(Atomic {
+                            index: content.text.len(),
+                            node,
+                            result: None,
+                            inline_box: me,
+                            seq,
+                        });
+                        ws.last_was_space = false;
+                        ws.at_line_start = false;
                         continue;
                     }
                     if is_inline_level(&cs) {
@@ -1445,7 +1825,7 @@ impl BoxBuilder<'_> {
 fn is_inline_level(style: &ComputedStyle) -> bool {
     matches!(
         style.display,
-        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::Contents
+        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable | Display::Contents
     )
 }
 

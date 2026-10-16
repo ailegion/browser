@@ -3099,6 +3099,29 @@ mod tests {
     }
 
     #[test]
+    fn tables_paint_row_backgrounds_behind_cells_hide_empty_cells_and_put_captions_on_top() {
+        const HTML: &str = "<body style='margin:0'>\
+            <table style='border-spacing:4px;background:lime'><tr style='background:blue'>\
+            <td style='padding:0;width:20px;height:20px'></td><td style='padding:0;width:20px;height:20px'></td></tr></table>\
+            <table style='position:absolute;top:50px;left:0;border-spacing:0;empty-cells:hide'><tr>\
+            <td style='padding:0;width:20px;height:20px;background:red;border:2px solid blue'></td>\
+            <td style='padding:0;width:20px;height:20px;background:red'>x</td></tr></table>\
+            <table style='position:absolute;top:100px;left:0;border-spacing:0;background:lime'>\
+            <caption style='margin:0;padding:0;height:20px;background:red'></caption>\
+            <tr><td style='padding:0;width:40px;height:20px'></td></tr></table></body>";
+        let (_, _, pixels) = render_adjusted(HTML, |_, _| {});
+        let Some(pixels) = pixels else { return };
+        assert!(is_blue(px(&pixels, 14.0, 14.0)), "the row's background behind the cell: {:?}", px(&pixels, 14.0, 14.0));
+        assert!(is_green(px(&pixels, 26.0, 14.0)), "the table's background in the spacing: {:?}", px(&pixels, 26.0, 14.0));
+        assert!(is_green(px(&pixels, 2.0, 14.0)), "and at the edge");
+        assert!(is_white(px(&pixels, 10.0, 60.0)), "an empty cell hidden: no background: {:?}", px(&pixels, 10.0, 60.0));
+        assert!(is_white(px(&pixels, 1.0, 60.0)), "nor border");
+        assert!(is_red(px(&pixels, 30.0, 52.0)), "the cell with content paints");
+        assert!(is_red(px(&pixels, 2.0, 102.0)), "the caption above the table box: {:?}", px(&pixels, 2.0, 102.0));
+        assert!(is_green(px(&pixels, 2.0, 130.0)), "the table box below it: {:?}", px(&pixels, 2.0, 130.0));
+    }
+
+    #[test]
     fn fixed_boxes_stay_put_when_the_page_scrolls() {
         const HTML: &str = "<body style='margin:0'><div style='height:2000px'>\
             <div style='position:fixed;top:10px;left:10px;width:30px;height:30px;background:red'></div></div></body>";

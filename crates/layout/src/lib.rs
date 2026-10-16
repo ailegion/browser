@@ -17,6 +17,7 @@ mod engine;
 mod lines;
 pub mod selection;
 pub mod stacking;
+mod table;
 
 use std::collections::HashMap;
 use std::sync::Arc;

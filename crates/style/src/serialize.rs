@@ -183,6 +183,18 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
             ScaleValue::None => "none".to_owned(),
             ScaleValue::Values(x, y, z) => scale_css(*x, *y, *z),
         },
+        P::BorderSpacing(b) => match &b.1 {
+            Some(v) if *v != b.0 => format!("{} {}", b.0.to_css(), v.to_css()),
+            _ => b.0.to_css(),
+        },
+        P::BorderCollapse(b) => match b {
+            BorderCollapse::Separate => "separate".to_owned(),
+            BorderCollapse::Collapse => "collapse".to_owned(),
+        },
+        P::EmptyCells(e) => match e {
+            EmptyCells::Show => "show".to_owned(),
+            EmptyCells::Hide => "hide".to_owned(),
+        },
     }
 }
 
@@ -999,6 +1011,18 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::Scale => match style.scale {
             None => "none".to_owned(),
             Some((x, y, z)) => scale_css(x, y, z),
+        },
+        Id::BorderSpacing => {
+            let (h, v) = style.border_spacing;
+            if h == v { px(h) } else { format!("{} {}", px(h), px(v)) }
+        }
+        Id::BorderCollapse => match style.border_collapse {
+            BorderCollapse::Separate => "separate".to_owned(),
+            BorderCollapse::Collapse => "collapse".to_owned(),
+        },
+        Id::EmptyCells => match style.empty_cells {
+            EmptyCells::Show => "show".to_owned(),
+            EmptyCells::Hide => "hide".to_owned(),
         },
     }
 }

@@ -25,7 +25,7 @@ use taffy::prelude::*;
 
 use crate::boxes::{
     Atomic, AtomicResult, BoxBuilder, BoxKind, BoxNode, Ellipsis, FloatBand, InlineBoxInfo, InlineContent,
-    InlineLayout, LineItemId, Paragraph, ResolvedEdges, ScrollPlan, TaffyId, is_bidi_control, visible_overflow,
+    InlineLayout, LineItemId, Paragraph, ResolvedEdges, ScrollPlan, TableBox, TaffyId, is_bidi_control, visible_overflow,
 };
 use crate::convert::to_taffy;
 use crate::decor::{Decorator, font_of};
@@ -84,6 +84,8 @@ enum Leaf {
     /// Index into the inline roots collected for the current subtree.
     Inline(usize),
     Image { intrinsic: Option<(f32, f32)> },
+    /// Index into the tables collected for the current subtree.
+    Table(usize),
 }
 
 /// One taffy node of the tree being laid out, recorded while building it so
@@ -233,6 +235,71 @@ impl LayoutEngine {
         self.plans.clear();
         self.viewport = (viewport_width, viewport_height);
         self.atomic_fixed = false;
+        let mut engine = Engine {
+            fonts: &mut self.fonts,
+            lcx: &mut self.lcx,
+            smcp: &mut self.smcp,
+            decor: &mut self.decor,
+            plans: &mut self.plans,
+            viewport: self.viewport,
+            atomic_fixed: &mut self.atomic_fixed,
+        };
+        engine.layout_document(doc, styles, viewport_width, viewport_height, images, scrolls, page_scroll)
+    }
+}
+
+/// The engine's working state, borrowed apart so that a layout can run
+/// from inside taffy's measure callback (a table lays its cells out
+/// there): the same fields as `LayoutEngine`, by reference.
+pub(crate) struct Engine<'e> {
+    pub fonts: &'e mut FontContext,
+    pub lcx: &'e mut LayoutContext<Brush>,
+    pub smcp: &'e mut HashMap<(u64, u32), bool>,
+    pub decor: &'e mut Decorator,
+    pub plans: &'e mut HashMap<NodeId, ScrollPlan>,
+    pub viewport: (f32, f32),
+    pub atomic_fixed: &'e mut bool,
+}
+
+/// How wide an independently laid out subtree (an atomic, a table cell,
+/// a caption) is made.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SubtreeWidth {
+    /// Its min-content width.
+    MinContent,
+    /// Its max-content width.
+    MaxContent,
+    /// Shrink-to-fit: the max-content width, no wider than the available
+    /// width (an inline-block).
+    ShrinkToFit,
+    /// A given border-box width (a cell at its columns' width).
+    Definite(f32),
+}
+
+/// What an independent layout produced: the border-box size, the margins
+/// (outside it), the fragment with its border box at (0, 0), and the
+/// first and last baselines from the border box's top.
+pub(crate) struct SubtreeResult {
+    pub width: f32,
+    pub height: f32,
+    pub margin: Sides<f32>,
+    pub fragment: Fragment,
+    pub first_baseline: Option<f32>,
+    pub last_baseline: Option<f32>,
+}
+
+impl Engine<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn layout_document(
+        &mut self,
+        doc: &Document,
+        styles: &StyleMap,
+        viewport_width: f32,
+        viewport_height: f32,
+        images: &dyn ImageSizes,
+        scrolls: &HashMap<NodeId, (f32, f32)>,
+        page_scroll: (f32, f32),
+    ) -> LayoutTree {
         let vo = viewport_overflow(doc, styles);
         let builder = BoxBuilder {
             doc,
@@ -302,9 +369,21 @@ impl LayoutEngine {
         let mut inlines: Vec<&mut InlineContent> = Vec::new();
         let mut inline_ids: Vec<TaffyId> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
+        let mut tables: Vec<&mut TableBox> = Vec::new();
+        let mut table_ids: Vec<TaffyId> = Vec::new();
         let mut hoisted: Vec<TaffyId> = Vec::new();
-        let html_id = self.build_taffy(&mut tree, &mut html, &mut inlines, &mut inline_ids, &mut entries, &mut hoisted);
+        let html_id = self.build_taffy(
+            &mut tree,
+            &mut html,
+            &mut inlines,
+            &mut inline_ids,
+            &mut tables,
+            &mut table_ids,
+            &mut entries,
+            &mut hoisted,
+        );
         drop(inlines);
+        drop(tables);
 
         // The fixed boxes are children of the viewport node, after the
         // root element (CSS Positioned 3 §3.3: their containing block).
@@ -324,10 +403,12 @@ impl LayoutEngine {
         let mut pass = 0;
         loop {
             let mut inlines: Vec<&mut InlineContent> = Vec::new();
-            collect_inlines(&mut html, &mut inlines);
-            self.run_with_floats(&mut tree, viewport_id, available, &mut inlines, &inline_ids, &entries);
+            let mut tables: Vec<&mut TableBox> = Vec::new();
+            collect_leaves(&mut html, &mut inlines, &mut tables);
+            self.run_with_floats(&mut tree, viewport_id, available, &mut inlines, &mut tables, &inline_ids, &entries);
             drop(inlines);
-            html_fragment = self.fragments(&html, &tree, 0.0, 0.0);
+            drop(tables);
+            html_fragment = self.fragments(&mut html, &tree, 0.0, 0.0);
             pass += 1;
             if pass >= MAX_SCROLLBAR_PASSES {
                 break;
@@ -343,12 +424,17 @@ impl LayoutEngine {
                 // the atomics holding any are laid out again for it.
                 let (gl, gr, gb) = plan_gutters(&viewport_plan);
                 self.viewport = (viewport_width - gl - gr, viewport_height - gb);
-                if self.atomic_fixed {
+                if *self.atomic_fixed {
                     self.prepare_atomics(&mut html, viewport_width);
                     let mut inlines: Vec<&mut InlineContent> = Vec::new();
-                    collect_inlines(&mut html, &mut inlines);
+                    let mut tables: Vec<&mut TableBox> = Vec::new();
+                    collect_leaves(&mut html, &mut inlines, &mut tables);
                     for (content, id) in inlines.into_iter().zip(&inline_ids) {
                         content.cache.clear();
+                        let _ = tree.mark_dirty(*id);
+                    }
+                    for (table, id) in tables.into_iter().zip(&table_ids) {
+                        table.layouts.clear();
                         let _ = tree.mark_dirty(*id);
                     }
                 }
@@ -419,7 +505,7 @@ impl LayoutEngine {
         if let Some(marker) = &mut node.marker {
             self.prepare_atomics(marker, available_width);
             if let BoxKind::Inline(content) = &mut marker.kind {
-                ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, &mut self.decor, None);
+                ensure_layout(content, self.fonts, self.lcx, self.smcp, self.decor, None);
             }
         }
         if let BoxKind::Inline(content) = &mut node.kind {
@@ -466,7 +552,7 @@ impl LayoutEngine {
         let text: Arc<str> = Arc::from(content.text.as_str());
         let mut kids = Vec::new();
         for p in &il.paragraphs {
-            emit_text_fragments(content, &text, p, &il.edges, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
+            emit_text_fragments(content, &text, p, &il.edges, x, y, None, &mut kids, self.decor, self.fonts);
         }
         Fragment {
             rect: Rect::new(x, y, width, il.height),
@@ -508,51 +594,142 @@ impl LayoutEngine {
                 baseline: h,
             };
         }
+        let is_table = matches!(node.kind, BoxKind::Table(_));
+        let r = self.layout_subtree(node, available_width, SubtreeWidth::ShrinkToFit, false, true);
+        // The margins are in the reported size and the line layout offsets
+        // the box by them.
+        let height = r.height + r.margin.top + r.margin.bottom;
+        // CSS 2.1 §10.8.1: an inline-block's baseline is its last in-flow
+        // line's, when it has one and does not clip its overflow; else its
+        // bottom margin edge. An inline-table's is its first row's.
+        let baseline = if matches!(node.style.overflow_x, Overflow::Visible)
+            && matches!(node.style.overflow_y, Overflow::Visible)
+            && let Some(b) = if is_table { r.first_baseline } else { r.last_baseline }
+        {
+            b + r.margin.top
+        } else {
+            height
+        };
+        AtomicResult {
+            width: r.width + r.margin.left + r.margin.right,
+            height,
+            fragment: r.fragment,
+            baseline,
+        }
+    }
 
-        self.prepare_atomics(node, available_width);
+    /// Lay a box subtree out on its own (an atomic inline box, a table
+    /// cell, a caption): its own taffy tree, its scrollbar passes, its
+    /// fixed boxes hung from a viewport-sized wrapper. `cell` lays the
+    /// root out as a table cell: no margins, the given width its border
+    /// box, its height from the content (the row decides the rest).
+    /// `prepare` lays the atomics inside out first (once per subtree).
+    pub(crate) fn layout_subtree(
+        &mut self,
+        node: &mut BoxNode,
+        available_width: f32,
+        width: SubtreeWidth,
+        cell: bool,
+        prepare: bool,
+    ) -> SubtreeResult {
+        if prepare {
+            self.prepare_atomics(node, available_width);
+        }
         let width_is_auto = matches!(node.style.width, browser_style::ComputedSize::Auto);
 
-        // Pass 1: max-content width. Pass 2: lay out at min(available, max-content).
         let mut tree: TaffyTree<Leaf> = TaffyTree::new();
         let mut inlines: Vec<&mut InlineContent> = Vec::new();
         let mut inline_ids: Vec<TaffyId> = Vec::new();
+        let mut tables: Vec<&mut TableBox> = Vec::new();
+        let mut table_ids: Vec<TaffyId> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
         let mut hoisted: Vec<TaffyId> = Vec::new();
-        let root = self.build_taffy(&mut tree, node, &mut inlines, &mut inline_ids, &mut entries, &mut hoisted);
+        let root = self.build_taffy(
+            &mut tree,
+            node,
+            &mut inlines,
+            &mut inline_ids,
+            &mut tables,
+            &mut table_ids,
+            &mut entries,
+            &mut hoisted,
+        );
 
+        let mut root_style = tree.style(root).cloned().unwrap_or_default();
+        if cell {
+            root_style.margin = taffy::Rect::zero();
+            root_style.position = taffy::Position::Relative;
+            root_style.inset = taffy::Rect::auto();
+            root_style.box_sizing = taffy::BoxSizing::BorderBox;
+            root_style.size.height = Dimension::auto();
+            root_style.min_size.height = LengthPercentageAuto::auto();
+            root_style.max_size.height = LengthPercentageAuto::auto();
+            root_style.item_is_table = false;
+        }
         // The width taffy is told, kept across the scrollbar passes below
         // (a pass rebuilds the root's style from the plan).
         let mut fixed_width = None;
-        if width_is_auto {
-            self.run_taffy(
-                &mut tree,
-                root,
+        let available = match width {
+            SubtreeWidth::MinContent | SubtreeWidth::MaxContent => {
+                root_style.size.width = Dimension::auto();
+                root_style.min_size.width = LengthPercentageAuto::auto();
+                root_style.max_size.width = LengthPercentageAuto::auto();
+                let _ = tree.set_style(root, root_style);
+                let w = if width == SubtreeWidth::MinContent { AvailableSpace::MinContent } else { AvailableSpace::MaxContent };
                 Size {
-                    width: AvailableSpace::MaxContent,
+                    width: w,
                     height: AvailableSpace::MaxContent,
-                },
-                &mut inlines,
-            );
-            let max_content = tree.layout(root).map(|l| l.size.width).unwrap_or(0.0);
-            let width = max_content.min(available_width);
-            let mut style = tree.style(root).cloned().unwrap_or_default();
-            style.size.width = Dimension::length(width);
-            let _ = tree.set_style(root, style);
-            fixed_width = Some(width);
-        }
-        drop(inlines);
-        let available = Size {
-            width: AvailableSpace::Definite(available_width),
-            height: AvailableSpace::MaxContent,
+                }
+            }
+            SubtreeWidth::Definite(w) => {
+                root_style.size.width = Dimension::length(w);
+                root_style.min_size.width = LengthPercentageAuto::auto();
+                root_style.max_size.width = LengthPercentageAuto::auto();
+                let _ = tree.set_style(root, root_style);
+                fixed_width = Some(w);
+                Size {
+                    width: AvailableSpace::Definite(available_width),
+                    height: AvailableSpace::MaxContent,
+                }
+            }
+            SubtreeWidth::ShrinkToFit => {
+                let _ = tree.set_style(root, root_style);
+                // Pass 1: max-content width. Pass 2: lay out at
+                // min(available, max-content).
+                if width_is_auto {
+                    self.run_taffy(
+                        &mut tree,
+                        root,
+                        Size {
+                            width: AvailableSpace::MaxContent,
+                            height: AvailableSpace::MaxContent,
+                        },
+                        &mut inlines,
+                        &mut tables,
+                    );
+                    let max_content = tree.layout(root).map(|l| l.size.width).unwrap_or(0.0);
+                    let w = max_content.min(available_width);
+                    let mut style = tree.style(root).cloned().unwrap_or_default();
+                    style.size.width = Dimension::length(w);
+                    let _ = tree.set_style(root, style);
+                    fixed_width = Some(w);
+                }
+                Size {
+                    width: AvailableSpace::Definite(available_width),
+                    height: AvailableSpace::MaxContent,
+                }
+            }
         };
-        // Fixed boxes inside the atomic hang from a viewport-sized node
-        // around it (their containing block), the atomic itself in a
+        drop(inlines);
+        drop(tables);
+        // Fixed boxes inside the subtree hang from a viewport-sized node
+        // around it (their containing block), the subtree itself in a
         // block of the available width inside it, so its own layout is
         // the same as without them.
         let run_root = if hoisted.is_empty() {
             root
         } else {
-            self.atomic_fixed = true;
+            *self.atomic_fixed = true;
             let inner = tree
                 .new_with_children(
                     Style {
@@ -588,9 +765,11 @@ impl LayoutEngine {
         let mut pass = 0;
         loop {
             let mut inlines: Vec<&mut InlineContent> = Vec::new();
-            collect_inlines(node, &mut inlines);
-            self.run_with_floats(&mut tree, run_root, available, &mut inlines, &inline_ids, &entries);
+            let mut tables: Vec<&mut TableBox> = Vec::new();
+            collect_leaves(node, &mut inlines, &mut tables);
+            self.run_with_floats(&mut tree, run_root, available, &mut inlines, &mut tables, &inline_ids, &entries);
             drop(inlines);
+            drop(tables);
             fragment = self.fragments(node, &tree, 0.0, 0.0);
             pass += 1;
             if pass >= MAX_SCROLLBAR_PASSES {
@@ -600,37 +779,38 @@ impl LayoutEngine {
             if !add_auto_gutters(node, &infos, &mut tree) {
                 break;
             }
-            if let Some(width) = fixed_width
-                && let Ok(style) = tree.style(root)
-            {
+            if let Ok(style) = tree.style(root) {
                 let mut style = style.clone();
-                style.size.width = Dimension::length(width);
+                if let Some(w) = fixed_width {
+                    style.size.width = Dimension::length(w);
+                }
+                if cell {
+                    style.margin = taffy::Rect::zero();
+                    style.box_sizing = taffy::BoxSizing::BorderBox;
+                    style.size.height = Dimension::auto();
+                }
                 let _ = tree.set_style(root, style);
             }
         }
 
         let layout = tree.layout(root).cloned().unwrap_or_default();
-        // Position relative to the atomic's own border box origin; the
-        // margins are in the reported size and the line layout offsets
-        // the box by them.
+        // Position relative to the subtree's own border box origin.
         fragment.translate(-layout.location.x, -layout.location.y);
-        let height = layout.size.height + layout.margin.top + layout.margin.bottom;
-        // CSS 2.1 §10.8.1: an inline-block's baseline is its last in-flow
-        // line's, when it has one and does not clip its overflow; else its
-        // bottom margin edge.
-        let baseline = if matches!(node.style.overflow_x, Overflow::Visible)
-            && matches!(node.style.overflow_y, Overflow::Visible)
-            && let Some(b) = last_baseline_of(std::slice::from_ref(&fragment))
-        {
-            b + layout.margin.top
-        } else {
-            height
+        let margin = Sides {
+            top: layout.margin.top,
+            right: layout.margin.right,
+            bottom: layout.margin.bottom,
+            left: layout.margin.left,
         };
-        AtomicResult {
-            width: layout.size.width + layout.margin.left + layout.margin.right,
-            height,
+        let first_baseline = first_baseline_of(std::slice::from_ref(&fragment));
+        let last_baseline = last_baseline_of(std::slice::from_ref(&fragment));
+        SubtreeResult {
+            width: layout.size.width,
+            height: layout.size.height,
+            margin,
             fragment,
-            baseline,
+            first_baseline,
+            last_baseline,
         }
     }
 
@@ -639,12 +819,15 @@ impl LayoutEngine {
     /// `hoisted` collects the fixed boxes' nodes, to be made children of
     /// the viewport node; each leaves a zero-size absolutely positioned
     /// placeholder in its parent, whose position is its static one.
+    #[allow(clippy::too_many_arguments)]
     fn build_taffy<'a>(
         &mut self,
         tree: &mut TaffyTree<Leaf>,
         node: &'a mut BoxNode,
         inlines: &mut Vec<&'a mut InlineContent>,
         inline_ids: &mut Vec<TaffyId>,
+        tables: &mut Vec<&'a mut TableBox>,
+        table_ids: &mut Vec<TaffyId>,
         entries: &mut Vec<Entry>,
         hoisted: &mut Vec<TaffyId>,
     ) -> TaffyId {
@@ -685,6 +868,20 @@ impl LayoutEngine {
                 tree.new_leaf_with_context(style, Leaf::Image { intrinsic: *intrinsic })
                     .expect("taffy leaf")
             }
+            // A table is a leaf measured by 	able.rs; its border and
+            // padding are the table box's, inside the measured size.
+            BoxKind::Table(table) => {
+                let mut style = to_taffy(&node.style, false, false, None);
+                style.item_is_table = true;
+                style.padding = taffy::Rect::zero();
+                style.border = taffy::Rect::zero();
+                entry.isolates = true;
+                let idx = tables.len();
+                let id = tree.new_leaf_with_context(style, Leaf::Table(idx)).expect("taffy leaf");
+                tables.push(&mut **table);
+                table_ids.push(id);
+                id
+            }
             BoxKind::Block | BoxKind::Flex => {
                 let taffy_style = if anonymous {
                     Style {
@@ -713,7 +910,7 @@ impl LayoutEngine {
                         .expect("taffy leaf")
                     });
                     child.placeholder = placeholder;
-                    let child_id = self.build_taffy(tree, child, inlines, inline_ids, entries, hoisted);
+                    let child_id = self.build_taffy(tree, child, inlines, inline_ids, tables, table_ids, entries, hoisted);
                     entry.children.push(entries.len() - 1);
                     match placeholder {
                         Some(p) => {
@@ -744,10 +941,11 @@ impl LayoutEngine {
         root: TaffyId,
         available: Size<AvailableSpace>,
         inlines: &mut [&mut InlineContent],
+        tables: &mut [&mut TableBox],
         inline_ids: &[TaffyId],
         entries: &[Entry],
     ) {
-        self.run_taffy(tree, root, available, inlines);
+        self.run_taffy(tree, root, available, inlines, tables);
         for _ in 0..MAX_FLOAT_PASSES {
             let bands = float_bands(tree, entries, inlines.len());
             let mut changed = false;
@@ -762,7 +960,7 @@ impl LayoutEngine {
             if !changed {
                 break;
             }
-            self.run_taffy(tree, root, available, inlines);
+            self.run_taffy(tree, root, available, inlines, tables);
         }
         self.finalize_inlines(tree, inlines, inline_ids);
     }
@@ -773,13 +971,32 @@ impl LayoutEngine {
         root: TaffyId,
         available: Size<AvailableSpace>,
         inlines: &mut [&mut InlineContent],
+        tables: &mut [&mut TableBox],
     ) {
-        let fonts = &mut self.fonts;
-        let lcx = &mut self.lcx;
-        let smcp = &mut self.smcp;
-        let decor = &mut self.decor;
+        let fonts = &mut *self.fonts;
+        let lcx = &mut *self.lcx;
+        let smcp = &mut *self.smcp;
+        let decor = &mut *self.decor;
+        let plans = &mut *self.plans;
+        let viewport = self.viewport;
+        let atomic_fixed = &mut *self.atomic_fixed;
         let result = tree.compute_layout_with_measure(root, available, |inputs, _id, ctx, style| {
             match ctx {
+                Some(Leaf::Table(idx)) => {
+                    let table = &mut *tables[*idx];
+                    let mut sub = Engine {
+                        fonts: &mut *fonts,
+                        lcx: &mut *lcx,
+                        smcp: &mut *smcp,
+                        decor: &mut *decor,
+                        plans: &mut *plans,
+                        viewport,
+                        atomic_fixed: &mut *atomic_fixed,
+                    };
+                    taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
+                        crate::table::measure(&mut sub, table, known, avail)
+                    })
+                }
                 Some(Leaf::Inline(idx)) => {
                     let content = &mut *inlines[*idx];
                     taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
@@ -809,13 +1026,13 @@ impl LayoutEngine {
     ) {
         for (content, id) in inlines.iter_mut().zip(inline_ids) {
             let width = tree.layout(*id).map(|l| l.size.width).unwrap_or(0.0);
-            ensure_layout(content, &mut self.fonts, &mut self.lcx, &mut self.smcp, &mut self.decor, Some(width));
+            ensure_layout(content, self.fonts, self.lcx, self.smcp, self.decor, Some(width));
             // Keep only the final layout.
             content.cache.retain(|l| l.max_width == Some(width));
             // The `text-overflow` marker, in the container's font.
             let marker = content.text_overflow_marker().map(str::to_owned);
             content.ellipsis = marker.map(|marker| {
-                let mut builder = self.lcx.ranged_builder(&mut self.fonts, &marker, 1.0, true);
+                let mut builder = self.lcx.ranged_builder(self.fonts, &marker, 1.0, true);
                 push_style(&mut builder, &content.container, None);
                 let mut layout = builder.build(&marker);
                 layout.break_all_lines(None);
@@ -829,7 +1046,7 @@ impl LayoutEngine {
     }
 
     /// Produce fragments for a laid-out box subtree.
-    fn fragments(&mut self, node: &BoxNode, tree: &TaffyTree<Leaf>, ox: f32, oy: f32) -> Fragment {
+    fn fragments(&mut self, node: &mut BoxNode, tree: &TaffyTree<Leaf>, ox: f32, oy: f32) -> Fragment {
         let layout = node
             .taffy
             .and_then(|id| tree.layout(id).ok().cloned())
@@ -865,7 +1082,40 @@ impl LayoutEngine {
         let margin = sides(layout.margin);
         let transform = node.node.and_then(|_| box_transform(&node.style, &rect, &padding));
 
-        match &node.kind {
+        match &mut node.kind {
+            BoxKind::Table(table) => {
+                // The layout taffy's final size came from, else one made
+                // for it now; the table box may be wider than taffy's box
+                // when its columns' minima need it.
+                let (w, h) = (layout.size.width, layout.size.height);
+                let idx = match table.layouts.iter().rposition(|l| (l.key.0 - w).abs() < 0.01 && (l.height - h).abs() < 0.01) {
+                    Some(i) => i,
+                    None => crate::table::layout_at(self, table, w, Some(h)),
+                };
+                let tl = &table.layouts[idx];
+                let mut children = tl.children.clone();
+                for c in &mut children {
+                    c.translate(x, y);
+                }
+                let style = if table.captions.is_empty() {
+                    node.style.clone()
+                } else {
+                    let mut s = ComputedStyle::anonymous_from(&node.style);
+                    s.display = browser_style::Display::Block;
+                    Arc::new(s)
+                };
+                Fragment {
+                    rect: Rect::new(x, y, tl.width, tl.height),
+                    node: node.node,
+                    style,
+                    content: FragmentContent::Box,
+                    children,
+                    padding: tl.padding,
+                    margin,
+                    transform,
+                    fixed,
+                }
+            }
             BoxKind::Inline(content) => {
                 let mut children = Vec::new();
                 // A hanging marker (the item's one line) sits left of the
@@ -889,8 +1139,8 @@ impl LayoutEngine {
                             y,
                             overflow,
                             &mut children,
-                            &mut self.decor,
-                            &mut self.fonts,
+                            self.decor,
+                            self.fonts,
                         );
                     }
                     place_inline_offsets(&mut children);
@@ -925,11 +1175,10 @@ impl LayoutEngine {
                 if let (Some(n), Some(plan)) = (node.node, node.scroll) {
                     self.plans.insert(n, plan);
                 }
-                let mut children: Vec<Fragment> = node
-                    .children
-                    .iter()
-                    .map(|c| self.fragments(c, tree, x, y))
-                    .collect();
+                let mut children: Vec<Fragment> = Vec::new();
+                for c in &mut node.children {
+                    children.push(self.fragments(c, tree, x, y));
+                }
                 if let Some(marker) = &node.marker {
                     let fragment = self.marker_fragment(marker, rect, &layout, &children);
                     children.insert(0, fragment);
@@ -1398,13 +1647,14 @@ fn out_of_flow(f: &Fragment) -> bool {
 
 /// The inline roots of a box subtree in the order `build_taffy` gave
 /// them to taffy, borrowed again for a further layout pass.
-fn collect_inlines<'a>(node: &'a mut BoxNode, out: &mut Vec<&'a mut InlineContent>) {
+fn collect_leaves<'a>(node: &'a mut BoxNode, inlines: &mut Vec<&'a mut InlineContent>, tables: &mut Vec<&'a mut TableBox>) {
     match &mut node.kind {
-        BoxKind::Inline(content) => out.push(content),
+        BoxKind::Inline(content) => inlines.push(content),
+        BoxKind::Table(table) => tables.push(table),
         BoxKind::Image { .. } => {}
         BoxKind::Block | BoxKind::Flex => {
             for c in &mut node.children {
-                collect_inlines(c, out);
+                collect_leaves(c, inlines, tables);
             }
         }
     }
@@ -1679,7 +1929,7 @@ fn collapsed_end_margin(f: &Fragment) -> f32 {
 /// text's baseline, or the bottom margin edge of the first in-flow image
 /// (which sits on its line's baseline). Floats and out-of-flow boxes make
 /// no line of the item's.
-fn first_baseline_of(fragments: &[Fragment]) -> Option<f32> {
+pub(crate) fn first_baseline_of(fragments: &[Fragment]) -> Option<f32> {
     for f in fragments {
         if out_of_flow(f) {
             continue;
@@ -3606,6 +3856,141 @@ mod tests {
         assert!(painted("shown"));
         assert!(painted("front"), "preserve-3d: two half turns face front");
         assert!(!painted("back"), "flat: the child's own matrix shows its back");
+    }
+
+    #[test]
+    fn tables_place_cells_on_a_grid_with_spacing_borders_padding_and_spans() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'><table id=t border=1 cellpadding=2 cellspacing=4>\
+             <tr><td id=a>a</td><td id=b>bb</td></tr><tr><td id=c colspan=2>c</td></tr></table></body>",
+            "",
+        );
+        let (t, a, b, c) = (box_of(&tree, by_id(&doc, "t")), box_of(&tree, by_id(&doc, "a")), box_of(&tree, by_id(&doc, "b")), box_of(&tree, by_id(&doc, "c")));
+        // The table's 1px outset border, then the 4px spacing, then the
+        // first cell; the cells 4px apart; the spanning cell as wide as
+        // both plus the spacing between them; the table closes 4px + 1px
+        // past them.
+        assert_eq!((a.x, a.y), (5.0, 5.0));
+        assert_eq!(b.x, a.right() + 4.0);
+        assert_eq!(b.y, a.y);
+        assert_eq!(a.height, b.height, "cells of a row share its height");
+        assert_eq!((c.x, c.y), (5.0, a.bottom() + 4.0));
+        assert!((c.width - (a.width + 4.0 + b.width)).abs() < 0.01, "{c:?} spans {a:?} and {b:?}");
+        assert!((t.width - (c.right() + 5.0)).abs() < 0.01, "{t:?}");
+        assert!((t.height - (c.bottom() + 5.0)).abs() < 0.01, "{t:?}");
+        assert!(b.width > a.width, "the wider content makes the wider column");
+        // The cells' 1px inset borders and 2px padding from the attributes.
+        let a_style = &tree_style(&tree, by_id(&doc, "a"));
+        assert_eq!(a_style.border_width.left, 1.0);
+        assert_eq!(tree_padding(&tree, by_id(&doc, "a")).left, 2.0);
+        assert_eq!(tree_style(&tree, by_id(&doc, "t")).border_width.top, 1.0);
+        // Hit testing: a point in a cell is the cell's text, the spacing
+        // is the table itself.
+        let hit = tree.hit_test(a.x + a.width / 2.0, a.y + a.height / 2.0).expect("hit");
+        assert!(hit == by_id(&doc, "a") || doc.parent(hit) == Some(by_id(&doc, "a")), "{hit:?}");
+        assert_eq!(tree.hit_test(3.0, 3.0), Some(by_id(&doc, "t")));
+    }
+
+    fn tree_style(tree: &LayoutTree, node: NodeId) -> Arc<ComputedStyle> {
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(node) && found.is_none() && matches!(f.content, FragmentContent::Box) {
+                found = Some(f.style.clone());
+            }
+        });
+        found.expect("box fragment")
+    }
+
+    fn tree_padding(tree: &LayoutTree, node: NodeId) -> Sides<f32> {
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(node) && found.is_none() && matches!(f.content, FragmentContent::Box) {
+                found = Some(f.padding);
+            }
+        });
+        found.expect("box fragment")
+    }
+
+    #[test]
+    fn table_columns_take_fixed_percent_and_auto_widths() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <table id=t style='width:300px;border-spacing:0'><tr>\
+             <td id=a style='width:100px;padding:0'>a</td><td id=b style='padding:0'>b</td></tr></table>\
+             <table id=u style='width:400px;border-spacing:0'><tr>\
+             <td id=p style='width:25%;padding:0'>a</td><td id=q style='padding:0'>b</td><td id=r style='padding:0'>b</td></tr></table>\
+             <table id=v style='border-spacing:0'><tr><td id=s style='padding:0'>short</td><td id=l style='padding:0'>a much longer cell</td></tr></table>\
+             </body>",
+            "",
+        );
+        let (a, b) = (box_of(&tree, by_id(&doc, "a")), box_of(&tree, by_id(&doc, "b")));
+        assert_eq!((a.width, b.x, b.width), (100.0, 100.0, 200.0));
+        assert_eq!(box_of(&tree, by_id(&doc, "t")).width, 300.0);
+        let (p, q, r) = (box_of(&tree, by_id(&doc, "p")), box_of(&tree, by_id(&doc, "q")), box_of(&tree, by_id(&doc, "r")));
+        assert_eq!(p.width, 100.0, "25% of 400");
+        assert!((q.width + r.width - 300.0).abs() < 0.01);
+        assert_eq!(q.width, r.width, "equal content shares equally");
+        // An auto table is as wide as its content; the columns at their
+        // max-content widths.
+        let (v, s, l) = (box_of(&tree, by_id(&doc, "v")), box_of(&tree, by_id(&doc, "s")), box_of(&tree, by_id(&doc, "l")));
+        assert!((v.width - (s.width + l.width)).abs() < 0.01);
+        assert!(v.width < 400.0 && l.width > s.width);
+        let text_l = tree.first_rect(|n| doc.parent(n) == Some(by_id(&doc, "l"))).expect("text");
+        assert!((text_l.width - l.width).abs() < 0.5, "the cell fits its line: {text_l:?} in {l:?}");
+    }
+
+    #[test]
+    fn table_rows_take_their_cells_heights_spans_and_vertical_alignment() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'><table style='border-spacing:0'>\
+             <tr><td id=r rowspan=2 style='padding:0'><div style='height:100px;width:10px'></div></td>\
+             <td id=s style='padding:0'><div style='height:10px;width:10px'></div></td></tr>\
+             <tr><td id=u style='padding:0'><div style='height:10px;width:10px'></div></td></tr></table>\
+             <table style='border-spacing:0'><tr>\
+             <td id=tall style='padding:0'><div style='height:60px;width:10px'></div></td>\
+             <td id=top style='padding:0;vertical-align:top'>x</td>\
+             <td id=mid style='padding:0;vertical-align:middle'>x</td>\
+             <td id=bot style='padding:0;vertical-align:bottom'>x</td>\
+             <td id=base style='padding:0;vertical-align:baseline;font-size:32px'>x</td></tr></table></body>",
+            "",
+        );
+        let (r, s, u) = (box_of(&tree, by_id(&doc, "r")), box_of(&tree, by_id(&doc, "s")), box_of(&tree, by_id(&doc, "u")));
+        assert_eq!(r.height, 100.0);
+        assert_eq!((s.height, u.height), (50.0, 50.0), "the span's extra height shared by the rows");
+        assert_eq!(u.y, 50.0);
+        let text = |id: &str| tree.first_rect(|n| doc.parent(n) == Some(by_id(&doc, id))).expect("text");
+        let tall = box_of(&tree, by_id(&doc, "tall"));
+        let (top, mid, bot) = (box_of(&tree, by_id(&doc, "top")), box_of(&tree, by_id(&doc, "mid")), box_of(&tree, by_id(&doc, "bot")));
+        assert!(tall.height >= 60.0 && top.height == tall.height && mid.height == tall.height && bot.height == tall.height);
+        assert_eq!(text("top").y, top.y);
+        assert!((text("bot").bottom() - bot.bottom()).abs() < 0.01);
+        let m = text("mid");
+        assert!(((m.y - mid.y) - (mid.bottom() - m.bottom())).abs() < 1.0, "centred: {m:?} in {mid:?}");
+        // Baseline cells share the row's baseline: the 32px text's
+        // baseline is lower in its line, so the 16px one moves down.
+        let (base_text, base) = (text("base"), box_of(&tree, by_id(&doc, "base")));
+        assert!((base_text.y - base.y).abs() < 0.01, "the one baseline cell sets the row's baseline: {base_text:?} in {base:?}");
+    }
+
+    #[test]
+    fn table_parts_outside_a_table_get_an_anonymous_table_and_groups_keep_their_order() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'><div style='width:300px'>\
+             <div id=p style='display:table-cell;width:100px'>p</div><div id=q style='display:table-cell'>q</div></div>\
+             <p id=line style='margin:0'>ab<table id=it style='display:inline-table;border-spacing:0'><tr><td style='padding:0'>x</td></tr></table>cd</p>\
+             <table style='border-spacing:0'><tfoot><tr><td id=f style='padding:0'>f</td></tr></tfoot>\
+             <tbody><tr><td id=bd style='padding:0'>b</td></tr></tbody><thead><tr><td id=h style='padding:0'>h</td></tr></thead></table>\
+             </body>",
+            "",
+        );
+        let (p, q) = (box_of(&tree, by_id(&doc, "p")), box_of(&tree, by_id(&doc, "q")));
+        assert_eq!((p.width, q.x), (100.0, 100.0));
+        assert_eq!(p.y, q.y, "cells of the anonymous row side by side");
+        let it = box_of(&tree, by_id(&doc, "it"));
+        let line = box_of(&tree, by_id(&doc, "line"));
+        assert!(it.x > 0.0 && it.y >= line.y && it.bottom() <= line.bottom() + 0.01, "the inline-table sits in the line: {it:?} in {line:?}");
+        let (h, bd, f) = (box_of(&tree, by_id(&doc, "h")), box_of(&tree, by_id(&doc, "bd")), box_of(&tree, by_id(&doc, "f")));
+        assert!(h.y < bd.y && bd.y < f.y, "head {h:?}, body {bd:?}, foot {f:?}");
     }
 
     #[test]

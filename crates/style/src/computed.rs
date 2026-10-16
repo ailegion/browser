@@ -270,6 +270,11 @@ pub struct ComputedStyle {
     pub translate: Option<(ComputedLp, ComputedLp, f32)>,
     pub rotate: Option<(f32, f32, f32, f32)>,
     pub scale: Option<(f32, f32, f32)>,
+    /// Tables: `border-spacing` (horizontal, vertical) in px,
+    /// `border-collapse`, `empty-cells`; all inherited.
+    pub border_spacing: (f32, f32),
+    pub border_collapse: BorderCollapse,
+    pub empty_cells: EmptyCells,
     /// Custom properties in effect, inherited; shared with the parent when
     /// this element declares none.
     pub custom: Arc<CustomMap>,
@@ -477,6 +482,9 @@ impl ComputedStyle {
             translate: None,
             rotate: None,
             scale: None,
+            border_spacing: (0.0, 0.0),
+            border_collapse: BorderCollapse::Separate,
+            empty_cells: EmptyCells::Show,
             custom: Arc::new(CustomMap::new()),
         }
     }
@@ -515,6 +523,10 @@ impl ComputedStyle {
         self.scrollbar_color = p.scrollbar_color;
         self.cursor = p.cursor.clone();
         self.pointer_events = p.pointer_events;
+        self.border_spacing = p.border_spacing;
+        self.border_collapse = p.border_collapse;
+        self.empty_cells = p.empty_cells;
+        self.vertical_align = p.vertical_align;
         // Not inherited, but `auto` resolves through the parent's used value.
         self.user_select_used = match p.user_select_used {
             UserSelect::All => UserSelect::All,
@@ -543,7 +555,7 @@ impl ComputedStyle {
     pub fn is_block_container(&self) -> bool {
         matches!(
             self.display,
-            Display::Block | Display::ListItem | Display::InlineBlock
+            Display::Block | Display::ListItem | Display::InlineBlock | Display::TableCell | Display::TableCaption
         )
     }
 
@@ -597,6 +609,8 @@ impl ComputedStyle {
     /// (repaint without reflow).
     pub fn layout_differs(&self, other: &ComputedStyle) -> bool {
         self.display != other.display
+            || self.border_spacing != other.border_spacing
+            || self.empty_cells != other.empty_cells
             || self.position != other.position
             || self.float != other.float
             || self.clear != other.clear
@@ -1030,7 +1044,7 @@ pub fn compute(
     // out-of-flow box, whose contents start afresh (what Blink's
     // `StopPropagateTextDecorations` lists). An element with lines of its
     // own is a decorating box too and adds its entry after theirs.
-    let stops = matches!(out.display, Display::InlineBlock | Display::InlineFlex)
+    let stops = matches!(out.display, Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
         || out.float != Float::None
         || matches!(out.position, Position::Absolute | Position::Fixed);
     out.decorations = match (stops, out.text_decoration_line.is_none()) {
@@ -1218,6 +1232,12 @@ pub fn compute(
         ScaleValue::None => None,
         ScaleValue::Values(x, y, z) => Some((*x, *y, *z)),
     });
+    pick!(border_spacing, BorderSpacing, BorderSpacing, |v| {
+        let h = v.0.to_px(&ctx).max(0.0);
+        (h, v.1.as_ref().map_or(h, |l| l.to_px(&ctx).max(0.0)))
+    });
+    pick!(border_collapse, BorderCollapse, BorderCollapse, |v| *v);
+    pick!(empty_cells, EmptyCells, EmptyCells, |v| *v);
 
     // Display fixups (CSS Display 3, "blockification").
     if is_root && !out.display.is_none() {
@@ -1234,10 +1254,20 @@ pub fn compute(
     out
 }
 
+/// CSS Display 3 §2.7: the block-level counterpart of a display type
+/// (for floated and absolutely positioned boxes). Internal table boxes
+/// become `block` (CSS 2.1 §9.7).
 fn blockify(d: Display) -> Display {
     match d {
         Display::Inline | Display::InlineBlock | Display::Contents => Display::Block,
         Display::InlineFlex => Display::Flex,
+        Display::InlineTable => Display::Table,
+        Display::TableRowGroup
+        | Display::TableHeaderGroup
+        | Display::TableFooterGroup
+        | Display::TableRow
+        | Display::TableCell
+        | Display::TableCaption => Display::Block,
         other => other,
     }
 }

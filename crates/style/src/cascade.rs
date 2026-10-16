@@ -474,7 +474,7 @@ impl<'a> Restyler<'a> {
             .map(parse_declaration_block)
             .unwrap_or_default();
         // Presentational hints from HTML attributes (width/height/align/bgcolor).
-        let hints = presentational_hints(element);
+        let hints = presentational_hints(doc, id, element);
         let inline_order = self.index.rules.len() as u32 + 1;
         for d in &hints {
             matched.push((level(Origin::Author, false), 0, 0, d));
@@ -742,13 +742,28 @@ fn compound_key(compound: &[&Component<BrowserSelectors>]) -> SubjectKey {
 
 
 /// HTML attributes that map to CSS (a subset of the rendering section of
-/// the HTML spec). These sit below author styles.
-fn presentational_hints(e: &browser_dom::Element) -> Vec<Declaration> {
-    use crate::properties::{DeclaredValue as D, DisplayValue, PropertyDeclaration as P, TextAlignValue};
-    use crate::values::{Length, SizeValue};
+/// the HTML spec). These sit below author styles. `id` is the element's
+/// node, for the table attributes a cell takes from its table
+/// (`cellpadding`, `border`).
+fn presentational_hints(doc: &Document, id: NodeId, e: &browser_dom::Element) -> Vec<Declaration> {
+    use crate::properties::{
+        BorderSpacingValue, BorderStyle, BorderWidth, DeclaredValue as D, DisplayValue, FloatValue, PropertyDeclaration as P,
+        TextAlignValue, VerticalAlign, VerticalAlignValue, WhiteSpace,
+    };
+    use crate::values::{Length, LengthPercentage, LengthPercentageAuto, SizeValue};
 
     let mut out = Vec::new();
     let tag = &*e.name.local;
+    let pixels = |v: &str| -> Option<f32> {
+        let v = v.trim();
+        let digits: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        digits.parse::<f32>().ok()
+    };
+    // The nearest table above a cell or row, for the attributes that
+    // apply to its cells (HTML rendering §15.3.9).
+    let table_above = || {
+        doc.ancestors(id).find(|&a| doc.element(a).is_some_and(|t| t.name.ns == html5ever::ns!(html) && &*t.name.local == "table"))
+    };
     let push = |out: &mut Vec<Declaration>, p: P| {
         out.push(Declaration {
             value: D::Value(p),
@@ -801,6 +816,82 @@ fn presentational_hints(e: &browser_dom::Element) -> Vec<Declaration> {
     }
     if e.attr("hidden").is_some() {
         push(&mut out, P::Display(DisplayValue::None));
+    }
+    // Tables (HTML rendering §15.3.9): `cellspacing` is the table's
+    // border-spacing, `border` its 1px outset border, `align` floats or
+    // centres it; a cell takes `cellpadding` as padding and a 1px inset
+    // border from a table with a non-zero `border`, `valign` as
+    // vertical-align, `nowrap` as white-space.
+    if tag == "table" {
+        if let Some(s) = e.attr("cellspacing").and_then(pixels) {
+            push(&mut out, P::BorderSpacing(BorderSpacingValue(Length::Px(s), None)));
+        }
+        if let Some(b) = e.attr("border") {
+            let width = pixels(b).unwrap_or(1.0);
+            if width > 0.0 {
+                for p in [
+                    P::BorderTopWidth(BorderWidth::Length(Length::Px(width))),
+                    P::BorderRightWidth(BorderWidth::Length(Length::Px(width))),
+                    P::BorderBottomWidth(BorderWidth::Length(Length::Px(width))),
+                    P::BorderLeftWidth(BorderWidth::Length(Length::Px(width))),
+                    P::BorderTopStyle(BorderStyle::Outset),
+                    P::BorderRightStyle(BorderStyle::Outset),
+                    P::BorderBottomStyle(BorderStyle::Outset),
+                    P::BorderLeftStyle(BorderStyle::Outset),
+                ] {
+                    push(&mut out, p);
+                }
+            }
+        }
+        match e.attr("align").map(|a| a.to_ascii_lowercase()).as_deref() {
+            Some("center") => {
+                push(&mut out, P::MarginLeft(LengthPercentageAuto::Auto));
+                push(&mut out, P::MarginRight(LengthPercentageAuto::Auto));
+            }
+            Some("left") => push(&mut out, P::Float(FloatValue::Left)),
+            Some("right") => push(&mut out, P::Float(FloatValue::Right)),
+            _ => {}
+        }
+    }
+    if matches!(tag, "td" | "th") {
+        if let Some(table) = table_above().and_then(|t| doc.element(t)) {
+            if let Some(p) = table.attr("cellpadding").and_then(pixels) {
+                for side in [P::PaddingTop, P::PaddingRight, P::PaddingBottom, P::PaddingLeft] {
+                    push(&mut out, side(LengthPercentage::Length(Length::Px(p))));
+                }
+            }
+            if table.attr("border").is_some_and(|b| pixels(b).unwrap_or(1.0) > 0.0) {
+                for p in [
+                    P::BorderTopWidth(BorderWidth::Length(Length::Px(1.0))),
+                    P::BorderRightWidth(BorderWidth::Length(Length::Px(1.0))),
+                    P::BorderBottomWidth(BorderWidth::Length(Length::Px(1.0))),
+                    P::BorderLeftWidth(BorderWidth::Length(Length::Px(1.0))),
+                    P::BorderTopStyle(BorderStyle::Inset),
+                    P::BorderRightStyle(BorderStyle::Inset),
+                    P::BorderBottomStyle(BorderStyle::Inset),
+                    P::BorderLeftStyle(BorderStyle::Inset),
+                ] {
+                    push(&mut out, p);
+                }
+            }
+        }
+        if e.attr("nowrap").is_some() {
+            push(&mut out, P::WhiteSpace(WhiteSpace::Nowrap));
+        }
+    }
+    if matches!(tag, "td" | "th" | "tr" | "thead" | "tbody" | "tfoot")
+        && let Some(v) = e.attr("valign")
+    {
+        let va = match v.to_ascii_lowercase().as_str() {
+            "top" => Some(VerticalAlignValue::Keyword(VerticalAlign::Top)),
+            "middle" | "center" => Some(VerticalAlignValue::Keyword(VerticalAlign::Middle)),
+            "bottom" => Some(VerticalAlignValue::Keyword(VerticalAlign::Bottom)),
+            "baseline" => Some(VerticalAlignValue::Keyword(VerticalAlign::Baseline)),
+            _ => None,
+        };
+        if let Some(va) = va {
+            push(&mut out, P::VerticalAlign(va));
+        }
     }
     out
 }

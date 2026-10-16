@@ -4,14 +4,26 @@
 html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, dl, dt, dd, blockquote,
 pre, address, article, aside, footer, header, hgroup, main, nav, section,
 figure, figcaption, form, fieldset, legend, details, summary, dialog,
-center, dir, menu, hr, table, caption, thead, tbody, tfoot, tr, search,
+center, dir, menu, hr, search,
 optgroup, option, noscript, frameset, frame, iframe { display: block; }
 
 head, script, style, title, meta, link, base, template, area, param, datalist,
 noembed, noframes, rp, [hidden] { display: none !important; }
 
-td, th, button, input, select, textarea, img, video, audio, canvas, embed,
+button, input, select, textarea, img, video, audio, canvas, embed,
 object, svg, math, meter, progress { display: inline-block; }
+
+/* Tables (HTML rendering §15.3.9 and Chrome's sheet): the cells inherit
+   `vertical-align: middle` from the row groups. */
+table { display: table; border-collapse: separate; border-spacing: 2px; box-sizing: border-box; text-indent: 0; }
+caption { display: table-caption; }
+thead { display: table-header-group; vertical-align: middle; border-color: inherit; }
+tbody { display: table-row-group; vertical-align: middle; border-color: inherit; }
+tfoot { display: table-footer-group; vertical-align: middle; border-color: inherit; }
+tr { display: table-row; vertical-align: inherit; border-color: inherit; }
+col { display: table-column; }
+colgroup { display: table-column-group; }
+td, th { display: table-cell; vertical-align: inherit; }
 
 li { display: list-item; }
 
@@ -72,7 +84,7 @@ hr { border: 1px inset; margin: 0.5em auto; color: gray; }
 table { border-color: gray; }
 caption, th { text-align: center; }
 th { font-weight: bold; }
-td, th { padding: 1px; vertical-align: middle; }
+td, th { padding: 1px; }
 
 fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0; }
 legend { padding: 0 2px; }

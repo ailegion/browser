@@ -209,7 +209,7 @@ struct Stacked<'a> {
 }
 
 enum StackedKind<'a> {
-    Real(Sub<'a>, Walk, bool),
+    Real(Box<(Sub<'a>, Walk, bool)>),
     Pseudo(Box<Pseudo<'a>>),
 }
 
@@ -234,7 +234,7 @@ struct Phases<'a> {
 
 enum Fore<'a> {
     Item(Placed<'a>),
-    Atomic(Pseudo<'a>),
+    Atomic(Box<Pseudo<'a>>),
 }
 
 const ALL_SIDES: [bool; 4] = [true; 4];
@@ -472,7 +472,11 @@ impl<'a> Builder<'a> {
                         };
                         if let Some(st) = stacked.iter_mut().find(|st| st.node == n) {
                             match &mut st.kind {
-                                StackedKind::Real(Sub::Inline(v), _, _) => v.push(c),
+                                StackedKind::Real(real) => {
+                                    if let Sub::Inline(v) = &mut real.0 {
+                                        v.push(c);
+                                    }
+                                }
                                 StackedKind::Pseudo(p) => {
                                     if let Sub::Inline(v) = &mut p.sub {
                                         v.push(c);
@@ -485,14 +489,13 @@ impl<'a> Builder<'a> {
                                         p.phases = phases;
                                     }
                                 }
-                                _ => {}
                             }
                         } else if real {
                             stacked.push(Stacked {
                                 z,
                                 seq,
                                 node: n,
-                                kind: StackedKind::Real(Sub::Inline(vec![c]), walk, false),
+                                kind: StackedKind::Real(Box::new((Sub::Inline(vec![c]), walk, false))),
                             });
                         } else {
                             let p = self.gather(Sub::Inline(vec![c]), walk, false, stacked);
@@ -510,7 +513,9 @@ impl<'a> Builder<'a> {
                 FragmentContent::Box | FragmentContent::Control(_) | FragmentContent::Image(_) => {
                     let Some(n) = c.node else {
                         // A generated box without an element: a
-                        // `list-style-image` marker or an anonymous box.
+                        // `list-style-image` marker, or an anonymous box
+                        // with a background of its own (a table box under
+                        // its captions, a row's background behind a cell).
                         if matches!(c.content, FragmentContent::Image(_)) {
                             if visible(c) {
                                 ph.foreground.push(Fore::Item(Placed {
@@ -519,7 +524,17 @@ impl<'a> Builder<'a> {
                                 }));
                             }
                         } else {
-                            self.collect(c, walk, false, ph, stacked);
+                            if visible(c) && matches!(c.content, FragmentContent::Box) {
+                                ph.block_bg.push(Placed {
+                                    op: Op::Decoration {
+                                        fragment: c,
+                                        sides: ALL_SIDES,
+                                    },
+                                    space: walk.space,
+                                });
+                            }
+                            let cw = self.child_walk(c, walk);
+                            self.collect(c, cw, false, ph, stacked);
                         }
                         continue;
                     };
@@ -545,7 +560,7 @@ impl<'a> Builder<'a> {
                             walk
                         };
                         let kind = if real {
-                            StackedKind::Real(Sub::Box(c), w, parent_flex)
+                            StackedKind::Real(Box::new((Sub::Box(c), w, parent_flex)))
                         } else {
                             StackedKind::Pseudo(Box::new(self.gather(Sub::Box(c), w, parent_flex, stacked)))
                         };
@@ -558,7 +573,7 @@ impl<'a> Builder<'a> {
                         || matches!(c.content, FragmentContent::Image(_))
                     {
                         let p = self.gather(Sub::Box(c), walk, parent_flex, stacked);
-                        ph.foreground.push(Fore::Atomic(p));
+                        ph.foreground.push(Fore::Atomic(Box::new(p)));
                     } else if self.scrolls_overflow(c) || s.backface_visibility == BackfaceVisibility::Hidden {
                         let p = self.gather(Sub::Box(c), walk, false, stacked);
                         ph.normal.push(p);
@@ -644,7 +659,7 @@ impl<'a> Builder<'a> {
         for fo in phases.foreground {
             match fo {
                 Fore::Item(item) => self.list.items.push(item),
-                Fore::Atomic(p) => self.emit(p, Vec::new(), Vec::new()),
+                Fore::Atomic(p) => self.emit(*p, Vec::new(), Vec::new()),
             }
         }
         // 6. Descendants' outlines, then the root's own.
@@ -705,7 +720,10 @@ impl<'a> Builder<'a> {
 
     fn emit_stacked(&mut self, s: Stacked<'a>) {
         match s.kind {
-            StackedKind::Real(sub, walk, flex_item) => self.context(sub, walk, flex_item),
+            StackedKind::Real(real) => {
+                let (sub, walk, flex_item) = *real;
+                self.context(sub, walk, flex_item)
+            }
             StackedKind::Pseudo(p) => self.emit(*p, Vec::new(), Vec::new()),
         }
     }

@@ -27,14 +27,41 @@ pub enum Display {
     ListItem,
     /// `display: contents`; treated as inline in layout for now.
     Contents,
+    /// The table boxes (CSS 2.1 §17; "Working sites first" line 3).
+    Table,
+    InlineTable,
+    TableRowGroup,
+    TableHeaderGroup,
+    TableFooterGroup,
+    TableRow,
+    TableCell,
+    TableCaption,
 }
 
 impl Display {
     pub fn is_block_level(self) -> bool {
-        matches!(self, Display::Block | Display::Flex | Display::ListItem)
+        matches!(self, Display::Block | Display::Flex | Display::ListItem | Display::Table | Display::TableCaption)
     }
     pub fn is_none(self) -> bool {
         self == Display::None
+    }
+
+    /// A table box of either outer display type.
+    pub fn is_table(self) -> bool {
+        matches!(self, Display::Table | Display::InlineTable)
+    }
+
+    /// A box that only lives inside a table: a row group, row or cell
+    /// (CSS 2.1 §17.2 "internal table elements"; captions are not).
+    pub fn is_table_internal(self) -> bool {
+        matches!(
+            self,
+            Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup | Display::TableRow | Display::TableCell
+        )
+    }
+
+    pub fn is_table_row_group(self) -> bool {
+        matches!(self, Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup)
     }
 
     pub fn keyword(self) -> &'static str {
@@ -47,6 +74,14 @@ impl Display {
             Display::InlineFlex => "inline-flex",
             Display::ListItem => "list-item",
             Display::Contents => "contents",
+            Display::Table => "table",
+            Display::InlineTable => "inline-table",
+            Display::TableRowGroup => "table-row-group",
+            Display::TableHeaderGroup => "table-header-group",
+            Display::TableFooterGroup => "table-footer-group",
+            Display::TableRow => "table-row",
+            Display::TableCell => "table-cell",
+            Display::TableCaption => "table-caption",
         }
     }
 }
@@ -87,10 +122,20 @@ impl DisplayValue {
         use DisplayValue::*;
         match self {
             None => Display::None,
-            Block | FlowRoot | Table | TableCaption | TableRowGroup | TableHeaderGroup | TableFooterGroup
-            | TableRow | TableColumn | TableColumnGroup | Grid | WebkitBox | MozBox => Display::Block,
+            Block | FlowRoot | Grid | WebkitBox | MozBox => Display::Block,
+            Table => Display::Table,
+            InlineTable => Display::InlineTable,
+            TableCaption => Display::TableCaption,
+            TableRowGroup => Display::TableRowGroup,
+            TableHeaderGroup => Display::TableHeaderGroup,
+            TableFooterGroup => Display::TableFooterGroup,
+            TableRow => Display::TableRow,
+            TableCell => Display::TableCell,
+            // Columns and column groups make no box of their own here
+            // (their widths and backgrounds are a later part of tables).
+            TableColumn | TableColumnGroup => Display::None,
             Inline | Ruby => Display::Inline,
-            InlineBlock | TableCell | InlineTable | InlineGrid | WebkitInlineBox => Display::InlineBlock,
+            InlineBlock | InlineGrid | WebkitInlineBox => Display::InlineBlock,
             Flex => Display::Flex,
             InlineFlex => Display::InlineFlex,
             ListItem => Display::ListItem,
@@ -2465,6 +2510,28 @@ longhands! {
     Translate: "translate" => TranslateValue, false;
     Rotate: "rotate" => RotateValue, false;
     Scale: "scale" => ScaleValue, false;
+    BorderSpacing: "border-spacing" => BorderSpacingValue, true;
+    BorderCollapse: "border-collapse" => BorderCollapse, true;
+    EmptyCells: "empty-cells" => EmptyCells, true;
+}
+
+/// `border-spacing`: the horizontal and vertical spacing (one value for
+/// both).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BorderSpacingValue(pub Length, pub Option<Length>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderCollapse {
+    #[default]
+    Separate,
+    Collapse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmptyCells {
+    #[default]
+    Show,
+    Hide,
 }
 
 /// `transform-origin` as written: the horizontal and vertical position
@@ -2837,6 +2904,21 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
         PropertyId::Translate => P::Translate(parse_translate(input)?),
         PropertyId::Rotate => P::Rotate(parse_rotate(input)?),
         PropertyId::Scale => P::Scale(parse_scale(input)?),
+        PropertyId::BorderSpacing => {
+            let h = parse_length(input)?;
+            if h.parts().0 < 0.0 {
+                return Err(input.new_custom_error(()));
+            }
+            let v = input.try_parse(parse_length).ok();
+            if v.as_ref().is_some_and(|v| v.parts().0 < 0.0) {
+                return Err(input.new_custom_error(()));
+            }
+            P::BorderSpacing(BorderSpacingValue(h, v))
+        }
+        PropertyId::BorderCollapse => P::BorderCollapse(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "separate" => BorderCollapse::Separate, "collapse" => BorderCollapse::Collapse, _ => return None }))?),
+        PropertyId::EmptyCells => P::EmptyCells(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "show" => EmptyCells::Show, "hide" => EmptyCells::Hide, _ => return None }))?),
     })
 }
 
@@ -4520,7 +4602,7 @@ mod tests {
     fn display_values() {
         assert_eq!(parse("display", "inline-block"), vec![DeclaredValue::Value(PropertyDeclaration::Display(DisplayValue::InlineBlock))]);
         assert_eq!(parse("display", "table-cell"), vec![DeclaredValue::Value(PropertyDeclaration::Display(DisplayValue::TableCell))]);
-        assert_eq!(DisplayValue::TableCell.computed(), Display::InlineBlock);
+        assert_eq!(DisplayValue::TableCell.computed(), Display::TableCell);
         assert_eq!(parse("display", "flex"), vec![DeclaredValue::Value(PropertyDeclaration::Display(DisplayValue::Flex))]);
         assert_eq!(parse("display", "none"), vec![DeclaredValue::Value(PropertyDeclaration::Display(DisplayValue::None))]);
         assert_eq!(parse("display", "inline flow-root"), vec![DeclaredValue::Value(PropertyDeclaration::Display(DisplayValue::InlineBlock))]);
