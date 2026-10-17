@@ -67,22 +67,27 @@ pub(crate) fn size_for(
     known_height: Option<f32>,
     cb_width: Option<f32>,
 ) -> Size<f32> {
+    let width = width_for(engine, table, sizing, cb_width);
+    let i = layout_at(engine, table, width, None);
+    Size {
+        width,
+        height: known_height.unwrap_or(table.layouts[i].height),
+    }
+}
+
+/// The width of `size_for`, from the intrinsic widths alone.
+pub(crate) fn width_for(engine: &mut LayoutEngine, table: &mut TableBox, sizing: Sizing, cb_width: Option<f32>) -> f32 {
     // Percentages resolve against the containing block taffy last gave
     // a definite width for (an intrinsic question has none).
     if let Some(cb) = cb_width {
         table.available_width = cb;
     }
     let (min, max) = intrinsic_widths(engine, table);
-    let width = match sizing {
+    match sizing {
         Sizing::MinContent => min,
         Sizing::MaxContent => max,
         Sizing::Exactly(w) => w.max(min),
         Sizing::FitInto(a) | Sizing::Fill(a) => a.min(max).max(min),
-    };
-    let i = layout_at(engine, table, width, None);
-    Size {
-        width,
-        height: known_height.unwrap_or(table.layouts[i].height),
     }
 }
 

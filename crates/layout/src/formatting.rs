@@ -89,6 +89,13 @@ pub(crate) trait SelfLayout {
     /// container places, as `min_content` measures it. What was laid out
     /// is kept for the fragments.
     fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, known_height: Option<f32>, cb_width: Option<f32>) -> Size<f32>;
+
+    /// The width `layout` would answer, when that is all the container
+    /// asked (taffy's horizontal-only measures); a box that can tell it
+    /// without laying out its height says so.
+    fn width_for(&mut self, engine: &mut LayoutEngine, sizing: Sizing, cb_width: Option<f32>) -> f32 {
+        self.layout(engine, sizing, None, cb_width).width
+    }
 }
 
 /// taffy's measure question for a leaf, put as a `Sizing`: a width taffy
@@ -100,6 +107,7 @@ pub(crate) fn measure(
     known: Size<Option<f32>>,
     available: Size<AvailableSpace>,
     cb_width: Option<f32>,
+    width_only: bool,
 ) -> Size<f32> {
     let sizing = match (known.width, available.width) {
         (Some(w), _) => Sizing::Exactly(w),
@@ -107,6 +115,14 @@ pub(crate) fn measure(
         (None, AvailableSpace::MaxContent) => Sizing::MaxContent,
         (None, AvailableSpace::Definite(w)) => Sizing::FitInto(w),
     };
+    if width_only {
+        // taffy keeps a horizontal-only answer apart from full ones
+        // (`Cache::size_is_valid_for`), so its height is never read.
+        return Size {
+            width: leaf.width_for(engine, sizing, cb_width),
+            height: 0.0,
+        };
+    }
     leaf.layout(engine, sizing, known.height, cb_width)
 }
 
@@ -196,6 +212,10 @@ impl SelfLayout for TableBox {
 
     fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, known_height: Option<f32>, cb_width: Option<f32>) -> Size<f32> {
         crate::table::size_for(engine, self, sizing, known_height, cb_width)
+    }
+
+    fn width_for(&mut self, engine: &mut LayoutEngine, sizing: Sizing, cb_width: Option<f32>) -> f32 {
+        crate::table::width_for(engine, self, sizing, cb_width)
     }
 }
 

@@ -944,6 +944,7 @@ impl LayoutEngine {
         let engine = &mut *self;
         let result = tree.compute_layout_with_measure(root, available, |inputs, _id, ctx, style| {
             let cb_width = inputs.parent_size.width;
+            let width_only = inputs.run_mode == taffy::RunMode::ComputeSize && inputs.axis == taffy::RequestedAxis::Horizontal;
             let mut image;
             let leaf: &mut dyn SelfLayout = match ctx {
                 Some(Leaf::Measured(idx)) => leaves[*idx].as_dyn(),
@@ -954,7 +955,7 @@ impl LayoutEngine {
                 None => return taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |_, _| Size::ZERO),
             };
             taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
-                crate::formatting::measure(leaf, engine, known, avail, cb_width)
+                crate::formatting::measure(leaf, engine, known, avail, cb_width, width_only)
             })
         });
         if let Err(e) = result {
@@ -4002,6 +4003,87 @@ mod tests {
         assert!(it.x > 0.0 && it.y >= line.y && it.bottom() <= line.bottom() + 0.01, "the inline-table sits in the line: {it:?} in {line:?}");
         let (h, bd, f) = (box_of(&tree, by_id(&doc, "h")), box_of(&tree, by_id(&doc, "bd")), box_of(&tree, by_id(&doc, "f")));
         assert!(h.y < bd.y && bd.y < f.y, "head {h:?}, body {bd:?}, foot {f:?}");
+    }
+
+    /// Atomics answer their min- and max-content widths and shrink to fit
+    /// the line they are in, as browsers size them (CSS 2.1 §10.3.9; CSS
+    /// Sizing 3 §5): a content-box inline-block's padding and border go
+    /// around its content once; a long one is as wide as its line and
+    /// wraps; a percentage width is of its container; a cell holding an
+    /// inline-block is as narrow as the inline-block's longest word; a
+    /// caption is as wide as its table; a table inside a cell fits it; an
+    /// inline image's margins take room in the line; percentage padding
+    /// on an inline-block resolves against its line around its content.
+    #[test]
+    fn atomics_answer_intrinsic_widths_and_fit_their_line() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div><span id=cb style='display:inline-block;padding:10px;border:3px solid'>abc</span>\
+             <span id=bb style='display:inline-block;box-sizing:border-box;padding:10px;border:3px solid'>abc</span></div>\
+             <div style='width:150px'>a <span id=long style='display:inline-block;padding:5px'>inline block with long text that wraps</span> b</div>\
+             <div style='width:400px'><span id=half style='display:inline-block;width:50%'>half</span></div>\
+             <table id=t style='width:1px;border-spacing:0'><tr><td id=c style='padding:0'><span id=ib style='display:inline-block'>one two three four</span></td></tr></table>\
+             <table id=ct style='border-spacing:0'><caption id=cap style='padding:4px;border:1px solid'>Caption</caption><tr><td style='padding:0'>a b c d e f g</td></tr></table>\
+             <div id=narrow style='width:200px'><table id=inner style='border-spacing:0'><tr><td style='padding:0'>some quite long text that cannot fit in two hundred pixels</td></tr></table></div>\
+             <p style='margin:0'><img id=img style='width:20px;height:20px;margin:0 10px'><span id=after>x</span></p>\
+             <div style='width:400px'><span id=pp style='display:inline-block;padding:0 5%;white-space:nowrap'><span id=ppt>abc</span></span></div>\
+             </body>",
+            "",
+        );
+        let b = |id: &str| box_of(&tree, by_id(&doc, id));
+        // The same content: the content-box one is wider by nothing but its
+        // own padding and border; the border-box one is its content plus
+        // both, too (box-sizing changes nothing for an auto width).
+        assert_eq!(b("cb").width, b("bb").width, "padding and border counted once");
+        assert!(b("cb").width < 60.0, "{:?}", b("cb"));
+        let long = b("long");
+        assert_eq!(long.width, 150.0, "as wide as its line");
+        assert!(long.height > 30.0, "and its text wraps: {long:?}");
+        assert_eq!(b("half").width, 200.0, "50% of its 400px container");
+        // `width: 1px` shrinks the table to its minimum: the inline-block's
+        // longest word, not its unbroken text.
+        let (c, ib) = (b("c"), b("ib"));
+        assert_eq!(c.width, ib.width);
+        assert!(ib.width < 60.0 && ib.height > 50.0, "the inline-block at its min-content width: {ib:?}");
+        assert_eq!(b("cap").width, b("ct").width, "the caption's border box is the table's width");
+        assert_eq!(b("inner").width, 200.0, "the table fits the cell it is in");
+        let (img, after) = (b("img"), tree.first_rect(|n| n == by_id(&doc, "after")).expect("after"));
+        assert_eq!(img.x, 10.0, "the image's left margin");
+        assert_eq!(after.x, 40.0, "and its right margin before the text");
+        let (pp, ppt) = (b("pp"), tree.first_rect(|n| n == by_id(&doc, "ppt")).expect("text"));
+        assert_eq!(ppt.x - pp.x, 20.0, "5% of the 400px line");
+        assert!((pp.width - (ppt.width + 40.0)).abs() < 1.0, "the content and both paddings: {pp:?} {ppt:?}");
+    }
+
+    /// The paint order is kept on the tree and built again when the
+    /// fragments move or restyle, so hit testing after a scroll or a
+    /// style refresh sees the boxes where they now are.
+    #[test]
+    fn the_kept_paint_order_follows_scrolls_and_restyles() {
+        let html = "<body style='margin:0'><div id=s style='overflow:auto;width:200px;height:100px'>\
+                    <div id=a style='height:100px'>a</div><div id=b style='height:100px'>b</div></div>\
+                    <div id=p style='width:100px;height:100px'></div></body>";
+        let doc = browser_dom::parse_html(html.as_bytes());
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        let mut engine = LayoutEngine::new();
+        let mut tree = engine.layout(&doc, &styles, 800.0, 600.0, &());
+        let (a, b, p) = (by_id(&doc, "a"), by_id(&doc, "b"), by_id(&doc, "p"));
+        assert_eq!(tree.hit_test(50.0, 50.0), Some(a));
+        tree.set_scroll_offset(by_id(&doc, "s"), (0.0, 100.0));
+        assert_eq!(tree.hit_test(50.0, 50.0), Some(b), "the scrolled content under the point");
+        assert_eq!(tree.hit_test(50.0, 150.0), Some(p));
+        // `pointer-events: none` through a restyle without layout.
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse("#p { pointer-events: none }", Origin::Author)));
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        engine.refresh_styles(&mut tree, &doc, &styles);
+        assert_ne!(tree.hit_test(50.0, 150.0), Some(p), "passed through after the restyle");
+        let fresh = crate::stacking::build(&tree);
+        assert_eq!(fresh.spaces(), tree.spaces());
+        assert_eq!(tree.paint_list().items.len(), fresh.resolve(&tree.root).items.len());
     }
 
     /// A layout timing for the owner's rule (release build, real-world

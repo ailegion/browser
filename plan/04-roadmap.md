@@ -44,11 +44,12 @@ remaining lists as they stand.
       orientation of JPEG and WebP (Chrome and Firefox display images
       rotated per EXIF). Tests: a JPEG decoded, the same JPEG with an
       EXIF orientation 6 segment shown rotated, an `<img>` painting it.
-- [ ] 3. Tables (new 4a entry): table/row/cell boxes, colspan/rowspan,
+- [x] 3. Tables (new 4a entry): table/row/cell boxes, colspan/rowspan,
       auto column widths, borders and padding. Later: captions,
       border-collapse, table-layout: fixed, column groups.
-      Built 2026-10-16, not ticked (one SKIPPED part, at the end of this
-      record). Style: `Display` gained the table types
+      Built 2026-10-16; its SKIPPED part (atomics in cells) resolved
+      2026-10-17 by the layout rewrite recorded after this line, which
+      also replaced the prelay/relay mechanism described below. Style: `Display` gained the table types
       (`table`, `inline-table`, row groups, `table-row`, `table-cell`,
       `table-caption`; columns make no box), `border-spacing`,
       `border-collapse` (kept, the separated model always), `empty-cells`;
@@ -94,6 +95,43 @@ remaining lists as they stand.
       Chrome gives it. The fix is per-mode measurement of atomics
       (min-content, max-content, final), which touches the atomic
       pipeline for every container, not only tables.
+- [x] 3b. Layout rewrite (2026-10-17, owner's direction): one interface
+      for everything that lays itself out, and the paint order kept.
+      `crates/layout/src/formatting.rs`: the trait `SelfLayout`
+      (`min_content`, `max_content`, `layout(Sizing)`), implemented by
+      inline roots, tables, block images, atomics, cells and captions;
+      taffy's measure callback asks a leaf only that (`measure`; a
+      horizontal-only question gets `width_for`, which a table answers
+      from its intrinsic widths). A table lays itself out inside its
+      answer (no `prelay`/`relay`); an inline root lays its atomics out
+      per line width (`LineWidth`: their min- or max-content contribution
+      while its intrinsic sizes are measured, shrink-to-fit into the line
+      otherwise, kept per width on the `Atomic`); cells, captions and
+      atomics go through one `LayoutEngine::layout_independent` (`Role`,
+      `Run`). Fixed on the way, all browser behaviour the old code broke:
+      a content-box atomic counted its padding and border twice; atomics
+      and tables were sized against the viewport, not their containing
+      block (Hacker News' story table overflowed its cell by 58px);
+      percentage widths of atomics were of the viewport; a caption was
+      wider than its table by its padding and border; inline image
+      margins took no room; atomics now shrink to no less than their
+      min-content width. Percentage padding of an atomic resolves against
+      the line around its content (taken as zero in its contributions).
+      The paint order (`stacking::PaintOrder`) is built once per layout
+      and again after a scroll, a sticky shift or a style refresh, kept
+      on `LayoutTree`; hit testing reads it with no tree walk, the
+      painter resolves it with one walk, the geometry helpers and
+      selection read its spaces (`LayoutTree::spaces`). Release timings
+      (old → new): Hacker News relayout 18 → 41 ms, mouse move 0.55 →
+      0.04 ms; Wikipedia relayout 199 → 177 ms, mouse move 26 → 1 ms;
+      the table timing test 34.6 → 46.7 ms (a nested table is now laid
+      out at each width its cell is measured at; a size-only taffy
+      query would remove it). Not changed and not browser-equal, found
+      on the way: a block inside an inline is an atomic (no split); an
+      inline image's percentage height resolves against the width; a
+      shrink-to-fit float with wrapping text is its longest line wide,
+      not its available width; a cell's percentage padding resolves
+      against the table's containing block (Chrome not checked).
 - [ ] 4. Positioned containing block (new 4a entry; the deviation is
       noted in the 4a block 6 record): absolute and fixed boxes sized
       and placed against the nearest positioned or transformed
