@@ -24,6 +24,10 @@ pub enum Display {
     InlineBlock,
     Flex,
     InlineFlex,
+    /// A grid container ("Working sites first" line 5), block- or
+    /// inline-level.
+    Grid,
+    InlineGrid,
     ListItem,
     /// `display: contents`; treated as inline in layout for now.
     Contents,
@@ -40,7 +44,17 @@ pub enum Display {
 
 impl Display {
     pub fn is_block_level(self) -> bool {
-        matches!(self, Display::Block | Display::Flex | Display::ListItem | Display::Table | Display::TableCaption)
+        matches!(self, Display::Block | Display::Flex | Display::Grid | Display::ListItem | Display::Table | Display::TableCaption)
+    }
+
+    /// A flex or grid container, whose children are its items.
+    pub fn is_flex_or_grid(self) -> bool {
+        matches!(self, Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid)
+    }
+
+    /// A grid container of either outer display type.
+    pub fn is_grid(self) -> bool {
+        matches!(self, Display::Grid | Display::InlineGrid)
     }
     pub fn is_none(self) -> bool {
         self == Display::None
@@ -72,6 +86,8 @@ impl Display {
             Display::InlineBlock => "inline-block",
             Display::Flex => "flex",
             Display::InlineFlex => "inline-flex",
+            Display::Grid => "grid",
+            Display::InlineGrid => "inline-grid",
             Display::ListItem => "list-item",
             Display::Contents => "contents",
             Display::Table => "table",
@@ -87,7 +103,7 @@ impl Display {
 }
 
 /// `display` as written: every keyword the parser accepts, each mapped
-/// to the `Display` layout uses (table and grid lay out as blocks).
+/// to the `Display` layout uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayValue {
     None,
@@ -122,7 +138,9 @@ impl DisplayValue {
         use DisplayValue::*;
         match self {
             None => Display::None,
-            Block | FlowRoot | Grid | WebkitBox | MozBox => Display::Block,
+            Block | FlowRoot | WebkitBox | MozBox => Display::Block,
+            Grid => Display::Grid,
+            InlineGrid => Display::InlineGrid,
             Table => Display::Table,
             InlineTable => Display::InlineTable,
             TableCaption => Display::TableCaption,
@@ -135,7 +153,7 @@ impl DisplayValue {
             // (their widths and backgrounds are a later part of tables).
             TableColumn | TableColumnGroup => Display::None,
             Inline | Ruby => Display::Inline,
-            InlineBlock | InlineGrid | WebkitInlineBox => Display::InlineBlock,
+            InlineBlock | WebkitInlineBox => Display::InlineBlock,
             Flex => Display::Flex,
             InlineFlex => Display::InlineFlex,
             ListItem => Display::ListItem,
@@ -2513,6 +2531,15 @@ longhands! {
     BorderSpacing: "border-spacing" => BorderSpacingValue, true;
     BorderCollapse: "border-collapse" => BorderCollapse, true;
     EmptyCells: "empty-cells" => EmptyCells, true;
+    GridTemplateColumns: "grid-template-columns" => crate::grid::TrackList<LengthPercentage>, false;
+    GridTemplateRows: "grid-template-rows" => crate::grid::TrackList<LengthPercentage>, false;
+    GridAutoColumns: "grid-auto-columns" => Vec<crate::grid::TrackSize<LengthPercentage>>, false;
+    GridAutoRows: "grid-auto-rows" => Vec<crate::grid::TrackSize<LengthPercentage>>, false;
+    GridAutoFlow: "grid-auto-flow" => crate::grid::GridAutoFlow, false;
+    GridRowStart: "grid-row-start" => crate::grid::GridLine, false;
+    GridRowEnd: "grid-row-end" => crate::grid::GridLine, false;
+    GridColumnStart: "grid-column-start" => crate::grid::GridLine, false;
+    GridColumnEnd: "grid-column-end" => crate::grid::GridLine, false;
 }
 
 /// `border-spacing`: the horizontal and vertical spacing (one value for
@@ -2625,7 +2652,12 @@ pub fn is_shorthand(name: &str) -> bool {
 /// `-webkit-background-*` names are the legacy aliases of `gap`,
 /// `overflow-wrap`, `box-decoration-break`, `background-clip`,
 /// `background-origin` and `background-size`, never written).
-pub const SHORTHANDS: [&str; 37] = [
+pub const SHORTHANDS: [&str; 42] = [
+    "grid",
+    "grid-template",
+    "grid-area",
+    "grid-row",
+    "grid-column",
     "outline",
     "-webkit-user-select",
     "-webkit-transform",
@@ -2919,6 +2951,15 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "separate" => BorderCollapse::Separate, "collapse" => BorderCollapse::Collapse, _ => return None }))?),
         PropertyId::EmptyCells => P::EmptyCells(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "show" => EmptyCells::Show, "hide" => EmptyCells::Hide, _ => return None }))?),
+        PropertyId::GridTemplateColumns => P::GridTemplateColumns(crate::grid::parse_track_list(input)?),
+        PropertyId::GridTemplateRows => P::GridTemplateRows(crate::grid::parse_track_list(input)?),
+        PropertyId::GridAutoColumns => P::GridAutoColumns(crate::grid::parse_auto_tracks(input)?),
+        PropertyId::GridAutoRows => P::GridAutoRows(crate::grid::parse_auto_tracks(input)?),
+        PropertyId::GridAutoFlow => P::GridAutoFlow(crate::grid::parse_auto_flow(input)?),
+        PropertyId::GridRowStart => P::GridRowStart(crate::grid::parse_grid_line(input)?),
+        PropertyId::GridRowEnd => P::GridRowEnd(crate::grid::parse_grid_line(input)?),
+        PropertyId::GridColumnStart => P::GridColumnStart(crate::grid::parse_grid_line(input)?),
+        PropertyId::GridColumnEnd => P::GridColumnEnd(crate::grid::parse_grid_line(input)?),
     })
 }
 
@@ -3355,8 +3396,6 @@ fn parse_display<'i>(input: &mut Parser<'i, '_>) -> Result<DisplayValue, ParseEr
     use DisplayValue as D;
     Ok(match combined.as_str() {
         "none" => D::None,
-        // Table and grid layouts are not implemented; their containers lay
-        // out as blocks so their content still shows.
         "block" | "block flow" => D::Block,
         "flow-root" | "block flow-root" => D::FlowRoot,
         "table" => D::Table,
@@ -3954,8 +3993,72 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "list-style" => &[ListStyleType, ListStylePosition, ListStyleImage],
         "place-items" => &[AlignItems],
         "place-content" => &[AlignContent, JustifyContent],
+        "grid-row" => &[GridRowStart, GridRowEnd],
+        "grid-column" => &[GridColumnStart, GridColumnEnd],
+        "grid-area" => &[GridRowStart, GridColumnStart, GridRowEnd, GridColumnEnd],
+        "grid-template" => &[GridTemplateRows, GridTemplateColumns],
+        "grid" => &[GridTemplateRows, GridTemplateColumns, GridAutoRows, GridAutoColumns, GridAutoFlow],
         _ => return None,
     })
+}
+
+/// The omitted end of a `grid-row`/`grid-column`/`grid-area` part: a
+/// named line repeats, anything else is `auto` (CSS Grid 1 §8.4).
+fn grid_line_default(start: &crate::grid::GridLine) -> crate::grid::GridLine {
+    match start {
+        crate::grid::GridLine::Ident(n) => crate::grid::GridLine::Ident(n.clone()),
+        _ => crate::grid::GridLine::Auto,
+    }
+}
+
+/// `<grid-line> [ / <grid-line> ]{0,max-1}`.
+fn parse_grid_lines<'i>(input: &mut Parser<'i, '_>, max: usize) -> Result<Vec<crate::grid::GridLine>, ParseErr<'i>> {
+    let mut lines = vec![crate::grid::parse_grid_line(input)?];
+    while lines.len() < max && input.try_parse(|i| i.expect_delim('/')).is_ok() {
+        lines.push(crate::grid::parse_grid_line(input)?);
+    }
+    Ok(lines)
+}
+
+/// `grid-template`: `none`, or `<'grid-template-rows'> /
+/// <'grid-template-columns'>` (the form with area strings is a later
+/// part of grid).
+fn parse_grid_template<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<(crate::grid::TrackList<LengthPercentage>, crate::grid::TrackList<LengthPercentage>), ParseErr<'i>> {
+    use crate::grid::TrackList;
+    if input
+        .try_parse(|i| {
+            i.expect_ident_matching("none")?;
+            i.expect_exhausted()
+        })
+        .is_ok()
+    {
+        return Ok((TrackList::None, TrackList::None));
+    }
+    let rows = crate::grid::parse_track_list(input)?;
+    input.expect_delim('/')?;
+    let columns = crate::grid::parse_track_list(input)?;
+    Ok((rows, columns))
+}
+
+/// `[ auto-flow && dense? ]`, for the `grid` shorthand.
+fn parse_grid_auto_flow_keyword<'i>(input: &mut Parser<'i, '_>) -> Result<bool, ParseErr<'i>> {
+    let mut auto_flow = false;
+    let mut dense = false;
+    loop {
+        if !auto_flow && input.try_parse(|i| i.expect_ident_matching("auto-flow")).is_ok() {
+            auto_flow = true;
+        } else if !dense && input.try_parse(|i| i.expect_ident_matching("dense")).is_ok() {
+            dense = true;
+        } else {
+            break;
+        }
+    }
+    if !auto_flow {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(dense)
 }
 
 fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclaration>, ParseErr<'i>> {
@@ -4000,6 +4103,72 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
                 P::OutlineStyle(style.unwrap_or(OutlineStyle::None)),
                 P::OutlineColor(color.unwrap_or(Color::CurrentColor)),
             ]
+        },
+        "grid-row" | "grid-column" => {
+            let lines = parse_grid_lines(input, 2)?;
+            let start = lines[0].clone();
+            let end = lines.get(1).cloned().unwrap_or_else(|| grid_line_default(&start));
+            if name.eq_ignore_ascii_case("grid-row") {
+                vec![P::GridRowStart(start), P::GridRowEnd(end)]
+            } else {
+                vec![P::GridColumnStart(start), P::GridColumnEnd(end)]
+            }
+        },
+        "grid-area" => {
+            let lines = parse_grid_lines(input, 4)?;
+            let row_start = lines[0].clone();
+            let column_start = lines.get(1).cloned().unwrap_or_else(|| grid_line_default(&row_start));
+            let row_end = lines.get(2).cloned().unwrap_or_else(|| grid_line_default(&row_start));
+            let column_end = lines.get(3).cloned().unwrap_or_else(|| grid_line_default(&column_start));
+            vec![P::GridRowStart(row_start), P::GridColumnStart(column_start), P::GridRowEnd(row_end), P::GridColumnEnd(column_end)]
+        },
+        "grid-template" => {
+            let (rows, columns) = parse_grid_template(input)?;
+            vec![P::GridTemplateRows(rows), P::GridTemplateColumns(columns)]
+        },
+        "grid" => {
+            use crate::grid::{GridAutoFlow, TrackBreadth, TrackList, TrackSize};
+            let auto = || vec![TrackSize::Breadth(TrackBreadth::Auto)];
+            // `<'grid-template'>`, or one axis auto-flowed: the
+            // other longhands back to their initial values.
+            if let Ok((rows, columns)) = input.try_parse(|i| {
+                let t = parse_grid_template(i)?;
+                i.expect_exhausted()?;
+                Ok::<_, ParseErr<'i>>(t)
+            }) {
+                vec![
+                    P::GridTemplateRows(rows),
+                    P::GridTemplateColumns(columns),
+                    P::GridAutoRows(auto()),
+                    P::GridAutoColumns(auto()),
+                    P::GridAutoFlow(GridAutoFlow::default()),
+                ]
+            } else if let Ok(dense) = input.try_parse(parse_grid_auto_flow_keyword) {
+                // `[ auto-flow && dense? ] <'grid-auto-rows'>? / <'grid-template-columns'>`
+                let rows = input.try_parse(crate::grid::parse_auto_tracks).unwrap_or_else(|_| auto());
+                input.expect_delim('/')?;
+                let columns = crate::grid::parse_track_list(input)?;
+                vec![
+                    P::GridTemplateRows(TrackList::None),
+                    P::GridTemplateColumns(columns),
+                    P::GridAutoRows(rows),
+                    P::GridAutoColumns(auto()),
+                    P::GridAutoFlow(GridAutoFlow { column: false, dense }),
+                ]
+            } else {
+                // `<'grid-template-rows'> / [ auto-flow && dense? ] <'grid-auto-columns'>?`
+                let rows = crate::grid::parse_track_list(input)?;
+                input.expect_delim('/')?;
+                let dense = parse_grid_auto_flow_keyword(input)?;
+                let columns = input.try_parse(crate::grid::parse_auto_tracks).unwrap_or_else(|_| auto());
+                vec![
+                    P::GridTemplateRows(rows),
+                    P::GridTemplateColumns(TrackList::None),
+                    P::GridAutoRows(auto()),
+                    P::GridAutoColumns(columns),
+                    P::GridAutoFlow(GridAutoFlow { column: true, dense }),
+                ]
+            }
         },
         "-webkit-user-select" => vec![P::UserSelect(parse_user_select(input)?)],
         "-webkit-transform" => vec![P::Transform(parse_transform_list(input)?)],

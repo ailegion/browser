@@ -12,6 +12,7 @@
 pub mod cascade;
 pub mod computed;
 pub mod custom;
+pub mod grid;
 pub mod image;
 pub mod media;
 pub mod properties;
@@ -38,7 +39,7 @@ pub use image::{
 };
 pub use properties::*;
 pub use media::MediaQueryList;
-pub use serialize::{UsedValues, resolved_value, serialize_block, serialize_declared, serialize_shorthand};
+pub use serialize::{UsedGrid, UsedTracks, UsedValues, resolved_value, serialize_block, serialize_declared, serialize_shorthand};
 pub use stylesheet::{
     Origin, Rule, StyleRule, Stylesheet, parse_cssom_block, parse_declaration_block, parse_declaration_value,
 };

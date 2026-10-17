@@ -698,6 +698,29 @@ pub struct Fragment {
     /// scrollable overflow of the boxes between it and that block pass it
     /// by, as they do in browsers.
     pub containing: Option<Containing>,
+    /// A grid container's tracks as laid out (`GridInfo`).
+    pub grid: Option<Arc<GridInfo>>,
+}
+
+/// A grid container's laid-out tracks: where each column and row is, the
+/// explicit grid among them ("Working sites first" line 5).
+#[derive(Debug, Clone)]
+pub struct GridInfo(pub(crate) taffy::DetailedGridInfo<String>);
+
+impl GridInfo {
+    /// Every track's used size per axis, for the resolved
+    /// `grid-template-columns`/`-rows`.
+    pub fn used(&self) -> browser_style::UsedGrid {
+        let axis = |t: &taffy::DetailedGridTracksInfo<String>| browser_style::UsedTracks {
+            leading_implicit: t.negative_implicit_tracks as usize,
+            explicit: t.explicit_tracks as usize,
+            sizes: t.positions.iter().map(|p| p.end - p.start).collect(),
+        };
+        browser_style::UsedGrid {
+            columns: axis(&self.0.columns),
+            rows: axis(&self.0.rows),
+        }
+    }
 }
 
 impl Fragment {

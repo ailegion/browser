@@ -226,6 +226,18 @@ pub struct ComputedStyle {
     pub flex_basis: ComputedSize,
     pub row_gap: ComputedLp,
     pub column_gap: ComputedLp,
+    /// Grid ("Working sites first" line 5): the explicit tracks, the
+    /// implicit tracks' sizes (empty for the initial `auto`), the
+    /// auto-placement flow, and the lines an item is placed on.
+    pub grid_template_columns: crate::grid::TrackList<ComputedLp>,
+    pub grid_template_rows: crate::grid::TrackList<ComputedLp>,
+    pub grid_auto_columns: Vec<crate::grid::TrackSize<ComputedLp>>,
+    pub grid_auto_rows: Vec<crate::grid::TrackSize<ComputedLp>>,
+    pub grid_auto_flow: crate::grid::GridAutoFlow,
+    pub grid_row_start: crate::grid::GridLine,
+    pub grid_row_end: crate::grid::GridLine,
+    pub grid_column_start: crate::grid::GridLine,
+    pub grid_column_end: crate::grid::GridLine,
     pub opacity: f32,
     /// Scroll container properties (roadmap 4a (4s)).
     pub scrollbar_width: ScrollbarWidth,
@@ -445,6 +457,16 @@ impl ComputedStyle {
             flex_basis: ComputedSize::Auto,
             row_gap: ComputedLp::ZERO,
             column_gap: ComputedLp::ZERO,
+            grid_template_columns: crate::grid::TrackList::None,
+            grid_template_rows: crate::grid::TrackList::None,
+            // Empty for the initial `auto` (no allocation per style).
+            grid_auto_columns: Vec::new(),
+            grid_auto_rows: Vec::new(),
+            grid_auto_flow: crate::grid::GridAutoFlow::default(),
+            grid_row_start: crate::grid::GridLine::Auto,
+            grid_row_end: crate::grid::GridLine::Auto,
+            grid_column_start: crate::grid::GridLine::Auto,
+            grid_column_end: crate::grid::GridLine::Auto,
             opacity: 1.0,
             scrollbar_width: ScrollbarWidth::Auto,
             scrollbar_color: ScrollbarColor::Auto,
@@ -664,6 +686,15 @@ impl ComputedStyle {
             || self.flex_basis != other.flex_basis
             || self.row_gap != other.row_gap
             || self.column_gap != other.column_gap
+            || self.grid_template_columns != other.grid_template_columns
+            || self.grid_template_rows != other.grid_template_rows
+            || self.grid_auto_columns != other.grid_auto_columns
+            || self.grid_auto_rows != other.grid_auto_rows
+            || self.grid_auto_flow != other.grid_auto_flow
+            || self.grid_row_start != other.grid_row_start
+            || self.grid_row_end != other.grid_row_end
+            || self.grid_column_start != other.grid_column_start
+            || self.grid_column_end != other.grid_column_end
             // The scrollbar gutter is part of the box; the other scroll
             // properties change scrolling, not layout.
             || self.scrollbar_width != other.scrollbar_width
@@ -1049,7 +1080,7 @@ pub fn compute(
     // out-of-flow box, whose contents start afresh (what Blink's
     // `StopPropagateTextDecorations` lists). An element with lines of its
     // own is a decorating box too and adds its entry after theirs.
-    let stops = matches!(out.display, Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
+    let stops = matches!(out.display, Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable)
         || out.float != Float::None
         || matches!(out.position, Position::Absolute | Position::Fixed);
     out.decorations = match (stops, out.text_decoration_line.is_none()) {
@@ -1243,6 +1274,15 @@ pub fn compute(
     });
     pick!(border_collapse, BorderCollapse, BorderCollapse, |v| *v);
     pick!(empty_cells, EmptyCells, EmptyCells, |v| *v);
+    pick!(grid_template_columns, GridTemplateColumns, GridTemplateColumns, |v| v.compute(&ctx));
+    pick!(grid_template_rows, GridTemplateRows, GridTemplateRows, |v| v.compute(&ctx));
+    pick!(grid_auto_columns, GridAutoColumns, GridAutoColumns, |v| v.iter().map(|t| t.compute(&ctx)).collect());
+    pick!(grid_auto_rows, GridAutoRows, GridAutoRows, |v| v.iter().map(|t| t.compute(&ctx)).collect());
+    pick!(grid_auto_flow, GridAutoFlow, GridAutoFlow, |v| *v);
+    pick!(grid_row_start, GridRowStart, GridRowStart, |v| v.clone());
+    pick!(grid_row_end, GridRowEnd, GridRowEnd, |v| v.clone());
+    pick!(grid_column_start, GridColumnStart, GridColumnStart, |v| v.clone());
+    pick!(grid_column_end, GridColumnEnd, GridColumnEnd, |v| v.clone());
 
     // Display fixups (CSS Display 3, "blockification").
     out.original_display = out.display;
@@ -1251,6 +1291,15 @@ pub fn compute(
     }
     if matches!(out.position, Position::Absolute | Position::Fixed) || out.float != Float::None {
         out.display = blockify(out.display);
+    }
+    // A flex or grid container's children are its items, blockified
+    // (CSS Display 3 §2.7; `contents` stays).
+    if !is_root && parent.display.is_flex_or_grid() && out.display != Display::Contents {
+        out.display = blockify(out.display);
+    }
+    // An absolutely positioned box does not float (CSS 2.1 §9.7).
+    if matches!(out.position, Position::Absolute | Position::Fixed) {
+        out.float = Float::None;
     }
     if out.display == Display::None {
         // Nothing else matters, but keep values sane.
@@ -1267,6 +1316,7 @@ fn blockify(d: Display) -> Display {
     match d {
         Display::Inline | Display::InlineBlock | Display::Contents => Display::Block,
         Display::InlineFlex => Display::Flex,
+        Display::InlineGrid => Display::Grid,
         Display::InlineTable => Display::Table,
         Display::TableRowGroup
         | Display::TableHeaderGroup

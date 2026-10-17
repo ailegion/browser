@@ -317,6 +317,13 @@ where
                 (Display::Flex, true) => compute_flexbox_layout(tree, node_id, inputs),
                 #[cfg(feature = "grid")]
                 (Display::Grid, true) => compute_grid_layout(tree, node_id, inputs),
+                // A grid container without items still has its explicit
+                // tracks (CSS Grid 1: an empty grid is as tall as its rows),
+                // unless it is a measured leaf.
+                #[cfg(feature = "grid")]
+                (Display::Grid, false) if !tree.taffy.nodes[node_id.into()].has_context => {
+                    compute_grid_layout(tree, node_id, inputs)
+                }
                 (_, false) => {
                     let node_key = node_id.into();
                     let style = &tree.taffy.nodes[node_key].style;

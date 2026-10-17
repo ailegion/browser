@@ -6437,6 +6437,14 @@ mod tests {
             run_js(&mut h, "[cs(abs).top, cs(abs).left, cs(abs).right, cs(none).width, cs(none).display, cs(inl).width, cs(inl).display, cs(inl).marginLeft].join('|')"),
             "\"10px|20px|750px|100px|none|auto|inline|0px\""
         );
+        // A grid container ("Working sites first" line 5) reports its used
+        // tracks with their line names; the declared value stays as
+        // written; `grid-area` collapses back.
+        assert_eq!(
+            run_js(&mut h, "var gr = document.createElement('div'); gr.style.cssText = 'display:grid;width:300px;grid-template-columns:[a] 100px 1fr;grid-area:2 / 1'; document.body.appendChild(gr); \
+                            [cs(gr).display, cs(gr).gridTemplateColumns, gr.style.gridTemplateColumns, gr.style.gridArea, cs(gr).gridRowStart, cs(gr).gridColumnEnd].join('|')"),
+            "\"grid|[a] 100px 200px|[a] 100px 1fr|2 / 1|2|auto\""
+        );
         // The used insets are the distances to the margin box ("Working
         // sites first" line 4): a margin does not change `top`.
         assert_eq!(

@@ -428,6 +428,21 @@ impl View {
         self.index().get(&id).and_then(|v| v.first()).copied()
     }
 
+    /// A grid container's used tracks, from its box.
+    pub(crate) fn grid_of(&mut self, id: NodeId) -> Option<std::sync::Arc<browser_style::UsedGrid>> {
+        let tree = self.layout.as_ref()?;
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if found.is_none()
+                && f.node == Some(id)
+                && let Some(g) = &f.grid
+            {
+                found = Some(std::sync::Arc::new(g.used()));
+            }
+        });
+        found
+    }
+
     /// The containing block of an absolutely positioned (or fixed) box
     /// as layout used it (CSS 2.1 §10.1): the padding box of the element
     /// `cb`, an inline element's from the start of its first fragment to

@@ -1,11 +1,13 @@
 //! Computed style -> taffy style.
 
+use browser_style::grid::{GridLine, TrackBreadth, TrackList, TrackSize};
 use browser_style::{
     AlignValue, BoxSizing, Clear, ComputedLp, ComputedLpAuto, ComputedSize, ComputedStyle, Direction, Display,
     FlexDirection, FlexWrap, Float, Overflow, Position,
 };
 use taffy::prelude::*;
-use taffy::style::{AlignContent, AlignItems};
+use taffy::style::{AlignContent, AlignItems, GridTemplateComponent, MaxTrackSizingFunction, MinTrackSizingFunction};
+use taffy::{GridPlacement, MinMax};
 
 use crate::boxes::ScrollPlan;
 
@@ -90,15 +92,126 @@ fn overflow(v: Overflow, gutter: bool) -> taffy::Overflow {
     }
 }
 
+// ----- grid ("Working sites first" line 5) -----
+
+fn min_breadth(b: &TrackBreadth<ComputedLp>) -> MinTrackSizingFunction {
+    match b {
+        TrackBreadth::Length(ComputedLp::Px(px)) => MinTrackSizingFunction::length(*px),
+        TrackBreadth::Length(ComputedLp::Percent(p)) => MinTrackSizingFunction::percent(*p / 100.0),
+        // A flexible minimum is not valid; a lone `fr` track's minimum is
+        // `auto` (CSS Grid 1 §7.2.4).
+        TrackBreadth::Flex(_) | TrackBreadth::Auto => MinTrackSizingFunction::auto(),
+        TrackBreadth::MinContent => MinTrackSizingFunction::min_content(),
+        TrackBreadth::MaxContent => MinTrackSizingFunction::max_content(),
+    }
+}
+
+fn max_breadth(b: &TrackBreadth<ComputedLp>) -> MaxTrackSizingFunction {
+    match b {
+        TrackBreadth::Length(ComputedLp::Px(px)) => MaxTrackSizingFunction::length(*px),
+        TrackBreadth::Length(ComputedLp::Percent(p)) => MaxTrackSizingFunction::percent(*p / 100.0),
+        TrackBreadth::Flex(f) => MaxTrackSizingFunction::fr(*f),
+        TrackBreadth::Auto => MaxTrackSizingFunction::auto(),
+        TrackBreadth::MinContent => MaxTrackSizingFunction::min_content(),
+        TrackBreadth::MaxContent => MaxTrackSizingFunction::max_content(),
+    }
+}
+
+/// A track size as taffy's `minmax`: a lone breadth is both bounds (a
+/// flexible one has an `auto` minimum), `fit-content(l)` is
+/// `minmax(auto, fit-content(l))`.
+fn track(t: &TrackSize<ComputedLp>) -> TrackSizingFunction {
+    match t {
+        TrackSize::Breadth(b) => MinMax {
+            min: min_breadth(b),
+            max: max_breadth(b),
+        },
+        TrackSize::MinMax(a, b) => MinMax {
+            min: min_breadth(a),
+            max: max_breadth(b),
+        },
+        TrackSize::FitContent(l) => MinMax {
+            min: MinTrackSizingFunction::auto(),
+            max: match l {
+                ComputedLp::Px(px) => MaxTrackSizingFunction::fit_content_px(*px),
+                ComputedLp::Percent(p) => MaxTrackSizingFunction::fit_content_percent(*p / 100.0),
+            },
+        },
+    }
+}
+
+/// The explicit tracks (repetitions written out) and each line's names.
+fn template(list: &TrackList<ComputedLp>) -> (Vec<GridTemplateComponent<String>>, Vec<Vec<String>>) {
+    let (tracks, names) = list.expanded();
+    let tracks = tracks.iter().map(|t| GridTemplateComponent::Single(track(t))).collect();
+    let names = if names.iter().all(Vec::is_empty) {
+        Vec::new()
+    } else {
+        names.iter().map(|n| n.iter().map(|s| s.to_string()).collect()).collect()
+    };
+    (tracks, names)
+}
+
+pub(crate) fn placement(l: &GridLine) -> GridPlacement<String> {
+    let clamp = |i: i32| i.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    let count = |c: u32| c.min(u16::MAX as u32) as u16;
+    match l {
+        GridLine::Auto => GridPlacement::Auto,
+        GridLine::Ident(n) => GridPlacement::NamedLine(n.to_string(), 1),
+        GridLine::Line(i, None) => GridPlacement::Line(clamp(*i).into()),
+        GridLine::Line(i, Some(n)) => GridPlacement::NamedLine(n.to_string(), clamp(*i)),
+        GridLine::Span(c, None) => GridPlacement::Span(count(*c)),
+        GridLine::Span(c, Some(n)) => GridPlacement::NamedSpan(n.to_string(), count(*c)),
+    }
+}
+
+/// The grid properties of a style: the container's tracks and flow, the
+/// item's placement (taffy reads each where it applies).
+fn grid_style(style: &ComputedStyle, out: &mut Style) {
+    out.grid_row = taffy::Line {
+        start: placement(&style.grid_row_start),
+        end: placement(&style.grid_row_end),
+    };
+    out.grid_column = taffy::Line {
+        start: placement(&style.grid_column_start),
+        end: placement(&style.grid_column_end),
+    };
+    if !style.display.is_grid() {
+        return;
+    }
+    let (columns, column_names) = template(&style.grid_template_columns);
+    let (rows, row_names) = template(&style.grid_template_rows);
+    out.grid_template_columns = columns;
+    out.grid_template_column_names = column_names;
+    out.grid_template_rows = rows;
+    out.grid_template_row_names = row_names;
+    out.grid_auto_columns = style.grid_auto_columns.iter().map(track).collect();
+    out.grid_auto_rows = style.grid_auto_rows.iter().map(track).collect();
+    out.grid_auto_flow = match (style.grid_auto_flow.column, style.grid_auto_flow.dense) {
+        (false, false) => taffy::GridAutoFlow::Row,
+        (false, true) => taffy::GridAutoFlow::RowDense,
+        (true, false) => taffy::GridAutoFlow::Column,
+        (true, true) => taffy::GridAutoFlow::ColumnDense,
+    };
+}
+
 /// Convert a computed style to a taffy style for a box of the given kind.
-/// `blockify` forces block-level display for atomic roots. `scroll` is
-/// the box's scroll container plan, if it is one.
+/// `is_flex_container`: the box is a flex or grid container (its
+/// `display` says which). `scroll` is the box's scroll container plan,
+/// if it is one.
 pub(crate) fn to_taffy(style: &ComputedStyle, is_flex_container: bool, is_replaced: bool, scroll: Option<&ScrollPlan>) -> Style {
     let display = match style.display {
         Display::None => taffy::Display::None,
+        _ if is_flex_container && style.display.is_grid() => taffy::Display::Grid,
         _ if is_flex_container => taffy::Display::Flex,
         _ => taffy::Display::Block,
     };
+    let mut out = to_taffy_box(style, display, is_replaced, scroll);
+    grid_style(style, &mut out);
+    out
+}
+
+fn to_taffy_box(style: &ComputedStyle, display: taffy::Display, is_replaced: bool, scroll: Option<&ScrollPlan>) -> Style {
     let position = match style.position {
         Position::Absolute | Position::Fixed => taffy::Position::Absolute,
         _ => taffy::Position::Relative,

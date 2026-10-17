@@ -471,12 +471,14 @@ fn used_values(view: &mut View, doc: &Document, id: NodeId, style: &ComputedStyl
         }
         _ => None,
     };
+    let grid = if style.display.is_grid() { view.grid_of(id) } else { None };
     Some(UsedValues {
         width: b.rect.width,
         height: b.rect.height,
         margin: b.margin,
         padding: b.padding,
         inset,
+        grid,
     })
 }
 

@@ -26,11 +26,47 @@ use crate::engine::{LayoutEngine, Role, Run, box_transform, image_size_for};
 use crate::{Containing, Fragment, FragmentContent, Rect};
 
 /// A containing block: the padding box, and the direction that decides
-/// which inset is static and which is dropped when over-constrained.
-#[derive(Debug, Clone, Copy)]
+/// which inset is static and which is dropped when over-constrained; for
+/// a grid container its tracks and border box, whose grid areas are the
+/// containing blocks of the boxes positioned against it.
+#[derive(Debug, Clone)]
 struct Block {
     rect: Rect,
     rtl: bool,
+    grid: Option<(std::sync::Arc<crate::GridInfo>, Rect, Sides<f32>)>,
+}
+
+impl Block {
+    /// The containing block of a box with `style` positioned against this
+    /// one: a grid container's grid area from the box's grid lines (CSS
+    /// Grid 1 §9.1; `auto` lines are the padding edges), else the padding
+    /// box.
+    fn for_box(&self, style: &ComputedStyle) -> Rect {
+        let Some((info, border_box, border)) = &self.grid else { return self.rect };
+        let line = |s: &browser_style::grid::GridLine, e: &browser_style::grid::GridLine| taffy::Line {
+            start: crate::convert::placement(s),
+            end: crate::convert::placement(e),
+        };
+        let padding = taffy::Rect {
+            left: border.left,
+            right: border_box.width - border.right,
+            top: border.top,
+            bottom: border_box.height - border.bottom,
+        };
+        let direction = if self.rtl { taffy::Direction::Rtl } else { taffy::Direction::Ltr };
+        let area = info.0.resolve_absolute_grid_area(
+            line(&style.grid_row_start, &style.grid_row_end),
+            line(&style.grid_column_start, &style.grid_column_end),
+            direction,
+            padding,
+        );
+        Rect::new(
+            border_box.x + area.left,
+            border_box.y + area.top,
+            (area.right - area.left).max(0.0),
+            (area.bottom - area.top).max(0.0),
+        )
+    }
 }
 
 impl LayoutEngine {
@@ -60,15 +96,24 @@ impl LayoutEngine {
                 let Some(ph) = fragment_at(root, &path) else { continue };
                 let at = (ph.rect.x, ph.rect.y);
                 let fixed = ph.style.position == Position::Fixed;
+                let style = ph.style.clone();
                 let (block, containing, fixed_flags) = match cb_node {
                     Some(n) => match blocks.get(&n) {
-                        Some(b) => (*b, Some(Containing::Element(n)), false),
+                        Some(b) => (
+                            Block {
+                                rect: b.for_box(&style),
+                                rtl: b.rtl,
+                                grid: None,
+                            },
+                            Some(Containing::Element(n)),
+                            false,
+                        ),
                         None => continue,
                     },
                     None => match viewport {
                         Some(v) => {
                             let rtl = root.style.direction == Direction::Rtl;
-                            (Block { rect: v, rtl }, (!fixed).then_some(Containing::Initial), fixed)
+                            (Block { rect: v, rtl, grid: None }, (!fixed).then_some(Containing::Initial), fixed)
                         }
                         None => continue,
                     },
@@ -169,6 +214,7 @@ impl LayoutEngine {
                 transform: box_transform(&s, &rect, &padding),
                 fixed: None,
                 containing: None,
+                grid: None,
             };
         }
 
@@ -384,6 +430,7 @@ fn containing_blocks(root: &Fragment, wanted: &HashSet<NodeId>) -> HashMap<NodeI
                 boxes.entry(n).or_insert(Block {
                     rect: padding_box(f.rect, &f.style),
                     rtl,
+                    grid: f.grid.clone().map(|g| (g, f.rect, f.style.border_width)),
                 });
             }
             _ => {}
@@ -397,7 +444,7 @@ fn containing_blocks(root: &Fragment, wanted: &HashSet<NodeId>) -> HashMap<NodeI
         } else {
             Rect::new(first.x, first.y, (last.right() - first.x).max(0.0), (last.bottom() - first.y).max(0.0))
         };
-        boxes.entry(n).or_insert(Block { rect, rtl });
+        boxes.entry(n).or_insert(Block { rect, rtl, grid: None });
     }
     boxes
 }

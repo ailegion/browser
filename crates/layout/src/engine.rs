@@ -266,6 +266,7 @@ impl LayoutEngine {
                     transform: None,
                     fixed: None,
                     containing: None,
+                    grid: None,
                 },
                 content_width: viewport_width,
                 content_height: viewport_height,
@@ -365,6 +366,7 @@ impl LayoutEngine {
                 transform: None,
                 fixed: None,
                 containing: None,
+                grid: None,
             },
             content_width: viewport.scroll_width,
             content_height: viewport.scroll_height,
@@ -438,6 +440,7 @@ impl LayoutEngine {
             transform: None,
             fixed: None,
             containing: None,
+            grid: None,
         };
         let BoxKind::Inline(content) = &marker.kind else { return empty(&marker.style) };
         let Some(il) = content.cache.first() else { return empty(&marker.style) };
@@ -471,6 +474,7 @@ impl LayoutEngine {
             transform: None,
             fixed: None,
             containing: None,
+            grid: None,
         }
     }
 
@@ -528,6 +532,7 @@ impl LayoutEngine {
                 transform: box_transform(&node.style, &rect, &padding),
                 fixed: None,
                 containing: None,
+                grid: None,
             };
             // A replaced box's baseline is its bottom margin edge.
             let height = h + margin.top + margin.bottom;
@@ -1011,6 +1016,7 @@ impl LayoutEngine {
                 transform: None,
                 fixed: None,
                 containing: None,
+                grid: None,
             },
             BoxKind::Table(table) => {
                 // The layout for taffy's size (`table::finish`); the table
@@ -1040,6 +1046,7 @@ impl LayoutEngine {
                     transform,
                     fixed,
                     containing: None,
+                    grid: None,
                 }
             }
             BoxKind::Inline(content) => {
@@ -1090,6 +1097,7 @@ impl LayoutEngine {
                     transform: None,
                     fixed: None,
                     containing: None,
+                    grid: None,
                 }
             }
             BoxKind::Image { url, .. } => Fragment {
@@ -1106,6 +1114,7 @@ impl LayoutEngine {
                 transform,
                 fixed,
                 containing: None,
+                grid: None,
             },
             BoxKind::Block | BoxKind::Flex => {
                 if let (Some(n), Some(plan)) = (node.node, node.scroll) {
@@ -1120,6 +1129,15 @@ impl LayoutEngine {
                     let fragment = self.marker_fragment(marker, rect, &layout, &children);
                     children.insert(0, fragment);
                 }
+                // A grid container's tracks, for the CSSOM and its
+                // absolutely positioned children's grid areas.
+                let grid = match (node.style.display.is_grid(), node.taffy) {
+                    (true, Some(id)) => match tree.detailed_layout_info(id) {
+                        taffy::DetailedLayoutInfo::Grid(info) => Some(Arc::new(crate::GridInfo((**info).clone()))),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 Fragment {
                     rect,
                     node: node.node,
@@ -1135,6 +1153,7 @@ impl LayoutEngine {
                     transform,
                     fixed,
                     containing: None,
+                    grid,
                 }
             }
         }
@@ -1711,7 +1730,7 @@ fn scroll_info_for(f: &Fragment, plan: &ScrollPlan) -> ScrollInfo {
     } else {
         f.padding
     };
-    let is_flex = matches!(f.style.display, Display::Flex | Display::InlineFlex);
+    let is_flex = f.style.display.is_flex_or_grid();
     let inside = f.containing_blocks_within();
     let (mut scroll_width, scroll_height) =
         scroll_extent(&f.children, None, is_flex, &scrollport, &end_padding, plan.rtl, &Within { blocks: &inside, initial: false });
@@ -1838,7 +1857,7 @@ fn scroll_extent(
         }
         let flex = c.node.is_some()
             && matches!(c.content, FragmentContent::Box | FragmentContent::Control(_))
-            && matches!(c.style.display, Display::Flex | Display::InlineFlex);
+            && c.style.display.is_flex_or_grid();
         for k in &c.children {
             visit(k, flex, all, flow.as_deref_mut(), &acc, within);
         }
@@ -1932,7 +1951,8 @@ fn collapsed_end_margin(f: &Fragment) -> f32 {
             || s.overflow_y != Overflow::Visible
             || s.float != Float::None
             || matches!(s.position, Position::Absolute | Position::Fixed)
-            || matches!(s.display, Display::Flex | Display::InlineFlex | Display::InlineBlock);
+            || s.display.is_flex_or_grid()
+            || matches!(s.display, Display::InlineBlock);
         if !auto_height || cur.padding.bottom > 0.0 || s.border_width.bottom > 0.0 || root {
             break;
         }
@@ -2454,6 +2474,7 @@ fn emit_marker(
             transform: None,
             fixed: None,
             containing: None,
+            grid: None,
         };
         decorate(&mut fragment, decor, fonts);
         out.push(fragment);
@@ -2631,6 +2652,7 @@ fn emit_text_fragments(
                             transform: None,
                             fixed: None,
                             containing: None,
+                            grid: None,
                         };
                         LineItem {
                             kind: LineItemKind::Text {
@@ -2962,6 +2984,7 @@ fn piece_fragment(
         transform: None,
         fixed: None,
         containing: None,
+        grid: None,
     }
 }
 
@@ -3437,6 +3460,7 @@ fn oof_placeholder(ctx: &LineCtx<'_>, index: usize, x: f32, inflow: &[(usize, u3
         transform: None,
         fixed: None,
         containing: None,
+        grid: None,
     })
 }
 
@@ -4229,6 +4253,67 @@ mod tests {
         assert_eq!((k.right(), k.bottom()), (last.right(), last.bottom()), "the end of the inline's last fragment");
         let (tr, f) = (b("tr"), b("f"));
         assert_eq!((f.x, f.y), (tr.x, tr.y), "a fixed box against its transformed ancestor");
+    }
+
+    /// "Working sites first" line 5: grid containers with explicit tracks
+    /// (lengths, `fr`, `repeat()`, `minmax()`, `auto`, `fit-content()`),
+    /// gaps, auto placement into implicit rows of `grid-auto-rows`, items
+    /// placed on numbered and named lines with spans, column flow,
+    /// `inline-grid` in a line, and an absolutely positioned child in the
+    /// grid area of its lines.
+    #[test]
+    fn grid_containers_place_and_size_their_items() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div id=g style='display:grid;width:400px;grid-template-columns:100px 1fr 2fr;column-gap:10px;row-gap:5px;grid-auto-rows:20px'>\
+             <div id=a>a</div><div id=b>b</div><div id=c>c</div><div id=d>d</div></div>\
+             <div id=p style='display:grid;grid-template-columns:[s] repeat(2, 50px) [e] minmax(10px, 100px);grid-template-rows:30px 30px'>\
+             <div id=x style='grid-column:2 / span 2;grid-row:2'>x</div><div id=n style='grid-column:s / e'>n</div></div>\
+             <div id=col style='display:grid;grid-auto-flow:column;grid-template-rows:10px 10px;grid-auto-columns:40px'>\
+             <div id=c1>1</div><div id=c2>2</div><div id=c3>3</div></div>\
+             <p style='margin:0'>before <span id=ig style='display:inline-grid;grid-template-columns:30px 30px'><i>1</i><i>2</i></span> after</p>\
+             <div id=pos style='display:grid;position:relative;grid-template-columns:100px 100px;grid-template-rows:50px'>\
+             <div>z</div><div id=ab style='position:absolute;grid-column:2 / 3;top:0;left:0;right:0;height:10px'></div>\
+             <div id=ae style='position:absolute;grid-column:2;top:0;left:0;right:0;height:10px'></div></div>\
+             <div id=empty style='display:grid;grid-template-rows:40px 20px;row-gap:5px'></div>\
+             </body>",
+            "",
+        );
+        let b = |id: &str| box_of(&tree, by_id(&doc, id));
+        let g = b("g");
+        let (a, bb, c, d) = (b("a"), b("b"), b("c"), b("d"));
+        // 400 - 100 - two 10px gaps = 280 shared 1:2 (layout rounds to
+        // whole pixels).
+        assert_eq!(a.width, 100.0);
+        assert!((bb.width - 280.0 / 3.0).abs() <= 0.5 && (c.width - 560.0 / 3.0).abs() <= 0.5, "1fr:2fr: {bb:?} {c:?}");
+        assert_eq!(bb.x - g.x, 110.0, "the column gap between");
+        assert!((c.x - g.x - (120.0 + 280.0 / 3.0)).abs() <= 0.5);
+        assert_eq!((d.x, d.y - g.y, d.height), (g.x, 25.0, 20.0), "auto-placed into an implicit row of 20px after the 5px gap");
+        assert_eq!(g.height, 45.0);
+        let (p, x, n) = (b("p"), b("x"), b("n"));
+        assert_eq!((x.x - p.x, x.y - p.y, x.width), (50.0, 30.0, 150.0), "column 2 spanning 2, row 2");
+        assert_eq!((n.x - p.x, n.width), (0.0, 100.0), "between the named lines");
+        let (c1, c2, c3) = (b("c1"), b("c2"), b("c3"));
+        assert_eq!((c2.x, c2.y - c1.y), (c1.x, 10.0), "column flow fills the column first");
+        assert_eq!((c3.x - c1.x, c3.width), (40.0, 40.0), "then an implicit column of 40px");
+        let ig = b("ig");
+        assert!(ig.x > 0.0 && ig.width == 60.0, "an inline grid in the line: {ig:?}");
+        // The container's tracks, as the CSSOM reports them.
+        let mut used = None;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(by_id(&doc, "p")) && used.is_none() {
+                used = f.grid.as_ref().map(|g| g.used());
+            }
+        });
+        let used = used.expect("grid tracks");
+        assert_eq!((used.columns.sizes.as_slice(), used.rows.sizes.as_slice()), (&[50.0, 50.0, 100.0][..], &[30.0, 30.0][..]));
+        assert_eq!(b("empty").height, 65.0, "an empty grid is as tall as its rows");
+        let (pos, ab) = (b("pos"), b("ab"));
+        assert_eq!((ab.x - pos.x, ab.width, ab.y - pos.y), (100.0, 100.0, 0.0), "in the grid area of column 2");
+        // An `auto` line of a positioned box is the padding edge (CSS Grid
+        // 1 §9.1): from line 2 to the container's right edge.
+        let ae = b("ae");
+        assert_eq!((ae.x - pos.x, ae.right()), (100.0, pos.right()));
     }
 
     /// Clipping, scrolling and scrollable overflow follow the containing

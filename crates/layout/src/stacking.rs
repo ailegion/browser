@@ -449,10 +449,10 @@ fn sides_of(f: &Fragment) -> [bool; 4] {
     }
 }
 
+/// A flex or grid container: its items paint atomically and stack with a
+/// `z-index` (CSS Flexbox 1 §4.3, CSS Grid 1 §9.4).
 fn is_flex_container(f: &Fragment) -> bool {
-    f.node.is_some()
-        && matches!(f.content, FragmentContent::Box | FragmentContent::Control(_))
-        && matches!(f.style.display, Display::Flex | Display::InlineFlex)
+    f.node.is_some() && matches!(f.content, FragmentContent::Box | FragmentContent::Control(_)) && f.style.display.is_flex_or_grid()
 }
 
 /// Whether an inline element's fragments make a stacking context: the
@@ -808,7 +808,7 @@ impl<'a> Builder<'a> {
                         let p = self.gather(Sub::Box(cr), walk, false, stacked);
                         ph.floats.push(p);
                     } else if parent_flex
-                        || matches!(s.display, Display::Inline | Display::InlineBlock | Display::InlineFlex)
+                        || matches!(s.display, Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineGrid)
                         || matches!(c.content, FragmentContent::Image(_))
                     {
                         let p = self.gather(Sub::Box(cr), walk, parent_flex, stacked);

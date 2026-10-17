@@ -968,6 +968,22 @@ mod tests {
         assert_eq!(styles[span].display, Display::Block);
     }
 
+    /// Flex and grid items blockify (CSS Display 3 §2.7); `contents`
+    /// stays; an absolutely positioned box computes `float: none`.
+    #[test]
+    fn flex_and_grid_items_blockify() {
+        let (doc, styles) = styles_for(
+            "<div id=g><span>a</span><b>b</b><i>c</i></div><div id=f><em>d</em></div><u>e</u>",
+            "#g { display: grid } #f { display: inline-flex } b { display: inline-grid } i { display: contents } u { position: absolute; float: left }",
+        );
+        assert_eq!(styles[find(&doc, "span")].display, Display::Block);
+        assert_eq!(styles[find(&doc, "b")].display, Display::Grid);
+        assert_eq!(styles[find(&doc, "i")].display, Display::Contents);
+        assert_eq!(styles[find(&doc, "em")].display, Display::Block);
+        assert_eq!(styles[find(&doc, "u")].float, crate::properties::Float::None);
+        assert_eq!(styles[find(&doc, "u")].original_display, Display::Inline);
+    }
+
     #[test]
     fn example_com_rules_apply() {
         let (doc, styles) = styles_for(

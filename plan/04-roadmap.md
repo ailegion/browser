@@ -176,10 +176,41 @@ remaining lists as they stand.
       included), as CSS 2.1 §17.4 applies `position` to the wrapper.
       Timing unchanged (tables 45.4 ms, Hacker News relayout 36 ms,
       Wikipedia 170 ms).
-- [ ] 5. From 4a block 7 (grid): grid-template-rows/columns with
+- [x] 5. From 4a block 7 (grid): grid-template-rows/columns with
       lengths, fr, repeat, minmax, auto; gap; auto placement; line
       spans. Later: named areas, auto-fill/fit, alignment keywords,
       subgrid.
+      Done 2026-10-18. Style (`crates/style/src/grid.rs`): `display:
+      grid`/`inline-grid` are their own computed values (they computed
+      to `block`/`inline-block`); `grid-template-columns`/`-rows` (`none`
+      or a track list: lengths, percentages, `fr`, `min-content`,
+      `max-content`, `auto`, `minmax()`, `fit-content()`, `repeat()` with
+      a count, line names), `grid-auto-columns`/`-rows`, `grid-auto-flow`
+      (`row`/`column` and `dense`, shortest serialization), `grid-row-
+      start`/`-end`, `grid-column-start`/`-end` (the full `<grid-line>`:
+      `auto`, names, numbers, `span`), the shorthands `grid-row`,
+      `grid-column`, `grid-area`, `grid-template` (rows / columns; the
+      area-string form is the later named-areas part), `grid` (template
+      and auto-flow forms), each refusing what the grammar refuses and
+      serializing back as Chrome writes it; flex and grid items blockify
+      (CSS Display 3 §2.7; flex items kept `inline` before); an
+      absolutely positioned box computes `float: none`. Layout: grid
+      containers go to taffy's grid (`convert::grid_style`; repeats
+      written out, line names per line), items like flex items (text
+      runs anonymous items; `z-index` stacking; atomically painted);
+      `inline-grid` is an atomic; an absolutely positioned box whose
+      containing block is a grid container takes the grid area of its
+      lines (`auto` lines its padding edges, CSS Grid 1 §9.1;
+      `Fragment::grid`, `GridInfo`); an empty grid has its tracks
+      (taffy patch, `03-crates.md`). CSSOM: a grid container's resolved
+      `grid-template-*` lists its used tracks with their line names.
+      Tests: style (parsing, refusals, serialization, shorthands,
+      blockification), layout (fr shares less gaps, auto placement into
+      `grid-auto-rows`, line and named-line placement with spans, column
+      flow, inline-grid, positioned grid areas, an empty grid's height),
+      tab (resolved tracks). Timing: tables 47–50 ms, blocks 14 ms (run
+      to run ±3 ms; line 4 measured 45.4/12.9 once; disabling the grid
+      conversion changes nothing measurable).
 - [ ] 6. Web fonts (new 4a entry): `@font-face` with url()+format,
       fetched through net, used by parley, system fallback until loaded.
       Later: unicode-range, font-display, local().

@@ -20,6 +20,8 @@ pub(crate) type TaffyId = taffy::NodeId;
 
 pub(crate) enum BoxKind {
     Block,
+    /// A flex or grid container (its `display` says which): its children
+    /// are its items, each a formatting context of its own.
     Flex,
     /// Inline formatting context; laid out by parley.
     Inline(InlineContent),
@@ -1288,7 +1290,7 @@ impl BoxBuilder<'_> {
             return self.build_table(Some(id), style, children, depth);
         }
         let kind = match style.display {
-            Display::Flex | Display::InlineFlex => BoxKind::Flex,
+            d if d.is_flex_or_grid() => BoxKind::Flex,
             _ => BoxKind::Block,
         };
         let mut b = BoxNode::new(kind, Some(id), style.clone());
@@ -1343,7 +1345,8 @@ impl BoxBuilder<'_> {
             at_line_start: true,
         };
 
-        let is_flex = matches!(container.display, Display::Flex | Display::InlineFlex);
+        // A flex or grid container's children are its items.
+        let is_flex = container.display.is_flex_or_grid();
 
         // A run of inline content becomes an anonymous inline root. The
         // absolutely positioned boxes in it are part of it only when it
@@ -1708,7 +1711,7 @@ impl BoxBuilder<'_> {
             return InlineKind::Break;
         }
         let atomic = self.is_image(id)
-            || matches!(style.display, Display::InlineBlock | Display::InlineFlex | Display::InlineTable)
+            || matches!(style.display, Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable)
             || element.is_some_and(|e| {
                 e.name.ns == ns!(html)
                     && matches!(
@@ -1997,7 +2000,10 @@ fn is_inline_level(style: &ComputedStyle) -> bool {
 
 /// Whether a display value is inline-level.
 pub(crate) fn is_inline_level_display(d: Display) -> bool {
-    matches!(d, Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable | Display::Contents)
+    matches!(
+        d,
+        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable | Display::Contents
+    )
 }
 
 /// Append a text node's content with CSS white-space processing and

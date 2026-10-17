@@ -195,6 +195,10 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
             EmptyCells::Show => "show".to_owned(),
             EmptyCells::Hide => "hide".to_owned(),
         },
+        P::GridTemplateColumns(t) | P::GridTemplateRows(t) => t.to_css(),
+        P::GridAutoColumns(t) | P::GridAutoRows(t) => crate::grid::auto_tracks_css(t),
+        P::GridAutoFlow(f) => f.to_css(),
+        P::GridRowStart(l) | P::GridRowEnd(l) | P::GridColumnStart(l) | P::GridColumnEnd(l) => l.to_css(),
     }
 }
 
@@ -573,6 +577,62 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
         }
         "place-items" | "word-wrap" | "-webkit-box-decoration-break" | "-webkit-user-select" | "-webkit-transform"
         | "-webkit-transform-origin" | "-webkit-backface-visibility" => v(0).to_owned(),
+        // A grid line part is left out when it is what the shorthand would
+        // give it: a named start line repeated, else `auto`.
+        "grid-row" | "grid-column" => {
+            if v(1) == grid_line_default_css(v(0)) {
+                v(0).to_owned()
+            } else {
+                format!("{} / {}", v(0), v(1))
+            }
+        }
+        "grid-area" => {
+            let (rs, cs, re, ce) = (v(0), v(1), v(2), v(3));
+            let mut parts = vec![rs, cs, re, ce];
+            if ce == grid_line_default_css(cs) {
+                parts.pop();
+                if re == grid_line_default_css(rs) {
+                    parts.pop();
+                    if cs == grid_line_default_css(rs) {
+                        parts.pop();
+                    }
+                }
+            }
+            parts.join(" / ")
+        }
+        "grid-template" => {
+            if v(0) == "none" && v(1) == "none" {
+                "none".to_owned()
+            } else {
+                format!("{} / {}", v(0), v(1))
+            }
+        }
+        "grid" => {
+            let (rows, columns, auto_rows, auto_columns, flow) = (v(0), v(1), v(2), v(3), v(4));
+            if auto_rows == "auto" && auto_columns == "auto" && flow == "row" {
+                if rows == "none" && columns == "none" {
+                    "none".to_owned()
+                } else {
+                    format!("{rows} / {columns}")
+                }
+            } else if rows == "none" && auto_columns == "auto" && (flow == "row" || flow == "dense") {
+                let keyword = if flow == "dense" { "auto-flow dense" } else { "auto-flow" };
+                if auto_rows == "auto" {
+                    format!("{keyword} / {columns}")
+                } else {
+                    format!("{keyword} {auto_rows} / {columns}")
+                }
+            } else if columns == "none" && auto_rows == "auto" && (flow == "column" || flow == "column dense") {
+                let keyword = if flow == "column dense" { "auto-flow dense" } else { "auto-flow" };
+                if auto_columns == "auto" {
+                    format!("{rows} / {keyword}")
+                } else {
+                    format!("{rows} / {keyword} {auto_columns}")
+                }
+            } else {
+                return None;
+            }
+        }
         "outline" => {
             // Chrome's order: colour, style, width; the initial parts left
             // out, `none` alone for the initial value.
@@ -591,6 +651,19 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
         }
         _ => return None,
     })
+}
+
+/// The serialized grid line a shorthand gives an omitted part after the
+/// line `start`: the same name when `start` is a lone name, else `auto`.
+fn grid_line_default_css(start: &str) -> &str {
+    let mut chars = start.chars();
+    let ident_start = match (chars.next(), chars.next()) {
+        (Some(c), _) if c.is_alphabetic() || c == '_' => true,
+        (Some('-'), Some(d)) => !d.is_ascii_digit(),
+        _ => false,
+    };
+    let lone_name = !start.contains(' ') && start != "auto" && ident_start;
+    if lone_name { start } else { "auto" }
 }
 
 /// Four side values collapsed to one, two, three or four.
@@ -727,7 +800,7 @@ fn declaration_text(name: &str, value: &str, important: bool) -> String {
 /// What layout decided for an element with a box: its border box size,
 /// used margins and paddings, and used insets when positioned. Resolved
 /// values use these where the CSSOM says the used value is reported.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct UsedValues {
     pub width: f32,
     pub height: f32,
@@ -736,6 +809,49 @@ pub struct UsedValues {
     /// Used `top`, `right`, `bottom`, `left` for an absolutely or fixed
     /// positioned box.
     pub inset: Option<Sides<f32>>,
+    /// A grid container's tracks as laid out.
+    pub grid: Option<std::sync::Arc<UsedGrid>>,
+}
+
+/// A grid container's used columns and rows (CSS Grid 1 §7.2.6: the
+/// resolved value of `grid-template-columns`/`-rows` lists every track).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UsedGrid {
+    pub columns: UsedTracks,
+    pub rows: UsedTracks,
+}
+
+/// The tracks of one axis: how many implicit ones come before the
+/// explicit grid, how many are explicit, and every track's size.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UsedTracks {
+    pub leading_implicit: usize,
+    pub explicit: usize,
+    pub sizes: Vec<f32>,
+}
+
+/// The resolved track list of a grid container: each track's used size,
+/// the explicit grid's line names where they are.
+fn used_tracks_css(tracks: &UsedTracks, list: &crate::grid::TrackList<ComputedLp>) -> String {
+    if tracks.sizes.is_empty() {
+        return "none".to_owned();
+    }
+    let (_, names) = list.expanded();
+    let mut parts: Vec<String> = Vec::new();
+    let named = |line: usize, parts: &mut Vec<String>| {
+        if line >= tracks.leading_implicit
+            && let Some(n) = names.get(line - tracks.leading_implicit)
+            && !n.is_empty()
+        {
+            parts.push(crate::grid::names_css(n));
+        }
+    };
+    for (i, size) in tracks.sizes.iter().enumerate() {
+        named(i, &mut parts);
+        parts.push(px(*size));
+    }
+    named(tracks.sizes.len(), &mut parts);
+    parts.join(" ")
 }
 
 fn px(v: f32) -> String {
@@ -1024,6 +1140,23 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
             EmptyCells::Show => "show".to_owned(),
             EmptyCells::Hide => "hide".to_owned(),
         },
+        // A grid container's tracks are its used sizes, every one listed;
+        // anything else gives the computed list.
+        Id::GridTemplateColumns => match rendered.and_then(|u| u.grid.as_ref()) {
+            Some(g) => used_tracks_css(&g.columns, &style.grid_template_columns),
+            None => style.grid_template_columns.to_css(),
+        },
+        Id::GridTemplateRows => match rendered.and_then(|u| u.grid.as_ref()) {
+            Some(g) => used_tracks_css(&g.rows, &style.grid_template_rows),
+            None => style.grid_template_rows.to_css(),
+        },
+        Id::GridAutoColumns => crate::grid::auto_tracks_css(&style.grid_auto_columns),
+        Id::GridAutoRows => crate::grid::auto_tracks_css(&style.grid_auto_rows),
+        Id::GridAutoFlow => style.grid_auto_flow.to_css(),
+        Id::GridRowStart => style.grid_row_start.to_css(),
+        Id::GridRowEnd => style.grid_row_end.to_css(),
+        Id::GridColumnStart => style.grid_column_start.to_css(),
+        Id::GridColumnEnd => style.grid_column_end.to_css(),
     }
 }
 
@@ -1034,6 +1167,59 @@ mod tests {
 
     fn block(css: &str) -> String {
         serialize_block(&parse_cssom_block(css))
+    }
+
+    /// "Working sites first" line 5: the grid properties parse, refuse
+    /// what the grammar refuses, serialize as written (shortest forms),
+    /// and the shorthands expand and collapse back.
+    #[test]
+    fn grid_properties_parse_and_serialize() {
+        let cases = [
+            ("grid-template-columns: 100px 1fr 2FR", "grid-template-columns: 100px 1fr 2fr;"),
+            ("grid-template-columns: [a] repeat(2, [b] 50px) [c]", "grid-template-columns: [a] repeat(2, [b] 50px) [c];"),
+            ("grid-template-rows: minmax(100px, 1fr) fit-content(20%) auto min-content", "grid-template-rows: minmax(100px, 1fr) fit-content(20%) auto min-content;"),
+            ("grid-template-columns: none", "grid-template-columns: none;"),
+            ("grid-auto-rows: 50px minmax(10px, auto)", "grid-auto-rows: 50px minmax(10px, auto);"),
+            ("grid-auto-flow: dense row", "grid-auto-flow: dense;"),
+            ("grid-auto-flow: column dense", "grid-auto-flow: column dense;"),
+            ("grid-auto-flow: column", "grid-auto-flow: column;"),
+            ("grid-row-start: span 2", "grid-row-start: span 2;"),
+            ("grid-column-end: 2 foo", "grid-column-end: 2 foo;"),
+            ("grid-column-start: span foo", "grid-column-start: span foo;"),
+            ("grid-row-end: -1", "grid-row-end: -1;"),
+            ("grid-row: 2 / span 3", "grid-row: 2 / span 3;"),
+            ("grid-row: 2", "grid-row: 2;"),
+            ("grid-column: foo", "grid-column: foo;"),
+            ("grid-column: 1 / auto", "grid-column: 1;"),
+            ("grid-area: 1 / 2", "grid-area: 1 / 2;"),
+            ("grid-area: a", "grid-area: a;"),
+            ("grid-area: 1 / 2 / 3 / 4", "grid-area: 1 / 2 / 3 / 4;"),
+            ("grid-template: 100px auto / 1fr 2fr", "grid-template: 100px auto / 1fr 2fr;"),
+            ("grid-template: none", "grid-template: none;"),
+            ("grid: auto-flow 50px / 1fr 1fr", "grid: auto-flow 50px / 1fr 1fr;"),
+            ("grid: 100px / auto-flow dense 20px", "grid: 100px / auto-flow dense 20px;"),
+            ("grid: 10px / 20px", "grid: 10px / 20px;"),
+        ];
+        for (css, want) in cases {
+            assert_eq!(block(css), want, "{css}");
+        }
+        // Refused: auto-repeat (a later part of grid), flexible minima,
+        // two name sets in a row, zero lines, a zero span, `span` as a
+        // name, negative sizes, an empty list.
+        for css in [
+            "grid-template-columns: repeat(auto-fill, 100px)",
+            "grid-template-columns: minmax(1fr, 100px)",
+            "grid-template-columns: [a] [b] 10px",
+            "grid-template-columns: -10px",
+            "grid-template-columns: [a]",
+            "grid-row-start: 0",
+            "grid-row-start: span 0",
+            "grid-row-start: span",
+            "grid-auto-flow: row column",
+            "grid-template: \"a b\" / 1fr",
+        ] {
+            assert_eq!(block(css), "", "{css} refused");
+        }
     }
 
     #[test]
@@ -1313,6 +1499,7 @@ mod tests {
             margin: Sides { top: 0.0, right: 0.0, bottom: 0.0, left: 37.5 },
             padding: Sides { top: 0.0, right: 0.0, bottom: 0.0, left: 40.0 },
             inset: Some(Sides { top: 5.0, right: 1.0, bottom: 2.0, left: 3.0 }),
+            grid: None,
         };
         assert_eq!(resolved_value(&style, PropertyId::Transform, Some(&used)), "matrix(2, 0, 0, 3, 100, 10)");
         assert_eq!(resolved_value(&style, PropertyId::TransformOrigin, Some(&used)), "100px 50px");
