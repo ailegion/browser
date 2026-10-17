@@ -6437,6 +6437,12 @@ mod tests {
             run_js(&mut h, "[cs(abs).top, cs(abs).left, cs(abs).right, cs(none).width, cs(none).display, cs(inl).width, cs(inl).display, cs(inl).marginLeft].join('|')"),
             "\"10px|20px|750px|100px|none|auto|inline|0px\""
         );
+        // The used insets are the distances to the margin box ("Working
+        // sites first" line 4): a margin does not change `top`.
+        assert_eq!(
+            run_js(&mut h, "abs.style.margin = '5px'; [cs(abs).top, cs(abs).left, cs(abs).right].join('|')"),
+            "\"10px|20px|740px\""
+        );
         // Custom properties are listed after the longhands; the list is
         // read-only and `cssText` empty.
         assert_eq!(

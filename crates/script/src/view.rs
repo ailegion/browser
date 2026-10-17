@@ -428,6 +428,40 @@ impl View {
         self.index().get(&id).and_then(|v| v.first()).copied()
     }
 
+    /// The containing block of an absolutely positioned (or fixed) box
+    /// as layout used it (CSS 2.1 §10.1): the padding box of the element
+    /// `cb`, an inline element's from the start of its first fragment to
+    /// the end of its last; with no element, the initial containing block
+    /// (the viewport less the page's scrollbar gutters, in the
+    /// coordinates fixed boxes have too).
+    pub(crate) fn containing_rect(&mut self, cb: Option<NodeId>) -> Rect {
+        let initial = self
+            .layout
+            .as_ref()
+            .map(|t| {
+                let p = t.viewport.scrollport;
+                Rect::new(p.x, 0.0, p.width, p.height)
+            })
+            .unwrap_or(Rect::new(0.0, 0.0, self.viewport.0, self.viewport.1));
+        let Some(a) = cb else { return initial };
+        let style = self.styles.get(a).cloned();
+        let Some(boxes) = self.index().get(&a).cloned() else { return initial };
+        let (Some(first), Some(last)) = (boxes.first(), boxes.last()) else { return initial };
+        let bw = style.as_ref().map(|s| s.border_width).unwrap_or(Sides::all(0.0));
+        let pad = |r: &Rect| Rect::new(r.x + bw.left, r.y + bw.top, (r.width - bw.left - bw.right).max(0.0), (r.height - bw.top - bw.bottom).max(0.0));
+        let inline = style.as_ref().is_some_and(|s| matches!(s.display, browser_style::Display::Inline));
+        if !inline || boxes.len() == 1 {
+            return pad(&first.rect);
+        }
+        let (f, l) = (pad(&first.rect), pad(&last.rect));
+        let rtl = style.as_ref().is_some_and(|s| s.direction == browser_style::Direction::Rtl);
+        if rtl {
+            Rect::new(l.x, f.y, (f.right() - l.x).max(0.0), (l.bottom() - f.y).max(0.0))
+        } else {
+            Rect::new(f.x, f.y, (l.right() - f.x).max(0.0), (l.bottom() - f.y).max(0.0))
+        }
+    }
+
     /// The smallest rectangle around all of an element's boxes as they
     /// show; zero when it has none (not rendered).
     pub fn bounding(&mut self, doc: &Document, id: NodeId) -> Rect {

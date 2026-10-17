@@ -39,15 +39,20 @@ impl LayoutEngine {
     /// containing block and the fixed boxes' viewport (less the page's
     /// scrollbar gutters) when `root` is the document's; inside a box laid
     /// out on its own it is `None` and the boxes whose block is outside
-    /// stay placeholders.
-    pub(crate) fn place_out_of_flow(&mut self, root: &mut Fragment, viewport: Option<Rect>) {
+    /// stay placeholders, as do those against `not_final` (a block whose
+    /// box its container still moves or sizes).
+    pub(crate) fn place_out_of_flow(&mut self, root: &mut Fragment, viewport: Option<Rect>, not_final: Option<NodeId>) {
         loop {
             let mut pending: Vec<(Vec<usize>, usize)> = Vec::new();
             collect_placeholders(root, &mut Vec::new(), &mut pending);
             if pending.is_empty() {
                 return;
             }
-            let wanted: HashSet<NodeId> = pending.iter().filter_map(|(_, i)| self.oofs.get(*i).and_then(|o| o.cb)).collect();
+            let wanted: HashSet<NodeId> = pending
+                .iter()
+                .filter_map(|(_, i)| self.oofs.get(*i).and_then(|o| o.cb))
+                .filter(|n| Some(*n) != not_final)
+                .collect();
             let blocks = containing_blocks(root, &wanted);
             let mut placed = false;
             for (path, i) in pending {

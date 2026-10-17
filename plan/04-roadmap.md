@@ -132,10 +132,50 @@ remaining lists as they stand.
       shrink-to-fit float with wrapping text is its longest line wide,
       not its available width; a cell's percentage padding resolves
       against the table's containing block (Chrome not checked).
-- [ ] 4. Positioned containing block (new 4a entry; the deviation is
+- [x] 4. Positioned containing block (new 4a entry; the deviation is
       noted in the 4a block 6 record): absolute and fixed boxes sized
       and placed against the nearest positioned or transformed
       ancestor's padding box, static position kept. Later: nothing.
+      Done 2026-10-18 (owner's go on the engine change). `crates/layout/
+      src/positioned.rs`: the box builder takes every `absolute`/`fixed`
+      box out of its flow (`BoxBuilder::oofs`, with its containing
+      block's element from the DOM: the nearest ancestor positioned or
+      containing fixed boxes, for `fixed` the nearest containing fixed
+      boxes; `display: contents` passed over) and leaves a placeholder:
+      a zero-size absolute taffy leaf in block flow (`BoxKind::OutOfFlow`),
+      a zero-width glued line item among inline content (`OofAnchor`,
+      `LineItemId::Oof`: no break opportunity, no line height). A run of
+      inline content keeps its absolutely positioned boxes only when it
+      has something in flow (Blink's inline run); in a flex container
+      they stand outside the items. `ComputedStyle::original_display`
+      (display before blockification) gives an inline-level box its place
+      in the line and a block-level one the line's start, below the line
+      when content precedes it. Each laid-out tree (the document's, an
+      inline-block's, a cell's (except boxes against the cell itself,
+      whose height its row decides), a caption's, a positioned box's)
+      replaces the placeholders whose containing block is in it
+      (`place_out_of_flow`); the document resolves the rest against the
+      initial containing block or the viewport (less the page's gutters).
+      Sizing per CSS 2.1 §10.3.7/§10.3.8/§10.6.4/§10.6.5: static insets,
+      shrink-to-fit into the block less the known inset, stretch between
+      both, `auto` margins centring (a negative share to the end margin
+      horizontally), over-constraint dropping the end inset (the start
+      one in a right-to-left block), min/max sizes, a replaced box at its
+      own size, percentages of the block (heights of its height), an
+      inline element's block from its first fragment's start to its last
+      fragment's end. The viewport hoisting and the atomics'
+      viewport-sized wrappers are gone (fixed boxes take the same path).
+      A positioned box is clipped, scrolled and counted as scrollable
+      overflow by its containing block's chain only (`Fragment::
+      containing`; paint order `cb_clips`; `translate_scrolled`;
+      `scroll_extent`'s `Within`), and its extent no longer takes the
+      scroller's end padding. CSSOM: used insets from the same containing
+      block to the margin box (`View::containing_rect`). Tests: layout
+      (the eleven cases above, clip/scroll/overflow escape), tab (insets
+      with margins). A table's containing block is its wrapper (captions
+      included), as CSS 2.1 §17.4 applies `position` to the wrapper.
+      Timing unchanged (tables 45.4 ms, Hacker News relayout 36 ms,
+      Wikipedia 170 ms).
 - [ ] 5. From 4a block 7 (grid): grid-template-rows/columns with
       lengths, fr, repeat, minmax, auto; gap; auto placement; line
       spans. Later: named areas, auto-fill/fit, alignment keywords,

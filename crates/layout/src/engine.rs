@@ -329,7 +329,7 @@ impl LayoutEngine {
             // both the viewport less the page's scrollbar gutters.
             let (gl, gr, gb) = plan_gutters(&viewport_plan);
             let icb = Rect::new(gl, 0.0, (viewport_width - gl - gr).max(0.0), (viewport_height - gb).max(0.0));
-            self.place_out_of_flow(&mut html_fragment, Some(icb));
+            self.place_out_of_flow(&mut html_fragment, Some(icb), None);
             pass += 1;
             if pass >= MAX_SCROLLBAR_PASSES {
                 break;
@@ -732,9 +732,13 @@ impl LayoutEngine {
             fragment = self.fragments(node, &tree, 0.0, 0.0);
             // An intrinsic size leaves the absolutely positioned boxes out
             // (they are out of flow); a layout places those whose
-            // containing block is in it.
+            // containing block is in it. A cell's own box is not final
+            // here (its row sets its height, its content moves by its
+            // `vertical-align`): the boxes positioned against it wait for
+            // the table's placement of it.
             if matches!(run, Run::Width { .. }) {
-                self.place_out_of_flow(&mut fragment, None);
+                let not_final = if role == Role::Cell { node.node } else { None };
+                self.place_out_of_flow(&mut fragment, None, not_final);
             }
             pass += 1;
             if pass >= MAX_SCROLLBAR_PASSES {
@@ -4158,6 +4162,98 @@ mod tests {
         let (pp, ppt) = (b("pp"), tree.first_rect(|n| n == by_id(&doc, "ppt")).expect("text"));
         assert_eq!(ppt.x - pp.x, 20.0, "5% of the 400px line");
         assert!((pp.width - (ppt.width + 40.0)).abs() < 1.0, "the content and both paddings: {pp:?} {ppt:?}");
+    }
+
+    /// "Working sites first" line 4: absolutely positioned boxes against
+    /// the padding box of their nearest positioned ancestor (else the
+    /// initial containing block), through an inline-block's and a cell's
+    /// own layouts; an inline-level one keeps its place in the line and
+    /// takes none; sizes and places per CSS 2.1 §10.3.7/§10.6.4 (shrink-
+    /// to-fit beside its static left, stretched between both insets,
+    /// centred by `auto` margins, a replaced box keeping its size); an
+    /// inline element's containing block from its first fragment to its
+    /// last; a fixed box inside a transformed one against that box.
+    #[test]
+    fn absolutely_positioned_boxes_use_their_containing_block() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div id=rel style='position:relative;margin:20px;width:300px;height:200px;border:5px solid'>\
+             <div style='margin:10px'><div id=a style='position:absolute;right:0;bottom:0;width:50px;height:30px'></div></div></div>\
+             <div style='margin:10px'><div id=b style='position:absolute;left:5px;top:5px;width:20px;height:20px'></div></div>\
+             <p id=p style='margin:0;width:300px'><span id=t1>Some text </span><span id=s style='position:absolute'>abs</span><span id=t2>more</span></p>\
+             <div style='position:relative;width:400px;height:300px'>\
+             <div id=s1 style='position:absolute;left:300px'>shrink to fit text that is long</div>\
+             <div id=s2 style='position:absolute;left:10px;right:10px'>stretch</div>\
+             <div id=s3 style='position:absolute;left:0;right:0;width:100px;margin:auto'>centre</div>\
+             <div id=s4 style='position:absolute;top:10px;bottom:10px;width:10px'></div>\
+             <img id=s5 style='position:absolute;left:0;right:0;width:20px;height:20px;margin:0 auto'></div>\
+             <div id=outer style='position:relative;width:500px;height:50px'><span style='display:inline-block'>x<i id=c style='position:absolute;right:0;top:0;width:5px;height:5px'></i></span></div>\
+             <table style='border-spacing:0'><tr><td style='padding:0;height:20px'>c</td><td id=td style='position:relative;width:100px;height:50px;padding:0'><i id=u style='position:absolute;left:0;bottom:0;width:10px;height:10px'></i></td></tr></table>\
+             <p style='margin:0;width:200px'>aa <span id=icb style='position:relative'>positioned inline that wraps over lines<b id=k style='position:absolute;right:0;bottom:0;width:5px;height:5px'></b></span> bb</p>\
+             <div id=tr style='transform:translateX(10px);height:40px'><div id=f style='position:fixed;top:0;left:0;width:20px;height:20px'></div></div>\
+             </body>",
+            "",
+        );
+        let b = |id: &str| box_of(&tree, by_id(&doc, id));
+        let rel = b("rel");
+        // The padding box of the positioned ancestor, not the parent's box.
+        assert_eq!((b("a").x, b("a").y), (rel.x + 5.0 + 300.0 - 50.0, rel.y + 5.0 + 200.0 - 30.0));
+        assert_eq!((b("b").x, b("b").y), (5.0, 5.0), "the initial containing block");
+        // In the line, taking no room: the text after it starts where it is.
+        let (t1, t2, s) = (tree.first_rect(|n| n == by_id(&doc, "t1")).expect("t1"), tree.first_rect(|n| n == by_id(&doc, "t2")).expect("t2"), b("s"));
+        assert_eq!(t2.x, t1.right(), "the line goes on past it");
+        assert_eq!((s.x, s.y), (t1.right(), t1.y), "at its static position");
+        let s1 = b("s1");
+        assert!(s1.width <= 100.0 + 0.01 && s1.height > 20.0, "shrink-to-fit in the 100px beside its left: {s1:?}");
+        assert_eq!(b("s2").width, 380.0, "stretched between its insets");
+        let base = b("s2").x - 10.0;
+        assert_eq!(b("s3").x - base, 150.0, "centred by its auto margins");
+        assert_eq!(b("s4").height, 280.0, "stretched between top and bottom");
+        assert_eq!((b("s5").x - base, b("s5").width), (190.0, 20.0), "a replaced box keeps its width, centred");
+        let (outer, c) = (b("outer"), b("c"));
+        assert_eq!(c.right(), outer.right(), "out of the inline-block to the positioned div");
+        let (td, u) = (b("td"), b("u"));
+        assert_eq!((u.x, u.bottom()), (td.x, td.bottom()), "against the cell as its row made it");
+        let k = b("k");
+        let icb_frags: Vec<Rect> = {
+            let mut v = Vec::new();
+            tree.root.walk(&mut |f| {
+                if f.node == Some(by_id(&doc, "icb")) && matches!(f.content, FragmentContent::Inline { .. }) {
+                    v.push(f.rect);
+                }
+            });
+            v
+        };
+        assert!(icb_frags.len() >= 2, "the inline wraps");
+        let last = icb_frags.last().expect("last");
+        assert_eq!((k.right(), k.bottom()), (last.right(), last.bottom()), "the end of the inline's last fragment");
+        let (tr, f) = (b("tr"), b("f"));
+        assert_eq!((f.x, f.y), (tr.x, tr.y), "a fixed box against its transformed ancestor");
+    }
+
+    /// Clipping, scrolling and scrollable overflow follow the containing
+    /// block, not the fragment tree: a box positioned against an ancestor
+    /// outside an `overflow` box is neither clipped nor scrolled by it,
+    /// nor part of its scrollable overflow.
+    #[test]
+    fn absolutely_positioned_boxes_escape_boxes_that_do_not_contain_them() {
+        let (doc, mut tree) = layout(
+            "<body style='margin:0'><div style='position:relative'>\
+             <div id=clip style='overflow:hidden;width:100px;height:50px'><div id=e style='position:absolute;left:150px;top:0;width:40px;height:40px'></div></div>\
+             <div id=sc style='overflow:auto;width:200px;height:80px'><div style='height:300px'></div>\
+             <div id=x style='position:absolute;left:0;top:500px;width:10px;height:10px'></div>\
+             <div id=in style='position:relative'><div id=y style='position:absolute;top:0;left:0;width:10px;height:10px'></div></div></div>\
+             </div></body>",
+            "",
+        );
+        let (e, x, y) = (by_id(&doc, "e"), by_id(&doc, "x"), by_id(&doc, "y"));
+        assert_eq!(tree.hit_test(160.0, 20.0), Some(e), "not clipped by the overflow box");
+        let sc = tree.scroller(by_id(&doc, "sc")).expect("scroller").clone();
+        assert!(sc.scroll_height < 400.0, "the box against the outer div is not the scroller's overflow: {}", sc.scroll_height);
+        let (xr, yr) = (box_of(&tree, x), box_of(&tree, y));
+        tree.set_scroll_offset(by_id(&doc, "sc"), (0.0, 100.0));
+        assert_eq!(box_of(&tree, x), xr, "not scrolled");
+        assert_eq!(box_of(&tree, y).y, yr.y - 100.0, "the one against a box inside the scroller moves");
     }
 
     /// The paint order is kept on the tree and built again when the

@@ -31,7 +31,6 @@ use boa_engine::{
 };
 use boa_gc::{Finalize, Trace};
 use browser_dom::{Document, NodeId};
-use browser_layout::Rect;
 use browser_style::serialize::shorthand_value;
 use browser_style::{
     ComputedStyle, Declaration, DeclaredValue, Position, PropertyId, SHORTHANDS, Sides, UsedValues, is_shorthand,
@@ -449,29 +448,25 @@ fn used_values(view: &mut View, doc: &Document, id: NodeId, style: &ComputedStyl
     let b = view.own_box(id)?;
     let inset = match style.position {
         Position::Absolute | Position::Fixed => {
-            // The containing block: the padding box of the nearest
-            // positioned ancestor, else the initial containing block.
-            let mut cb = Rect::new(0.0, 0.0, view.viewport.0, view.viewport.1);
-            for a in doc.ancestors(id) {
-                if view.styles.get(a).is_some_and(|s| s.position != Position::Static)
-                    && let Some(ab) = view.own_box(a)
-                {
-                    let s = view.styles.get(a).cloned();
-                    let bw = s.as_ref().map(|s| s.border_width).unwrap_or(Sides::all(0.0));
-                    cb = Rect::new(
-                        ab.rect.x + bw.left,
-                        ab.rect.y + bw.top,
-                        (ab.rect.width - bw.left - bw.right).max(0.0),
-                        (ab.rect.height - bw.top - bw.bottom).max(0.0),
-                    );
-                    break;
-                }
-            }
+            // The containing block (CSS 2.1 §10.1): the nearest ancestor
+            // that is positioned or contains fixed boxes (a transform and
+            // the like), for `fixed` the nearest that contains fixed boxes;
+            // else the initial containing block. The insets are the
+            // distances from it to the margin box.
+            let fixed = style.position == Position::Fixed;
+            let cb_element = doc.ancestors(id).filter(|&a| doc.get(a).is_element()).find(|&a| {
+                view.styles.get(a).is_some_and(|s| {
+                    !matches!(s.display, browser_style::Display::Contents | browser_style::Display::None)
+                        && (s.contains_fixed() || (!fixed && s.position != Position::Static))
+                })
+            });
+            let cb = view.containing_rect(cb_element);
+            let m = &b.margin;
             Some(Sides {
-                top: b.rect.y - cb.y,
-                right: cb.right() - b.rect.right(),
-                bottom: cb.bottom() - b.rect.bottom(),
-                left: b.rect.x - cb.x,
+                top: b.rect.y - m.top - cb.y,
+                right: cb.right() - (b.rect.right() + m.right),
+                bottom: cb.bottom() - (b.rect.bottom() + m.bottom),
+                left: b.rect.x - m.left - cb.x,
             })
         }
         _ => None,
