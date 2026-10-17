@@ -254,7 +254,7 @@ fn place_line(
                     }
                 }
             }
-            PositionedLayoutItem::InlineBox(b) => match LineItemId::decode(b.id, content.atomics.len()) {
+            PositionedLayoutItem::InlineBox(b) => match LineItemId::decode(b.id, content.atomics.len(), content.boxes.len()) {
                 LineItemId::Atomic(index) => {
                     let Some(atomic) = content.atomics.get(index) else { continue };
                     state.open(atomic.inline_box, content, metrics, decor, fonts);
@@ -273,6 +273,9 @@ fn place_line(
                 LineItemId::Edge { inline_box, .. } => {
                     state.open(Some(inline_box), content, metrics, decor, fonts);
                 }
+                // An absolutely positioned box is not in the line (CSS 2.1
+                // §9.3.1): it adds nothing to the line's height.
+                LineItemId::Oof(_) => {}
             },
         }
     }

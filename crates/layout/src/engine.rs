@@ -50,15 +50,14 @@ pub struct LayoutEngine {
     /// emitted in the current layout, by element, so the scroll
     /// information can be computed from the fragment tree once every
     /// box, atomics included, is in its final place.
-    plans: HashMap<NodeId, ScrollPlan>,
+    pub(crate) plans: HashMap<NodeId, ScrollPlan>,
     /// The viewport of the current layout less the page scrollbars'
-    /// gutters: the containing block of the `position: fixed` boxes,
-    /// inside atomics too.
+    /// gutters.
     viewport: (f32, f32),
-    /// Some atomic laid out in this layout holds a fixed box: when the
-    /// page's gutters change, the atomics are laid out again for the
-    /// new containing block.
-    atomic_fixed: bool,
+    /// The absolutely positioned and fixed boxes of the current layout,
+    /// out of their flows (`BoxKind::OutOfFlow`, `OofAnchor`); each is
+    /// taken while it is laid out (`positioned.rs`).
+    pub(crate) oofs: Vec<crate::boxes::OutOfFlowBox>,
 }
 
 /// Relayouts after a pass finds an `overflow: auto` axis overflowing, so
@@ -103,9 +102,6 @@ struct Entry {
     isolates: bool,
     /// Flex container: every child is its own formatting context.
     flex: bool,
-    /// A fixed box hung from the viewport node: its layout position is
-    /// relative to the tree root, not to its entry parent.
-    hoisted: bool,
 }
 
 /// A float's margin box in the coordinates of the tree root.
@@ -140,7 +136,7 @@ impl LayoutEngine {
             decor: Decorator::default(),
             plans: HashMap::new(),
             viewport: (0.0, 0.0),
-            atomic_fixed: false,
+            oofs: Vec::new(),
         }
     }
 
@@ -236,14 +232,8 @@ impl LayoutEngine {
     ) -> LayoutTree {
         self.plans.clear();
         self.viewport = (viewport_width, viewport_height);
-        self.atomic_fixed = false;
         let vo = viewport_overflow(doc, styles);
-        let builder = BoxBuilder {
-            doc,
-            styles,
-            images,
-            viewport_source: vo.source,
-        };
+        let builder = BoxBuilder::new(doc, styles, images, vo.source);
         let root_style = Arc::new(ComputedStyle::initial());
         let viewport_rect = Rect::new(0.0, 0.0, viewport_width, viewport_height);
         let empty_viewport = |overflow: ViewportOverflow| ScrollInfo {
@@ -275,6 +265,7 @@ impl LayoutEngine {
                     margin: Default::default(),
                     transform: None,
                     fixed: None,
+                    containing: None,
                 },
                 content_width: viewport_width,
                 content_height: viewport_height,
@@ -303,22 +294,19 @@ impl LayoutEngine {
             caret_room: false,
         });
 
+        // The absolutely positioned and fixed boxes, out of their flows.
+        self.oofs = builder.oofs.take();
         self.prepare_markers(&mut html);
 
         let mut tree: TaffyTree<Leaf> = TaffyTree::new();
         let mut leaves: Vec<LeafRef<'_>> = Vec::new();
         let mut leaf_ids: Vec<TaffyId> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
-        let mut hoisted: Vec<TaffyId> = Vec::new();
-        let html_id = self.build_taffy(&mut tree, &mut html, &mut leaves, &mut leaf_ids, &mut entries, &mut hoisted);
+        let html_id = self.build_taffy(&mut tree, &mut html, &mut leaves, &mut leaf_ids, &mut entries);
         drop(leaves);
 
-        // The fixed boxes are children of the viewport node, after the
-        // root element (CSS Positioned 3 §3.3: their containing block).
-        let mut viewport_children = vec![html_id];
-        viewport_children.extend(hoisted);
         let viewport_id = tree
-            .new_with_children(viewport_style(viewport_width, viewport_height, &viewport_plan), &viewport_children)
+            .new_with_children(viewport_style(viewport_width, viewport_height, &viewport_plan), &[html_id])
             .expect("taffy root");
         let available = Size {
             width: AvailableSpace::Definite(viewport_width),
@@ -335,6 +323,13 @@ impl LayoutEngine {
             self.run_with_floats(&mut tree, viewport_id, available, &mut leaves, &leaf_ids, &entries);
             drop(leaves);
             html_fragment = self.fragments(&html, &tree, 0.0, 0.0);
+            // The absolutely positioned boxes left: against their
+            // containing blocks in here, else the initial containing
+            // block; the fixed ones against the viewport (CSS 2.1 §10.1),
+            // both the viewport less the page's scrollbar gutters.
+            let (gl, gr, gb) = plan_gutters(&viewport_plan);
+            let icb = Rect::new(gl, 0.0, (viewport_width - gl - gr).max(0.0), (viewport_height - gb).max(0.0));
+            self.place_out_of_flow(&mut html_fragment, Some(icb));
             pass += 1;
             if pass >= MAX_SCROLLBAR_PASSES {
                 break;
@@ -346,17 +341,8 @@ impl LayoutEngine {
             if viewport_plan.add_gutters(ox, oy) {
                 let _ = tree.set_style(viewport_id, viewport_style(viewport_width, viewport_height, &viewport_plan));
                 changed = true;
-                // The fixed boxes' containing block shrank by the gutters:
-                // the boxes laid out on their own that hold any are laid
-                // out again for it.
                 let (gl, gr, gb) = plan_gutters(&viewport_plan);
                 self.viewport = (viewport_width - gl - gr, viewport_height - gb);
-                if self.atomic_fixed {
-                    clear_independent_layouts(&mut html);
-                    for id in &leaf_ids {
-                        let _ = tree.mark_dirty(*id);
-                    }
-                }
             }
             if !changed {
                 break;
@@ -378,6 +364,7 @@ impl LayoutEngine {
                 margin: Default::default(),
                 transform: None,
                 fixed: None,
+                containing: None,
             },
             content_width: viewport.scroll_width,
             content_height: viewport.scroll_height,
@@ -450,6 +437,7 @@ impl LayoutEngine {
             margin: Default::default(),
             transform: None,
             fixed: None,
+            containing: None,
         };
         let BoxKind::Inline(content) = &marker.kind else { return empty(&marker.style) };
         let Some(il) = content.cache.first() else { return empty(&marker.style) };
@@ -470,7 +458,7 @@ impl LayoutEngine {
         let text: Arc<str> = Arc::from(content.text.as_str());
         let mut kids = Vec::new();
         for p in &il.paragraphs {
-            emit_text_fragments(content, &text, p, &il.edges, x, y, None, &mut kids, &mut self.decor, &mut self.fonts);
+            emit_text_fragments(content, &text, p, &il.edges, x, y, width, None, &mut kids, &mut self.decor, &mut self.fonts);
         }
         Fragment {
             rect: Rect::new(x, y, width, il.height),
@@ -482,6 +470,7 @@ impl LayoutEngine {
             margin: Default::default(),
             transform: None,
             fixed: None,
+            containing: None,
         }
     }
 
@@ -538,6 +527,7 @@ impl LayoutEngine {
                 margin,
                 transform: box_transform(&node.style, &rect, &padding),
                 fixed: None,
+                containing: None,
             };
             // A replaced box's baseline is its bottom margin edge.
             let height = h + margin.top + margin.bottom;
@@ -557,6 +547,7 @@ impl LayoutEngine {
             Sizing::Exactly(w) => Run::Width {
                 border_box: Some(w),
                 cb: w,
+                height: None,
             },
             Sizing::FitInto(w) | Sizing::Fill(w) => {
                 if matches!(atomic.node.style.width, ComputedSize::Auto) {
@@ -577,9 +568,14 @@ impl LayoutEngine {
                     Run::Width {
                         border_box: Some(bb),
                         cb: w,
+                        height: None,
                     }
                 } else {
-                    Run::Width { border_box: None, cb: w }
+                    Run::Width {
+                        border_box: None,
+                        cb: w,
+                        height: None,
+                    }
                 }
             }
         };
@@ -620,10 +616,12 @@ impl LayoutEngine {
     }
 
     /// Lay a box subtree out on its own (an atomic inline-level box, a
-    /// table cell, a caption): its own taffy tree, its float and scrollbar
-    /// passes, its fixed boxes hung from a viewport-sized wrapper, its
-    /// outside markers. `role` says how its root sits in its container
-    /// (`Role`), `run` what it is laid out for (`Run`).
+    /// table cell, a caption, an absolutely positioned box): its own taffy
+    /// tree, its float and scrollbar passes, its outside markers, and the
+    /// absolutely positioned boxes whose containing block is in it (the
+    /// others stay placeholders for the container's pass). `role` says
+    /// how its root sits in its container (`Role`), `run` what it is laid
+    /// out for (`Run`).
     pub(crate) fn layout_independent(&mut self, node: &mut BoxNode, role: Role, run: Run) -> SubtreeResult {
         self.prepare_markers(node);
         // The plans this layout leaves are its own: the container's are
@@ -634,14 +632,20 @@ impl LayoutEngine {
         let mut leaves: Vec<LeafRef<'_>> = Vec::new();
         let mut leaf_ids: Vec<TaffyId> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
-        let mut hoisted: Vec<TaffyId> = Vec::new();
-        let root = self.build_taffy(&mut tree, node, &mut leaves, &mut leaf_ids, &mut entries, &mut hoisted);
+        let root = self.build_taffy(&mut tree, node, &mut leaves, &mut leaf_ids, &mut entries);
         drop(leaves);
 
         // The root's style for this run, set again after a scrollbar pass
         // rebuilds it from the plan.
         let own = node.style.clone();
         let root_style = |style: &mut Style| {
+            if role == Role::Positioned {
+                // Placed by `positioned.rs`: no offsets or margins of its
+                // own here, its border box at the origin.
+                style.position = taffy::Position::Relative;
+                style.inset = taffy::Rect::auto();
+                style.margin = taffy::Rect::zero();
+            }
             if role == Role::Cell {
                 // A cell: no margins, its border box the width its columns
                 // give it, its height from the content (the row decides
@@ -665,16 +669,17 @@ impl LayoutEngine {
                         style.max_size.width = LengthPercentageAuto::auto();
                     }
                 }
-                Run::Width { border_box: Some(bb), cb } => match role {
+                Run::Width { border_box: Some(bb), cb, .. } => match role {
                     Role::Cell | Role::Caption => {
                         style.box_sizing = taffy::BoxSizing::BorderBox;
                         style.size.width = Dimension::length(bb);
                         style.min_size.width = LengthPercentageAuto::auto();
                         style.max_size.width = LengthPercentageAuto::auto();
                     }
-                    // The shrink-to-fit border box, in the box's own
-                    // `box-sizing`, under its own min and max widths.
-                    Role::Atomic => {
+                    // The shrink-to-fit (or positioned) border box, in the
+                    // box's own `box-sizing`, under its own min and max
+                    // widths.
+                    Role::Atomic | Role::Positioned => {
                         let width = match style.box_sizing {
                             taffy::BoxSizing::BorderBox => bb,
                             taffy::BoxSizing::ContentBox => {
@@ -687,58 +692,32 @@ impl LayoutEngine {
                 },
                 Run::Width { border_box: None, .. } => {}
             }
+            // A height the container decided (a positioned box's), in the
+            // box's own `box-sizing`; its vertical padding resolves against
+            // the containing block's width.
+            if let Run::Width { height: Some(bh), cb, .. } = run {
+                let height = match style.box_sizing {
+                    taffy::BoxSizing::BorderBox => bh,
+                    taffy::BoxSizing::ContentBox => {
+                        let (p, b) = (&own.padding, &own.border_width);
+                        (bh - p.top.resolve(cb) - p.bottom.resolve(cb) - b.top - b.bottom).max(0.0)
+                    }
+                };
+                style.size.height = Dimension::length(height);
+            }
         };
         if let Ok(style) = tree.style(root) {
             let mut style = style.clone();
             root_style(&mut style);
             let _ = tree.set_style(root, style);
         }
-        let (available, cb) = match run {
-            Run::MinContent => (AvailableSpace::MinContent, None),
-            Run::MaxContent => (AvailableSpace::MaxContent, None),
-            Run::Width { cb, .. } => (AvailableSpace::Definite(cb), Some(cb)),
-        };
         let available = Size {
-            width: available,
+            width: match run {
+                Run::MinContent => AvailableSpace::MinContent,
+                Run::MaxContent => AvailableSpace::MaxContent,
+                Run::Width { cb, .. } => AvailableSpace::Definite(cb),
+            },
             height: AvailableSpace::MaxContent,
-        };
-        // Fixed boxes inside the subtree hang from a viewport-sized node
-        // around it (their containing block), the subtree itself in a
-        // block of its containing block's width inside it, so its own
-        // layout is the same as without them. Measuring an intrinsic size
-        // leaves them out (they are out of flow).
-        let run_root = match cb {
-            Some(cb) if !hoisted.is_empty() => {
-                self.atomic_fixed = true;
-                let inner = tree
-                    .new_with_children(
-                        Style {
-                            display: taffy::Display::Block,
-                            size: Size {
-                                width: Dimension::length(cb),
-                                height: Dimension::auto(),
-                            },
-                            ..Style::default()
-                        },
-                        &[root],
-                    )
-                    .expect("taffy node");
-                let mut kids = vec![inner];
-                kids.extend(hoisted);
-                tree.new_with_children(
-                    Style {
-                        display: taffy::Display::Block,
-                        size: Size {
-                            width: Dimension::length(self.viewport.0),
-                            height: Dimension::length(self.viewport.1),
-                        },
-                        ..Style::default()
-                    },
-                    &kids,
-                )
-                .expect("taffy node")
-            }
-            _ => root,
         };
         // As for the document: an `auto` scroller in here (the box itself
         // or one inside it) found overflowing gets its gutter and the box
@@ -748,9 +727,15 @@ impl LayoutEngine {
         loop {
             let mut leaves: Vec<LeafRef<'_>> = Vec::new();
             collect_leaves(node, &mut leaves);
-            self.run_with_floats(&mut tree, run_root, available, &mut leaves, &leaf_ids, &entries);
+            self.run_with_floats(&mut tree, root, available, &mut leaves, &leaf_ids, &entries);
             drop(leaves);
             fragment = self.fragments(node, &tree, 0.0, 0.0);
+            // An intrinsic size leaves the absolutely positioned boxes out
+            // (they are out of flow); a layout places those whose
+            // containing block is in it.
+            if matches!(run, Run::Width { .. }) {
+                self.place_out_of_flow(&mut fragment, None);
+            }
             pass += 1;
             if pass >= MAX_SCROLLBAR_PASSES {
                 break;
@@ -791,10 +776,9 @@ impl LayoutEngine {
 
     /// Create taffy nodes for a box subtree. Inline roots and tables
     /// become leaves that lay themselves out, whose context indexes
-    /// `leaves` (`formatting::SelfLayout`).
-    /// `hoisted` collects the fixed boxes' nodes, to be made children of
-    /// the viewport node; each leaves a zero-size absolutely positioned
-    /// placeholder in its parent, whose position is its static one.
+    /// `leaves` (`formatting::SelfLayout`). An absolutely positioned box
+    /// is a zero-size absolutely positioned leaf, whose place taffy works
+    /// out as its static position (`positioned.rs` lays the box out).
     fn build_taffy<'a>(
         &mut self,
         tree: &mut TaffyTree<Leaf>,
@@ -802,21 +786,27 @@ impl LayoutEngine {
         leaves: &mut Vec<LeafRef<'a>>,
         leaf_ids: &mut Vec<TaffyId>,
         entries: &mut Vec<Entry>,
-        hoisted: &mut Vec<TaffyId>,
     ) -> TaffyId {
         let is_flex = matches!(node.kind, BoxKind::Flex);
         let anonymous = node.anonymous;
         let style = node.style.clone();
+        let placeholder = matches!(node.kind, BoxKind::OutOfFlow(_));
         let mut entry = Entry {
             taffy: TaffyId::new(0),
             inline: None,
             children: Vec::new(),
-            float: if anonymous { Float::None } else { style.float },
+            float: if anonymous || placeholder { Float::None } else { style.float },
             isolates: false,
             flex: is_flex,
-            hoisted: node.fixed,
         };
         let id = match &mut node.kind {
+            BoxKind::OutOfFlow(_) => tree
+                .new_leaf(Style {
+                    display: taffy::Display::Block,
+                    position: taffy::Position::Absolute,
+                    ..Style::default()
+                })
+                .expect("taffy leaf"),
             BoxKind::Inline(content) => {
                 let style = Style {
                     display: taffy::Display::Block,
@@ -874,24 +864,9 @@ impl LayoutEngine {
                         || !matches!(style.overflow_y, Overflow::Visible));
                 let mut kids = Vec::with_capacity(node.children.len());
                 for child in &mut node.children {
-                    let placeholder = child.fixed.then(|| {
-                        tree.new_leaf(Style {
-                            display: taffy::Display::Block,
-                            position: taffy::Position::Absolute,
-                            ..Style::default()
-                        })
-                        .expect("taffy leaf")
-                    });
-                    child.placeholder = placeholder;
-                    let child_id = self.build_taffy(tree, child, leaves, leaf_ids, entries, hoisted);
+                    let child_id = self.build_taffy(tree, child, leaves, leaf_ids, entries);
                     entry.children.push(entries.len() - 1);
-                    match placeholder {
-                        Some(p) => {
-                            hoisted.push(child_id);
-                            kids.push(p);
-                        }
-                        None => kids.push(child_id),
-                    }
+                    kids.push(child_id);
                 }
                 tree.new_with_children(taffy_style, &kids).expect("taffy node")
             }
@@ -1004,26 +979,9 @@ impl LayoutEngine {
             .taffy
             .and_then(|id| tree.layout(id).ok().cloned())
             .unwrap_or_default();
-        let mut x = ox + layout.location.x;
-        let mut y = oy + layout.location.y;
-        // A fixed box hangs from the viewport node: its position is
-        // relative to that, except along an axis with both insets `auto`,
-        // where it sits at its static position: the placeholder's place
-        // in its parent (CSS 2.1 §10.3.7, §10.6.4).
-        let mut fixed = None;
-        if node.fixed {
-            let s = &node.style;
-            let auto = |v: ComputedLpAuto| matches!(v, ComputedLpAuto::Auto);
-            let static_x = auto(s.inset.left) && auto(s.inset.right);
-            let static_y = auto(s.inset.top) && auto(s.inset.bottom);
-            let placeholder = node
-                .placeholder
-                .and_then(|id| tree.layout(id).ok().cloned())
-                .unwrap_or_default();
-            x = if static_x { ox + placeholder.location.x + layout.margin.left } else { layout.location.x };
-            y = if static_y { oy + placeholder.location.y + layout.margin.top } else { layout.location.y };
-            fixed = Some((static_x, static_y));
-        }
+        let x = ox + layout.location.x;
+        let y = oy + layout.location.y;
+        let fixed = None;
         let rect = Rect::new(x, y, layout.size.width, layout.size.height);
         let sides = |r: taffy::Rect<f32>| browser_style::Sides {
             top: r.top,
@@ -1036,6 +994,20 @@ impl LayoutEngine {
         let transform = node.node.and_then(|_| box_transform(&node.style, &rect, &padding));
 
         match &node.kind {
+            // An absolutely positioned box's static position: the margin
+            // edge of a block box there (`positioned.rs` replaces it).
+            BoxKind::OutOfFlow(i) => Fragment {
+                rect: Rect::new(x, y, 0.0, 0.0),
+                node: node.node,
+                style: node.style.clone(),
+                content: FragmentContent::Placeholder(*i),
+                children: Vec::new(),
+                padding: Default::default(),
+                margin: Default::default(),
+                transform: None,
+                fixed: None,
+                containing: None,
+            },
             BoxKind::Table(table) => {
                 // The layout for taffy's size (`table::finish`); the table
                 // box may be wider than taffy's box when its columns'
@@ -1063,6 +1035,7 @@ impl LayoutEngine {
                     margin,
                     transform,
                     fixed,
+                    containing: None,
                 }
             }
             BoxKind::Inline(content) => {
@@ -1086,6 +1059,7 @@ impl LayoutEngine {
                             &il.edges,
                             x,
                             y,
+                            rect.width,
                             overflow,
                             &mut children,
                             &mut self.decor,
@@ -1111,6 +1085,7 @@ impl LayoutEngine {
                     margin,
                     transform: None,
                     fixed: None,
+                    containing: None,
                 }
             }
             BoxKind::Image { url, .. } => Fragment {
@@ -1126,6 +1101,7 @@ impl LayoutEngine {
                 margin,
                 transform,
                 fixed,
+                containing: None,
             },
             BoxKind::Block | BoxKind::Flex => {
                 if let (Some(n), Some(plan)) = (node.node, node.scroll) {
@@ -1154,6 +1130,7 @@ impl LayoutEngine {
                     margin,
                     transform,
                     fixed,
+                    containing: None,
                 }
             }
         }
@@ -1170,6 +1147,9 @@ pub(crate) enum Role {
     Cell,
     /// A table caption: a block box in the table wrapper.
     Caption,
+    /// An absolutely positioned box: its size decided against its
+    /// containing block (`positioned.rs`), placed there.
+    Positioned,
 }
 
 /// What an independent layout is for.
@@ -1181,8 +1161,9 @@ pub(crate) enum Run {
     MaxContent,
     /// Laid out in a containing block `cb` wide, the root's border box
     /// `border_box` wide when the container decided it (else from its
-    /// style: `auto` fills the containing block less the margins).
-    Width { border_box: Option<f32>, cb: f32 },
+    /// style: `auto` fills the containing block less the margins), and
+    /// `height` tall when the container decided that too.
+    Width { border_box: Option<f32>, cb: f32, height: Option<f32> },
 }
 
 /// What an independent layout produced: the border-box size, the margins
@@ -1258,7 +1239,7 @@ fn walk_entries(
 ) {
     let e = &entries[idx];
     let Ok(l) = tree.layout(e.taffy) else { return };
-    let (x, y) = if e.hoisted { (l.location.x, l.location.y) } else { (ox + l.location.x, oy + l.location.y) };
+    let (x, y) = (ox + l.location.x, oy + l.location.y);
     if e.float != Float::None {
         floats.push(FloatRect {
             bfc,
@@ -1295,16 +1276,24 @@ fn walk_entries(
 
 /// Border-box size of an inline image from its style and intrinsic size;
 /// `basis` is the containing block's width, `None` while an intrinsic
-/// contribution is measured (a percentage then behaves as `auto`).
+/// contribution is measured (a percentage then behaves as `auto`). A
+/// percentage height resolves against the width too (O22 b).
 fn image_size(style: &ComputedStyle, intrinsic: Option<(f32, f32)>, basis: Option<f32>) -> (f32, f32) {
-    let resolve = |s: ComputedSize| match s {
+    image_size_for(style, intrinsic, basis, basis)
+}
+
+/// `image_size` with the containing block's width and height apart
+/// (`height_basis` for a percentage `height`/`max-height`).
+pub(crate) fn image_size_for(style: &ComputedStyle, intrinsic: Option<(f32, f32)>, basis: Option<f32>, height_basis: Option<f32>) -> (f32, f32) {
+    let resolve_in = |s: ComputedSize, basis: Option<f32>| match s {
         ComputedSize::Px(px) => Some(px),
         ComputedSize::Percent(p) => basis.map(|b| p / 100.0 * b),
         _ => None,
     };
+    let resolve = |s: ComputedSize| resolve_in(s, basis);
     let available_width = basis.unwrap_or(0.0);
     let w = resolve(style.width);
-    let h = resolve(style.height);
+    let h = resolve_in(style.height, height_basis);
     let (iw, ih) = intrinsic.unwrap_or((0.0, 0.0));
     let ratio = if ih > 0.0 { iw / ih } else { 0.0 };
     let (mut w, mut h) = match (w, h) {
@@ -1503,6 +1492,11 @@ fn build_paragraphs(
                 items.push((end, b.seq_end, LineItemId::Edge { inline_box: bi, end: true }));
             }
         }
+        for (i, a) in content.oofs.iter().enumerate() {
+            if inside(a.index) {
+                items.push((a.index, a.seq, LineItemId::Oof(i)));
+            }
+        }
         items.sort_by_key(|&(index, seq, _)| (index, seq));
         for (index, _, id) in items {
             let (kind, width, height) = match id {
@@ -1519,9 +1513,12 @@ fn build_paragraphs(
                         (InlineBoxKind::AttachedToNext, e.start(rtl), 0.0)
                     }
                 }
+                // An absolutely positioned box's place: nothing in the
+                // line, no break opportunity, moving with what follows.
+                LineItemId::Oof(_) => (InlineBoxKind::AttachedToNext, 0.0, 0.0),
             };
             builder.push_inline_box(InlineBox {
-                id: id.encode(n_atomics),
+                id: id.encode(n_atomics, content.boxes.len()),
                 kind,
                 index: index - base,
                 width,
@@ -1581,7 +1578,7 @@ fn build_paragraphs(
 /// `transform-origin` of its reference box (`transform-box`: the border
 /// box, or the content box for `content-box`/`fill-box`; CSS Transforms
 /// 1 §6, 2 §5), with how it treats the boxes inside it.
-fn box_transform(style: &ComputedStyle, rect: &Rect, padding: &Sides<f32>) -> Option<Arc<BoxTransform>> {
+pub(crate) fn box_transform(style: &ComputedStyle, rect: &Rect, padding: &Sides<f32>) -> Option<Arc<BoxTransform>> {
     if !style.has_transform() {
         return None;
     }
@@ -1624,51 +1621,12 @@ fn collect_leaves<'a>(node: &'a mut BoxNode, leaves: &mut Vec<LeafRef<'a>>) {
     match &mut node.kind {
         BoxKind::Inline(content) => leaves.push(LeafRef::Inline(content)),
         BoxKind::Table(table) => leaves.push(LeafRef::Table(table)),
-        BoxKind::Image { .. } => {}
+        BoxKind::Image { .. } | BoxKind::OutOfFlow(_) => {}
         BoxKind::Block | BoxKind::Flex => {
             for c in &mut node.children {
                 collect_leaves(c, leaves);
             }
         }
-    }
-}
-
-/// Forget every layout made for a width in the subtree, down through the
-/// atomics, cells and captions (their intrinsic sizes stay: out-of-flow
-/// fixed boxes do not change them), so they are laid out again for a new
-/// fixed containing block. Outside markers keep theirs (nothing in them
-/// is fixed).
-fn clear_independent_layouts(node: &mut BoxNode) {
-    match &mut node.kind {
-        BoxKind::Inline(content) => {
-            content.cache.clear();
-            for atomic in &mut content.atomics {
-                atomic.results.retain(|(s, _)| matches!(s, Sizing::MinContent | Sizing::MaxContent));
-                atomic.selected = None;
-                clear_independent_layouts(&mut atomic.node);
-            }
-        }
-        BoxKind::Table(table) => {
-            table.layouts.clear();
-            table.current = 0;
-            for caption in &mut table.captions {
-                caption.last = None;
-                clear_independent_layouts(&mut caption.node);
-            }
-            for group in &mut table.groups {
-                for row in &mut group.rows {
-                    for cell in &mut row.cells {
-                        cell.last = None;
-                        clear_independent_layouts(&mut cell.node);
-                    }
-                }
-            }
-        }
-        BoxKind::Image { .. } => {}
-        BoxKind::Block | BoxKind::Flex => {}
-    }
-    for c in &mut node.children {
-        clear_independent_layouts(c);
     }
 }
 
@@ -1750,7 +1708,9 @@ fn scroll_info_for(f: &Fragment, plan: &ScrollPlan) -> ScrollInfo {
         f.padding
     };
     let is_flex = matches!(f.style.display, Display::Flex | Display::InlineFlex);
-    let (mut scroll_width, scroll_height) = scroll_extent(&f.children, None, is_flex, &scrollport, &end_padding, plan.rtl);
+    let inside = f.containing_blocks_within();
+    let (mut scroll_width, scroll_height) =
+        scroll_extent(&f.children, None, is_flex, &scrollport, &end_padding, plan.rtl, &Within { blocks: &inside, initial: false });
     if plan.caret_room {
         scroll_width += 1.0;
     }
@@ -1769,8 +1729,16 @@ fn viewport_scroll_info(html: &Fragment, viewport: Rect, plan: &ScrollPlan) -> S
         html.rect.width + html.margin.left + html.margin.right,
         html.rect.height + collapsed_end_margin(html),
     );
-    let (scroll_width, scroll_height) =
-        scroll_extent(std::slice::from_ref(html), Some(margin_box), false, &scrollport, &Sides::all(0.0), plan.rtl);
+    let inside = html.containing_blocks_within();
+    let (scroll_width, scroll_height) = scroll_extent(
+        std::slice::from_ref(html),
+        Some(margin_box),
+        false,
+        &scrollport,
+        &Sides::all(0.0),
+        plan.rtl,
+        &Within { blocks: &inside, initial: true },
+    );
     finish_scroll_info(viewport, scrollport, Sides::all(0.0), scroll_width, scroll_height, plan, (gl, gr, gb))
 }
 
@@ -1814,7 +1782,11 @@ fn finish_scroll_info(
 /// them) extended by the scroller's end padding; and `extra`, if any,
 /// as both. The origin is the scrollport's top-left, or its top-right
 /// when `rtl`, where the width is how far the content reaches to the
-/// left.
+/// left. An absolutely positioned box counts for the scroller its
+/// containing block is in (`within`), wherever its fragment sits: past
+/// the clip of a box between them, not for a scroller its containing
+/// block is outside; it is no in-flow content (the end padding does not
+/// extend past it).
 fn scroll_extent(
     children: &[Fragment],
     extra: Option<Rect>,
@@ -1822,6 +1794,7 @@ fn scroll_extent(
     scrollport: &Rect,
     padding: &Sides<f32>,
     rtl: bool,
+    within: &Within<'_>,
 ) -> (f32, f32) {
     fn margin_box(c: &Fragment) -> Rect {
         let m = &c.margin;
@@ -1830,43 +1803,68 @@ fn scroll_extent(
     fn add(all: &mut Option<Rect>, r: Rect) {
         *all = Some(all.map_or(r, |a| a.union(&r)));
     }
+    fn positioned(c: &Fragment) -> bool {
+        matches!(c.style.position, Position::Absolute | Position::Fixed) && c.node.is_some()
+    }
     // `acc` is the transform of the boxes above `c` within the scroller:
     // a transformed box contributes its transformed bounds (CSS Overflow
-    // 3 §2.2), and so does everything inside it.
-    fn visit(c: &Fragment, parent_flex: bool, all: &mut Option<Rect>, acc: &Affine2) {
-        if c.is_fixed() {
+    // 3 §2.2), and so does everything inside it. `flow` gathers what is
+    // not inside an absolutely positioned box.
+    fn visit(c: &Fragment, parent_flex: bool, all: &mut Option<Rect>, flow: Option<&mut Option<Rect>>, acc: &Affine2, within: &Within<'_>) {
+        if c.is_fixed() || within.escapes(c) {
             return;
         }
+        let mut flow = if positioned(c) { None } else { flow };
         let acc = match c.page_matrix(None) {
             Some((_, own, _)) => affine_mul(acc, &own),
             None => *acc,
         };
         let r = if parent_flex && c.node.is_some() { margin_box(c) } else { c.rect };
-        add(all, affine_bounds(&acc, &r));
+        let shown = affine_bounds(&acc, &r);
+        add(all, shown);
+        if let Some(f) = flow.as_deref_mut() {
+            add(f, shown);
+        }
         if c.clips_children() {
+            // Its content is clipped, but not the absolutely positioned
+            // boxes whose containing block is outside it.
+            let clipped = c.containing_blocks_within();
+            escapees(c, &clipped, all, &acc, within);
             return;
         }
         let flex = c.node.is_some()
             && matches!(c.content, FragmentContent::Box | FragmentContent::Control(_))
             && matches!(c.style.display, Display::Flex | Display::InlineFlex);
         for k in &c.children {
-            visit(k, flex, all, &acc);
+            visit(k, flex, all, flow.as_deref_mut(), &acc, within);
+        }
+    }
+    // The absolutely positioned boxes under `c` positioned against a
+    // containing block outside the clipped `c` (none in `clipped`).
+    fn escapees(c: &Fragment, clipped: &std::collections::HashSet<NodeId>, all: &mut Option<Rect>, acc: &Affine2, within: &Within<'_>) {
+        for k in &c.children {
+            match k.containing {
+                Some(crate::Containing::Element(n)) if !clipped.contains(&n) => visit(k, false, all, None, acc, within),
+                Some(crate::Containing::Initial) => visit(k, false, all, None, acc, within),
+                _ => escapees(k, clipped, all, acc, within),
+            }
         }
     }
     let mut all = extra;
     let mut inflow = extra;
     for c in children {
         // The child's whole extent (its box and what overflows it, such as
-        // a long word past its line box).
+        // a long word past its line box), and the part of it in flow.
         let mut sub = None;
-        visit(c, container_flex, &mut sub, &IDENTITY);
+        let mut sub_flow = None;
+        visit(c, container_flex, &mut sub, Some(&mut sub_flow), &IDENTITY, within);
         if let Some(r) = sub {
             add(&mut all, r);
         }
         if out_of_flow(c) || matches!(c.content, FragmentContent::Marker) {
             continue;
         }
-        if let Some(r) = sub {
+        if let Some(r) = sub_flow {
             add(&mut inflow, r);
         }
         if c.node.is_some() && !container_flex {
@@ -1892,6 +1890,24 @@ fn scroll_extent(
     }
     let width = if rtl { scrollport.right() - left } else { right - scrollport.x };
     (width, bottom - scrollport.y)
+}
+
+/// The containing blocks inside a scroller (and whether the initial
+/// containing block is, for the viewport): an absolutely positioned box
+/// against any other one is not the scroller's overflow.
+struct Within<'a> {
+    blocks: &'a std::collections::HashSet<NodeId>,
+    initial: bool,
+}
+
+impl Within<'_> {
+    fn escapes(&self, f: &Fragment) -> bool {
+        match f.containing {
+            Some(crate::Containing::Element(n)) => !self.blocks.contains(&n),
+            Some(crate::Containing::Initial) => !self.initial,
+            None => false,
+        }
+    }
 }
 
 /// The bottom margin of a box with the bottom margins that collapse
@@ -2433,6 +2449,7 @@ fn emit_marker(
             margin: Default::default(),
             transform: None,
             fixed: None,
+            containing: None,
         };
         decorate(&mut fragment, decor, fonts);
         out.push(fragment);
@@ -2469,6 +2486,9 @@ enum LineItemKind {
     Edge { end: bool },
     /// An empty inline element with no edges: where it sits.
     Empty,
+    /// The `index`th absolutely positioned box's place
+    /// (`InlineContent::oofs`).
+    Oof { index: usize },
 }
 
 /// Whether the inline element `inline_box` or one of its ancestors is `b`.
@@ -2514,6 +2534,7 @@ fn emit_text_fragments(
     edges: &[ResolvedEdges],
     ox: f32,
     oy: f32,
+    root_width: f32,
     overflow: Option<(f32, &Ellipsis)>,
     out: &mut Vec<Fragment>,
     decor: &mut Decorator,
@@ -2605,6 +2626,7 @@ fn emit_text_fragments(
                             margin: Default::default(),
                             transform: None,
                             fixed: None,
+                            containing: None,
                         };
                         LineItem {
                             kind: LineItemKind::Text {
@@ -2685,7 +2707,13 @@ fn emit_text_fragments(
                         }
                     }
                 }
-                PositionedLayoutItem::InlineBox(b) => match LineItemId::decode(b.id, n_atomics) {
+                PositionedLayoutItem::InlineBox(b) => match LineItemId::decode(b.id, n_atomics, content.boxes.len()) {
+                    LineItemId::Oof(index) => items.push(LineItem {
+                        kind: LineItemKind::Oof { index },
+                        x0: b.x,
+                        x1: b.x,
+                        inline_box: content.oofs.get(index).and_then(|a| a.inline_box),
+                    }),
                     LineItemId::Atomic(index) => {
                         if let Some(atomic) = content.atomics.get(index)
                             && let Some(result) = atomic.result()
@@ -2723,6 +2751,7 @@ fn emit_text_fragments(
             ox,
             oy,
             line_top,
+            root_width,
             rtl,
             lr: lr.clone(),
             line_left: m.inline_min_coord + m.offset,
@@ -2857,6 +2886,9 @@ struct LineCtx<'a> {
     ox: f32,
     oy: f32,
     line_top: f32,
+    /// The inline root's width (where a block-level hypothetical box of
+    /// a right-to-left container ends).
+    root_width: f32,
     /// The paragraph reads right to left.
     rtl: bool,
     /// The line's text, in the root's offsets.
@@ -2925,6 +2957,7 @@ fn piece_fragment(
         margin: e.margin,
         transform: None,
         fixed: None,
+        containing: None,
     }
 }
 
@@ -3001,6 +3034,30 @@ fn place_line_items(
     let content = ctx.content;
     let edges = ctx.edges;
     let nb = content.boxes.len();
+
+    // The absolutely positioned boxes' places on this line, and where the
+    // line's in-flow content starts in the text (a block-level one goes
+    // below the line when content precedes it).
+    let oof_items: Vec<(usize, f32)> = items
+        .iter()
+        .filter_map(|it| match it.kind {
+            LineItemKind::Oof { index } => Some((index, it.x0)),
+            _ => None,
+        })
+        .collect();
+    let mut oof_done = vec![false; content.oofs.len()];
+    let inflow: Vec<(usize, u32)> = items
+        .iter()
+        .filter_map(|it| match &it.kind {
+            LineItemKind::Text { fragment, .. } => match &fragment.content {
+                // Text at the box's offset comes after it.
+                FragmentContent::Text(t) => Some((t.range.start, u32::MAX)),
+                _ => None,
+            },
+            LineItemKind::Atomic { index, .. } => content.atomics.get(*index).map(|a| (a.index, a.seq)),
+            _ => None,
+        })
+        .collect();
 
     // The trailing collapsible space at a soft wrap: the line's last
     // cluster, when it is a space that collapses and no atomic follows it
@@ -3304,6 +3361,15 @@ fn place_line_items(
                     open.kept = true;
                 }
             }
+            LineItemKind::Oof { index } => {
+                if let Some(f) = oof_placeholder(ctx, index, x, &inflow) {
+                    oof_done[index] = true;
+                    if let Some(open) = stack.last_mut() {
+                        open.kept = true;
+                    }
+                    emit(&mut stack, out, f);
+                }
+            }
         }
     }
     let last_index = count.saturating_sub(1);
@@ -3328,7 +3394,46 @@ fn place_line_items(
         }
         close(&mut stack, out, &mut x, last_index, &mut kept_edge, &mut truncated, decor, fonts);
     }
+    // Places past a `text-overflow` cut: the boxes still show (the cut
+    // hides content, it moves nothing), at their places in the line.
+    for (index, x0) in oof_items {
+        if !oof_done[index]
+            && let Some(f) = oof_placeholder(ctx, index, x0, &inflow)
+        {
+            out.push(f);
+        }
+    }
     (truncated, kept_edge)
+}
+
+/// The placeholder of the `index`th absolutely positioned box of a line,
+/// at `x` along it (CSS 2.1 §10.3.7, §10.6.4, the hypothetical box): an
+/// inline-level one where it stands in the line, at the line's top; a
+/// block-level one at the line's start edge, at its top or, when in-flow
+/// content precedes it on the line, below the line (as Blink places a
+/// block-level hypothetical box that would have broken the line).
+fn oof_placeholder(ctx: &LineCtx<'_>, index: usize, x: f32, inflow: &[(usize, u32)]) -> Option<Fragment> {
+    let a = ctx.content.oofs.get(index)?;
+    let (px, py) = if crate::boxes::is_inline_level_display(a.style.original_display) {
+        (ctx.ox + x, ctx.oy + ctx.line_top)
+    } else {
+        let before = inflow.iter().any(|&(i, seq)| i < a.index || (i == a.index && seq < a.seq));
+        let start = if ctx.content.container.direction == Direction::Rtl { ctx.root_width } else { 0.0 };
+        let y = ctx.line_top + if before { ctx.placement.height } else { 0.0 };
+        (ctx.ox + start, ctx.oy + y)
+    };
+    Some(Fragment {
+        rect: Rect::new(px, py, 0.0, 0.0),
+        node: Some(a.node),
+        style: a.style.clone(),
+        content: FragmentContent::Placeholder(a.oof),
+        children: Vec::new(),
+        padding: Default::default(),
+        margin: Default::default(),
+        transform: None,
+        fixed: None,
+        containing: None,
+    })
 }
 
 /// Convenience for tests and tools: style + layout in one call.

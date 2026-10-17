@@ -658,6 +658,7 @@ pub(crate) fn layout_at(engine: &mut LayoutEngine, table: &mut TableBox, width: 
                                 margin: Sides::all(0.0),
                                 transform: None,
                                 fixed: None,
+                                containing: None,
                             });
                         }
                     }
@@ -693,6 +694,7 @@ pub(crate) fn layout_at(engine: &mut LayoutEngine, table: &mut TableBox, width: 
                 margin: Sides::all(0.0),
                 transform: None,
                 fixed: None,
+                containing: None,
             });
         }
         let rect = row_fragments
@@ -710,6 +712,7 @@ pub(crate) fn layout_at(engine: &mut LayoutEngine, table: &mut TableBox, width: 
             margin: Sides::all(0.0),
             transform: None,
             fixed: None,
+            containing: None,
         });
     }
     if table.captions.is_empty() {
@@ -725,6 +728,7 @@ pub(crate) fn layout_at(engine: &mut LayoutEngine, table: &mut TableBox, width: 
             margin: Sides::all(0.0),
             transform: None,
             fixed: None,
+            containing: None,
         });
     }
     table.layouts.push(TableLayout {

@@ -277,6 +277,7 @@ impl SelfLayout for CellBox {
             Sizing::Exactly(w) | Sizing::FitInto(w) | Sizing::Fill(w) => Run::Width {
                 border_box: Some(w),
                 cb: cb_width.unwrap_or(w),
+                height: None,
             },
         };
         let r = engine.layout_independent(&mut self.node, Role::Cell, run);
@@ -327,10 +328,15 @@ impl SelfLayout for CaptionBox {
         let run = match sizing {
             Sizing::MinContent => Run::MinContent,
             Sizing::MaxContent => Run::MaxContent,
-            Sizing::Fill(w) | Sizing::FitInto(w) => Run::Width { border_box: None, cb: w },
+            Sizing::Fill(w) | Sizing::FitInto(w) => Run::Width {
+                border_box: None,
+                cb: w,
+                height: None,
+            },
             Sizing::Exactly(w) => Run::Width {
                 border_box: Some(w),
                 cb: w,
+                height: None,
             },
         };
         let r = engine.layout_independent(&mut self.node, Role::Caption, run);

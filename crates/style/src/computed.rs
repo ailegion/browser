@@ -137,6 +137,10 @@ impl Default for ComputedBackgroundSize {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     pub display: Display,
+    /// `display` before blockification (CSS Display 3 §2.7): whether an
+    /// absolutely positioned box was inline-level decides its static
+    /// position (CSS 2.1 §10.3.7, the hypothetical box).
+    pub original_display: Display,
     pub position: Position,
     pub float: Float,
     pub clear: Clear,
@@ -369,6 +373,7 @@ impl ComputedStyle {
     pub fn initial() -> Self {
         Self {
             display: Display::Inline,
+            original_display: Display::Inline,
             position: Position::Static,
             float: Float::None,
             clear: Clear::None,
@@ -1240,6 +1245,7 @@ pub fn compute(
     pick!(empty_cells, EmptyCells, EmptyCells, |v| *v);
 
     // Display fixups (CSS Display 3, "blockification").
+    out.original_display = out.display;
     if is_root && !out.display.is_none() {
         out.display = blockify(out.display);
     }

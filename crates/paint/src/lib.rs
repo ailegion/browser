@@ -574,7 +574,7 @@ impl<'a> Painter<'a> {
             // §9.4.2). Corners at a missing side have no radius.
             FragmentContent::Inline { .. } => self.background_and_border(f, sides),
             FragmentContent::Control(_) | FragmentContent::Image(_) => self.background_and_border(f, ALL_SIDES),
-            FragmentContent::Anonymous | FragmentContent::Marker | FragmentContent::Text(_) => {}
+            FragmentContent::Anonymous | FragmentContent::Marker | FragmentContent::Text(_) | FragmentContent::Placeholder(_) => {}
         }
         if !f.style.box_shadow.is_empty() {
             self.box_shadows(f, sides, true);

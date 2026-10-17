@@ -33,8 +33,8 @@ use browser_style::transform::Matrix4;
 use browser_style::{BackfaceVisibility, ComputedStyle, Display, Float, Overflow, PointerEvents, Position, Visibility, ZIndex};
 
 use crate::{
-    Affine2, Fragment, FragmentContent, IDENTITY, LayoutTree, Rect, affine_apply, affine_invert, affine_mul, rounded_contains,
-    rounded_contains_inset,
+    Affine2, Containing, Fragment, FragmentContent, IDENTITY, LayoutTree, Rect, affine_apply, affine_invert, affine_mul,
+    rounded_contains, rounded_contains_inset,
 };
 
 /// Where an item is drawn: the accumulated transform of the boxes above
@@ -297,6 +297,7 @@ pub fn build(tree: &LayoutTree) -> PaintOrder {
         sizes,
         list: PaintOrder::default(),
         seq: 0,
+        cb_clips: HashMap::new(),
     };
     // The root element is the viewport fragment's first child.
     if let Some(html) = tree.root.children.first() {
@@ -424,6 +425,17 @@ struct Builder<'a> {
     sizes: Vec<u32>,
     list: PaintOrder,
     seq: u32,
+    /// The clip in effect inside each element that is a containing block
+    /// of absolutely positioned boxes: what clips those boxes (the
+    /// overflow of the boxes between them and it does not, CSS Overflow
+    /// 3 §3).
+    cb_clips: HashMap<NodeId, Option<usize>>,
+}
+
+/// Whether a fragment's element is the containing block of absolutely
+/// positioned descendants (positioned, or containing fixed boxes).
+fn is_containing_block(f: &Fragment) -> bool {
+    f.node.is_some() && (f.style.position != Position::Static || f.style.contains_fixed())
 }
 
 fn visible(f: &Fragment) -> bool {
@@ -551,6 +563,29 @@ impl<'a> Builder<'a> {
             });
             w.space.clip = Some(self.list.clips.len() - 1);
         }
+        if is_containing_block(f)
+            && let Some(n) = f.node
+        {
+            self.cb_clips.entry(n).or_insert(w.space.clip);
+        }
+        w
+    }
+
+    /// The walk of an absolutely positioned box: under the clips of its
+    /// containing block and the boxes above that, not of the boxes
+    /// between (an `overflow` box that is not its containing block, nor
+    /// inside one, does not clip it).
+    fn escaping_walk(&self, f: &Fragment, walk: Walk) -> Walk {
+        let clip = match f.containing {
+            Some(Containing::Element(n)) => match self.cb_clips.get(&n) {
+                Some(c) => *c,
+                None => return walk,
+            },
+            Some(Containing::Initial) => None,
+            None => return walk,
+        };
+        let mut w = walk;
+        w.space.clip = clip;
         w
     }
 
@@ -621,6 +656,11 @@ impl<'a> Builder<'a> {
     fn inline_fragment(&mut self, fr: Fr<'a>, walk: Walk, ph: &mut Phases<'a>, stacked: &mut Vec<Stacked<'a>>) {
         let f = fr.f;
         self.note_space(f, walk.space);
+        if is_containing_block(f)
+            && let Some(n) = f.node
+        {
+            self.cb_clips.entry(n).or_insert(walk.space.clip);
+        }
         if visible(f) {
             ph.foreground.push(Fore::Item(StoredItem {
                 op: StoredOp::Decoration {
@@ -654,6 +694,8 @@ impl<'a> Builder<'a> {
                 FragmentContent::Anonymous | FragmentContent::Marker => {
                     self.collect(cr, walk, false, ph, stacked);
                 }
+                // Never in a finished layout.
+                FragmentContent::Placeholder(_) => {}
                 FragmentContent::Inline { .. } => {
                     let Some(n) = c.node else {
                         self.collect(cr, walk, false, ph, stacked);
@@ -754,7 +796,7 @@ impl<'a> Builder<'a> {
                                 matrix3d: None,
                             }
                         } else {
-                            walk
+                            self.escaping_walk(c, walk)
                         };
                         let kind = if real {
                             StackedKind::Real(Box::new((Sub::Box(cr), w, parent_flex)))

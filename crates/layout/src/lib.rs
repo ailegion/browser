@@ -16,6 +16,7 @@ mod decor;
 mod engine;
 mod formatting;
 mod lines;
+mod positioned;
 pub mod selection;
 pub mod stacking;
 mod table;
@@ -585,6 +586,18 @@ pub enum FragmentContent {
         offset: f32,
         total: f32,
     },
+    /// Where an absolutely positioned box stands in its flow (its static
+    /// position), until the box is laid out against its containing block
+    /// and takes the place: never in a finished layout.
+    Placeholder(usize),
+}
+
+/// The containing block of an absolutely positioned box (CSS 2.1 §10.1):
+/// an ancestor element's (padding) box, or the initial containing block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Containing {
+    Element(NodeId),
+    Initial,
 }
 
 /// The transform of a box (CSS Transforms 1 §6, 2 §13): its matrix
@@ -680,6 +693,11 @@ pub struct Fragment {
     /// ones (both insets of the axis `auto`), decided from where it would
     /// have been in flow.
     pub fixed: Option<(bool, bool)>,
+    /// An absolutely positioned box (or a fixed one inside a transformed
+    /// ancestor): its containing block. Scrolling, clipping and the
+    /// scrollable overflow of the boxes between it and that block pass it
+    /// by, as they do in browsers.
+    pub containing: Option<Containing>,
 }
 
 impl Fragment {
@@ -831,12 +849,33 @@ pub fn rounded_contains_inset(rect: &Rect, style: &ComputedStyle, inset: [f32; 4
 
 impl Fragment {
 
+    /// The elements in this subtree (itself included) that are the
+    /// containing blocks of absolutely positioned boxes.
+    pub(crate) fn containing_blocks_within(&self) -> std::collections::HashSet<NodeId> {
+        let mut out = std::collections::HashSet::new();
+        self.walk(&mut |f| {
+            if let Some(n) = f.node
+                && (f.style.position != Position::Static || f.style.contains_fixed())
+            {
+                out.insert(n);
+            }
+        });
+        out
+    }
+
     /// Move this fragment and its descendants by `(dx, dy)` as a scroll
-    /// does: fixed boxes stay, and the scroll containers inside keep
-    /// their rectangles current.
-    fn translate_scrolled(&mut self, dx: f32, dy: f32, scrollers: &mut HashMap<NodeId, ScrollInfo>) {
+    /// does: fixed boxes stay, so do absolutely positioned boxes whose
+    /// containing block is not among `inside` (the containing blocks in
+    /// what moves), and the scroll containers inside keep their
+    /// rectangles current.
+    fn translate_scrolled(&mut self, dx: f32, dy: f32, scrollers: &mut HashMap<NodeId, ScrollInfo>, inside: &std::collections::HashSet<NodeId>) {
         if self.is_fixed() {
             return;
+        }
+        match self.containing {
+            Some(Containing::Element(n)) if !inside.contains(&n) => return,
+            Some(Containing::Initial) => return,
+            _ => {}
         }
         self.rect = self.rect.translate(dx, dy);
         if self.is_scroll_container()
@@ -846,7 +885,7 @@ impl Fragment {
             info.translate(dx, dy);
         }
         for c in &mut self.children {
-            c.translate_scrolled(dx, dy, scrollers);
+            c.translate_scrolled(dx, dy, scrollers, inside);
         }
     }
 
@@ -927,8 +966,12 @@ impl LayoutTree {
         if moved {
             let scrollers = &mut self.scrollers;
             if let Some(f) = self.root.find_mut(node) {
+                // What the scroller's own containing blocks hold moves
+                // with its content; a box positioned against one outside
+                // stays.
+                let inside = f.containing_blocks_within();
                 for c in &mut f.children {
-                    c.translate_scrolled(dx, dy, scrollers);
+                    c.translate_scrolled(dx, dy, scrollers, &inside);
                 }
             }
             if let Some(info) = self.scrollers.get_mut(&node) {
@@ -1097,7 +1140,8 @@ fn place_sticky(
         if let Some(&(px, py)) = sticky.get(&n)
             && (px != 0.0 || py != 0.0)
         {
-            c.translate_scrolled(-px, -py, scrollers);
+            let inside = c.containing_blocks_within();
+            c.translate_scrolled(-px, -py, scrollers, &inside);
         }
         match groups.iter_mut().find(|(g, _)| *g == n) {
             Some((_, r)) => *r = r.union(&c.rect),
@@ -1131,7 +1175,8 @@ fn place_sticky(
         let dx = shift(left, right, rect.x, rect.right(), port.x, port.right(), cb.x, cb.right(), margin.left, margin.right);
         if dx != 0.0 || dy != 0.0 {
             for c in f.children.iter_mut().filter(|c| c.node == Some(n)) {
-                c.translate_scrolled(dx, dy, scrollers);
+                let inside = c.containing_blocks_within();
+                c.translate_scrolled(dx, dy, scrollers, &inside);
             }
             sticky.insert(n, (dx, dy));
         } else {

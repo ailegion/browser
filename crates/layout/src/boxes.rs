@@ -1,6 +1,7 @@
 //! Box tree construction: DOM + computed styles -> boxes that taffy lays
 //! out, with inline content gathered into inline roots.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -30,6 +31,9 @@ pub(crate) enum BoxKind {
     /// A table (CSS 2.1 §17; "Working sites first" line 3): laid out by
     /// `table.rs`, a leaf to taffy like an inline root.
     Table(Box<TableBox>),
+    /// Where an absolutely positioned box would have been as a block box
+    /// (its static position): an index into the out-of-flow boxes.
+    OutOfFlow(usize),
 }
 
 /// The table wrapper's content: its captions (above the table box) and
@@ -215,12 +219,6 @@ pub(crate) struct BoxNode {
     /// line); its fragment is moved left of the content edge by its
     /// width.
     pub hangs: bool,
-    /// A `position: fixed` box whose containing block is the viewport
-    /// (no ancestor with a transform or the like, CSS Transforms 1 §3):
-    /// laid out as a child of the viewport's node (4a block 6), a
-    /// zero-size placeholder left in its place for its static position.
-    pub fixed: bool,
-    pub placeholder: Option<TaffyId>,
 }
 
 impl BoxNode {
@@ -236,8 +234,6 @@ impl BoxNode {
             scroll: None,
             marker: None,
             hangs: false,
-            fixed: false,
-            placeholder: None,
         }
     }
 
@@ -420,27 +416,33 @@ impl ResolvedEdges {
 pub(crate) enum LineItemId {
     Atomic(usize),
     Edge { inline_box: usize, end: bool },
+    /// An absolutely positioned box's place (`InlineContent::oofs`).
+    Oof(usize),
 }
 
 impl LineItemId {
-    /// Atomics are numbered first, then the edges two per inline box.
-    pub fn encode(self, atomics: usize) -> u64 {
+    /// Atomics are numbered first, then the edges two per inline box,
+    /// then the out-of-flow anchors.
+    pub fn encode(self, atomics: usize, boxes: usize) -> u64 {
         match self {
             LineItemId::Atomic(i) => i as u64,
             LineItemId::Edge { inline_box, end } => (atomics + 2 * inline_box + usize::from(end)) as u64,
+            LineItemId::Oof(i) => (atomics + 2 * boxes + i) as u64,
         }
     }
 
-    pub fn decode(id: u64, atomics: usize) -> Self {
+    pub fn decode(id: u64, atomics: usize, boxes: usize) -> Self {
         let id = id as usize;
         if id < atomics {
             LineItemId::Atomic(id)
-        } else {
+        } else if id < atomics + 2 * boxes {
             let v = id - atomics;
             LineItemId::Edge {
                 inline_box: v / 2,
                 end: v % 2 == 1,
             }
+        } else {
+            LineItemId::Oof(id - atomics - 2 * boxes)
         }
     }
 }
@@ -566,6 +568,9 @@ pub(crate) struct InlineContent {
     pub text: String,
     pub spans: Vec<TextSpan>,
     pub atomics: Vec<Atomic>,
+    /// The absolutely positioned boxes among the content, at their text
+    /// offsets.
+    pub oofs: Vec<OofAnchor>,
     /// The inline elements of this root, parents before children.
     pub boxes: Vec<InlineBoxInfo>,
     /// The bidi contexts open at the end of the text, outermost first.
@@ -602,6 +607,7 @@ impl InlineContent {
             text: String::new(),
             spans: Vec::new(),
             atomics: Vec::new(),
+            oofs: Vec::new(),
             boxes: Vec::new(),
             bidi: Vec::new(),
             container: container.clone(),
@@ -754,6 +760,11 @@ impl InlineContent {
                 a.index += n;
             }
         }
+        for a in &mut self.oofs {
+            if a.index >= pos {
+                a.index += n;
+            }
+        }
         // A box starting at the position follows the controls (as its
         // spans do); one spanning it grows.
         for b in &mut self.boxes {
@@ -812,6 +823,11 @@ impl InlineContent {
         }
         self.spans.retain(|s| s.end > s.start);
         for a in &mut self.atomics {
+            if a.index > pos {
+                a.index -= 1;
+            }
+        }
+        for a in &mut self.oofs {
             if a.index > pos {
                 a.index -= 1;
             }
@@ -916,6 +932,9 @@ impl InlineContent {
         for a in &mut self.atomics {
             a.index = map[a.index];
         }
+        for a in &mut self.oofs {
+            a.index = map[a.index];
+        }
         for b in &mut self.boxes {
             b.start = map[b.start];
             b.end = map[b.end];
@@ -936,6 +955,9 @@ impl InlineContent {
             s.end += n;
         }
         for a in &mut self.atomics {
+            a.index += n;
+        }
+        for a in &mut self.oofs {
             a.index += n;
         }
         for b in &mut self.boxes {
@@ -991,6 +1013,84 @@ pub(crate) struct BoxBuilder<'a> {
     /// §3.3): its own used value is `visible`, so its box neither clips
     /// nor scrolls.
     pub viewport_source: Option<NodeId>,
+    /// The absolutely positioned and fixed boxes, taken out of their flow
+    /// (`BoxKind::OutOfFlow`, `OofAnchor` name them by index), with their
+    /// containing block's element; the engine lays each out against it
+    /// (`positioned.rs`).
+    pub oofs: RefCell<Vec<OutOfFlowBox>>,
+}
+
+/// An absolutely positioned or fixed box out of its flow.
+pub(crate) struct OutOfFlowBox {
+    /// Taken while the engine lays it out.
+    pub node: Option<BoxNode>,
+    /// The element whose box is its containing block (CSS 2.1 §10.1;
+    /// CSS Transforms 1 §3 for transformed ancestors): `None` for the
+    /// initial containing block (`absolute`) or the viewport (`fixed`).
+    pub cb: Option<NodeId>,
+}
+
+impl<'a> BoxBuilder<'a> {
+    pub fn new(doc: &'a Document, styles: &'a StyleMap, images: &'a dyn ImageSizes, viewport_source: Option<NodeId>) -> Self {
+        Self {
+            doc,
+            styles,
+            images,
+            viewport_source,
+            oofs: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Take an out-of-flow element's box out of its flow: its index.
+    fn take_out_of_flow(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> usize {
+        let cb = self.containing_block_of(id, &style);
+        let b = self.build_element(id, style, depth + 1);
+        let mut oofs = self.oofs.borrow_mut();
+        oofs.push(OutOfFlowBox { node: Some(b), cb });
+        oofs.len() - 1
+    }
+
+    /// The element whose box is an absolutely positioned element's
+    /// containing block: the nearest ancestor that is positioned or
+    /// contains fixed boxes (a transform, `perspective`, a `will-change`
+    /// of one; CSS Transforms 1 §3) for `absolute`, the nearest that
+    /// contains fixed boxes for `fixed`. Ancestors without a box
+    /// (`display: contents`) are passed over.
+    fn containing_block_of(&self, id: NodeId, style: &ComputedStyle) -> Option<NodeId> {
+        let fixed = style.position == Position::Fixed;
+        self.doc.ancestors(id).filter(|&a| self.doc.get(a).is_element()).find(|&a| {
+            self.styles.get(a).is_some_and(|s| {
+                !matches!(s.display, Display::Contents | Display::None)
+                    && (s.contains_fixed() || (!fixed && s.position != Position::Static))
+            })
+        })
+    }
+
+    /// A block-level placeholder for an out-of-flow box (its static
+    /// position, CSS 2.1 §10.3.7: where a block box would be).
+    fn out_of_flow_placeholder(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
+        let index = self.take_out_of_flow(id, style.clone(), depth);
+        BoxNode::new(BoxKind::OutOfFlow(index), Some(id), style)
+    }
+}
+
+/// Whether an element's box is absolutely positioned (`absolute` or
+/// `fixed`): out of the flow, laid out against its containing block.
+pub(crate) fn is_out_of_flow(style: &ComputedStyle) -> bool {
+    matches!(style.position, Position::Absolute | Position::Fixed)
+}
+
+/// An absolutely positioned box among an inline root's content: a
+/// zero-width item of the line at its text offset (no break opportunity,
+/// no height), whose place is the box's static position.
+pub(crate) struct OofAnchor {
+    pub index: usize,
+    pub seq: u32,
+    pub inline_box: Option<usize>,
+    /// The box in the engine's out-of-flow list.
+    pub oof: usize,
+    pub node: NodeId,
+    pub style: Arc<ComputedStyle>,
 }
 
 /// `style` with `overflow: visible` in both axes, for the element the
@@ -1155,16 +1255,9 @@ impl BoxBuilder<'_> {
     /// Whether a `position: fixed` element's containing block is the
     /// viewport: no ancestor has a transform, a `perspective` or a
     /// `will-change` promising one (CSS Transforms 1 §3).
-    fn fixed_to_viewport(&self, id: NodeId, style: &ComputedStyle) -> bool {
-        style.position == Position::Fixed
-            && !self.doc.ancestors(id).any(|a| self.styles.get(a).is_some_and(|s| s.contains_fixed()))
-    }
-
     /// Build a block-level or atomic box for an element.
     fn build_element(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
-        let mut b = self.build_element_box(id, style, depth);
-        b.fixed = self.fixed_to_viewport(id, &b.style);
-        b
+        self.build_element_box(id, style, depth)
     }
 
     fn build_element_box(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
@@ -1252,18 +1345,27 @@ impl BoxBuilder<'_> {
 
         let is_flex = matches!(container.display, Display::Flex | Display::InlineFlex);
 
+        // A run of inline content becomes an anonymous inline root. The
+        // absolutely positioned boxes in it are part of it only when it
+        // has something in flow (Blink's inline run must hold an inline);
+        // in a run of nothing but white space they stand where block
+        // boxes would.
         let flush = |pending: &mut Option<InlineContent>, out: &mut Vec<BoxNode>, ws: &mut WsState| {
-            if let Some(mut content) = pending.take()
-                && !content.is_empty()
-            {
-                if ws.last_was_space {
-                    content.trim_trailing_space();
+            if let Some(mut content) = pending.take() {
+                if !content.is_empty() {
+                    if ws.last_was_space {
+                        content.trim_trailing_space();
+                    }
+                    content.finish();
+                    let style = Arc::new(ComputedStyle::anonymous_from(&content.container));
+                    let mut b = BoxNode::new(BoxKind::Inline(content), None, style);
+                    b.anonymous = true;
+                    out.push(b);
+                } else {
+                    for a in content.oofs {
+                        out.push(BoxNode::new(BoxKind::OutOfFlow(a.oof), Some(a.node), a.style));
+                    }
                 }
-                content.finish();
-                let style = Arc::new(ComputedStyle::anonymous_from(&content.container));
-                let mut b = BoxNode::new(BoxKind::Inline(content), None, style);
-                b.anonymous = true;
-                out.push(b);
             }
             ws.last_was_space = false;
             ws.at_line_start = true;
@@ -1281,6 +1383,21 @@ impl BoxBuilder<'_> {
                 NodeKind::Element(_) => {
                     let Some(style) = self.style_of(child) else { continue };
                     if style.display.is_none() {
+                        continue;
+                    }
+                    if is_out_of_flow(&style) {
+                        if is_flex {
+                            // A flex container's absolutely positioned
+                            // child is no item; its static position is the
+                            // flex layout's (CSS Flexbox 1 §4.1).
+                            flush(&mut pending, &mut out, &mut ws);
+                            out.push(self.out_of_flow_placeholder(child, style, depth));
+                        } else {
+                            // With the inline run it is in, or that it
+                            // starts (CSS 2.1 §10.3.7's hypothetical box).
+                            let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
+                            self.push_out_of_flow(child, style, content, depth, None);
+                        }
                         continue;
                     }
                     if is_table_part(style.display) {
@@ -1609,6 +1726,22 @@ impl BoxBuilder<'_> {
         if atomic { InlineKind::Atomic } else { InlineKind::Plain }
     }
 
+    /// An absolutely positioned element among inline content: its box out
+    /// of the flow, an anchor at the current text offset. White space
+    /// collapses across it, as across nothing (it is not in the flow).
+    fn push_out_of_flow(&self, id: NodeId, style: Arc<ComputedStyle>, content: &mut InlineContent, depth: usize, inline_box: Option<usize>) {
+        let oof = self.take_out_of_flow(id, style.clone(), depth);
+        let seq = content.seq();
+        content.oofs.push(OofAnchor {
+            index: content.text.len(),
+            seq,
+            inline_box,
+            oof,
+            node: id,
+            style,
+        });
+    }
+
     /// A `<br>`: a forced line break in the run.
     fn push_break(
         id: NodeId,
@@ -1700,6 +1833,10 @@ impl BoxBuilder<'_> {
                 NodeKind::Element(_) => {
                     let Some(cs) = self.style_of(child) else { continue };
                     if cs.display.is_none() {
+                        continue;
+                    }
+                    if is_out_of_flow(&cs) {
+                        self.push_out_of_flow(child, cs, content, depth, me);
                         continue;
                     }
                     if is_table_part(cs.display) {
@@ -1855,10 +1992,12 @@ impl BoxBuilder<'_> {
 }
 
 fn is_inline_level(style: &ComputedStyle) -> bool {
-    matches!(
-        style.display,
-        Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable | Display::Contents
-    )
+    is_inline_level_display(style.display)
+}
+
+/// Whether a display value is inline-level.
+pub(crate) fn is_inline_level_display(d: Display) -> bool {
+    matches!(d, Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineTable | Display::Contents)
 }
 
 /// Append a text node's content with CSS white-space processing and
@@ -2038,7 +2177,7 @@ mod tests {
     fn small_caps_are_synthesized_over_the_given_ranges() {
         // Built as written; the engine asks for synthesis per shaped run.
         let (doc, styles) = build("<p style='font-variant: small-caps; font-size: 20px'>Hello <b>ab</b>!<img src=x.png> stra\u{df}e</p>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares, viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &Squares, None);
         let root = builder.build_root().expect("root");
         let p = &root.children[0].children[0];
         let BoxKind::Inline(c) = &p.children[0].kind else { panic!("inline root") };
@@ -2053,6 +2192,7 @@ mod tests {
                 .map(|s| TextSpan { start: s.start, end: s.end, style: s.style.clone(), node: s.node, inline_box: s.inline_box })
                 .collect(),
             atomics: Vec::new(),
+            oofs: Vec::new(),
             boxes: Vec::new(),
             bidi: Vec::new(),
             container: c.container.clone(),
@@ -2097,7 +2237,7 @@ mod tests {
              <li style='list-style-type: none; list-style-image: url(http://x/m.png)'>four</li>\
              <li style='list-style-type: none'>five</li></ul>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &Squares, viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &Squares, None);
         let root = builder.build_root().expect("root");
         let ul = &root.children[0].children[0];
         let inline = |b: &BoxNode| match &b.kind {
@@ -2144,7 +2284,7 @@ mod tests {
             "<p>a <span dir=rtl>b </span></p><p><bdo dir=rtl>ab<br>cd</bdo></p>\
              <div dir=rtl style='white-space:pre'>x\ny</div><div style='unicode-bidi:bidi-override'>q</div>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &(), None);
         let root = builder.build_root().expect("root");
         let texts = inline_text(&root);
         assert_eq!(texts[0], "a \u{2067}b\u{2069}");
@@ -2161,7 +2301,7 @@ mod tests {
     #[test]
     fn an_empty_item_gets_its_marker_as_its_one_line() {
         let (doc, styles) = build("<ul><li></li><li><div></div></li></ul>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &(), None);
         let root = builder.build_root().expect("root");
         let ul = &root.children[0].children[0];
         // Nothing else to make a line: the marker root is in flow, hanging.
@@ -2193,7 +2333,7 @@ mod tests {
     #[test]
     fn collapses_whitespace_and_splits_blocks() {
         let (doc, styles) = build("<body>  Hello   <b>big</b>\n world <div>block</div> tail  </body>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &(), None);
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["Hello big world", "block", "tail"]);
@@ -2202,7 +2342,7 @@ mod tests {
     #[test]
     fn pre_keeps_newlines_and_br_breaks() {
         let (doc, styles) = build("<pre>a\n  b</pre><p>x<br>y</p>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &(), None);
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["a\n  b", "x\ny"]);
@@ -2211,7 +2351,7 @@ mod tests {
     #[test]
     fn list_markers() {
         let (doc, styles) = build("<ol start=3><li>a<li value=7>b<li>c</ol><ul><li>d</ul>");
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &(), None);
         let root = builder.build_root().unwrap();
         let texts = inline_text(&root);
         assert_eq!(texts, vec!["3. ", "a", "7. ", "b", "8. ", "c", "\u{2022} ", "d"]);
@@ -2224,7 +2364,7 @@ mod tests {
              <input type=checkbox checked><input type=radio><select><option>One<option selected>Two</select>\
              <input type=submit><input type=button value='Go'><textarea>text\nhere</textarea><button>Push</button></body>",
         );
-        let builder = BoxBuilder { doc: &doc, styles: &styles, images: &(), viewport_source: None };
+        let builder = BoxBuilder::new(&doc, &styles, &(), None);
         let root = builder.build_root().expect("root");
         // Controls are inline-level, so they sit in the body's inline
         // root as atomics; visit those too.
