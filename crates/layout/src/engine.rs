@@ -59,8 +59,12 @@ pub struct LayoutEngine {
     /// taken while it is laid out (`positioned.rs`).
     pub(crate) oofs: Vec<crate::boxes::OutOfFlowBox>,
     /// The web fonts registered for the current document
-    /// (`register_web_font`), to take out again (`clear_web_fonts`).
-    web_fonts: Vec<(fontique::FamilyId, fontique::FontWidth, fontique::FontStyle, fontique::FontWeight)>,
+    /// (`register_web_font`): their decoded data and face, kept so they
+    /// can be registered again when the collection is rebuilt.
+    web_fonts: Vec<(fontique::Blob<u8>, Arc<browser_style::fontface::FontFaceRule>)>,
+    /// The `@font-face` family names of the current document
+    /// (`declare_web_families`), lowercased.
+    web_families: Vec<String>,
 }
 
 /// Relayouts after a pass finds an `overflow: auto` axis overflowing, so
@@ -141,16 +145,18 @@ impl LayoutEngine {
             viewport: (0.0, 0.0),
             oofs: Vec::new(),
             web_fonts: Vec::new(),
+            web_families: Vec::new(),
         }
     }
 
     /// Register a web font's data ("Working sites first" line 6): a
     /// TrueType/OpenType font or collection, or WOFF/WOFF2 (decoded here),
-    /// under its `@font-face` family name and with the face's descriptors
-    /// as its weight, style and stretch, so text in that family uses it
-    /// from the next layout (until then its fallbacks show). A weight
-    /// range registers at its start: a variable face then varies to the
-    /// weight asked. False when the data holds no font.
+    /// under its `@font-face` family name with the face's descriptors, so
+    /// text in that family uses it from the next layout (until then its
+    /// fallbacks show). The descriptors decide which of a family's faces a
+    /// text uses, clamp its variations, and decide faux bold and slant
+    /// (the vendored fontique's `FaceDescriptors`). False when the data
+    /// holds no font.
     pub fn register_web_font(&mut self, data: &[u8], face: &browser_style::fontface::FontFaceRule) -> bool {
         let font = match data.get(..4) {
             Some(b"wOF2") => wuff::decompress_woff2(data).ok(),
@@ -162,46 +168,86 @@ impl LayoutEngine {
         if read_fonts::FileRef::new(&font).is_err() {
             return false;
         }
-        let style = match face.style {
-            browser_style::fontface::FaceStyle::Normal => fontique::FontStyle::Normal,
-            browser_style::fontface::FaceStyle::Italic => fontique::FontStyle::Italic,
-            browser_style::fontface::FaceStyle::Oblique(a, _) => fontique::FontStyle::Oblique(Some(a)),
+        let blob = fontique::Blob::new(Arc::new(font));
+        let face = Arc::new(face.clone());
+        if !self.register_blob(&blob, &face) {
+            return false;
+        }
+        self.web_fonts.push((blob, face));
+        true
+    }
+
+    fn register_blob(&mut self, blob: &fontique::Blob<u8>, face: &browser_style::fontface::FontFaceRule) -> bool {
+        use browser_style::fontface::FaceStyle as S;
+        let descriptors = fontique::FaceDescriptors {
+            weight: face.weight,
+            width: face.stretch,
+            style: face.style.map(|s| match s {
+                S::Normal => fontique::FaceStyle::Normal,
+                S::Italic => fontique::FaceStyle::Italic,
+                S::Oblique(a, b) => fontique::FaceStyle::Oblique(a, b),
+            }),
         };
         let registered = self.fonts.collection.register_fonts(
-            fontique::Blob::new(Arc::new(font)),
+            blob.clone(),
             Some(fontique::FontInfoOverride {
                 family_name: Some(&face.family),
-                width: Some(fontique::FontWidth::from_percentage(face.stretch.0)),
-                style: Some(style),
-                weight: Some(fontique::FontWeight::new(face.weight.0)),
-                axes: None,
+                face: Some(descriptors),
+                ..Default::default()
             }),
         );
-        for (family, infos) in &registered {
-            for info in infos {
-                self.web_fonts.push((*family, info.width(), info.style(), info.weight()));
-            }
-        }
         !registered.is_empty()
     }
 
-    /// Forget every web font registered (a new document's fonts are its
-    /// own); the installed fonts stay.
+    /// The document's `@font-face` family names (from its style sheets
+    /// that apply). A declared family hides an installed one of the same
+    /// name from then on, loaded or not: until (and unless) one of its
+    /// faces loads, text in it falls through to the next family in its
+    /// list. A name no longer declared stops hiding: the collection is
+    /// rebuilt with the fonts of the families still declared.
+    pub fn declare_web_families(&mut self, names: &[&str]) {
+        let mut wanted: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        wanted.sort();
+        wanted.dedup();
+        if wanted == self.web_families {
+            return;
+        }
+        let dropped = self.web_families.iter().any(|n| wanted.binary_search(n).is_err());
+        if dropped {
+            self.fonts.collection.clear();
+            let kept: Vec<_> = std::mem::take(&mut self.web_fonts)
+                .into_iter()
+                .filter(|(_, face)| wanted.binary_search(&face.family.to_lowercase()).is_ok())
+                .collect();
+            for (blob, face) in &kept {
+                self.register_blob(blob, face);
+            }
+            self.web_fonts = kept;
+        }
+        for name in names {
+            self.fonts.collection.declare_family(name);
+        }
+        self.web_families = wanted;
+    }
+
+    /// Forget every web font and `@font-face` family (a new document's
+    /// fonts are its own); the installed fonts stay.
     pub fn clear_web_fonts(&mut self) {
-        // Unregistering a font keeps its family name (with no fonts left),
-        // and a web family named like an installed one would go on hiding
-        // it; `clear` drops every registered name and font. Nothing else is
+        // `clear` drops every registered name and font. Nothing else is
         // registered or set on the collection, so the installed fonts and
         // generic families stay as they were.
-        if !std::mem::take(&mut self.web_fonts).is_empty() {
+        let had = !self.web_fonts.is_empty() || !self.web_families.is_empty();
+        self.web_fonts.clear();
+        self.web_families.clear();
+        if had {
             self.fonts.collection.clear();
         }
     }
 
-    /// Whether a font family is available by that name: installed, or
-    /// registered from the web.
+    /// Whether a font family is available by that name with a font in it:
+    /// installed, or registered from the web.
     pub fn has_font_family(&mut self, name: &str) -> bool {
-        self.fonts.collection.family_id(name).is_some()
+        self.fonts.collection.family_by_name(name).is_some_and(|f| !f.fonts().is_empty())
     }
 
     /// After a restyle that changed no layout-affecting value: every
@@ -4380,6 +4426,63 @@ mod tests {
         assert_eq!((ae.x - pos.x, ae.right()), (100.0, pos.right()));
     }
 
+    /// Installed single-font files with no variation axes, and one with a
+    /// `wght` axis (portable test data: the machine's own fonts).
+    fn installed_fonts(engine: &mut LayoutEngine) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut cache = fontique::SourceCache::default();
+        let names: Vec<String> = engine.fonts.collection.family_names().map(str::to_owned).collect();
+        let mut statics = Vec::new();
+        let mut variable = None;
+        for f in names.iter().filter_map(|n| engine.fonts.collection.family_by_name(n)).flat_map(|fam| fam.fonts().to_vec()) {
+            let Some(data) = f.load(Some(&mut cache)).map(|b| b.data().to_vec()) else { continue };
+            let Ok(read_fonts::FileRef::Font(font)) = read_fonts::FileRef::new(&data) else { continue };
+            // It must draw the test text itself (not a symbol font).
+            let charmap = skrifa::MetadataProvider::charmap(&font);
+            if !"Helo".chars().all(|c| charmap.map(c).is_some()) {
+                continue;
+            }
+            if f.axes().is_empty() && statics.len() < 2 && !statics.contains(&data) {
+                statics.push(data);
+            } else if f.has_weight_axis() && variable.is_none() {
+                variable = Some(data);
+            }
+            if statics.len() == 2 && variable.is_some() {
+                break;
+            }
+        }
+        assert_eq!(statics.len(), 2, "two installed static fonts");
+        (statics, variable.expect("an installed font with a wght axis"))
+    }
+
+    fn web_face(family: &str) -> browser_style::fontface::FontFaceRule {
+        browser_style::fontface::FontFaceRule {
+            family: Arc::from(family),
+            sources: Vec::new(),
+            weight: None,
+            style: None,
+            stretch: None,
+        }
+    }
+
+    /// The first text fragment of `<p style='{style}'>Hello</p>`: its font
+    /// data, faux bold, faux slant and variation coordinates.
+    fn text_font(engine: &mut LayoutEngine, style: &str) -> (Vec<u8>, bool, Option<f32>, Vec<i16>) {
+        let doc = browser_dom::parse_html(format!("<body><p style='{style}'>Hello</p></body>").as_bytes());
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        let tree = engine.layout(&doc, &styles, 800.0, 600.0, &());
+        let mut out = None;
+        tree.root.walk(&mut |f| {
+            if let FragmentContent::Text(t) = &f.content
+                && out.is_none()
+            {
+                out = Some((t.font.data.data().to_vec(), t.embolden, t.skew, t.coords.clone()));
+            }
+        });
+        out.expect("text")
+    }
+
     /// "Working sites first" line 6: a web font registered from its bytes
     /// (TrueType, or WOFF around it) is the font of text in its
     /// `@font-face` family; garbage registers nothing; clearing the web
@@ -4387,44 +4490,14 @@ mod tests {
     #[test]
     fn web_fonts_register_under_their_family() {
         let mut engine = LayoutEngine::new();
-        // A single-font file from the installed fonts (portable test data).
-        let mut cache = fontique::SourceCache::default();
         let names: Vec<String> = engine.fonts.collection.family_names().map(str::to_owned).collect();
-        let ttf = names
-            .iter()
-            .filter_map(|n| engine.fonts.collection.family_by_name(n))
-            .flat_map(|fam| fam.fonts().to_vec())
-            .filter_map(|f| f.load(Some(&mut cache)))
-            .map(|b| b.data().to_vec())
-            .find(|d| matches!(read_fonts::FileRef::new(d), Ok(read_fonts::FileRef::Font(_))))
-            .expect("an installed single-font file");
-        let face = |family: &str| browser_style::fontface::FontFaceRule {
-            family: Arc::from(family),
-            sources: Vec::new(),
-            weight: (400.0, 400.0),
-            style: browser_style::fontface::FaceStyle::Normal,
-            stretch: (100.0, 100.0),
-        };
+        let ttf = installed_fonts(&mut engine).0.remove(0);
+        let face = web_face;
         assert!(!engine.register_web_font(b"not a font at all", &face("Junk")));
         assert!(engine.register_web_font(&ttf, &face("Web Test")));
         assert!(engine.register_web_font(&woff1(&ttf), &face("Woff Test")));
         assert!(engine.has_font_family("Web Test") && engine.has_font_family("Woff Test"));
-        let font_of = |engine: &mut LayoutEngine, family: &str| {
-            let doc = browser_dom::parse_html(format!("<body><p style='font-family:\"{family}\", monospace'>Hello</p></body>").as_bytes());
-            let mut stylist = Stylist::new();
-            stylist.add_sheet(ua_stylesheet());
-            let styles = compute_styles(&doc, &stylist, &Viewport::default());
-            let tree = engine.layout(&doc, &styles, 800.0, 600.0, &());
-            let mut data = None;
-            tree.root.walk(&mut |f| {
-                if let FragmentContent::Text(t) = &f.content
-                    && data.is_none()
-                {
-                    data = Some(t.font.data.data().to_vec());
-                }
-            });
-            data.expect("text")
-        };
+        let font_of = |engine: &mut LayoutEngine, family: &str| text_font(engine, &format!("font-family:\"{family}\", monospace")).0;
         // A decoder rebuilds the file around the tables (directory order,
         // padding), so the WOFF font is compared by its tables.
         let tables = |data: &[u8]| {
@@ -4458,6 +4531,110 @@ mod tests {
             installed_fonts,
             "the installed family is back"
         );
+    }
+
+    /// A family of web faces: the text's face is chosen by the faces'
+    /// descriptor ranges; faux bold only for a bold text in a face whose
+    /// weights stop below 600, faux slant only for a slanted text in an
+    /// upright face; a variable face's weight is the text's clamped to the
+    /// face's range (`auto`: to the font's own axis).
+    #[test]
+    fn web_faces_match_and_synthesize_by_their_descriptors() {
+        use browser_style::fontface::FaceStyle;
+        let mut engine = LayoutEngine::new();
+        let (statics, variable) = installed_fonts(&mut engine);
+        let (light, heavy) = (&statics[0], &statics[1]);
+        let mut regular = web_face("Fam");
+        regular.weight = Some((300.0, 500.0));
+        regular.style = Some(FaceStyle::Normal);
+        let mut bold = web_face("Fam");
+        bold.weight = Some((700.0, 700.0));
+        bold.style = Some(FaceStyle::Normal);
+        let mut slanted = web_face("Fam");
+        slanted.weight = Some((300.0, 500.0));
+        slanted.style = Some(FaceStyle::Italic);
+        assert!(engine.register_web_font(light, &regular));
+        assert!(engine.register_web_font(heavy, &bold));
+        let at = |engine: &mut LayoutEngine, s: &str| text_font(engine, &format!("font-family: Fam; {s}"));
+        let r = at(&mut engine, "font-weight: 400");
+        assert!(r.0 == *light && !r.1 && r.2.is_none(), "in the range: no faux bold");
+        let r = at(&mut engine, "font-weight: 500");
+        assert!(r.0 == *light && !r.1, "400 to 500: the face holding it");
+        let r = at(&mut engine, "font-weight: 600");
+        assert!(r.0 == *heavy && !r.1, "above 500: the heavier face, a bold one ({} {})", r.0 == *light, r.1);
+        let r = at(&mut engine, "font-weight: 200");
+        assert!(r.0 == *light && !r.1, "below 400: lighter first, else the nearest heavier");
+        let r = at(&mut engine, "font-weight: 900");
+        assert!(r.0 == *heavy && !r.1, "the bold face covers bold");
+        // No italic face: the upright one, slanted by 14deg.
+        let r = at(&mut engine, "font-style: italic");
+        assert!(r.0 == *light && r.2 == Some(14.0), "{:?}", r.2);
+        // An italic face wins for italic and is not slanted again.
+        assert!(engine.register_web_font(heavy, &slanted));
+        let r = at(&mut engine, "font-style: italic");
+        assert!(r.0 == *heavy && r.2.is_none() && !r.1, "the italic face");
+        let r = at(&mut engine, "font-style: italic; font-weight: 700");
+        assert!(r.0 == *heavy && r.1, "the italic face stops at 500: faux bold");
+        let r = at(&mut engine, "font-style: normal");
+        assert!(r.0 == *light && r.2.is_none(), "upright for normal");
+
+        // A family whose only face stops below 600: faux bold for bold.
+        let mut thin = web_face("Thin");
+        thin.weight = Some((100.0, 400.0));
+        assert!(engine.register_web_font(light, &thin));
+        let t = |engine: &mut LayoutEngine, w: u32| text_font(engine, &format!("font-family: Thin; font-weight: {w}"));
+        assert!(!t(&mut engine, 500).1, "500 is not bold");
+        assert!(t(&mut engine, 600).1, "600 is");
+
+        // A variable face: the weight is clamped to its range.
+        let mut ranged = web_face("Var");
+        ranged.weight = Some((400.0, 500.0));
+        assert!(engine.register_web_font(&variable, &ranged));
+        let v = |engine: &mut LayoutEngine, w: u32| text_font(engine, &format!("font-family: Var; font-weight: {w}"));
+        let (v400, v500, v900) = (v(&mut engine, 400), v(&mut engine, 500), v(&mut engine, 900));
+        assert!(v400.0 == variable && !v400.1);
+        assert_ne!(v400.3, v500.3, "varied inside the range");
+        assert_eq!(v900.3, v500.3, "clamped to 500");
+        assert!(v900.1 && !v500.1, "the face stops below 600: a bold text is faux bolded");
+        let mut auto = web_face("VarAuto");
+        auto.weight = None;
+        assert!(engine.register_web_font(&variable, &auto));
+        let a = |engine: &mut LayoutEngine, w: u32| text_font(engine, &format!("font-family: VarAuto; font-weight: {w}"));
+        assert_ne!(a(&mut engine, 900).3, a(&mut engine, 500).3, "auto: the font's own axis range");
+    }
+
+    /// A declared `@font-face` family hides an installed family of the
+    /// same name before any face loads (the text falls through to the next
+    /// family), and stops hiding it once no longer declared.
+    #[test]
+    fn declared_web_families_hide_installed_ones() {
+        let mut engine = LayoutEngine::new();
+        let names: Vec<String> = engine.fonts.collection.family_names().map(str::to_owned).collect();
+        let mut cache = fontique::SourceCache::default();
+        let (installed, data) = names
+            .iter()
+            .find_map(|n| {
+                let fam = engine.fonts.collection.family_by_name(n)?;
+                let font = fam.match_font(fontique::FontWidth::NORMAL, fontique::FontStyle::Normal, fontique::FontWeight::NORMAL, true)?;
+                Some((n.clone(), font.load(Some(&mut cache))?.data().to_vec()))
+            })
+            .expect("an installed family");
+        let style = format!("font-family: \"{installed}\", monospace");
+        assert!(text_font(&mut engine, &style).0 == data, "the installed family");
+        engine.declare_web_families(&[installed.as_str()]);
+        assert!(!engine.has_font_family(&installed));
+        assert!(text_font(&mut engine, &style).0 != data, "hidden: the next family shows");
+        // A face of it loads: that face is the family.
+        let (statics, _) = installed_fonts(&mut engine);
+        let web = statics.iter().find(|s| **s != data).expect("another font");
+        assert!(engine.register_web_font(web, &web_face(&installed)));
+        assert!(text_font(&mut engine, &style).0 == *web);
+        // Other families declared, this one dropped: the installed one is
+        // back, the others' fonts kept.
+        assert!(engine.register_web_font(web, &web_face("Other")));
+        engine.declare_web_families(&["Other"]);
+        assert!(text_font(&mut engine, &style).0 == data, "no longer hidden");
+        assert!(text_font(&mut engine, "font-family: Other").0 == *web, "kept across the rebuild");
     }
 
     /// A WOFF 1.0 file around a TrueType/OpenType font, its tables stored

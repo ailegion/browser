@@ -41,6 +41,7 @@ can only panic.
 | `skrifa` | 0.44.0 | 0/0 | forbids unsafe | Font parsing |
 | `read-fonts` | 0.41.0 | 0/0 | forbids unsafe | Font tables |
 | `harfrust` | 0.12.0 | 0/0 | forbids unsafe | Shaping |
+| `wuff` | 0.2.9 | 0 (source search, 2026-10-18; geiger not re-run) | none | WOFF/WOFF2 web fonts; added for "Working sites first" line 6 |
 | `zune-core` | 0.5.3 | 0/0 | none | |
 | `url` | 2.5.8 | 4/4 | unsafe | Tiny |
 | `idna` | 1.1.0 | 31/31 | unsafe | |
@@ -48,6 +49,7 @@ can only panic.
 | `selectors` | 0.40.0 | 16/16 | unsafe | |
 | `brotli` | 9.0.0 | 16/678 | unsafe | Most unsafe is in the encoder, unused |
 | `brotli-decompressor` | 6.0.1 | 4/561 | unsafe | |
+| `brotli-decompressor` | 5.0.3 | not measured by geiger; `unsafe` on 98 source lines (6.0.1: 187) | unsafe | Second copy, through `wuff` for WOFF2 (2026-10-18) |
 | `cssparser` | 0.37.0 | 56/56 | unsafe | |
 | `flate2` | 1.1.10 | 68/327 | unsafe | Backend miniz_oxide is clean |
 | `hyper` | 1.11.1 | 119/136 | unsafe | |
@@ -71,7 +73,7 @@ unsafe paths: `aes` 765/1113, `chacha20` 595/1391, `poly1305` 972/975,
 | `parley`, `kurbo`, `peniko`, `vello_encoding`, `vello_shaders` | 0.11.1, 0.13.1, 0.6.1, 0.10.0, 0.10.0 | 0/0 | |
 | `vello` | 0.10.0 | 5/5 | |
 | `taffy` | 0.14.0 | 7/66 | |
-| `fontique` | 0.11.1 | 222/327 | Memory-mapped font files via `memmap2` 220/314 |
+| `fontique` | 0.11.1 | 222/327 | Memory-mapped font files via `memmap2` 220/314. Vendored and patched since 2026-10-18 (`vendor/fontique`); the patch adds no `unsafe` |
 | `slotmap` | 1.1.1 | 642/642 | DOM arena |
 | `smallvec` | 1.16.2 | 606/608 | |
 | `bytes` | 1.12.1 | 780/826 | |

@@ -10,6 +10,15 @@ Before doing anything in this repository, read `plan/00-README.md` and then
   C++, no assembly, no `*-sys` crates that compile native code, no system
   WebView, no engine from another browser. Details and the ban list are in
   `plan/03-crates.md`.
+- HARD RULE: NEVER CLONE CODE FROM ANOTHER BROWSER. Learn browser behaviour
+  from the specs (WHATWG, W3C/CSSWG, IETF, OpenType), public docs (MDN), WPT
+  tests and expectations, and our own tests, in that order. That is how this
+  browser was built, and it is enough. Reading another browser's source is a
+  last resort: only when all of those fail to settle a behaviour, and only
+  after telling the owner which behaviour it is and why the others failed,
+  and getting a yes. Even then, copying is forbidden no matter what: no
+  pasting, no porting or translating it line by line, no asking a tool to
+  reproduce its functions. Every line here is ours.
 - Isolation is by Rust memory safety, not OS sandboxing. Our crates use
   `#![forbid(unsafe_code)]` except `crates/platform`.
 - No accounts, telemetry, sync, or any network request the user did not cause.

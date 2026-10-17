@@ -124,6 +124,13 @@ taffy = { path = "vendor/taffy" }
 # every line a text range breaks over (`ClonedDecoration`,
 # `box-decoration-break: clone`).
 parley = { path = "vendor/parley" }
+# fontique 0.11.1 as published, plus `@font-face` descriptors on a
+# registered font (`FontInfoOverride::face`, `FaceDescriptors`): a family of
+# web faces is matched by their ranges, variations are clamped to them, and
+# faux bold/slant only where they say the face lacks it; and
+# `Collection::declare_family`, a declared family hiding an installed one of
+# the same name (plan/03-crates.md).
+fontique = { path = "vendor/fontique" }
 
 [profile.dev]
 panic = "unwind"

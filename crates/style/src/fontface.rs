@@ -32,12 +32,15 @@ pub enum FontSource {
 pub struct FontFaceRule {
     pub family: Arc<str>,
     pub sources: Vec<FontSource>,
-    /// The weight range the face covers (one value is a range of one).
-    pub weight: (f32, f32),
-    /// `normal`, `italic`, or `oblique` (with its angle range).
-    pub style: FaceStyle,
-    /// The stretch range, in percent.
-    pub stretch: (f32, f32),
+    /// The weight range the face covers (one value is a range of one);
+    /// `None` is `auto` (the initial value): matched as `normal`, the
+    /// font's own range used.
+    pub weight: Option<(f32, f32)>,
+    /// `normal`, `italic`, or `oblique` (with its angle range); `None` is
+    /// `auto`.
+    pub style: Option<FaceStyle>,
+    /// The stretch range, in percent; `None` is `auto`.
+    pub stretch: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,10 +51,11 @@ pub enum FaceStyle {
 }
 
 impl FontFaceRule {
-    /// The first source this engine can load: a `url()` whose format (if
-    /// given) is one it decodes and whose `tech()` it supports.
-    pub fn loadable_source(&self) -> Option<&Arc<str>> {
-        self.sources.iter().find_map(|s| match s {
+    /// The sources this engine can load, in `src` order: each `url()`
+    /// whose format (if given) is one it decodes and whose `tech()` it
+    /// supports. A source that fails to load gives way to the next.
+    pub fn loadable_sources(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.sources.iter().filter_map(|s| match s {
             FontSource::Url { url, format, tech_supported } => {
                 let ok = match format.as_deref() {
                     None => true,
@@ -61,6 +65,21 @@ impl FontFaceRule {
             }
             FontSource::Local(_) => None,
         })
+    }
+
+    /// The first loadable source.
+    pub fn loadable_source(&self) -> Option<&Arc<str>> {
+        self.loadable_sources().next()
+    }
+
+    /// The weight, style and stretch the face is matched by (`auto` as
+    /// the normal values).
+    pub fn matched_ranges(&self) -> ((f32, f32), FaceStyle, (f32, f32)) {
+        (
+            self.weight.unwrap_or((400.0, 400.0)),
+            self.style.unwrap_or(FaceStyle::Normal),
+            self.stretch.unwrap_or((100.0, 100.0)),
+        )
     }
 }
 
@@ -78,19 +97,20 @@ pub fn parse_font_face_block(input: &mut Parser<'_, '_>) -> Option<FontFaceRule>
     Some(FontFaceRule {
         family,
         sources,
-        weight: parser.weight.unwrap_or((400.0, 400.0)),
-        style: parser.style.unwrap_or(FaceStyle::Normal),
-        stretch: parser.stretch.unwrap_or((100.0, 100.0)),
+        weight: parser.weight.flatten(),
+        style: parser.style.flatten(),
+        stretch: parser.stretch.flatten(),
     })
 }
 
+/// Each descriptor as last declared: `Some(None)` is an explicit `auto`.
 #[derive(Default)]
 struct Descriptors {
     family: Option<Arc<str>>,
     sources: Option<Vec<FontSource>>,
-    weight: Option<(f32, f32)>,
-    style: Option<FaceStyle>,
-    stretch: Option<(f32, f32)>,
+    weight: Option<Option<(f32, f32)>>,
+    style: Option<Option<FaceStyle>>,
+    stretch: Option<Option<(f32, f32)>>,
 }
 
 impl<'i> DeclarationParser<'i> for Descriptors {
@@ -110,14 +130,15 @@ impl<'i> DeclarationParser<'i> for Descriptors {
                 self.sources = Some(list);
             },
             "font-weight" => {
-                let w = parse_range(input, parse_weight)?;
+                let w = parse_auto(input, |i| parse_range(i, parse_weight))?;
                 self.weight = Some(w);
             },
             "font-style" => {
-                self.style = Some(parse_face_style(input)?);
+                self.style = Some(parse_auto(input, parse_face_style)?);
             },
-            "font-stretch" => {
-                let s = parse_range(input, parse_stretch)?;
+            // `font-width` is CSS Fonts 4's name for `font-stretch`.
+            "font-stretch" | "font-width" => {
+                let s = parse_auto(input, |i| parse_range(i, parse_stretch))?;
                 self.stretch = Some(s);
             },
             // `unicode-range`, `font-display`, `font-feature-settings`,
@@ -200,11 +221,20 @@ fn parse_source<'i>(input: &mut Parser<'i, '_>) -> Result<FontSource, ParseError
     })
 }
 
+/// `auto` (`None`) or a value.
+fn parse_auto<'i, 't, T>(
+    input: &mut Parser<'i, 't>,
+    value: impl FnOnce(&mut Parser<'i, 't>) -> Result<T, ParseError<'i, ()>>,
+) -> Result<Option<T>, ParseError<'i, ()>> {
+    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
+        input.expect_exhausted()?;
+        return Ok(None);
+    }
+    value(input).map(Some)
+}
+
 /// One value or a range of two (in ascending order).
 fn parse_range<'i>(input: &mut Parser<'i, '_>, one: fn(&mut Parser<'i, '_>) -> Result<f32, ParseError<'i, ()>>) -> Result<(f32, f32), ParseError<'i, ()>> {
-    if input.try_parse(|i| i.expect_ident_matching("auto")).is_ok() {
-        return Err(input.new_custom_error(()));
-    }
     let a = one(input)?;
     let b = input.try_parse(one).unwrap_or(a);
     input.expect_exhausted()?;
@@ -264,71 +294,115 @@ fn parse_face_style<'i>(input: &mut Parser<'i, '_>) -> Result<FaceStyle, ParseEr
 
 /// The face of a family (its `@font-face` rules, in order; a later rule
 /// with the same descriptors wins) a text in `style`, `weight` and
-/// `stretch` uses, per CSS Fonts 4 §5.2: the stretch nearest (narrower
-/// first at or below 100%, wider first above), then the style (italic →
-/// oblique → normal; oblique → italic → normal; normal → oblique →
-/// italic), then the weight (in range; else 400–500 up to 500 then down
-/// then up, below 400 down then up, above 500 up then down).
+/// `stretch` uses, per CSS Fonts 4 §5.2, `auto` descriptors matching as
+/// the normal values:
+/// - width: a range holding it; else at or below 100% the narrower faces
+///   nearest first, then the wider; above 100% the reverse;
+/// - style: `normal` is an oblique range of 0deg. Italic asks for italic
+///   faces, then obliques from 11deg up, then smaller positive ones, then
+///   the rest. An oblique angle of 11deg or more prefers larger angles,
+///   then smaller positive ones, then italic, then the rest; below 11deg
+///   (and `normal`, 0deg) smaller angles down to 0, then larger, then
+///   italic, then negative (mirrored for negative angles). `oblique`
+///   without an angle is 14deg;
+/// - weight: in range; else from 400 to 500 heavier up to 500, then
+///   lighter, then heavier; below 400 lighter then heavier; above 500
+///   heavier then lighter.
+///
+/// The same steps as the font matching of registered web fonts in the
+/// vendored fontique (`match_faces`), so the face fetched is the one used.
 pub fn best_face(faces: &[&FontFaceRule], style: FontStyle, weight: f32, stretch: f32) -> Option<usize> {
     if faces.is_empty() {
         return None;
     }
     let mut candidates: Vec<usize> = (0..faces.len()).collect();
+    let ranges = |i: usize| faces[i].matched_ranges();
 
-    // Stretch: the faces whose range is nearest the wanted one.
-    let stretch_key = |r: (f32, f32)| -> (u8, f32) {
-        if r.0 <= stretch && stretch <= r.1 {
-            return (0, 0.0);
+    // Width.
+    let w = stretch;
+    keep_best(&mut candidates, |i| {
+        let (lo, hi) = ranges(i).2;
+        if lo <= w && w <= hi {
+            (0, 0.0)
+        } else if hi < w {
+            (if w <= 100.0 { 1 } else { 2 }, w - hi)
+        } else {
+            (if w <= 100.0 { 2 } else { 1 }, lo - w)
         }
-        let below = r.1 < stretch;
-        let d = if below { stretch - r.1 } else { r.0 - stretch };
-        // Narrower faces first when the wanted stretch is normal or less.
-        let preferred = if stretch <= 100.0 { below } else { !below };
-        (if preferred { 1 } else { 2 }, d)
-    };
-    keep_best(&mut candidates, |i| stretch_key(faces[i].stretch));
+    });
 
     // Style.
-    let style_rank = |s: FaceStyle| -> u8 {
-        match (style, s) {
-            (FontStyle::Italic, FaceStyle::Italic) => 0,
-            (FontStyle::Italic, FaceStyle::Oblique(..)) => 1,
-            (FontStyle::Italic, FaceStyle::Normal) => 2,
-            (FontStyle::Oblique, FaceStyle::Oblique(..)) => 0,
-            (FontStyle::Oblique, FaceStyle::Italic) => 1,
-            (FontStyle::Oblique, FaceStyle::Normal) => 2,
-            (FontStyle::Normal, FaceStyle::Normal) => 0,
-            (FontStyle::Normal, FaceStyle::Oblique(..)) => 1,
-            (FontStyle::Normal, FaceStyle::Italic) => 2,
-        }
+    const T: f32 = 11.0;
+    let (italic, r) = match style {
+        FontStyle::Normal => (false, 0.0),
+        FontStyle::Italic => (true, T),
+        FontStyle::Oblique => (false, 14.0),
     };
-    keep_best(&mut candidates, |i| (style_rank(faces[i].style), 0.0));
+    keep_best(&mut candidates, |i| {
+        let (lo, hi) = match ranges(i).1 {
+            FaceStyle::Italic => return if italic { (0, 0.0) } else { (4, 0.0) },
+            FaceStyle::Normal => (0.0, 0.0),
+            FaceStyle::Oblique(lo, hi) => (lo, hi),
+        };
+        let tier = |t: u8, d: f32| (t + u8::from(italic), d);
+        if lo <= r && r <= hi {
+            return tier(0, 0.0);
+        }
+        if r >= T {
+            if lo > r {
+                tier(1, lo - r)
+            } else if hi > 0.0 {
+                tier(2, r - hi)
+            } else {
+                tier(5, -hi)
+            }
+        } else if r >= 0.0 {
+            if hi < r && hi >= 0.0 {
+                tier(1, r - hi)
+            } else if lo > r {
+                tier(2, lo - r)
+            } else {
+                tier(5, -hi)
+            }
+        } else if r > -T {
+            if lo > r && lo <= 0.0 {
+                tier(1, lo - r)
+            } else if hi < r {
+                tier(2, r - hi)
+            } else {
+                tier(5, lo)
+            }
+        } else if hi < r {
+            tier(1, r - hi)
+        } else if lo <= 0.0 {
+            tier(2, lo - r)
+        } else {
+            tier(5, lo)
+        }
+    });
 
     // Weight.
-    let weight_key = |r: (f32, f32)| -> (u8, f32) {
-        if r.0 <= weight && weight <= r.1 {
-            return (0, 0.0);
-        }
-        let below = r.1 < weight;
-        let d = if below { weight - r.1 } else { r.0 - weight };
-        if (400.0..=500.0).contains(&weight) {
-            // Up to 500 first, then down, then up past 500.
-            if !below && r.0 <= 500.0 {
-                (1, d)
-            } else if below {
-                (2, d)
+    let wt = weight;
+    keep_best(&mut candidates, |i| {
+        let (lo, hi) = ranges(i).0;
+        if lo <= wt && wt <= hi {
+            (0, 0.0)
+        } else if (400.0..=500.0).contains(&wt) {
+            if lo > wt && lo <= 500.0 {
+                (1, lo - wt)
+            } else if hi < wt {
+                (2, wt - hi)
             } else {
-                (3, d)
+                (3, lo - wt)
             }
-        } else if weight < 400.0 {
-            if below { (1, d) } else { (2, d) }
-        } else if below {
-            (2, d)
+        } else if wt < 400.0 {
+            if hi < wt { (1, wt - hi) } else { (2, lo - wt) }
+        } else if lo > wt {
+            (1, lo - wt)
         } else {
-            (1, d)
+            (2, wt - hi)
         }
-    };
-    keep_best(&mut candidates, |i| weight_key(faces[i].weight));
+    });
     // The last rule among equals wins.
     candidates.last().copied()
 }
@@ -418,20 +492,28 @@ mod tests {
         );
         assert_eq!(f.len(), 3, "the rules without a family or a source are dropped");
         assert_eq!(&*f[0].family, "My Font");
-        assert_eq!((f[0].weight, f[0].style, f[0].stretch), ((300.0, 700.0), FaceStyle::Italic, (75.0, 75.0)));
+        assert_eq!((f[0].weight, f[0].style, f[0].stretch), (Some((300.0, 700.0)), Some(FaceStyle::Italic), Some((75.0, 75.0))));
+        assert_eq!((f[1].weight, f[1].style, f[1].stretch), (None, None, None), "absent descriptors are auto");
         assert_eq!(f[0].loadable_source().map(|s| &**s), Some("https://example.com/f/a.woff2"), "local() passed over, the URL resolved");
         assert_eq!(&*f[1].family, "Bare Name");
         assert_eq!(f[1].loadable_source().map(|s| &**s), Some("https://example.com/css/z.otf"), "svg and colour technologies passed over");
         assert_eq!(&*f[2].family, "P", "kept; the media query decides whether it is used");
+        let g = faces(
+            "@font-face { font-family: A; src: url(a.woff2); font-weight: auto; font-style: oblique 10deg 20deg; font-width: 50% 200% }\
+             @font-face { font-family: B; src: url(b.woff2); font-weight: 300; font-weight: 1200; font-style: auto }",
+        );
+        assert_eq!((g[0].weight, g[0].style, g[0].stretch), (None, Some(FaceStyle::Oblique(10.0, 20.0)), Some((50.0, 200.0))));
+        assert_eq!((g[1].weight, g[1].style), (Some((300.0, 300.0)), None), "an out-of-range value is a parse error: the earlier one stays");
+        assert_eq!(g[0].matched_ranges().0, (400.0, 400.0), "auto matches as normal");
     }
 
     fn face(weight: (f32, f32), style: FaceStyle, stretch: (f32, f32)) -> FontFaceRule {
         FontFaceRule {
             family: Arc::from("F"),
             sources: Vec::new(),
-            weight,
-            style,
-            stretch,
+            weight: Some(weight),
+            style: Some(style),
+            stretch: Some(stretch),
         }
     }
 
@@ -456,6 +538,25 @@ mod tests {
         assert_eq!(m(FontStyle::Normal, 400.0, 80.0), Some(4), "stretch first, narrower at or below 100%");
         let range = [face((100.0, 900.0), FaceStyle::Normal, (100.0, 100.0))];
         assert_eq!(best_face(&[&range[0]], FontStyle::Normal, 650.0, 100.0), Some(0), "inside a range");
+        // Oblique ranges: italic takes an oblique from 11deg up before an
+        // upright face; `oblique` (14deg) the range holding it; normal the
+        // upright face before any slanted one.
+        let slants = [
+            face((400.0, 400.0), FaceStyle::Normal, (100.0, 100.0)),
+            face((400.0, 400.0), FaceStyle::Oblique(5.0, 9.0), (100.0, 100.0)),
+            face((400.0, 400.0), FaceStyle::Oblique(12.0, 20.0), (100.0, 100.0)),
+        ];
+        let refs: Vec<&FontFaceRule> = slants.iter().collect();
+        assert_eq!(best_face(&refs, FontStyle::Italic, 400.0, 100.0), Some(2));
+        assert_eq!(best_face(&refs, FontStyle::Oblique, 400.0, 100.0), Some(2));
+        assert_eq!(best_face(&refs, FontStyle::Normal, 400.0, 100.0), Some(0));
+        assert_eq!(best_face(&refs[1..], FontStyle::Normal, 400.0, 100.0), Some(0), "the smaller angle above 0");
+        assert_eq!(best_face(&refs[..2], FontStyle::Italic, 400.0, 100.0), Some(1), "smaller positive before upright");
+        // `auto` matches as normal.
+        let mut auto = face((400.0, 400.0), FaceStyle::Normal, (100.0, 100.0));
+        auto.weight = None;
+        let bold = face((700.0, 700.0), FaceStyle::Normal, (100.0, 100.0));
+        assert_eq!(best_face(&[&auto, &bold], FontStyle::Normal, 450.0, 100.0), Some(0));
     }
 
     #[test]

@@ -2215,6 +2215,17 @@ impl TabState {
                     self.fire_lifecycle_event(EventTargetRef::Document, "DOMContentLoaded", true);
                 }
                 Lifecycle::ContentLoaded if parsed && deferred_done && fetched => {
+                    // The fetches the cascade starts (web fonts text uses,
+                    // background images) are the document's too: style it
+                    // first, and `load` waits for what that requests.
+                    if self.needs_style {
+                        self.restyle_all();
+                        self.needs_style = false;
+                        self.needs_layout = true;
+                        if !self.pending.is_empty() {
+                            return;
+                        }
+                    }
                     self.lifecycle = Lifecycle::Complete;
                     self.fire_lifecycle_event(EventTargetRef::Document, "readystatechange", false);
                     self.fire_lifecycle_event(EventTargetRef::Window, "load", false);
@@ -2334,8 +2345,14 @@ impl TabState {
                 let mut registered = false;
                 if ok {
                     let faces = self.stylist().font_faces(&self.style_viewport());
+                    // The faces loading from this URL: it is their first
+                    // loadable source that has not failed.
+                    let failed = &self.web_fonts.failed;
+                    let current = |f: &browser_style::fontface::FontFaceRule| {
+                        f.loadable_sources().filter_map(|u| Url::parse(u).ok()).find(|u| !failed.contains(u))
+                    };
                     if let Some(engine) = &mut self.engine {
-                        for face in faces.iter().filter(|f| f.loadable_source().is_some_and(|s| **s == *url.as_str())) {
+                        for face in faces.iter().filter(|f| current(f).as_ref() == Some(&url)) {
                             registered |= engine.register_web_font(&p.body, face);
                         }
                     }
@@ -3196,9 +3213,21 @@ impl TabState {
         use browser_style::fontface::{best_face, family_names, is_generic_family};
         let Some(doc) = &self.doc else { return };
         let faces = self.stylist().font_faces(&self.style_viewport());
+        // Every family the document declares hides an installed one of
+        // that name, loaded or not.
+        if let Some(engine) = &mut self.engine {
+            let names: Vec<&str> = faces.iter().map(|f| &*f.family).collect();
+            engine.declare_web_families(&names);
+        }
         if faces.is_empty() {
             return;
         }
+        // The source a face loads from: its first loadable one that has not
+        // failed (a failed source gives way to the next, CSS Fonts 4 §4.3).
+        let failed = &self.web_fonts.failed;
+        let source_of = |f: &browser_style::fontface::FontFaceRule| {
+            f.loadable_sources().filter_map(|u| Url::parse(u).ok()).find(|u| !failed.contains(u))
+        };
         let mut families: HashMap<String, Vec<&Arc<browser_style::fontface::FontFaceRule>>> = HashMap::new();
         for f in &faces {
             families.entry(f.family.to_lowercase()).or_default().push(f);
@@ -3230,13 +3259,14 @@ impl TabState {
                     break;
                 }
                 if let Some(family) = families.get(&name.to_lowercase()) {
-                    let rules: Vec<&browser_style::fontface::FontFaceRule> = family.iter().map(|f| &***f).collect();
-                    let Some(i) = best_face(&rules, style, f32::from(weight), f32::from_bits(stretch)) else { break };
-                    let Some(url) = family[i].loadable_source().and_then(|u| Url::parse(u).ok()) else { continue };
-                    if self.web_fonts.failed.contains(&url) {
-                        continue;
-                    }
-                    urls.push(url);
+                    // A face none of whose sources can load is no face: the
+                    // match is among the others; a family with none left
+                    // passes to the next name in the list.
+                    let usable: Vec<(&browser_style::fontface::FontFaceRule, Url)> =
+                        family.iter().filter_map(|f| source_of(f).map(|u| (&***f, u))).collect();
+                    let rules: Vec<&browser_style::fontface::FontFaceRule> = usable.iter().map(|(f, _)| *f).collect();
+                    let Some(i) = best_face(&rules, style, f32::from(weight), f32::from_bits(stretch)) else { continue };
+                    urls.push(usable[i].1.clone());
                     break;
                 }
                 if self.engine.as_mut().is_some_and(|e| e.has_font_family(&name)) {
@@ -6501,8 +6531,23 @@ mod tests {
             .flat_map(|fam| fam.fonts().to_vec())
             .filter_map(|f| f.load(Some(&mut cache)))
             .map(|b| b.data().to_vec())
-            .find(|d| matches!(read_fonts::FileRef::new(d), Ok(read_fonts::FileRef::Font(_))))
+            .find(|d| {
+                use read_fonts::TableProvider;
+                // A single font that draws the test text (not a symbol font).
+                let Ok(read_fonts::FileRef::Font(f)) = read_fonts::FileRef::new(d) else { return false };
+                f.cmap().is_ok_and(|cmap| "usedclosopn".chars().all(|c| cmap.map_codepoint(c).is_some()))
+            })
             .expect("an installed single-font file");
+        // An installed family whose fonts are not the served one.
+        let installed = names
+            .iter()
+            .find(|n| {
+                collection.family_by_name(n).is_some_and(|fam| {
+                    !fam.fonts().is_empty() && fam.fonts().iter().all(|f| f.load(Some(&mut cache)).is_some_and(|b| b.data() != &ttf[..]))
+                })
+            })
+            .expect("another installed family")
+            .clone();
         let font = |cors: Option<&str>| {
             let mut headers = vec![("Content-Type".to_owned(), "font/ttf".to_owned())];
             if let Some(v) = cors {
@@ -6519,10 +6564,11 @@ mod tests {
         );
         let page = format!(
             "<!DOCTYPE html><script>document.cookie = 'k=v'; var loaded = false; addEventListener('load', () => loaded = true)</script>\
-             <style>@font-face {{ font-family: Used; src: url(/used.ttf) }} @font-face {{ font-family: Unused; src: url(/unused.ttf) }} \
+             <style>@font-face {{ font-family: Used; src: url(/missing.ttf), url(/bad.ttf) format('woff2'), url(/used.ttf) }} \
+             @font-face {{ font-family: Unused; src: url(/unused.ttf) }} @font-face {{ font-family: \"{installed}\"; src: url(/gone.ttf) }} \
              @font-face {{ font-family: Closed; src: url({}) }} @font-face {{ font-family: Open; src: url({}) format('truetype') }}</style>\
              <p style='font-family: Used'>used</p><p style='font-family: Closed, Used'>closed</p><p style='font-family: Open'>open</p>\
-             <div style='font-family: Unused'><span></span></div>",
+             <p style='font-family: \"{installed}\", Used'>hidden</p><div style='font-family: Unused'><span></span></div>",
             other.url("/closed.ttf"),
             other.url("/open.ttf")
         );
@@ -6530,6 +6576,7 @@ mod tests {
             vec![
                 ("/page".to_owned(), vec![("Content-Type".to_owned(), "text/html; charset=utf-8".to_owned())], page.into_bytes()),
                 ("/used.ttf".to_owned(), font(None), ttf.clone()),
+                ("/bad.ttf".to_owned(), font(None), b"not a font".to_vec()),
                 ("/unused.ttf".to_owned(), font(None), ttf.clone()),
             ],
             &[],
@@ -6542,8 +6589,17 @@ mod tests {
         let header = |head: &str, name: &str| {
             head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_owned()))
         };
+        // A source that fails (404, then data that is no font) gives way
+        // to the next.
+        assert_eq!(server.requests("/missing.ttf").len(), 1);
+        assert_eq!(server.requests("/bad.ttf").len(), 1);
         let used = server.requests("/used.ttf");
-        assert_eq!(used.len(), 1, "fetched once");
+        assert_eq!(
+            used.len(),
+            1,
+            "fetched once: {:?}",
+            server.log.lock().expect("lock").iter().map(|h| h.lines().next().unwrap_or("").to_owned()).collect::<Vec<_>>()
+        );
         assert_eq!(header(&used[0], "cookie").as_deref(), Some("k=v"), "credentials to the document's origin");
         assert!(server.requests("/unused.ttf").is_empty(), "no text uses the face");
         for path in ["/closed.ttf", "/open.ttf"] {
@@ -6562,6 +6618,12 @@ mod tests {
         assert_eq!(fonts.get("used"), Some(&true), "{fonts:?}");
         assert_eq!(fonts.get("open"), Some(&true), "allowed by ACAO: {fonts:?}");
         assert_eq!(fonts.get("closed"), Some(&true), "refused, so the next family (Used) shows: {fonts:?}");
+        assert_eq!(
+            fonts.get("hidden"),
+            Some(&true),
+            "an @font-face family named like an installed one hides it; it failed, so the next family shows: {fonts:?}"
+        );
+        assert_eq!(server.requests("/gone.ttf").len(), 1);
         // Refused leaves Closed unregistered: a page that names only it
         // shows the fallback.
         assert!(!h.state.engine.as_mut().expect("engine").has_font_family("Closed"));

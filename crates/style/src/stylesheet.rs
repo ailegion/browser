@@ -553,14 +553,16 @@ mod tests {
         "#;
         let sheet = Stylesheet::parse(css, Origin::Author);
         assert_eq!(sheet.imports.len(), 1);
-        assert_eq!(sheet.rule_count(), 5);
+        // Five style rules and the `@font-face` rule.
+        assert_eq!(sheet.rule_count(), 6);
+        assert!(matches!(&sheet.rules[2], Rule::FontFace(f) if &*f.family == "x"));
         let Rule::Style(p) = &sheet.rules[0] else { panic!() };
         // color + 4 margins; the unknown and invalid ones dropped
         assert_eq!(p.declarations.len(), 5);
         let Rule::Media(_, inner) = &sheet.rules[1] else { panic!() };
         let Rule::Style(green) = &inner[0] else { panic!() };
         assert!(green.declarations[0].important);
-        let Rule::Style(a) = &sheet.rules[4] else { panic!() };
+        let Rule::Style(a) = &sheet.rules[5] else { panic!() };
         // nested rule skipped, padding after it kept
         assert_eq!(a.declarations.len(), 5);
     }
