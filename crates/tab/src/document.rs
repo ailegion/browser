@@ -62,6 +62,10 @@ enum PendingKind {
     Image {
         url: Url,
     },
+    /// A web font's source ("Working sites first" line 6).
+    Font {
+        url: Url,
+    },
     /// An external script element's source; `id` is its `ScriptLoad`.
     Script {
         id: u64,
@@ -168,6 +172,17 @@ struct Pending {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Where the response came from after redirects.
+    final_url: Option<Url>,
+}
+
+/// The current document's web fonts: the sources asked for, and those
+/// that failed (their families' fallbacks are used, and a later family
+/// in a list may be fetched instead).
+#[derive(Default)]
+struct WebFonts {
+    requested: std::collections::HashSet<Url>,
+    failed: std::collections::HashSet<Url>,
 }
 
 /// The stages of a document's load, as `document.readyState` and the
@@ -265,6 +280,7 @@ pub(crate) struct TabState {
     /// `<link>` or `<style>` again does not fetch again.
     loaded_sheets: std::collections::HashMap<Url, Arc<Stylesheet>>,
     images: ImageStore,
+    web_fonts: WebFonts,
     /// How the current document's sub-resources use the HTTP cache: a
     /// reloaded document revalidates them, as browsers do.
     doc_cache: CacheMode,
@@ -455,6 +471,7 @@ impl TabState {
             fetched_urls: Default::default(),
             loaded_sheets: Default::default(),
             images: ImageStore::new(),
+            web_fonts: WebFonts::default(),
             doc_cache: CacheMode::Default,
             engine: Some(LayoutEngine::new()),
             styles: StyleMap::new(),
@@ -2011,6 +2028,8 @@ impl TabState {
         );
         if result.moved {
             self.needs_layout = true;
+            // A state may ask for another face (bold on hover).
+            self.fetch_web_fonts();
         } else if result.repaint {
             // Paint-only (colours, backgrounds, decorations): the boxes
             // stay where they are and take the new styles.
@@ -2056,6 +2075,7 @@ impl TabState {
                 status: 0,
                 headers: Vec::new(),
                 body: Vec::new(),
+                final_url: None,
             },
         );
         self.net.fetch(id, request, self.net_sink.clone());
@@ -2076,6 +2096,7 @@ impl TabState {
                 status: 0,
                 headers: Vec::new(),
                 body: Vec::new(),
+                final_url: None,
             },
         );
         match url.path() {
@@ -2117,6 +2138,7 @@ impl TabState {
                 let Some(p) = self.pending.get_mut(&id) else { return };
                 p.status = status;
                 p.headers = headers;
+                p.final_url = Some(final_url.clone());
                 if matches!(p.kind, PendingKind::Main) {
                     self.refresh_header = p
                         .headers
@@ -2305,6 +2327,28 @@ impl TabState {
                     self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
                 }
             }
+            PendingKind::Font { url } => {
+                // A CORS-mode load (CSS Fonts 4 §4.8.2): a font from another
+                // origin needs the server's leave.
+                let ok = (p.status == 0 || (200..300).contains(&p.status)) && self.cors_allows(&url, p.final_url.as_ref(), &p.headers);
+                let mut registered = false;
+                if ok {
+                    let faces = self.stylist().font_faces(&self.style_viewport());
+                    if let Some(engine) = &mut self.engine {
+                        for face in faces.iter().filter(|f| f.loadable_source().is_some_and(|s| **s == *url.as_str())) {
+                            registered |= engine.register_web_font(&p.body, face);
+                        }
+                    }
+                }
+                if registered {
+                    self.needs_layout = true;
+                } else {
+                    tracing::debug!(tab = self.id.0, url = url.as_str(), "web font failed");
+                    self.web_fonts.failed.insert(url);
+                    // A family later in a list may be a web font to use.
+                    self.fetch_web_fonts();
+                }
+            }
             PendingKind::Script { id } => {
                 let ok = p.status == 0 || (200..300).contains(&p.status);
                 let (ct, charset) = Self::content_type_of(&p.headers);
@@ -2381,6 +2425,11 @@ impl TabState {
         self.fetched_urls.clear();
         self.loaded_sheets.clear();
         self.images = ImageStore::new();
+        // The old document's web fonts are its own.
+        self.web_fonts = WebFonts::default();
+        if let Some(engine) = &mut self.engine {
+            engine.clear_web_fonts();
+        }
         self.doc = Some(doc);
         self.doc_url = self.url.clone();
         // Node ids of the old document mean nothing now. The pointer
@@ -2507,6 +2556,7 @@ impl TabState {
             self.needs_paint = true;
             self.host_layout_fresh = true;
             self.fetch_background_images();
+            self.fetch_web_fonts();
             self.after_layout();
         }
         if view.scroll_changed {
@@ -3135,6 +3185,103 @@ impl TabState {
         }
     }
 
+    /// Fetch the web fonts the document's text uses ("Working sites
+    /// first" line 6), as browsers fetch them: for each font a rendered
+    /// text asks for (its family list, style, weight and stretch), the
+    /// first family in the list that is a web font family, an installed
+    /// family or a generic family decides; for a web font family the one
+    /// face CSS Fonts 4 §5.2 matches is fetched. Until it arrives (or if
+    /// it fails) the next families in the list are used.
+    fn fetch_web_fonts(&mut self) {
+        use browser_style::fontface::{best_face, family_names, is_generic_family};
+        let Some(doc) = &self.doc else { return };
+        let faces = self.stylist().font_faces(&self.style_viewport());
+        if faces.is_empty() {
+            return;
+        }
+        let mut families: HashMap<String, Vec<&Arc<browser_style::fontface::FontFaceRule>>> = HashMap::new();
+        for f in &faces {
+            families.entry(f.family.to_lowercase()).or_default().push(f);
+        }
+        // The fonts rendered text asks for: elements with text of their
+        // own, and the controls that show text.
+        let mut wanted: Vec<(Arc<str>, browser_style::FontStyle, u16, u32)> = Vec::new();
+        let mut seen: std::collections::HashSet<(usize, u8, u16, u32)> = std::collections::HashSet::new();
+        for id in doc.descendants(doc.root()) {
+            let Some(e) = doc.element(id) else { continue };
+            let shows_text = matches!(&*e.name.local, "input" | "textarea" | "select" | "button")
+                || doc.children(id).any(|c| matches!(&doc.get(c).kind, browser_dom::NodeKind::Text(t) if !t.trim().is_empty()));
+            if !shows_text {
+                continue;
+            }
+            let Some(s) = self.styles.get(id) else { continue };
+            if s.display.is_none() {
+                continue;
+            }
+            let key = (Arc::as_ptr(&s.font_family) as *const u8 as usize, s.font_style as u8, s.font_weight, s.font_stretch.to_bits());
+            if seen.insert(key) {
+                wanted.push((s.font_family.clone(), s.font_style, s.font_weight, s.font_stretch.to_bits()));
+            }
+        }
+        let mut urls: Vec<Url> = Vec::new();
+        for (list, style, weight, stretch) in wanted {
+            for (name, quoted) in family_names(&list) {
+                if !quoted && is_generic_family(&name) {
+                    break;
+                }
+                if let Some(family) = families.get(&name.to_lowercase()) {
+                    let rules: Vec<&browser_style::fontface::FontFaceRule> = family.iter().map(|f| &***f).collect();
+                    let Some(i) = best_face(&rules, style, f32::from(weight), f32::from_bits(stretch)) else { break };
+                    let Some(url) = family[i].loadable_source().and_then(|u| Url::parse(u).ok()) else { continue };
+                    if self.web_fonts.failed.contains(&url) {
+                        continue;
+                    }
+                    urls.push(url);
+                    break;
+                }
+                if self.engine.as_mut().is_some_and(|e| e.has_font_family(&name)) {
+                    break;
+                }
+            }
+        }
+        for url in urls {
+            if !matches!(url.scheme(), "http" | "https" | "data") || !self.web_fonts.requested.insert(url.clone()) {
+                continue;
+            }
+            let mut request = self.subresource(url.clone());
+            request.headers.push(("Accept".to_owned(), "*/*".to_owned()));
+            // CORS mode, credentials only to the document's own origin.
+            if let Some(origin) = self.doc_url.as_ref().map(Url::origin) {
+                if url.origin() != origin {
+                    request.headers.push(("Origin".to_owned(), origin.ascii_serialization()));
+                }
+                request.credentials = browser_net::Credentials::SameOrigin(origin);
+            }
+            self.fetch(request, PendingKind::Font { url });
+        }
+    }
+
+    /// Whether a CORS-mode response may be used by the document: from its
+    /// own origin (before and after redirects), or allowed by
+    /// `Access-Control-Allow-Origin` (`*` or the document's origin).
+    fn cors_allows(&self, url: &Url, final_url: Option<&Url>, headers: &[(String, String)]) -> bool {
+        if url.scheme() == "data" {
+            return true;
+        }
+        let Some(origin) = self.doc_url.as_ref().map(Url::origin) else { return true };
+        let same = url.origin() == origin && final_url.is_none_or(|f| f.origin() == origin);
+        if same {
+            return true;
+        }
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("access-control-allow-origin"))
+            .is_some_and(|(_, v)| {
+                let v = v.trim();
+                v == "*" || v == origin.ascii_serialization()
+            })
+    }
+
     // ----- rendering -----
 
     fn stylist(&self) -> Stylist {
@@ -3236,9 +3383,10 @@ impl TabState {
             deps = ?self.deps,
             "restyle"
         );
-        // Background images only become known after the cascade; fetching
-        // them re-triggers layout when they arrive.
+        // Background images and the web fonts text uses only become known
+        // after the cascade; their arrival triggers layout again.
         self.fetch_background_images();
+        self.fetch_web_fonts();
     }
 
     fn relayout(&mut self) {
@@ -5686,19 +5834,31 @@ mod tests {
     struct Server {
         base: Url,
         held: Arc<(Mutex<std::collections::HashSet<String>>, std::sync::Condvar)>,
+        /// The head of every request received, in arrival order.
+        log: Arc<Mutex<Vec<String>>>,
     }
 
     impl Server {
         fn start(routes: &[(&str, &str, &str)], held: &[&str]) -> Self {
+            Self::start_with(
+                routes
+                    .iter()
+                    .map(|(p, ct, body)| ((*p).to_owned(), vec![("Content-Type".to_owned(), (*ct).to_owned())], body.as_bytes().to_vec()))
+                    .collect(),
+                held,
+            )
+        }
+
+        /// Routes with their own headers (after `Connection: close`,
+        /// before `Content-Length`) and binary bodies.
+        fn start_with(routes: Vec<(String, Vec<(String, String)>, Vec<u8>)>, held: &[&str]) -> Self {
             use std::io::{Read, Write};
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().expect("addr").port();
-            let routes: Arc<HashMap<String, (String, String)>> = Arc::new(
-                routes
-                    .iter()
-                    .map(|(p, ct, body)| ((*p).to_owned(), ((*ct).to_owned(), (*body).to_owned())))
-                    .collect(),
-            );
+            let routes: Arc<HashMap<String, (Vec<(String, String)>, Vec<u8>)>> =
+                Arc::new(routes.into_iter().map(|(p, headers, body)| (p, (headers, body))).collect());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let heads = log.clone();
             let held = Arc::new((
                 Mutex::new(held.iter().map(|s| (*s).to_owned()).collect::<std::collections::HashSet<_>>()),
                 std::sync::Condvar::new(),
@@ -5709,6 +5869,7 @@ mod tests {
                     let Ok(mut stream) = stream else { return };
                     let routes = routes.clone();
                     let gate = gate.clone();
+                    let heads = heads.clone();
                     std::thread::spawn(move || {
                         let mut head = Vec::new();
                         let mut buf = [0u8; 1024];
@@ -5721,6 +5882,7 @@ mod tests {
                         }
                         let head = String::from_utf8_lossy(&head).into_owned();
                         let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                        heads.lock().expect("lock").push(head.clone());
                         {
                             let (set, cv) = &*gate;
                             let mut set = set.lock().expect("lock");
@@ -5729,13 +5891,18 @@ mod tests {
                             }
                         }
                         let response = match routes.get(&path) {
-                            Some((ct, body)) => format!(
-                                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n{body}",
-                                body.len()
-                            ),
-                            None => "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                            Some((headers, body)) => {
+                                let mut r = b"HTTP/1.1 200 OK\r\nConnection: close\r\n".to_vec();
+                                for (k, v) in headers {
+                                    r.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+                                }
+                                r.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+                                r.extend_from_slice(body);
+                                r
+                            }
+                            None => b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_vec(),
                         };
-                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(&response);
                         let _ = stream.flush();
                     });
                 }
@@ -5743,7 +5910,19 @@ mod tests {
             Self {
                 base: Url::parse(&format!("http://127.0.0.1:{port}/")).expect("url"),
                 held,
+                log,
             }
+        }
+
+        /// The heads of the requests received for `path`.
+        fn requests(&self, path: &str) -> Vec<String> {
+            self.log
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|h| h.split_whitespace().nth(1) == Some(path))
+                .cloned()
+                .collect()
         }
 
         fn url(&self, path: &str) -> Url {
@@ -6304,6 +6483,88 @@ mod tests {
         assert_eq!(run_js(&mut h, "var f = document.getElementById('fixed').getBoundingClientRect(); [f.left, f.top, document.getElementById('fixed').offsetTop].join('|')"), "\"400|20|20\"");
         // The resolved transform is the matrix.
         assert_eq!(run_js(&mut h, "getComputedStyle(document.getElementById('moved')).transform"), "\"matrix(1, 0, 0, 1, 300, 0)\"");
+    }
+
+    /// "Working sites first" line 6: an `@font-face` face is fetched when
+    /// rendered text uses it (a face nothing shows is not), in CORS mode
+    /// with credentials only to the document's origin; a cross-origin font
+    /// needs `Access-Control-Allow-Origin`, else the next family in the
+    /// list shows. The load event waits for the fonts.
+    #[test]
+    fn web_fonts_load_when_used_and_cross_origin_needs_cors() {
+        let mut collection = fontique::Collection::new(fontique::CollectionOptions::default());
+        let mut cache = fontique::SourceCache::default();
+        let names: Vec<String> = collection.family_names().map(str::to_owned).collect();
+        let ttf = names
+            .iter()
+            .filter_map(|n| collection.family_by_name(n))
+            .flat_map(|fam| fam.fonts().to_vec())
+            .filter_map(|f| f.load(Some(&mut cache)))
+            .map(|b| b.data().to_vec())
+            .find(|d| matches!(read_fonts::FileRef::new(d), Ok(read_fonts::FileRef::Font(_))))
+            .expect("an installed single-font file");
+        let font = |cors: Option<&str>| {
+            let mut headers = vec![("Content-Type".to_owned(), "font/ttf".to_owned())];
+            if let Some(v) = cors {
+                headers.push(("Access-Control-Allow-Origin".to_owned(), v.to_owned()));
+            }
+            headers
+        };
+        let other = Server::start_with(
+            vec![
+                ("/closed.ttf".to_owned(), font(None), ttf.clone()),
+                ("/open.ttf".to_owned(), font(Some("*")), ttf.clone()),
+            ],
+            &[],
+        );
+        let page = format!(
+            "<!DOCTYPE html><script>document.cookie = 'k=v'; var loaded = false; addEventListener('load', () => loaded = true)</script>\
+             <style>@font-face {{ font-family: Used; src: url(/used.ttf) }} @font-face {{ font-family: Unused; src: url(/unused.ttf) }} \
+             @font-face {{ font-family: Closed; src: url({}) }} @font-face {{ font-family: Open; src: url({}) format('truetype') }}</style>\
+             <p style='font-family: Used'>used</p><p style='font-family: Closed, Used'>closed</p><p style='font-family: Open'>open</p>\
+             <div style='font-family: Unused'><span></span></div>",
+            other.url("/closed.ttf"),
+            other.url("/open.ttf")
+        );
+        let server = Server::start_with(
+            vec![
+                ("/page".to_owned(), vec![("Content-Type".to_owned(), "text/html; charset=utf-8".to_owned())], page.into_bytes()),
+                ("/used.ttf".to_owned(), font(None), ttf.clone()),
+                ("/unused.ttf".to_owned(), font(None), ttf.clone()),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.pump();
+        assert_eq!(run_js(&mut h, "loaded"), "true");
+        let origin = server.base.origin().ascii_serialization();
+        let header = |head: &str, name: &str| {
+            head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_owned()))
+        };
+        let used = server.requests("/used.ttf");
+        assert_eq!(used.len(), 1, "fetched once");
+        assert_eq!(header(&used[0], "cookie").as_deref(), Some("k=v"), "credentials to the document's origin");
+        assert!(server.requests("/unused.ttf").is_empty(), "no text uses the face");
+        for path in ["/closed.ttf", "/open.ttf"] {
+            let r = other.requests(path);
+            assert_eq!(r.len(), 1, "{path} fetched once");
+            assert_eq!(header(&r[0], "cookie"), None, "no credentials across origins: {}", r[0]);
+            assert_eq!(header(&r[0], "origin"), Some(origin.clone()), "a CORS request: {}", r[0]);
+        }
+        // Which font each paragraph's text is in.
+        let mut fonts: HashMap<String, bool> = HashMap::new();
+        h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+            if let browser_layout::FragmentContent::Text(t) = &f.content {
+                fonts.insert(t.text[t.range.clone()].to_owned(), t.font.data.data() == &ttf[..]);
+            }
+        });
+        assert_eq!(fonts.get("used"), Some(&true), "{fonts:?}");
+        assert_eq!(fonts.get("open"), Some(&true), "allowed by ACAO: {fonts:?}");
+        assert_eq!(fonts.get("closed"), Some(&true), "refused, so the next family (Used) shows: {fonts:?}");
+        // Refused leaves Closed unregistered: a page that names only it
+        // shows the fallback.
+        assert!(!h.state.engine.as_mut().expect("engine").has_font_family("Closed"));
     }
 
     #[test]

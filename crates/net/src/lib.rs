@@ -64,6 +64,31 @@ pub struct FetchRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub cache: CacheMode,
+    /// Whether cookies go with the request and are taken from its
+    /// responses (Fetch's credentials mode).
+    pub credentials: Credentials,
+}
+
+/// Fetch's credentials mode: cookies on every hop, only on hops to the
+/// given origin (`same-origin`, what a CORS-mode font or `fetch()` uses
+/// by default), or never.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Credentials {
+    #[default]
+    Include,
+    SameOrigin(url::Origin),
+    Omit,
+}
+
+impl Credentials {
+    /// Whether a hop to `url` carries (and stores) cookies.
+    pub fn allows(&self, url: &Url) -> bool {
+        match self {
+            Credentials::Include => true,
+            Credentials::SameOrigin(origin) => url.origin() == *origin,
+            Credentials::Omit => false,
+        }
+    }
 }
 
 impl FetchRequest {
@@ -74,6 +99,7 @@ impl FetchRequest {
             headers: Vec::new(),
             body: None,
             cache: CacheMode::Default,
+            credentials: Credentials::Include,
         }
     }
 }
@@ -238,7 +264,9 @@ async fn run(
                 headers.insert(name, value);
             }
         }
-        if let Some(cookie) = shared.cookies().cookie_header(&url, SystemTime::now())
+        let credentials = request.credentials.allows(&url);
+        if credentials
+            && let Some(cookie) = shared.cookies().cookie_header(&url, SystemTime::now())
             && let Ok(value) = HeaderValue::from_str(&cookie)
         {
             headers.insert(header::COOKIE, value);
@@ -286,8 +314,9 @@ async fn run(
         };
         let status = response.status();
 
-        // Every hop may set cookies, redirects and 304s included.
-        {
+        // Every hop may set cookies, redirects and 304s included (not when
+        // the request goes without credentials).
+        if credentials {
             let mut jar = shared.cookies();
             for value in response.headers().get_all(header::SET_COOKIE) {
                 jar.store(&url, &String::from_utf8_lossy(value.as_bytes()), timing.wall);

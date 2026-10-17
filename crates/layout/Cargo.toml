@@ -23,4 +23,6 @@ read-fonts.workspace = true
 skrifa.workspace = true
 url.workspace = true
 html5ever.workspace = true
+# Web fonts arrive as WOFF/WOFF2 most of the time.
+wuff.workspace = true
 tracing.workspace = true

@@ -58,6 +58,9 @@ pub struct LayoutEngine {
     /// out of their flows (`BoxKind::OutOfFlow`, `OofAnchor`); each is
     /// taken while it is laid out (`positioned.rs`).
     pub(crate) oofs: Vec<crate::boxes::OutOfFlowBox>,
+    /// The web fonts registered for the current document
+    /// (`register_web_font`), to take out again (`clear_web_fonts`).
+    web_fonts: Vec<(fontique::FamilyId, fontique::FontWidth, fontique::FontStyle, fontique::FontWeight)>,
 }
 
 /// Relayouts after a pass finds an `overflow: auto` axis overflowing, so
@@ -137,7 +140,68 @@ impl LayoutEngine {
             plans: HashMap::new(),
             viewport: (0.0, 0.0),
             oofs: Vec::new(),
+            web_fonts: Vec::new(),
         }
+    }
+
+    /// Register a web font's data ("Working sites first" line 6): a
+    /// TrueType/OpenType font or collection, or WOFF/WOFF2 (decoded here),
+    /// under its `@font-face` family name and with the face's descriptors
+    /// as its weight, style and stretch, so text in that family uses it
+    /// from the next layout (until then its fallbacks show). A weight
+    /// range registers at its start: a variable face then varies to the
+    /// weight asked. False when the data holds no font.
+    pub fn register_web_font(&mut self, data: &[u8], face: &browser_style::fontface::FontFaceRule) -> bool {
+        let font = match data.get(..4) {
+            Some(b"wOF2") => wuff::decompress_woff2(data).ok(),
+            Some(b"wOFF") => wuff::decompress_woff1(data).ok(),
+            _ => Some(data.to_vec()),
+        };
+        let Some(font) = font else { return false };
+        // Only data that parses as a font (or collection) is registered.
+        if read_fonts::FileRef::new(&font).is_err() {
+            return false;
+        }
+        let style = match face.style {
+            browser_style::fontface::FaceStyle::Normal => fontique::FontStyle::Normal,
+            browser_style::fontface::FaceStyle::Italic => fontique::FontStyle::Italic,
+            browser_style::fontface::FaceStyle::Oblique(a, _) => fontique::FontStyle::Oblique(Some(a)),
+        };
+        let registered = self.fonts.collection.register_fonts(
+            fontique::Blob::new(Arc::new(font)),
+            Some(fontique::FontInfoOverride {
+                family_name: Some(&face.family),
+                width: Some(fontique::FontWidth::from_percentage(face.stretch.0)),
+                style: Some(style),
+                weight: Some(fontique::FontWeight::new(face.weight.0)),
+                axes: None,
+            }),
+        );
+        for (family, infos) in &registered {
+            for info in infos {
+                self.web_fonts.push((*family, info.width(), info.style(), info.weight()));
+            }
+        }
+        !registered.is_empty()
+    }
+
+    /// Forget every web font registered (a new document's fonts are its
+    /// own); the installed fonts stay.
+    pub fn clear_web_fonts(&mut self) {
+        // Unregistering a font keeps its family name (with no fonts left),
+        // and a web family named like an installed one would go on hiding
+        // it; `clear` drops every registered name and font. Nothing else is
+        // registered or set on the collection, so the installed fonts and
+        // generic families stay as they were.
+        if !std::mem::take(&mut self.web_fonts).is_empty() {
+            self.fonts.collection.clear();
+        }
+    }
+
+    /// Whether a font family is available by that name: installed, or
+    /// registered from the web.
+    pub fn has_font_family(&mut self, name: &str) -> bool {
+        self.fonts.collection.family_id(name).is_some()
     }
 
     /// After a restyle that changed no layout-affecting value: every
@@ -4314,6 +4378,123 @@ mod tests {
         // 1 §9.1): from line 2 to the container's right edge.
         let ae = b("ae");
         assert_eq!((ae.x - pos.x, ae.right()), (100.0, pos.right()));
+    }
+
+    /// "Working sites first" line 6: a web font registered from its bytes
+    /// (TrueType, or WOFF around it) is the font of text in its
+    /// `@font-face` family; garbage registers nothing; clearing the web
+    /// fonts takes it out again (the fallback shows).
+    #[test]
+    fn web_fonts_register_under_their_family() {
+        let mut engine = LayoutEngine::new();
+        // A single-font file from the installed fonts (portable test data).
+        let mut cache = fontique::SourceCache::default();
+        let names: Vec<String> = engine.fonts.collection.family_names().map(str::to_owned).collect();
+        let ttf = names
+            .iter()
+            .filter_map(|n| engine.fonts.collection.family_by_name(n))
+            .flat_map(|fam| fam.fonts().to_vec())
+            .filter_map(|f| f.load(Some(&mut cache)))
+            .map(|b| b.data().to_vec())
+            .find(|d| matches!(read_fonts::FileRef::new(d), Ok(read_fonts::FileRef::Font(_))))
+            .expect("an installed single-font file");
+        let face = |family: &str| browser_style::fontface::FontFaceRule {
+            family: Arc::from(family),
+            sources: Vec::new(),
+            weight: (400.0, 400.0),
+            style: browser_style::fontface::FaceStyle::Normal,
+            stretch: (100.0, 100.0),
+        };
+        assert!(!engine.register_web_font(b"not a font at all", &face("Junk")));
+        assert!(engine.register_web_font(&ttf, &face("Web Test")));
+        assert!(engine.register_web_font(&woff1(&ttf), &face("Woff Test")));
+        assert!(engine.has_font_family("Web Test") && engine.has_font_family("Woff Test"));
+        let font_of = |engine: &mut LayoutEngine, family: &str| {
+            let doc = browser_dom::parse_html(format!("<body><p style='font-family:\"{family}\", monospace'>Hello</p></body>").as_bytes());
+            let mut stylist = Stylist::new();
+            stylist.add_sheet(ua_stylesheet());
+            let styles = compute_styles(&doc, &stylist, &Viewport::default());
+            let tree = engine.layout(&doc, &styles, 800.0, 600.0, &());
+            let mut data = None;
+            tree.root.walk(&mut |f| {
+                if let FragmentContent::Text(t) = &f.content
+                    && data.is_none()
+                {
+                    data = Some(t.font.data.data().to_vec());
+                }
+            });
+            data.expect("text")
+        };
+        // A decoder rebuilds the file around the tables (directory order,
+        // padding), so the WOFF font is compared by its tables.
+        let tables = |data: &[u8]| {
+            let font = read_fonts::FontRef::new(data).expect("font");
+            let mut t: Vec<([u8; 4], Vec<u8>)> = font
+                .table_directory
+                .table_records()
+                .iter()
+                .map(|r| (r.tag().to_be_bytes(), font.table_data(r.tag()).expect("table").as_bytes().to_vec()))
+                .collect();
+            t.sort();
+            t
+        };
+        assert!(font_of(&mut engine, "Web Test") == ttf, "the text is in the web font");
+        assert!(tables(&font_of(&mut engine, "Woff Test")) == tables(&ttf), "a WOFF decodes to the same font");
+        // A web family named like an installed one hides it (only the
+        // `@font-face` faces answer that name).
+        let installed = names
+            .iter()
+            .find(|n| engine.fonts.collection.family_by_name(n).is_some_and(|f| f.fonts().len() > 1))
+            .expect("an installed family")
+            .clone();
+        let installed_fonts = engine.fonts.collection.family_by_name(&installed).expect("family").fonts().len();
+        assert!(engine.register_web_font(&ttf, &face(&installed)));
+        assert_eq!(engine.fonts.collection.family_by_name(&installed).expect("family").fonts().len(), 1);
+        engine.clear_web_fonts();
+        assert!(!engine.has_font_family("Web Test"));
+        assert!(font_of(&mut engine, "Web Test") != ttf, "gone: the fallback shows");
+        assert_eq!(
+            engine.fonts.collection.family_by_name(&installed).expect("family").fonts().len(),
+            installed_fonts,
+            "the installed family is back"
+        );
+    }
+
+    /// A WOFF 1.0 file around a TrueType/OpenType font, its tables stored
+    /// uncompressed (allowed by WOFF 1.0 §5).
+    fn woff1(ttf: &[u8]) -> Vec<u8> {
+        let font = read_fonts::FontRef::new(ttf).expect("font");
+        let records = font.table_directory.table_records();
+        let n = records.len();
+        let header = 44;
+        let dir = 20 * n;
+        let mut out = vec![0u8; header + dir];
+        let mut offset = header + dir;
+        let mut tables: Vec<u8> = Vec::new();
+        for (i, r) in records.iter().enumerate() {
+            let data = font.table_data(r.tag()).expect("table");
+            let bytes = data.as_bytes();
+            let e = header + 20 * i;
+            out[e..e + 4].copy_from_slice(&r.tag().to_be_bytes());
+            out[e + 4..e + 8].copy_from_slice(&(offset as u32).to_be_bytes());
+            out[e + 8..e + 12].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out[e + 12..e + 16].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out[e + 16..e + 20].copy_from_slice(&r.checksum().to_be_bytes());
+            tables.extend_from_slice(bytes);
+            while tables.len() % 4 != 0 {
+                tables.push(0);
+            }
+            offset = header + dir + tables.len();
+        }
+        out.extend_from_slice(&tables);
+        let total = out.len() as u32;
+        out[0..4].copy_from_slice(b"wOFF");
+        out[4..8].copy_from_slice(&ttf[0..4]);
+        out[8..12].copy_from_slice(&total.to_be_bytes());
+        out[12..14].copy_from_slice(&(n as u16).to_be_bytes());
+        out[16..20].copy_from_slice(&(ttf.len() as u32).to_be_bytes());
+        out[20..22].copy_from_slice(&1u16.to_be_bytes());
+        out
     }
 
     /// Clipping, scrolling and scrollable overflow follow the containing

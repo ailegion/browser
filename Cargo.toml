@@ -53,6 +53,9 @@ skrifa = "0.44"
 # Unicode character properties (bidi classes); the version parley uses.
 icu_properties = { version = "2", default-features = false, features = ["compiled_data"] }
 pollster = "0.4"
+# WOFF and WOFF2 web font decoding (pure Rust; brotli-decompressor and
+# flate2, both already in the tree), "Working sites first" line 6.
+wuff = "0.2.9"
 
 # content (Servo parsing group)
 html5ever = "0.40.1"

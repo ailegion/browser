@@ -58,12 +58,32 @@ impl Stylist {
                             walk(inner, origin, vp, out);
                         }
                     }
+                    Rule::FontFace(_) => {}
                 }
             }
         }
         let mut out = Vec::new();
         for sheet in &self.sheets {
             walk(&sheet.rules, sheet.origin, viewport, &mut out);
+        }
+        out
+    }
+
+    /// The `@font-face` rules in effect under this viewport, in source
+    /// order (those in a `@media` block whose query matches).
+    pub fn font_faces(&self, viewport: &Viewport) -> Vec<Arc<crate::fontface::FontFaceRule>> {
+        fn walk(rules: &[Rule], vp: &Viewport, out: &mut Vec<Arc<crate::fontface::FontFaceRule>>) {
+            for r in rules {
+                match r {
+                    Rule::FontFace(f) => out.push(f.clone()),
+                    Rule::Media(q, inner) if q.evaluate(vp) => walk(inner, vp, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for sheet in &self.sheets {
+            walk(&sheet.rules, viewport, &mut out);
         }
         out
     }
@@ -582,6 +602,7 @@ impl Stylist {
                         }
                     }
                     Rule::Media(_, inner) => walk(inner, deps),
+                    Rule::FontFace(_) => {}
                 }
             }
         }

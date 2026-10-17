@@ -26,3 +26,6 @@ tracing.workspace = true
 [dev-dependencies]
 # The timing probe (`probe_page_timings`) shows the tab's debug logs.
 tracing-subscriber.workspace = true
+# The web font test serves an installed font file.
+fontique.workspace = true
+read-fonts.workspace = true

@@ -12,6 +12,7 @@
 pub mod cascade;
 pub mod computed;
 pub mod custom;
+pub mod fontface;
 pub mod grid;
 pub mod image;
 pub mod media;

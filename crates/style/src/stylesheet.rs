@@ -29,6 +29,8 @@ pub struct StyleRule {
 pub enum Rule {
     Style(StyleRule),
     Media(MediaQueryList, Vec<Rule>),
+    /// `@font-face` ("Working sites first" line 6).
+    FontFace(Arc<crate::fontface::FontFaceRule>),
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +112,16 @@ impl Stylesheet {
                         }
                     }
                     Rule::Media(_, inner) => walk(inner, base),
+                    Rule::FontFace(face) => {
+                        let face = Arc::make_mut(face);
+                        for s in &mut face.sources {
+                            if let crate::fontface::FontSource::Url { url, .. } = s
+                                && let Ok(abs) = base.join(url)
+                            {
+                                *url = Arc::from(abs.as_str());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -126,7 +138,7 @@ impl Stylesheet {
             rules
                 .iter()
                 .map(|r| match r {
-                    Rule::Style(_) => 1,
+                    Rule::Style(_) | Rule::FontFace(_) => 1,
                     Rule::Media(_, inner) => count(inner),
                 })
                 .sum()
@@ -217,6 +229,7 @@ struct TopLevel {
 enum AtPrelude {
     Media(MediaQueryList),
     Import(String, MediaQueryList),
+    FontFace,
     /// `@layer`, `@supports`, `@container` and friends: a block whose rules
     /// we either flatten or drop.
     Flatten,
@@ -278,7 +291,12 @@ impl<'i> AtRuleParser<'i> for TopLevel {
                 while input.next().is_ok() {}
                 AtPrelude::Flatten
             },
-            "supports" | "container" | "font-face" | "keyframes" | "-webkit-keyframes" | "page"
+            "font-face" => {
+                // No prelude.
+                input.expect_exhausted()?;
+                AtPrelude::FontFace
+            },
+            "supports" | "container" | "keyframes" | "-webkit-keyframes" | "page"
             | "charset" | "namespace" | "font-feature-values" | "counter-style" | "property"
             | "scope" | "starting-style" | "view-transition" => {
                 while input.next().is_ok() {}
@@ -298,7 +316,7 @@ impl<'i> AtRuleParser<'i> for TopLevel {
                 Ok(None)
             }
             AtPrelude::Flatten | AtPrelude::Ignore => Ok(None),
-            AtPrelude::Media(_) => Err(()),
+            AtPrelude::Media(_) | AtPrelude::FontFace => Err(()),
         }
     }
 
@@ -317,6 +335,7 @@ impl<'i> AtRuleParser<'i> for TopLevel {
                 let rules = parse_nested_rules(input, self);
                 Ok(Some(Rule::Media(MediaQueryList::all(), rules)))
             }
+            AtPrelude::FontFace => Ok(crate::fontface::parse_font_face_block(input).map(|f| Rule::FontFace(Arc::new(f)))),
             AtPrelude::Import(..) | AtPrelude::Ignore => {
                 while input.next().is_ok() {}
                 Ok(None)
