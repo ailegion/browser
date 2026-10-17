@@ -48,8 +48,12 @@ pub(crate) struct TableBox {
     pub placed: bool,
     /// The column constraints from the cells' intrinsic sizes.
     pub constraints: Option<Vec<crate::table::ColumnConstraint>>,
-    /// The layouts computed so far, by target width and height.
+    /// The layouts computed so far, by target width and height, and the
+    /// one in force (table::prelay, table::relay); the intrinsic widths.
     pub layouts: Vec<crate::table::TableLayout>,
+    pub current: usize,
+    pub min_width: f32,
+    pub max_width: f32,
     /// The width the table's containing block offered last, which the
     /// atomics inside the cells are measured against.
     pub available_width: f32,
@@ -1305,6 +1309,9 @@ impl BoxBuilder<'_> {
             placed: false,
             constraints: None,
             layouts: Vec::new(),
+            current: 0,
+            min_width: 0.0,
+            max_width: 0.0,
             available_width: 0.0,
         };
         let mut headers = Vec::new();

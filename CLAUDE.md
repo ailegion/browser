@@ -67,3 +67,9 @@ Before doing anything in this repository, read `plan/00-README.md` and then
     continuing wins.
   - You say "I lied" and name the part the moment you notice you built
     past a skip, before anything else in the message.
+- Never restructure the engine's flow (`LayoutEngine`'s fields and methods,
+  the taffy pass loop, `fragments`, the box builder's entry points) to fit a
+  new feature. A feature that needs the flow changed stops with "SKIPPED:
+  needs a core change" and waits for the owner's go.
+- No block is reported without a release-build timing of a real page against
+  the previous build; a slower number is the first line of the report.

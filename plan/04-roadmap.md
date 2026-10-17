@@ -72,10 +72,14 @@ remaining lists as they stand.
       `bottom` is not parsed yet). Row and row group borders are ignored
       and their backgrounds painted behind each cell, so the spacing
       shows the table's background; `empty-cells: hide` paints nothing
-      for an empty cell. The engine's working state is now `Engine` (the
-      fields by reference) so a table lays its cells out from inside
-      taffy's measure callback; `layout_subtree` is the one independent
-      layout for atomics, cells and captions. Tests: layout (grid with
+      for an empty cell. A table is laid out before taffy runs, with the
+      atomics (`table::prelay`: at its style's width or shrink-to-fit
+      against the available width), taffy's measure of the leaf returns
+      the stored size, and a table taffy sizes differently (a stretched
+      flex item, a percentage in a narrower box) is laid out again at
+      that size in the existing pass loop (`relay_tables`), so no layout
+      runs inside taffy and the engine's flow is as it was; cells and
+      captions use the new `layout_subtree`. Tests: layout (grid with
       spacing, borders, padding and a colspan; fixed, percent and auto
       columns; row spans and the four alignments; anonymous tables,
       inline-table in a line, group order), paint (row background behind

@@ -22,7 +22,7 @@ use browser_style::{ComputedVerticalAlign, Overflow};
 use taffy::prelude::*;
 
 use crate::boxes::{CellBox, TableBox};
-use crate::engine::{Engine, SubtreeWidth};
+use crate::engine::{LayoutEngine, SubtreeWidth};
 use crate::{Fragment, FragmentContent, Rect};
 
 /// What a column needs: its min- and max-content widths (the widest
@@ -47,31 +47,43 @@ pub(crate) struct TableLayout {
     pub padding: Sides<f32>,
 }
 
-/// The measure function of a table leaf.
-pub(crate) fn measure(
-    engine: &mut Engine<'_>,
-    table: &mut TableBox,
-    known: Size<Option<f32>>,
-    available: Size<AvailableSpace>,
-) -> Size<f32> {
-    if let Some(w) = known.width {
-        table.available_width = w;
-    } else if let AvailableSpace::Definite(w) = available.width {
-        table.available_width = w;
-    }
+/// Lay a table out before taffy runs (as the atomics are), at the width
+/// its style gives it or shrink-to-fit against the width available to
+/// it; taffy then measures the leaf from the stored layout (`measure`),
+/// and a table taffy sizes differently is laid out again at that width
+/// (`relay`) in the engine's pass loop, outside taffy.
+pub(crate) fn prelay(engine: &mut LayoutEngine, table: &mut TableBox, available_width: f32) {
+    table.available_width = available_width;
     let (min_w, max_w) = intrinsic_widths(engine, table);
+    let width = match table.style.width {
+        ComputedSize::Px(w) => w.max(min_w),
+        ComputedSize::Percent(p) => (available_width * p / 100.0).max(min_w),
+        _ => available_width.min(max_w).max(min_w),
+    };
+    table.current = layout_at(engine, table, width, None);
+    table.min_width = min_w;
+    table.max_width = max_w;
+}
+
+/// Lay the table out again at the width (and height) taffy assigned it.
+pub(crate) fn relay(engine: &mut LayoutEngine, table: &mut TableBox, width: f32, height: Option<f32>) {
+    table.current = layout_at(engine, table, width, height);
+}
+
+/// The measure function of a table leaf: the stored layout's size, the
+/// intrinsic widths for taffy's min- and max-content questions.
+pub(crate) fn measure(table: &TableBox, known: Size<Option<f32>>, available: Size<AvailableSpace>) -> Size<f32> {
+    let l = &table.layouts[table.current];
     let width = match known.width {
-        Some(w) => w,
+        Some(w) => w.max(table.min_width),
         None => match available.width {
-            AvailableSpace::Definite(a) => a.min(max_w).max(min_w),
-            AvailableSpace::MinContent => min_w,
-            AvailableSpace::MaxContent => max_w,
+            AvailableSpace::MinContent => table.min_width,
+            AvailableSpace::MaxContent => table.max_width,
+            AvailableSpace::Definite(_) => l.width,
         },
     };
-    let idx = layout_at(engine, table, width, known.height);
-    let l = &table.layouts[idx];
     Size {
-        width: l.width,
+        width,
         height: known.height.unwrap_or(l.height),
     }
 }
@@ -168,7 +180,7 @@ fn cell_edges(style: &ComputedStyle, cb_width: f32) -> (f32, f32) {
 /// a percentage `width` gives the column a percentage. A spanning cell
 /// hands what its columns lack over to them in proportion to their
 /// maxima (equally when those are zero).
-pub(crate) fn constraints<'a>(engine: &mut Engine<'_>, table: &'a mut TableBox) -> &'a [ColumnConstraint] {
+pub(crate) fn constraints<'a>(engine: &mut LayoutEngine, table: &'a mut TableBox) -> &'a [ColumnConstraint] {
     place_grid(table);
     if table.constraints.is_none() {
         let available = table.available_width;
@@ -265,7 +277,7 @@ fn share(cols: &mut [ColumnConstraint], extra: f32, weight: impl Fn(&ColumnConst
 }
 
 /// Lay a cell out at its min- and max-content widths, once.
-fn measure_cell(engine: &mut Engine<'_>, cell: &mut CellBox, available: f32) {
+fn measure_cell(engine: &mut LayoutEngine, cell: &mut CellBox, available: f32) {
     if cell.measured {
         return;
     }
@@ -279,7 +291,7 @@ fn measure_cell(engine: &mut Engine<'_>, cell: &mut CellBox, available: f32) {
 /// The wrapper's min- and max-content widths: the grid's (columns plus
 /// spacing, percentages scaling the max as Blink does) with the table
 /// box's border and padding, no narrower than a caption's minimum.
-pub(crate) fn intrinsic_widths(engine: &mut Engine<'_>, table: &mut TableBox) -> (f32, f32) {
+pub(crate) fn intrinsic_widths(engine: &mut LayoutEngine, table: &mut TableBox) -> (f32, f32) {
     let style = table.style.clone();
     let e = edges(&style, table.available_width);
     let cols = constraints(engine, table).to_vec();
@@ -441,7 +453,7 @@ struct Laid {
 /// The layout of the table at a wrapper content width (the table box's
 /// border-box width), with a known height to fill when the box is
 /// stretched or sized. Returns the index into `table.layouts`.
-pub(crate) fn layout_at(engine: &mut Engine<'_>, table: &mut TableBox, width: f32, known_height: Option<f32>) -> usize {
+pub(crate) fn layout_at(engine: &mut LayoutEngine, table: &mut TableBox, width: f32, known_height: Option<f32>) -> usize {
     let key = (width, known_height);
     if let Some(i) = table.layouts.iter().position(|l| l.key == key) {
         return i;
@@ -495,7 +507,7 @@ pub(crate) fn layout_at(engine: &mut Engine<'_>, table: &mut TableBox, width: f3
             for (ci, cell) in row.cells.iter_mut().enumerate() {
                 let end = (cell.col + cell.colspan).min(n);
                 let span_w: f32 = widths[cell.col..end].iter().sum::<f32>() + e.hs * (end.saturating_sub(cell.col).saturating_sub(1)) as f32;
-                let r = engine.layout_subtree(&mut cell.node, available, SubtreeWidth::Definite(span_w), true, true);
+                let r = engine.layout_subtree(&mut cell.node, available, SubtreeWidth::Definite(span_w), true, false);
                 let cs = cell.node.style.clone();
                 let (_, v_edges) = cell_edges(&cs, grid_width);
                 let mut height = r.height;
