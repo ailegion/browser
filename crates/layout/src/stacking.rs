@@ -9,6 +9,13 @@
 //! The painter draws the list front to back; hit testing walks it the
 //! same way and keeps the last box under the point.
 //!
+//! The order is built once per layout and again whenever the fragments
+//! move or restyle (a scroll, a sticky shift, a style refresh) and kept on
+//! the `LayoutTree` (`PaintOrder`), its fragments named by their index in
+//! a pre-order walk of the tree; the painter resolves it against the tree
+//! (`PaintOrder::resolve`), hit testing and the geometry helpers read it
+//! as it is.
+//!
 //! Boxes that Blink paints as a unit ("atomically", as if they made a
 //! stacking context whose positioned descendants still belong to the
 //! enclosing one) are the floats, the inline-level atomic boxes
@@ -26,7 +33,8 @@ use browser_style::transform::Matrix4;
 use browser_style::{BackfaceVisibility, ComputedStyle, Display, Float, Overflow, PointerEvents, Position, Visibility, ZIndex};
 
 use crate::{
-    Affine2, Fragment, FragmentContent, IDENTITY, LayoutTree, Rect, affine_apply, affine_invert, affine_mul, rounded_contains_inset,
+    Affine2, Fragment, FragmentContent, IDENTITY, LayoutTree, Rect, affine_apply, affine_invert, affine_mul, rounded_contains,
+    rounded_contains_inset,
 };
 
 /// Where an item is drawn: the accumulated transform of the boxes above
@@ -92,39 +100,148 @@ pub struct Placed<'a> {
     pub space: Space,
 }
 
-/// The paint order of a layout tree.
-#[derive(Debug, Clone, Default)]
+/// The paint order of a layout tree, resolved against its fragments for
+/// the painter (`PaintOrder::resolve`).
+#[derive(Debug, Clone)]
 pub struct PaintList<'a> {
     pub clips: Vec<ClipNode<'a>>,
     pub items: Vec<Placed<'a>>,
     /// The space each node's fragments are drawn in (its first
     /// fragment's), for mapping layout rectangles to where they show.
-    pub spaces: HashMap<NodeId, Space>,
+    pub spaces: &'a HashMap<NodeId, Space>,
 }
 
-impl PaintList<'_> {
+/// A fragment of the tree the order was built from: its index in a
+/// pre-order walk from the root.
+type FragId = u32;
+
+/// `Op` with the fragments named by index.
+#[derive(Debug, Clone)]
+enum StoredOp {
+    PushGroup { opacity: f32 },
+    PopGroup,
+    Decoration { fragment: FragId, sides: [bool; 4] },
+    Content(FragId),
+    Scrollbars(FragId),
+    Outline {
+        node: NodeId,
+        style: Arc<ComputedStyle>,
+        rects: Vec<Rect>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct StoredItem {
+    op: StoredOp,
+    space: Space,
+}
+
+/// A clip with what hit testing needs of its box.
+#[derive(Debug, Clone)]
+struct StoredClip {
+    parent: Option<usize>,
+    fragment: FragId,
+    rect: Rect,
+    style: Arc<ComputedStyle>,
+    scrollport: Option<Rect>,
+    transform: Affine2,
+    fixed: bool,
+}
+
+/// A box hit testing can find, in paint order: an element's box (its
+/// border box, corners rounded) or its text.
+#[derive(Debug, Clone)]
+struct Hit {
+    node: NodeId,
+    rect: Rect,
+    style: Arc<ComputedStyle>,
+    rounded: bool,
+    space: Space,
+}
+
+/// The paint order of a layout tree, as kept on it (`LayoutTree::paint`):
+/// built once per layout and again when its fragments move or restyle.
+#[derive(Debug, Clone, Default)]
+pub struct PaintOrder {
+    clips: Vec<StoredClip>,
+    items: Vec<StoredItem>,
+    hits: Vec<Hit>,
+    spaces: HashMap<NodeId, Space>,
+    /// How many fragments the tree had, for resolving.
+    fragments: usize,
+}
+
+impl PaintOrder {
+    /// The order resolved against the tree it was built from: one walk
+    /// to find each fragment by its index.
+    pub fn resolve<'a>(&'a self, root: &'a Fragment) -> PaintList<'a> {
+        let mut table: Vec<&'a Fragment> = Vec::with_capacity(self.fragments);
+        fn preorder<'a>(f: &'a Fragment, out: &mut Vec<&'a Fragment>) {
+            out.push(f);
+            for c in &f.children {
+                preorder(c, out);
+            }
+        }
+        preorder(root, &mut table);
+        debug_assert_eq!(table.len(), self.fragments, "the paint order is stale");
+        let get = |id: FragId| table.get(id as usize).copied();
+        let clips = self
+            .clips
+            .iter()
+            .filter_map(|c| {
+                Some(ClipNode {
+                    parent: c.parent,
+                    fragment: get(c.fragment)?,
+                    scrollport: c.scrollport,
+                    transform: c.transform,
+                    fixed: c.fixed,
+                })
+            })
+            .collect();
+        let items = self
+            .items
+            .iter()
+            .filter_map(|p| {
+                let op = match &p.op {
+                    StoredOp::PushGroup { opacity } => Op::PushGroup { opacity: *opacity },
+                    StoredOp::PopGroup => Op::PopGroup,
+                    StoredOp::Decoration { fragment, sides } => Op::Decoration {
+                        fragment: get(*fragment)?,
+                        sides: *sides,
+                    },
+                    StoredOp::Content(f) => Op::Content(get(*f)?),
+                    StoredOp::Scrollbars(f) => Op::Scrollbars(get(*f)?),
+                    StoredOp::Outline { node, style, rects } => Op::Outline {
+                        node: *node,
+                        style: style.clone(),
+                        rects: rects.clone(),
+                    },
+                };
+                Some(Placed { op, space: p.space })
+            })
+            .collect();
+        PaintList {
+            clips,
+            items,
+            spaces: &self.spaces,
+        }
+    }
+
+    /// The space each node's fragments are drawn in (its first
+    /// fragment's).
+    pub fn spaces(&self) -> &HashMap<NodeId, Space> {
+        &self.spaces
+    }
+
     /// The topmost box under the page point `(x, y)`: the last item in
     /// paint order whose fragment contains the point, through the
     /// transforms and the clips above it. `page_scroll` places the fixed
     /// content. `pointer-events: none` boxes are passed over.
     pub fn hit_test(&self, x: f32, y: f32, page_scroll: (f32, f32)) -> Option<NodeId> {
-        let mut best = None;
-        for p in &self.items {
-            let (f, rounded) = match &p.op {
-                Op::Decoration { fragment, .. } => (*fragment, true),
-                Op::Content(f) if matches!(f.content, FragmentContent::Text(_)) => (*f, false),
-                _ => continue,
-            };
-            let Some(n) = f.node else { continue };
-            if f.style.pointer_events == PointerEvents::None {
-                continue;
-            }
-            let inside = |lx: f32, ly: f32| if rounded { f.contains_rounded(lx, ly) } else { f.rect.contains(lx, ly) };
-            if self.point_in(&p.space, x, y, page_scroll, &inside) {
-                best = Some(n);
-            }
-        }
-        best
+        self.hits.iter().rev().find_map(|h| {
+            let inside = |lx: f32, ly: f32| if h.rounded { rounded_contains(&h.rect, &h.style, lx, ly) } else { h.rect.contains(lx, ly) };
+            self.point_in(&h.space, x, y, page_scroll, &inside).then_some(h.node)
+        })
     }
 
     /// Whether the page point, taken into `space`, satisfies `inside` and
@@ -144,8 +261,8 @@ impl PaintList<'_> {
         while let Some(i) = clip {
             let c = &self.clips[i];
             let Some((cx, cy)) = local(&c.transform, c.fixed) else { return false };
-            let b = &c.fragment.style.border_width;
-            if !rounded_contains_inset(&c.fragment.rect, &c.fragment.style, [b.top, b.right, b.bottom, b.left], cx, cy) {
+            let b = &c.style.border_width;
+            if !rounded_contains_inset(&c.rect, &c.style, [b.top, b.right, b.bottom, b.left], cx, cy) {
                 return false;
             }
             if let Some(port) = &c.scrollport
@@ -160,23 +277,86 @@ impl PaintList<'_> {
 }
 
 /// The paint order of `tree`.
-pub fn build(tree: &LayoutTree) -> PaintList<'_> {
+pub fn build(tree: &LayoutTree) -> PaintOrder {
+    // Each fragment's subtree size in pre-order, so a child's index is
+    // its parent's plus one plus the sizes of the siblings before it.
+    let mut sizes: Vec<u32> = Vec::new();
+    fn count(f: &Fragment, sizes: &mut Vec<u32>) -> u32 {
+        let me = sizes.len();
+        sizes.push(0);
+        let mut n = 1;
+        for c in &f.children {
+            n += count(c, sizes);
+        }
+        sizes[me] = n;
+        n
+    }
+    count(&tree.root, &mut sizes);
     let mut b = Builder {
         tree,
-        list: PaintList::default(),
+        sizes,
+        list: PaintOrder::default(),
         seq: 0,
     };
+    // The root element is the viewport fragment's first child.
     if let Some(html) = tree.root.children.first() {
-        b.context(Sub::Box(html), Walk::ROOT, false);
+        b.context(Sub::Box(Fr { f: html, id: 1 }), Walk::ROOT, false);
     }
-    b.list
+    let mut list = b.list;
+    list.fragments = b.sizes.first().copied().unwrap_or(0) as usize;
+    list.hits = hits(&tree.root, &list);
+    list
+}
+
+/// The boxes hit testing can find, in paint order, with what it needs
+/// of each.
+fn hits(root: &Fragment, list: &PaintOrder) -> Vec<Hit> {
+    let mut table: Vec<&Fragment> = Vec::with_capacity(list.fragments);
+    fn preorder<'a>(f: &'a Fragment, out: &mut Vec<&'a Fragment>) {
+        out.push(f);
+        for c in &f.children {
+            preorder(c, out);
+        }
+    }
+    preorder(root, &mut table);
+    let mut out = Vec::new();
+    for p in &list.items {
+        let (id, rounded) = match &p.op {
+            StoredOp::Decoration { fragment, .. } => (*fragment, true),
+            StoredOp::Content(f) => (*f, false),
+            _ => continue,
+        };
+        let Some(f) = table.get(id as usize) else { continue };
+        if !rounded && !matches!(f.content, FragmentContent::Text(_)) {
+            continue;
+        }
+        let Some(node) = f.node else { continue };
+        if f.style.pointer_events == PointerEvents::None {
+            continue;
+        }
+        out.push(Hit {
+            node,
+            rect: f.rect,
+            style: f.style.clone(),
+            rounded,
+            space: p.space,
+        });
+    }
+    out
+}
+
+/// A fragment with its pre-order index.
+#[derive(Clone, Copy)]
+struct Fr<'a> {
+    f: &'a Fragment,
+    id: FragId,
 }
 
 /// The root of a (pseudo) stacking context: a box, or an inline
 /// element's line fragments, painted together.
 enum Sub<'a> {
-    Box(&'a Fragment),
-    Inline(Vec<&'a Fragment>),
+    Box(Fr<'a>),
+    Inline(Vec<Fr<'a>>),
 }
 
 /// The walk's state going down the tree: the space, plus the 3D
@@ -225,7 +405,7 @@ struct Pseudo<'a> {
 /// The painting phases of a (pseudo) stacking context's in-flow content.
 #[derive(Default)]
 struct Phases<'a> {
-    block_bg: Vec<Placed<'a>>,
+    block_bg: Vec<StoredItem>,
     floats: Vec<Pseudo<'a>>,
     foreground: Vec<Fore<'a>>,
     outlines: Vec<(NodeId, Arc<ComputedStyle>, Vec<Rect>, Space)>,
@@ -233,7 +413,7 @@ struct Phases<'a> {
 }
 
 enum Fore<'a> {
-    Item(Placed<'a>),
+    Item(StoredItem),
     Atomic(Box<Pseudo<'a>>),
 }
 
@@ -241,7 +421,8 @@ const ALL_SIDES: [bool; 4] = [true; 4];
 
 struct Builder<'a> {
     tree: &'a LayoutTree,
-    list: PaintList<'a>,
+    sizes: Vec<u32>,
+    list: PaintOrder,
     seq: u32,
 }
 
@@ -273,14 +454,24 @@ fn inline_creates_context(s: &ComputedStyle) -> bool {
 }
 
 impl<'a> Builder<'a> {
-    fn push(&mut self, op: Op<'a>, space: Space) {
-        self.list.items.push(Placed { op, space });
+    fn push(&mut self, op: StoredOp, space: Space) {
+        self.list.items.push(StoredItem { op, space });
     }
 
     fn note_space(&mut self, f: &Fragment, space: Space) {
         if let Some(n) = f.node {
             self.list.spaces.entry(n).or_insert(space);
         }
+    }
+
+    /// The fragment's children with their indices.
+    fn children(&self, p: Fr<'a>) -> impl Iterator<Item = Fr<'a>> + use<'a, '_> {
+        let mut next = p.id + 1;
+        p.f.children.iter().map(move |c| {
+            let id = next;
+            next += self.sizes[id as usize];
+            Fr { f: c, id }
+        })
     }
 
     fn scroller(&self, f: &Fragment) -> Option<&'a crate::ScrollInfo> {
@@ -333,7 +524,8 @@ impl<'a> Builder<'a> {
 
     /// The walk for the children of `f`: under its overflow clip when it
     /// clips, continuing its 3D chain when it preserves 3D, else flat.
-    fn child_walk(&mut self, f: &'a Fragment, walk: Walk) -> Walk {
+    fn child_walk(&mut self, fr: Fr<'a>, walk: Walk) -> Walk {
+        let f = fr.f;
         let mut w = walk;
         if f.style.transform_style == browser_style::TransformStyle::Preserve3d {
             if w.matrix3d.is_none() {
@@ -348,9 +540,11 @@ impl<'a> Builder<'a> {
             let b = &f.style.border_width;
             let padding_box = f.rect.inset(b.top, b.right, b.bottom, b.left);
             let scrollport = self.scroller(f).map(|i| i.scrollport).filter(|p| *p != padding_box);
-            self.list.clips.push(ClipNode {
+            self.list.clips.push(StoredClip {
                 parent: w.space.clip,
-                fragment: f,
+                fragment: fr.id,
+                rect: f.rect,
+                style: f.style.clone(),
                 scrollport,
                 transform: w.space.transform,
                 fixed: w.space.fixed,
@@ -374,8 +568,8 @@ impl<'a> Builder<'a> {
     /// A real stacking context rooted at `sub`.
     fn context(&mut self, sub: Sub<'a>, walk: Walk, flex_item: bool) {
         let mut walk = walk;
-        if let Sub::Box(f) = &sub
-            && !self.enter(f, &mut walk)
+        if let Sub::Box(fr) = &sub
+            && !self.enter(fr.f, &mut walk)
         {
             return;
         }
@@ -383,18 +577,18 @@ impl<'a> Builder<'a> {
         let p = self.gather(sub, walk, flex_item, &mut stacked);
         stacked.sort_by_key(|s| (s.z, s.seq));
         let opacity = match &p.sub {
-            Sub::Box(f) => f.style.opacity,
-            Sub::Inline(v) => v[0].style.opacity,
+            Sub::Box(fr) => fr.f.style.opacity,
+            Sub::Inline(v) => v[0].f.style.opacity,
         }
         .clamp(0.0, 1.0);
         let group = opacity < 1.0;
         if group {
-            self.push(Op::PushGroup { opacity }, walk.space);
+            self.push(StoredOp::PushGroup { opacity }, walk.space);
         }
         let (neg, pos): (Vec<_>, Vec<_>) = stacked.into_iter().partition(|s| s.z < 0);
         self.emit(p, neg, pos);
         if group {
-            self.push(Op::PopGroup, walk.space);
+            self.push(StoredOp::PopGroup, walk.space);
         }
     }
 
@@ -403,14 +597,14 @@ impl<'a> Builder<'a> {
     fn gather(&mut self, sub: Sub<'a>, walk: Walk, flex_item: bool, stacked: &mut Vec<Stacked<'a>>) -> Pseudo<'a> {
         let mut phases = Phases::default();
         match &sub {
-            Sub::Box(f) => {
-                self.note_space(f, walk.space);
-                let cw = self.child_walk(f, walk);
-                self.collect(f, cw, is_flex_container(f), &mut phases, stacked);
+            Sub::Box(fr) => {
+                self.note_space(fr.f, walk.space);
+                let cw = self.child_walk(*fr, walk);
+                self.collect(*fr, cw, is_flex_container(fr.f), &mut phases, stacked);
             }
             Sub::Inline(frags) => {
-                for f in frags {
-                    self.inline_fragment(f, walk, &mut phases, stacked);
+                for fr in frags {
+                    self.inline_fragment(*fr, walk, &mut phases, stacked);
                 }
             }
         }
@@ -424,42 +618,45 @@ impl<'a> Builder<'a> {
 
     /// An inline element's line fragment into the phases: its background
     /// then what it holds on the line.
-    fn inline_fragment(&mut self, f: &'a Fragment, walk: Walk, ph: &mut Phases<'a>, stacked: &mut Vec<Stacked<'a>>) {
+    fn inline_fragment(&mut self, fr: Fr<'a>, walk: Walk, ph: &mut Phases<'a>, stacked: &mut Vec<Stacked<'a>>) {
+        let f = fr.f;
         self.note_space(f, walk.space);
         if visible(f) {
-            ph.foreground.push(Fore::Item(Placed {
-                op: Op::Decoration {
-                    fragment: f,
+            ph.foreground.push(Fore::Item(StoredItem {
+                op: StoredOp::Decoration {
+                    fragment: fr.id,
                     sides: sides_of(f),
                 },
                 space: walk.space,
             }));
         }
         Self::add_outline(ph, f, walk.space);
-        self.collect(f, walk, false, ph, stacked);
+        self.collect(fr, walk, false, ph, stacked);
     }
 
     /// Sort the children of `parent` into the phases and the stacked list.
-    fn collect(&mut self, parent: &'a Fragment, walk: Walk, parent_flex: bool, ph: &mut Phases<'a>, stacked: &mut Vec<Stacked<'a>>) {
-        for c in &parent.children {
+    fn collect(&mut self, parent: Fr<'a>, walk: Walk, parent_flex: bool, ph: &mut Phases<'a>, stacked: &mut Vec<Stacked<'a>>) {
+        let children: Vec<Fr<'a>> = self.children(parent).collect();
+        for cr in children {
+            let c = cr.f;
             self.seq += 1;
             let seq = self.seq;
             match &c.content {
                 FragmentContent::Text(_) => {
                     self.note_space(c, walk.space);
                     if visible(c) {
-                        ph.foreground.push(Fore::Item(Placed {
-                            op: Op::Content(c),
+                        ph.foreground.push(Fore::Item(StoredItem {
+                            op: StoredOp::Content(cr.id),
                             space: walk.space,
                         }));
                     }
                 }
                 FragmentContent::Anonymous | FragmentContent::Marker => {
-                    self.collect(c, walk, false, ph, stacked);
+                    self.collect(cr, walk, false, ph, stacked);
                 }
                 FragmentContent::Inline { .. } => {
                     let Some(n) = c.node else {
-                        self.collect(c, walk, false, ph, stacked);
+                        self.collect(cr, walk, false, ph, stacked);
                         continue;
                     };
                     let s = &c.style;
@@ -474,15 +671,15 @@ impl<'a> Builder<'a> {
                             match &mut st.kind {
                                 StackedKind::Real(real) => {
                                     if let Sub::Inline(v) = &mut real.0 {
-                                        v.push(c);
+                                        v.push(cr);
                                     }
                                 }
                                 StackedKind::Pseudo(p) => {
                                     if let Sub::Inline(v) = &mut p.sub {
-                                        v.push(c);
+                                        v.push(cr);
                                     }
                                     let mut phases = std::mem::take(&mut p.phases);
-                                    self.inline_fragment(c, walk, &mut phases, stacked);
+                                    self.inline_fragment(cr, walk, &mut phases, stacked);
                                     if let Some(st) = stacked.iter_mut().find(|st| st.node == n)
                                         && let StackedKind::Pseudo(p) = &mut st.kind
                                     {
@@ -495,10 +692,10 @@ impl<'a> Builder<'a> {
                                 z,
                                 seq,
                                 node: n,
-                                kind: StackedKind::Real(Box::new((Sub::Inline(vec![c]), walk, false))),
+                                kind: StackedKind::Real(Box::new((Sub::Inline(vec![cr]), walk, false))),
                             });
                         } else {
-                            let p = self.gather(Sub::Inline(vec![c]), walk, false, stacked);
+                            let p = self.gather(Sub::Inline(vec![cr]), walk, false, stacked);
                             stacked.push(Stacked {
                                 z,
                                 seq,
@@ -507,7 +704,7 @@ impl<'a> Builder<'a> {
                             });
                         }
                     } else {
-                        self.inline_fragment(c, walk, ph, stacked);
+                        self.inline_fragment(cr, walk, ph, stacked);
                     }
                 }
                 FragmentContent::Box | FragmentContent::Control(_) | FragmentContent::Image(_) => {
@@ -518,23 +715,23 @@ impl<'a> Builder<'a> {
                         // its captions, a row's background behind a cell).
                         if matches!(c.content, FragmentContent::Image(_)) {
                             if visible(c) {
-                                ph.foreground.push(Fore::Item(Placed {
-                                    op: Op::Content(c),
+                                ph.foreground.push(Fore::Item(StoredItem {
+                                    op: StoredOp::Content(cr.id),
                                     space: walk.space,
                                 }));
                             }
                         } else {
                             if visible(c) && matches!(c.content, FragmentContent::Box) {
-                                ph.block_bg.push(Placed {
-                                    op: Op::Decoration {
-                                        fragment: c,
+                                ph.block_bg.push(StoredItem {
+                                    op: StoredOp::Decoration {
+                                        fragment: cr.id,
                                         sides: ALL_SIDES,
                                     },
                                     space: walk.space,
                                 });
                             }
-                            let cw = self.child_walk(c, walk);
-                            self.collect(c, cw, false, ph, stacked);
+                            let cw = self.child_walk(cr, walk);
+                            self.collect(cr, cw, false, ph, stacked);
                         }
                         continue;
                     };
@@ -560,22 +757,22 @@ impl<'a> Builder<'a> {
                             walk
                         };
                         let kind = if real {
-                            StackedKind::Real(Box::new((Sub::Box(c), w, parent_flex)))
+                            StackedKind::Real(Box::new((Sub::Box(cr), w, parent_flex)))
                         } else {
-                            StackedKind::Pseudo(Box::new(self.gather(Sub::Box(c), w, parent_flex, stacked)))
+                            StackedKind::Pseudo(Box::new(self.gather(Sub::Box(cr), w, parent_flex, stacked)))
                         };
                         stacked.push(Stacked { z, seq, node: n, kind });
                     } else if s.float != Float::None {
-                        let p = self.gather(Sub::Box(c), walk, false, stacked);
+                        let p = self.gather(Sub::Box(cr), walk, false, stacked);
                         ph.floats.push(p);
                     } else if parent_flex
                         || matches!(s.display, Display::Inline | Display::InlineBlock | Display::InlineFlex)
                         || matches!(c.content, FragmentContent::Image(_))
                     {
-                        let p = self.gather(Sub::Box(c), walk, parent_flex, stacked);
+                        let p = self.gather(Sub::Box(cr), walk, parent_flex, stacked);
                         ph.foreground.push(Fore::Atomic(Box::new(p)));
                     } else if self.scrolls_overflow(c) || s.backface_visibility == BackfaceVisibility::Hidden {
-                        let p = self.gather(Sub::Box(c), walk, false, stacked);
+                        let p = self.gather(Sub::Box(cr), walk, false, stacked);
                         ph.normal.push(p);
                     } else {
                         // A block-level box in flow: its background in the
@@ -583,29 +780,29 @@ impl<'a> Builder<'a> {
                         // content, its outline with the outlines.
                         self.note_space(c, walk.space);
                         if visible(c) {
-                            ph.block_bg.push(Placed {
-                                op: Op::Decoration {
-                                    fragment: c,
+                            ph.block_bg.push(StoredItem {
+                                op: StoredOp::Decoration {
+                                    fragment: cr.id,
                                     sides: ALL_SIDES,
                                 },
                                 space: walk.space,
                             });
                             if self.scroller(c).is_some() {
-                                ph.block_bg.push(Placed {
-                                    op: Op::Scrollbars(c),
+                                ph.block_bg.push(StoredItem {
+                                    op: StoredOp::Scrollbars(cr.id),
                                     space: walk.space,
                                 });
                             }
                             if matches!(c.content, FragmentContent::Control(_) | FragmentContent::Image(_)) {
-                                ph.foreground.push(Fore::Item(Placed {
-                                    op: Op::Content(c),
+                                ph.foreground.push(Fore::Item(StoredItem {
+                                    op: StoredOp::Content(cr.id),
                                     space: walk.space,
                                 }));
                             }
                         }
                         Self::add_outline(ph, c, walk.space);
-                        let cw = self.child_walk(c, walk);
-                        self.collect(c, cw, is_flex_container(c), ph, stacked);
+                        let cw = self.child_walk(cr, walk);
+                        self.collect(cr, cw, is_flex_container(c), ph, stacked);
                     }
                 }
             }
@@ -623,26 +820,26 @@ impl<'a> Builder<'a> {
         } = p;
         let space = walk.space;
         let root = match &sub {
-            Sub::Box(f) => Some(*f),
+            Sub::Box(fr) => Some(*fr),
             Sub::Inline(_) => None,
         };
-        let self_painting = root.is_some_and(|f| self.self_painting(f, flex_item));
+        let self_painting = root.is_some_and(|fr| self.self_painting(fr.f, flex_item));
         // 1. The context root's own background and border.
-        if let Some(f) = root
-            && visible(f)
+        if let Some(fr) = root
+            && visible(fr.f)
         {
             self.push(
-                Op::Decoration {
-                    fragment: f,
+                StoredOp::Decoration {
+                    fragment: fr.id,
                     sides: ALL_SIDES,
                 },
                 space,
             );
-            if !self_painting && self.scroller(f).is_some() {
-                self.push(Op::Scrollbars(f), space);
+            if !self_painting && self.scroller(fr.f).is_some() {
+                self.push(StoredOp::Scrollbars(fr.id), space);
             }
-            if matches!(f.content, FragmentContent::Control(_) | FragmentContent::Image(_)) {
-                self.push(Op::Content(f), space);
+            if matches!(fr.f.content, FragmentContent::Control(_) | FragmentContent::Image(_)) {
+                self.push(StoredOp::Content(fr.id), space);
             }
         }
         // 2. Negative z-index contexts.
@@ -664,16 +861,17 @@ impl<'a> Builder<'a> {
         }
         // 6. Descendants' outlines, then the root's own.
         for (node, style, rects, space) in phases.outlines {
-            self.push(Op::Outline { node, style, rects }, space);
+            self.push(StoredOp::Outline { node, style, rects }, space);
         }
         match &sub {
-            Sub::Box(f) => {
+            Sub::Box(fr) => {
+                let f = fr.f;
                 if visible(f)
                     && f.style.outline_style.is_visible()
                     && let Some(n) = f.node
                 {
                     self.push(
-                        Op::Outline {
+                        StoredOp::Outline {
                             node: n,
                             style: f.style.clone(),
                             rects: vec![f.rect],
@@ -683,16 +881,16 @@ impl<'a> Builder<'a> {
                 }
             }
             Sub::Inline(frags) => {
-                let rects: Vec<Rect> = frags.iter().filter(|f| visible(f)).map(|f| f.rect).collect();
+                let rects: Vec<Rect> = frags.iter().filter(|fr| visible(fr.f)).map(|fr| fr.f.rect).collect();
                 if let Some(first) = frags.first()
-                    && first.style.outline_style.is_visible()
+                    && first.f.style.outline_style.is_visible()
                     && !rects.is_empty()
-                    && let Some(n) = first.node
+                    && let Some(n) = first.f.node
                 {
                     self.push(
-                        Op::Outline {
+                        StoredOp::Outline {
                             node: n,
-                            style: first.style.clone(),
+                            style: first.f.style.clone(),
                             rects,
                         },
                         space,
@@ -709,12 +907,12 @@ impl<'a> Builder<'a> {
             self.emit_stacked(s);
         }
         // 9. A self-painting scroll container's bars, over all of it.
-        if let Some(f) = root
-            && visible(f)
+        if let Some(fr) = root
+            && visible(fr.f)
             && self_painting
-            && self.scroller(f).is_some()
+            && self.scroller(fr.f).is_some()
         {
-            self.push(Op::Scrollbars(f), space);
+            self.push(StoredOp::Scrollbars(fr.id), space);
         }
     }
 

@@ -363,8 +363,7 @@ impl View {
                 }
             }
             if let Some(tree) = &self.layout {
-                let spaces = tree.paint_list().spaces;
-                visit(&tree.root, &mut order, &mut index, &spaces);
+                visit(&tree.root, &mut order, &mut index, tree.spaces());
             }
             self.rect_index = Some(index);
         }

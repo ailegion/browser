@@ -1,0 +1,324 @@
+//! The one interface of everything that lays itself out: an inline root,
+//! a table, an image, an atomic inline-level box (inline-block,
+//! inline-table, inline-flex, a replaced or control box), a table cell, a
+//! table caption, and whatever formatting context comes next (grid).
+//!
+//! Each answers its min-content and max-content inline sizes and lays
+//! itself out for a sizing question (`Sizing`), keeping what it produced
+//! (its lines, its cells, its fragment) for the width it is finally given.
+//! taffy's measure callback asks a leaf nothing else (`measure`), so a
+//! leaf that needs other boxes laid out first (a table's cells, a line's
+//! inline-blocks) does that inside its own answer, at the width asked, and
+//! the engine's pass loop never has to know.
+
+use taffy::prelude::*;
+
+use crate::boxes::{Atomic, CaptionBox, CellBox, InlineContent, TableBox};
+use crate::engine::{LayoutEngine, Role, Run};
+
+/// The inline-size question put to a box that lays itself out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Sizing {
+    /// Its min-content size (CSS Sizing 3 §2.1).
+    MinContent,
+    /// Its max-content size.
+    MaxContent,
+    /// Shrink-to-fit into this much available inline space (CSS 2.1
+    /// §10.3.5, §10.3.9; Sizing 3's fit-content): no wider than its
+    /// max-content size, no narrower than its min-content size.
+    FitInto(f32),
+    /// This border-box width, decided by its container (a block-level
+    /// leaf's stretched width, a cell's columns).
+    Exactly(f32),
+    /// As a block-level box in a containing block this wide: an `auto`
+    /// width fills it less the margins (a caption in its table wrapper).
+    Fill(f32),
+}
+
+/// The width an inline root's lines are broken at: what keys its cached
+/// layouts, and what its atomic boxes are laid out for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LineWidth {
+    MinContent,
+    MaxContent,
+    /// A definite width, quantised to a quarter pixel.
+    Definite(f32),
+}
+
+impl LineWidth {
+    pub fn definite(width: f32) -> Self {
+        Self::Definite((width * 4.0).round() / 4.0)
+    }
+
+    /// The width parley breaks the lines at: every opportunity taken for
+    /// the min-content size, none for the max-content size.
+    pub fn max_advance(self) -> Option<f32> {
+        match self {
+            LineWidth::MinContent => Some(0.0),
+            LineWidth::MaxContent => None,
+            LineWidth::Definite(w) => Some(w),
+        }
+    }
+
+    /// The question each atomic box of the line is asked: its min- or
+    /// max-content contribution while the root's intrinsic sizes are
+    /// measured (CSS Sizing 3 §5), shrink-to-fit into the line's width
+    /// otherwise (the root is the atomics' containing block).
+    pub fn atomic_sizing(self) -> Sizing {
+        match self {
+            LineWidth::MinContent => Sizing::MinContent,
+            LineWidth::MaxContent => Sizing::MaxContent,
+            LineWidth::Definite(w) => Sizing::FitInto(w),
+        }
+    }
+}
+
+/// Everything that lays itself out.
+pub(crate) trait SelfLayout {
+    /// The min-content inline size: the border box for a block-level
+    /// leaf, the margin box for an atomic inline-level box (what its line
+    /// counts).
+    fn min_content(&mut self, engine: &mut LayoutEngine) -> f32;
+
+    /// The max-content inline size, as `min_content`.
+    fn max_content(&mut self, engine: &mut LayoutEngine) -> f32;
+
+    /// Lay out for `sizing`, with a height decided by the container when
+    /// it has one; `cb_width` is the containing block's width when it is
+    /// definite (percentages resolve against it). Returns the size the
+    /// container places, as `min_content` measures it. What was laid out
+    /// is kept for the fragments.
+    fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, known_height: Option<f32>, cb_width: Option<f32>) -> Size<f32>;
+}
+
+/// taffy's measure question for a leaf, put as a `Sizing`: a width taffy
+/// already knows is `Exactly` that, otherwise the available space says
+/// which intrinsic size or what to fit into.
+pub(crate) fn measure(
+    leaf: &mut dyn SelfLayout,
+    engine: &mut LayoutEngine,
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+    cb_width: Option<f32>,
+) -> Size<f32> {
+    let sizing = match (known.width, available.width) {
+        (Some(w), _) => Sizing::Exactly(w),
+        (None, AvailableSpace::MinContent) => Sizing::MinContent,
+        (None, AvailableSpace::MaxContent) => Sizing::MaxContent,
+        (None, AvailableSpace::Definite(w)) => Sizing::FitInto(w),
+    };
+    leaf.layout(engine, sizing, known.height, cb_width)
+}
+
+/// A leaf of a taffy tree that lays itself out, borrowed from the box
+/// tree for one pass.
+pub(crate) enum LeafRef<'a> {
+    Inline(&'a mut InlineContent),
+    Table(&'a mut TableBox),
+}
+
+impl LeafRef<'_> {
+    pub fn as_dyn(&mut self) -> &mut dyn SelfLayout {
+        match self {
+            LeafRef::Inline(c) => &mut **c,
+            LeafRef::Table(t) => &mut **t,
+        }
+    }
+}
+
+/// An inline root: its lines broken at the width asked. Its width is the
+/// width given, or else its widest line's (trailing whitespace hangs).
+impl SelfLayout for InlineContent {
+    fn min_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        self.layout(engine, Sizing::MinContent, None, None).width
+    }
+
+    fn max_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        self.layout(engine, Sizing::MaxContent, None, None).width
+    }
+
+    fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, known_height: Option<f32>, _cb: Option<f32>) -> Size<f32> {
+        let key = match sizing {
+            Sizing::MinContent => LineWidth::MinContent,
+            Sizing::MaxContent => LineWidth::MaxContent,
+            Sizing::FitInto(w) | Sizing::Exactly(w) | Sizing::Fill(w) => LineWidth::definite(w),
+        };
+        let il = engine.ensure_layout(self, key);
+        let (lines_width, lines_height) = (il.width().max(0.0), il.height.max(0.0));
+        let width = match sizing {
+            Sizing::Exactly(w) => w,
+            _ => lines_width,
+        };
+        Size {
+            width,
+            height: known_height.unwrap_or(lines_height),
+        }
+    }
+}
+
+/// A block-level replaced image: its intrinsic size and ratio under the
+/// size taffy already resolved from its style.
+pub(crate) struct ImageLeaf(pub Option<(f32, f32)>);
+
+impl SelfLayout for ImageLeaf {
+    fn min_content(&mut self, _engine: &mut LayoutEngine) -> f32 {
+        self.0.map_or(0.0, |s| s.0)
+    }
+
+    fn max_content(&mut self, _engine: &mut LayoutEngine) -> f32 {
+        self.0.map_or(0.0, |s| s.0)
+    }
+
+    fn layout(&mut self, _engine: &mut LayoutEngine, sizing: Sizing, known_height: Option<f32>, _cb: Option<f32>) -> Size<f32> {
+        let known_width = match sizing {
+            Sizing::Exactly(w) => Some(w),
+            _ => None,
+        };
+        crate::engine::measure_image(
+            self.0,
+            Size {
+                width: known_width,
+                height: known_height,
+            },
+        )
+    }
+}
+
+/// A table wrapper (`table.rs`).
+impl SelfLayout for TableBox {
+    fn min_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        crate::table::intrinsic_widths(engine, self).0
+    }
+
+    fn max_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        crate::table::intrinsic_widths(engine, self).1
+    }
+
+    fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, known_height: Option<f32>, cb_width: Option<f32>) -> Size<f32> {
+        crate::table::size_for(engine, self, sizing, known_height, cb_width)
+    }
+}
+
+/// An atomic inline-level box: laid out on its own and placed in its line
+/// as one rectangle, its margin box what the line counts. The results are
+/// kept per question; the one the root's current layout used is selected
+/// (`Atomic::result`) for the line placement and the fragments.
+impl SelfLayout for Atomic {
+    fn min_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        self.layout(engine, Sizing::MinContent, None, None).width
+    }
+
+    fn max_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        self.layout(engine, Sizing::MaxContent, None, None).width
+    }
+
+    fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, _known_height: Option<f32>, _cb: Option<f32>) -> Size<f32> {
+        if let Some(i) = self.results.iter().position(|(s, _)| *s == sizing) {
+            self.selected = Some(i);
+        } else {
+            let result = engine.atomic_result(self, sizing);
+            // A handful of widths is what a line asks over a layout;
+            // beyond that the oldest definite one goes.
+            if self.results.len() >= ATOMIC_RESULTS
+                && let Some(old) = self.results.iter().position(|(s, _)| matches!(s, Sizing::FitInto(_)))
+            {
+                self.results.remove(old);
+            }
+            self.results.push((sizing, result));
+            self.selected = Some(self.results.len() - 1);
+        }
+        let r = self.result().expect("selected above");
+        Size {
+            width: r.width,
+            height: r.height,
+        }
+    }
+}
+
+const ATOMIC_RESULTS: usize = 8;
+
+/// A table cell: laid out with its border box at the width its columns
+/// give it (`Exactly`), its height from its content; no margins.
+impl SelfLayout for CellBox {
+    fn min_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        self.measure(engine);
+        self.min_content
+    }
+
+    fn max_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        self.measure(engine);
+        self.max_content
+    }
+
+    fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, _known_height: Option<f32>, cb_width: Option<f32>) -> Size<f32> {
+        let run = match sizing {
+            Sizing::MinContent => Run::MinContent,
+            Sizing::MaxContent => Run::MaxContent,
+            Sizing::Exactly(w) | Sizing::FitInto(w) | Sizing::Fill(w) => Run::Width {
+                border_box: Some(w),
+                cb: cb_width.unwrap_or(w),
+            },
+        };
+        let r = engine.layout_independent(&mut self.node, Role::Cell, run);
+        let size = Size {
+            width: r.width,
+            height: r.height,
+        };
+        self.last = Some(r);
+        size
+    }
+}
+
+impl CellBox {
+    /// The min- and max-content border-box widths, once.
+    fn measure(&mut self, engine: &mut LayoutEngine) {
+        if self.measured {
+            return;
+        }
+        self.measured = true;
+        let min = self.layout(engine, Sizing::MinContent, None, None).width;
+        let max = self.layout(engine, Sizing::MaxContent, None, None).width;
+        self.min_content = min;
+        self.max_content = max.max(min);
+        self.last = None;
+    }
+}
+
+/// A table caption: a block-level box in the table wrapper, as wide as
+/// the table box (`Fill`), its margins inside that.
+impl SelfLayout for CaptionBox {
+    fn min_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        if self.min_content.is_none() {
+            let r = engine.layout_independent(&mut self.node, Role::Caption, Run::MinContent);
+            self.min_content = Some(r.width);
+        }
+        self.min_content.unwrap_or(0.0)
+    }
+
+    fn max_content(&mut self, engine: &mut LayoutEngine) -> f32 {
+        if self.max_content.is_none() {
+            let r = engine.layout_independent(&mut self.node, Role::Caption, Run::MaxContent);
+            self.max_content = Some(r.width);
+        }
+        self.max_content.unwrap_or(0.0)
+    }
+
+    fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, _known_height: Option<f32>, _cb: Option<f32>) -> Size<f32> {
+        let run = match sizing {
+            Sizing::MinContent => Run::MinContent,
+            Sizing::MaxContent => Run::MaxContent,
+            Sizing::Fill(w) | Sizing::FitInto(w) => Run::Width { border_box: None, cb: w },
+            Sizing::Exactly(w) => Run::Width {
+                border_box: Some(w),
+                cb: w,
+            },
+        };
+        let r = engine.layout_independent(&mut self.node, Role::Caption, run);
+        let size = Size {
+            width: r.width,
+            height: r.height,
+        };
+        self.last = Some(r);
+        size
+    }
+}

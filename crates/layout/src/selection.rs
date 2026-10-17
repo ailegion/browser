@@ -91,9 +91,9 @@ fn texts(tree: &LayoutTree) -> Vec<TextRef<'_>> {
     let mut out = Vec::new();
     visit(&tree.root, &mut out);
     if out.iter().any(|t| t.text.selectable) {
-        let list = tree.paint_list();
+        let spaces = tree.spaces();
         for t in &mut out {
-            if let Some(s) = list.spaces.get(&t.node) {
+            if let Some(s) = spaces.get(&t.node) {
                 t.space = *s;
             }
         }

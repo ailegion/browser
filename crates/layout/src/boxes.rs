@@ -40,7 +40,7 @@ pub(crate) struct TableBox {
     /// The table element's style (the wrapper node's), for the table
     /// box's border, padding, spacing and sizes.
     pub style: Arc<ComputedStyle>,
-    pub captions: Vec<BoxNode>,
+    pub captions: Vec<CaptionBox>,
     pub groups: Vec<RowGroupBox>,
     /// Columns and rows of the grid once the cells are placed.
     pub columns: usize,
@@ -48,15 +48,25 @@ pub(crate) struct TableBox {
     pub placed: bool,
     /// The column constraints from the cells' intrinsic sizes.
     pub constraints: Option<Vec<crate::table::ColumnConstraint>>,
-    /// The layouts computed so far, by target width and height, and the
-    /// one in force (table::prelay, table::relay); the intrinsic widths.
+    /// The layouts computed so far, by width, height and containing
+    /// block, and the one taffy's final size picked (the fragments').
     pub layouts: Vec<crate::table::TableLayout>,
     pub current: usize,
-    pub min_width: f32,
-    pub max_width: f32,
-    /// The width the table's containing block offered last, which the
-    /// atomics inside the cells are measured against.
+    /// The wrapper's min- and max-content widths, for the containing
+    /// block width they were computed with (percentage padding).
+    pub intrinsic: Option<(f32, f32, f32)>,
+    /// The width of the table's containing block, which its percentage
+    /// padding resolves against (zero while it is indefinite).
     pub available_width: f32,
+}
+
+/// A table caption: a block box in the table wrapper above the table box,
+/// with its intrinsic widths once measured and its last layout.
+pub(crate) struct CaptionBox {
+    pub node: BoxNode,
+    pub min_content: Option<f32>,
+    pub max_content: Option<f32>,
+    pub last: Option<crate::engine::SubtreeResult>,
 }
 
 pub(crate) struct RowGroupBox {
@@ -89,6 +99,8 @@ pub(crate) struct CellBox {
     pub min_content: f32,
     pub max_content: f32,
     pub measured: bool,
+    /// The cell's last layout, taken by the table that asked for it.
+    pub last: Option<crate::engine::SubtreeResult>,
 }
 
 /// How a scroll container's box is laid out (roadmap 4a (4s)): which
@@ -281,13 +293,34 @@ pub(crate) struct Atomic {
     /// Byte offset in the text where the box sits.
     pub index: usize,
     pub node: BoxNode,
-    /// Filled by the engine before the containing inline root is measured.
-    pub result: Option<AtomicResult>,
+    /// The box laid out for each question its root's lines asked
+    /// (`formatting::SelfLayout for Atomic`).
+    pub results: Vec<(crate::formatting::Sizing, AtomicResult)>,
+    /// The result the root's layout being built or emitted uses.
+    pub selected: Option<usize>,
     /// The innermost inline element around the box, as for a `TextSpan`.
     pub inline_box: Option<usize>,
     /// Document-order position among the atomics and inline box edges at
     /// the same offset (an atomic sits before the character at its index).
     pub seq: u32,
+}
+
+impl Atomic {
+    pub fn new(index: usize, node: BoxNode, inline_box: Option<usize>, seq: u32) -> Self {
+        Self {
+            index,
+            node,
+            results: Vec::new(),
+            selected: None,
+            inline_box,
+            seq,
+        }
+    }
+
+    /// The layout the root's current lines were built with.
+    pub fn result(&self) -> Option<&AtomicResult> {
+        self.selected.and_then(|i| self.results.get(i)).map(|(_, r)| r)
+    }
 }
 
 /// The edges of an inline box resolved for one layout width: percentages
@@ -416,10 +449,15 @@ pub(crate) struct AtomicResult {
     /// The margin box's size.
     pub width: f32,
     pub height: f32,
+    /// The border box's width.
+    pub border_width: f32,
     pub fragment: Fragment,
     /// The box's baseline from the top of its margin box: an inline-block's
     /// last in-flow line's, else the bottom margin edge (CSS 2.1 §10.8).
     pub baseline: f32,
+    /// The scroll container plans of the boxes in `fragment`, as this
+    /// layout left them, for the scroll information of the final tree.
+    pub plans: Vec<(NodeId, ScrollPlan)>,
 }
 
 /// One bidi paragraph of an inline root: the text between forced breaks
@@ -439,7 +477,7 @@ pub(crate) struct Paragraph {
 /// Cached layout of an inline root for one width constraint: its
 /// paragraphs, stacked.
 pub(crate) struct InlineLayout {
-    pub max_width: Option<f32>,
+    pub key: crate::formatting::LineWidth,
     pub paragraphs: Vec<Paragraph>,
     /// Height of all the lines, including gaps left when a line was
     /// pushed below a float.
@@ -1310,8 +1348,7 @@ impl BoxBuilder<'_> {
             constraints: None,
             layouts: Vec::new(),
             current: 0,
-            min_width: 0.0,
-            max_width: 0.0,
+            intrinsic: None,
             available_width: 0.0,
         };
         let mut headers = Vec::new();
@@ -1335,7 +1372,12 @@ impl BoxBuilder<'_> {
                             if let BoxKind::Table(_) = caption.kind {
                                 caption = BoxNode::new(BoxKind::Block, Some(child), caption.style.clone());
                             }
-                            table.captions.push(caption);
+                            table.captions.push(CaptionBox {
+                                node: caption,
+                                min_content: None,
+                                max_content: None,
+                                last: None,
+                            });
                         }
                         d if d.is_table_row_group() => {
                             anon.flush_all(self, &style, depth, &mut bodies);
@@ -1476,6 +1518,7 @@ impl BoxBuilder<'_> {
             min_content: 0.0,
             max_content: 0.0,
             measured: false,
+            last: None,
         }
     }
 }
@@ -1594,13 +1637,7 @@ impl BoxBuilder<'_> {
     ) {
         let node = self.build_element(id, style, depth + 1);
         let seq = content.seq();
-        content.atomics.push(Atomic {
-            index: content.text.len(),
-            node,
-            result: None,
-            inline_box,
-            seq,
-        });
+        content.atomics.push(Atomic::new(content.text.len(), node, inline_box, seq));
         ws.last_was_space = false;
         ws.at_line_start = false;
     }
@@ -1679,13 +1716,7 @@ impl BoxBuilder<'_> {
                         }
                         let node = self.build_table(None, anon_style(&style, Display::InlineTable), run, depth + 1);
                         let seq = content.seq();
-                        content.atomics.push(Atomic {
-                            index: content.text.len(),
-                            node,
-                            result: None,
-                            inline_box: me,
-                            seq,
-                        });
+                        content.atomics.push(Atomic::new(content.text.len(), node, me, seq));
                         ws.last_was_space = false;
                         ws.at_line_start = false;
                         continue;
@@ -1751,13 +1782,7 @@ impl BoxBuilder<'_> {
                     None,
                     marker_style,
                 );
-                Atomic {
-                    index: 0,
-                    node,
-                    result: None,
-                    inline_box: None,
-                    seq: 0,
-                }
+                Atomic::new(0, node, None, 0)
             })
         };
         if style.list_style_position == ListStylePosition::Inside {
@@ -2038,13 +2063,12 @@ mod tests {
             next_seq: 0,
         };
         let img_index = 9;
-        c.atomics.push(Atomic {
-            index: img_index,
-            node: BoxNode::new(BoxKind::Image { url: None, intrinsic: None }, None, c.container.clone()),
-            result: None,
-            inline_box: None,
-            seq: 0,
-        });
+        c.atomics.push(Atomic::new(
+            img_index,
+            BoxNode::new(BoxKind::Image { url: None, intrinsic: None }, None, c.container.clone()),
+            None,
+            0,
+        ));
         // Only "Hello " and "straße" need synthesis (their runs' font has
         // no `smcp`); "ab" is left to its font. Lowercase letters become
         // capitals in runs 0.7 times the size, each a span of its node;

@@ -14,6 +14,7 @@ mod boxes;
 mod convert;
 mod decor;
 mod engine;
+mod formatting;
 mod lines;
 pub mod selection;
 pub mod stacking;
@@ -30,7 +31,7 @@ use url::Url;
 pub use engine::{LayoutEngine, layout_document};
 pub use parley::FontData;
 pub use selection::{SelectionRanges, TextPos};
-pub use stacking::{ClipNode, Op, PaintList, Placed, Space};
+pub use stacking::{ClipNode, Op, PaintList, PaintOrder, Placed, Space};
 
 /// Axis-aligned rectangle in page pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -890,6 +891,11 @@ pub struct LayoutTree {
     pub sticky: HashMap<NodeId, (f32, f32)>,
     /// Some box is `position: sticky`: scrolls recompute the shifts.
     pub has_sticky: bool,
+    /// The paint order of the fragments as they stand: built once per
+    /// layout and again whenever they move or restyle (a scroll, a
+    /// sticky shift, a style refresh), and read by the painter, hit
+    /// testing and the geometry helpers.
+    pub(crate) paint: stacking::PaintOrder,
 }
 
 impl LayoutTree {
@@ -903,10 +909,22 @@ impl LayoutTree {
     /// follow, sticky boxes are placed again. Returns the offset applied;
     /// `None` when the element is not a scroll container.
     pub fn set_scroll_offset(&mut self, node: NodeId, offset: (f32, f32)) -> Option<(f32, f32)> {
+        let (new, moved) = self.move_scroller(node, offset)?;
+        if moved {
+            self.rebuild_paint_order();
+        }
+        Some(new)
+    }
+
+    /// `set_scroll_offset` without building the paint order again (for a
+    /// caller that applies several and builds once); also says whether
+    /// anything moved.
+    pub(crate) fn move_scroller(&mut self, node: NodeId, offset: (f32, f32)) -> Option<((f32, f32), bool)> {
         let info = self.scrollers.get(&node)?;
         let new = info.clamp(offset);
         let (dx, dy) = (info.offset.0 - new.0, info.offset.1 - new.1);
-        if dx != 0.0 || dy != 0.0 {
+        let moved = dx != 0.0 || dy != 0.0;
+        if moved {
             let scrollers = &mut self.scrollers;
             if let Some(f) = self.root.find_mut(node) {
                 for c in &mut f.children {
@@ -916,9 +934,9 @@ impl LayoutTree {
             if let Some(info) = self.scrollers.get_mut(&node) {
                 info.offset = new;
             }
-            self.apply_sticky();
+            self.place_sticky_boxes();
         }
-        Some(new)
+        Some((new, moved))
     }
 
     /// Tell the tree where the page is scrolled to, so `position: sticky`
@@ -932,6 +950,11 @@ impl LayoutTree {
         }
     }
 
+    /// Build the paint order again from the fragments as they stand.
+    pub(crate) fn rebuild_paint_order(&mut self) {
+        self.paint = stacking::build(self);
+    }
+
     /// Place every `position: sticky` box (CSS Positioned 3 §3.4): each
     /// is shifted so that the border edges named by its non-`auto` insets
     /// stay inside its nearest scroll container's scrollport inset by
@@ -943,6 +966,15 @@ impl LayoutTree {
     /// scrollport. The fragments of an inline element are shifted
     /// together from their union.
     pub fn apply_sticky(&mut self) {
+        if !self.has_sticky {
+            return;
+        }
+        self.place_sticky_boxes();
+        self.rebuild_paint_order();
+    }
+
+    /// `apply_sticky` without building the paint order again.
+    fn place_sticky_boxes(&mut self) {
         if !self.has_sticky {
             return;
         }
@@ -979,13 +1011,20 @@ impl LayoutTree {
     /// box is where it shows for the page scroll last set
     /// (`set_page_scroll`).
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
-        self.paint_list().hit_test(x, y, self.viewport.offset)
+        self.paint.hit_test(x, y, self.viewport.offset)
     }
 
     /// Everything to paint, in paint order (CSS 2.1 Appendix E with the
-    /// stacking contexts, transforms and clips of 4a block 6).
+    /// stacking contexts, transforms and clips of 4a block 6): the kept
+    /// order resolved against the fragments.
     pub fn paint_list(&self) -> PaintList<'_> {
-        stacking::build(self)
+        self.paint.resolve(&self.root)
+    }
+
+    /// The space each node's fragments are drawn in (its first
+    /// fragment's), from the kept paint order.
+    pub fn spaces(&self) -> &HashMap<NodeId, Space> {
+        self.paint.spaces()
     }
 
     /// Where a layout rectangle in `space` shows, in page coordinates:
@@ -1008,8 +1047,7 @@ impl LayoutTree {
             }
         });
         let (n, rect) = found?;
-        let list = self.paint_list();
-        let space = list.spaces.get(&n).copied().unwrap_or(Space::ROOT);
+        let space = self.spaces().get(&n).copied().unwrap_or(Space::ROOT);
         Some(self.shown_rect(&space, &rect))
     }
 
@@ -1027,8 +1065,7 @@ impl LayoutTree {
             }
         });
         let (n, rect) = found?;
-        let list = self.paint_list();
-        let space = list.spaces.get(&n).copied().unwrap_or(Space::ROOT);
+        let space = self.spaces().get(&n).copied().unwrap_or(Space::ROOT);
         let (px, py) = if space.fixed { (x - self.viewport.offset.0, y - self.viewport.offset.1) } else { (x, y) };
         let inv = affine_invert(&space.transform)?;
         let (lx, ly) = affine_apply(&inv, f64::from(px), f64::from(py));

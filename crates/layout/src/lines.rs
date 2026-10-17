@@ -262,7 +262,7 @@ fn place_line(
                     state.present[node] = true;
                     state.parent[node] = node_of_box(atomic.inline_box);
                     let (height, baseline) =
-                        atomic.result.as_ref().map(|r| (r.height, r.baseline)).unwrap_or((0.0, 0.0));
+                        atomic.result().map(|r| (r.height, r.baseline)).unwrap_or((0.0, 0.0));
                     state.above[node] = baseline;
                     state.below[node] = height - baseline;
                 }
