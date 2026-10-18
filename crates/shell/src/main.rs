@@ -65,8 +65,8 @@ fn parse_args() -> Result<Options> {
         smoke: false,
         screenshot: None,
         with_chrome: false,
-        width: 1024.0,
-        height: 768.0,
+        width: 1280.0,
+        height: 720.0,
         url: None,
     };
     let mut args = std::env::args().skip(1);
