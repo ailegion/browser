@@ -179,6 +179,18 @@ pub struct ComputedStyle {
     pub background_origin: Vec<BackgroundBox>,
     pub background_clip: Vec<BackgroundBox>,
     pub background_blend_mode: Vec<BlendMode>,
+    /// The mask layers (CSS Masking 1 §6), as the background ones: one
+    /// entry per layer for each longhand, repeated to the image list's
+    /// length when painted. `mask_clip` `None` is `no-clip`.
+    pub mask_images: Vec<ComputedImage>,
+    pub mask_mode: Vec<crate::mask::MaskMode>,
+    pub mask_repeat: Vec<BackgroundRepeat>,
+    pub mask_position_x: Vec<PositionOffset>,
+    pub mask_position_y: Vec<PositionOffset>,
+    pub mask_size: Vec<ComputedBackgroundSize>,
+    pub mask_origin: Vec<BackgroundBox>,
+    pub mask_clip: Vec<Option<BackgroundBox>>,
+    pub mask_composite: Vec<crate::mask::MaskComposite>,
     pub font_family: Arc<str>,
     pub font_size: f32,
     pub font_weight: u16,
@@ -423,6 +435,15 @@ impl ComputedStyle {
             background_origin: vec![BackgroundBox::PaddingBox],
             background_clip: vec![BackgroundBox::BorderBox],
             background_blend_mode: vec![BlendMode::Normal],
+            mask_images: vec![ComputedImage::None],
+            mask_mode: vec![crate::mask::MaskMode::MatchSource],
+            mask_repeat: vec![BackgroundRepeat::default()],
+            mask_position_x: vec![PositionOffset::default()],
+            mask_position_y: vec![PositionOffset::default()],
+            mask_size: vec![ComputedBackgroundSize::default()],
+            mask_origin: vec![BackgroundBox::BorderBox],
+            mask_clip: vec![Some(BackgroundBox::BorderBox)],
+            mask_composite: vec![crate::mask::MaskComposite::Add],
             font_family: Arc::from(DEFAULT_FONT_FAMILY),
             font_size: DEFAULT_FONT_SIZE,
             font_weight: 400,
@@ -631,6 +652,13 @@ impl ComputedStyle {
             || self.will_change.creates_stacking_context()
             || self.perspective.is_some()
             || self.transform_style == TransformStyle::Preserve3d
+            || self.has_mask()
+    }
+
+    /// A mask image other than `none` (CSS Masking 1 §6.1): the element is
+    /// masked, and is a stacking context.
+    pub fn has_mask(&self) -> bool {
+        self.mask_images.iter().any(|i| !matches!(i, ComputedImage::None))
     }
 
     pub fn has_visible_border(&self) -> bool {
@@ -1032,6 +1060,34 @@ pub fn compute(
     pick!(background_repeat, BackgroundRepeat, BackgroundRepeat, |v| v.clone());
     pick!(background_attachment, BackgroundAttachment, BackgroundAttachment, |v| v.clone());
     pick!(background_origin, BackgroundOrigin, BackgroundOrigin, |v| v.clone());
+    pick!(mask_images, MaskImage, MaskImage, |v| v
+        .iter()
+        .map(|i| crate::image::compute_image(i, &ctx, current))
+        .collect());
+    pick!(mask_mode, MaskMode, MaskMode, |v| v.clone());
+    pick!(mask_repeat, MaskRepeat, MaskRepeat, |v| v.clone());
+    pick!(mask_position_x, MaskPosition, MaskPosition, |v| v.iter().map(|p| position_offset(&p.x, &ctx)).collect());
+    pick!(mask_position_y, MaskPosition, MaskPosition, |v| v.iter().map(|p| position_offset(&p.y, &ctx)).collect());
+    pick!(mask_size, MaskSize, MaskSize, |v| v
+        .iter()
+        .map(|s| match s {
+            BackgroundSize::Cover => ComputedBackgroundSize::Cover,
+            BackgroundSize::Contain => ComputedBackgroundSize::Contain,
+            BackgroundSize::Explicit(x, y) => {
+                let one = |v: &Option<LengthPercentage>| match v {
+                    None => ComputedLpAuto::Auto,
+                    Some(v) => match lp(v) {
+                        ComputedLp::Px(px) => ComputedLpAuto::Px(px),
+                        ComputedLp::Percent(p) => ComputedLpAuto::Percent(p),
+                    },
+                };
+                ComputedBackgroundSize::Explicit(one(x), one(y))
+            }
+        })
+        .collect());
+    pick!(mask_origin, MaskOrigin, MaskOrigin, |v| v.iter().map(|b| b.computed()).collect());
+    pick!(mask_clip, MaskClip, MaskClip, |v| v.iter().map(|c| c.computed()).collect());
+    pick!(mask_composite, MaskComposite, MaskComposite, |v| v.clone());
     pick!(background_clip, BackgroundClip, BackgroundClip, |v| v.clone());
     pick!(font_family, FontFamily, FontFamily, |v| font_family_computed(v));
     pick!(font_style, FontStyle, FontStyle, |v| v.computed());

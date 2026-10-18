@@ -77,6 +77,9 @@ pub enum Op<'a> {
     /// drawn as one and faded together.
     PushGroup { opacity: f32 },
     PopGroup,
+    /// Mask what the open group drew by the mask layers of these
+    /// fragments (the masked element's), just before its `PopGroup`.
+    Mask(Vec<&'a Fragment>),
     /// A box's own background, border and shadows. `sides` says which
     /// edges the fragment carries (an inline element's line fragment
     /// lacks the ones not on that line).
@@ -120,6 +123,7 @@ type FragId = u32;
 enum StoredOp {
     PushGroup { opacity: f32 },
     PopGroup,
+    Mask(Vec<FragId>),
     Decoration { fragment: FragId, sides: [bool; 4] },
     Content(FragId),
     Scrollbars(FragId),
@@ -205,6 +209,7 @@ impl PaintOrder {
                 let op = match &p.op {
                     StoredOp::PushGroup { opacity } => Op::PushGroup { opacity: *opacity },
                     StoredOp::PopGroup => Op::PopGroup,
+                    StoredOp::Mask(ids) => Op::Mask(ids.iter().filter_map(|id| get(*id)).collect()),
                     StoredOp::Decoration { fragment, sides } => Op::Decoration {
                         fragment: get(*fragment)?,
                         sides: *sides,
@@ -461,6 +466,7 @@ fn inline_creates_context(s: &ComputedStyle) -> bool {
     (s.position != Position::Static && s.z_index != ZIndex::Auto)
         || matches!(s.position, Position::Fixed | Position::Sticky)
         || s.opacity < 1.0
+        || s.has_mask()
         || s.isolation == browser_style::Isolation::Isolate
         || s.will_change.creates_stacking_context()
 }
@@ -611,17 +617,26 @@ impl<'a> Builder<'a> {
         let mut stacked = Vec::new();
         let p = self.gather(sub, walk, flex_item, &mut stacked);
         stacked.sort_by_key(|s| (s.z, s.seq));
-        let opacity = match &p.sub {
-            Sub::Box(fr) => fr.f.style.opacity,
-            Sub::Inline(v) => v[0].f.style.opacity,
-        }
-        .clamp(0.0, 1.0);
-        let group = opacity < 1.0;
+        let style = match &p.sub {
+            Sub::Box(fr) => fr.f.style.clone(),
+            Sub::Inline(v) => v[0].f.style.clone(),
+        };
+        let opacity = style.opacity.clamp(0.0, 1.0);
+        // A mask is applied to the context's content as one, as opacity is
+        // (CSS Masking 1 §6): the element's fragments, for its mask layers.
+        let mask: Option<Vec<FragId>> = style.has_mask().then(|| match &p.sub {
+            Sub::Box(fr) => vec![fr.id],
+            Sub::Inline(v) => v.iter().map(|fr| fr.id).collect(),
+        });
+        let group = opacity < 1.0 || mask.is_some();
         if group {
             self.push(StoredOp::PushGroup { opacity }, walk.space);
         }
         let (neg, pos): (Vec<_>, Vec<_>) = stacked.into_iter().partition(|s| s.z < 0);
         self.emit(p, neg, pos);
+        if let Some(fragments) = mask {
+            self.push(StoredOp::Mask(fragments), walk.space);
+        }
         if group {
             self.push(StoredOp::PopGroup, walk.space);
         }

@@ -15,6 +15,7 @@ pub mod custom;
 pub mod fontface;
 pub mod grid;
 pub mod image;
+pub mod mask;
 pub mod media;
 pub mod properties;
 pub mod selector_impl;

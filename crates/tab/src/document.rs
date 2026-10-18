@@ -3372,6 +3372,8 @@ impl TabState {
             let mut names: Vec<String> =
                 style.background_images.iter().filter_map(|i| i.url_to_fetch(scale)).map(|u| u.to_string()).collect();
             names.extend(style.list_style_image.iter().map(|s| s.to_string()));
+            // Mask layers' images.
+            names.extend(style.mask_images.iter().filter_map(|i| i.url_to_fetch(scale)).map(|u| u.to_string()));
             // `cursor: url()` images too.
             names.extend(style.cursor.images.iter().map(|i| i.url.to_string()));
             for u in names {

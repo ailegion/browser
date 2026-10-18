@@ -52,6 +52,14 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::BackgroundRepeat(list) => layers(list.iter().map(|r| r.to_css())),
         P::BackgroundAttachment(list) => layers(list.iter().map(|a| a.keyword().to_owned())),
         P::BackgroundOrigin(list) | P::BackgroundClip(list) => layers(list.iter().map(|b| b.keyword().to_owned())),
+        P::MaskImage(list) => layers(list.iter().map(ImageValue::to_css)),
+        P::MaskMode(list) => layers(list.iter().map(|m| m.keyword().to_owned())),
+        P::MaskRepeat(list) => layers(list.iter().map(|r| r.to_css())),
+        P::MaskPosition(list) => layers(list.iter().map(|p| format!("{} {}", p.x.to_css(true), p.y.to_css(false)))),
+        P::MaskSize(list) => layers(list.iter().map(BackgroundSize::to_css)),
+        P::MaskOrigin(list) => layers(list.iter().map(|b| b.keyword().to_owned())),
+        P::MaskClip(list) => layers(list.iter().map(|c| c.keyword().to_owned())),
+        P::MaskComposite(list) => layers(list.iter().map(|c| c.keyword().to_owned())),
         P::FontFamily(f) => font_family_css(f),
         P::FontSize(s) => font_size_css(s),
         P::FontWeight(w) => match w {
@@ -480,6 +488,49 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             xs.iter().zip(&ys).map(|(x, y)| format!("{x} {y}")).collect::<Vec<_>>().join(", ")
         }
         "-webkit-background-clip" | "-webkit-background-origin" | "-webkit-background-size" => v(0).to_owned(),
+        "-webkit-mask-image" | "-webkit-mask-position" | "-webkit-mask-size" | "-webkit-mask-repeat" | "-webkit-mask-origin"
+        | "-webkit-mask-clip" | "-webkit-mask-composite" => v(0).to_owned(),
+        "mask" | "-webkit-mask" => {
+            // One layer per entry of the lists, which must agree in
+            // length; the initial parts left out.
+            let lists: Vec<Vec<&str>> = (0..8).map(|i| split_layers(v(i))).collect();
+            let count = lists[0].len();
+            if lists.iter().any(|l| l.len() != count) || count == 0 {
+                return None;
+            }
+            let mut out: Vec<String> = Vec::with_capacity(count);
+            for layer in 0..count {
+                let [image, position, size, repeat, origin, clip, composite, mode] =
+                    [0, 1, 2, 3, 4, 5, 6, 7].map(|i| lists[i][layer]);
+                let mut parts: Vec<String> = Vec::new();
+                if image != "none" {
+                    parts.push(image.to_owned());
+                }
+                let size_set = size != "auto";
+                if position != "0% 0%" || size_set {
+                    parts.push(if size_set { format!("{position} / {size}") } else { position.to_owned() });
+                }
+                if repeat != "repeat" {
+                    parts.push(repeat.to_owned());
+                }
+                if origin == "border-box" && clip == "no-clip" {
+                    parts.push(clip.to_owned());
+                } else if origin != "border-box" || clip != "border-box" {
+                    parts.push(origin.to_owned());
+                    if clip != origin {
+                        parts.push(clip.to_owned());
+                    }
+                }
+                if composite != "add" {
+                    parts.push(composite.to_owned());
+                }
+                if mode != "match-source" {
+                    parts.push(mode.to_owned());
+                }
+                out.push(if parts.is_empty() { "none".to_owned() } else { parts.join(" ") });
+            }
+            out.join(", ")
+        }
         "background" => {
             // One layer per entry of the lists, which must agree in
             // length; the color goes with the last layer.
@@ -1050,6 +1101,31 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::BackgroundAttachment => layers(style.background_attachment.iter().map(|a| a.keyword().to_owned())),
         Id::BackgroundOrigin => layers(style.background_origin.iter().map(|b| b.keyword().to_owned())),
         Id::BackgroundClip => layers(style.background_clip.iter().map(|b| b.keyword().to_owned())),
+        Id::MaskImage => layers(style.mask_images.iter().map(ComputedImage::to_css)),
+        Id::MaskMode => layers(style.mask_mode.iter().map(|m| m.keyword().to_owned())),
+        Id::MaskRepeat => layers(style.mask_repeat.iter().map(|r| r.to_css())),
+        Id::MaskPosition => layers(
+            style
+                .mask_position_x
+                .iter()
+                .zip(&style.mask_position_y)
+                .map(|(x, y)| format!("{} {}", position_offset_css(*x), position_offset_css(*y))),
+        ),
+        Id::MaskSize => layers(style.mask_size.iter().map(|s| match *s {
+            ComputedBackgroundSize::Cover => "cover".to_owned(),
+            ComputedBackgroundSize::Contain => "contain".to_owned(),
+            ComputedBackgroundSize::Explicit(x, y) => {
+                let one = |v: ComputedLpAuto| match v {
+                    ComputedLpAuto::Auto => "auto".to_owned(),
+                    ComputedLpAuto::Px(p) => px(p),
+                    ComputedLpAuto::Percent(p) => format!("{}%", css_number(p)),
+                };
+                if matches!(y, ComputedLpAuto::Auto) { one(x) } else { format!("{} {}", one(x), one(y)) }
+            }
+        })),
+        Id::MaskOrigin => layers(style.mask_origin.iter().map(|b| b.keyword().to_owned())),
+        Id::MaskClip => layers(style.mask_clip.iter().map(|c| c.map_or("no-clip", |b| b.keyword()).to_owned())),
+        Id::MaskComposite => layers(style.mask_composite.iter().map(|c| c.keyword().to_owned())),
         Id::FontFamily => computed_font_family_css(&style.font_family),
         Id::FontSize => px(style.font_size),
         Id::FontWeight => style.font_weight.to_string(),
@@ -1280,6 +1356,33 @@ mod tests {
         let s = styles.get(p).expect("style");
         assert_eq!(resolved_value(s, PropertyId::FontOpticalSizing, None), "none");
         assert_eq!(resolved_value(s, PropertyId::FontVariationSettings, None), "\"slnt\" -10");
+    }
+
+    /// "Working sites first" line 6c: the `mask-*` longhands, the `mask`
+    /// shorthand and the `-webkit-` names parse and serialize; the
+    /// shorthand collapses back leaving the initial parts out.
+    #[test]
+    fn mask_properties_parse_and_serialize() {
+        let cases = [
+            ("mask-image: url(a.svg), none", "mask-image: url(\"a.svg\"), none;"),
+            ("mask-mode: luminance, alpha", "mask-mode: luminance, alpha;"),
+            ("mask-position: center top", "mask-position: center top;"),
+            ("mask-size: contain", "mask-size: contain;"),
+            ("mask-repeat: no-repeat", "mask-repeat: no-repeat;"),
+            ("mask-origin: fill-box", "mask-origin: fill-box;"),
+            ("mask-clip: no-clip", "mask-clip: no-clip;"),
+            ("mask-composite: exclude", "mask-composite: exclude;"),
+            ("mask-composite: xor", ""),
+            ("-webkit-mask-composite: xor", "mask-composite: exclude;"),
+            ("-webkit-mask-image: url(b.png)", "mask-image: url(\"b.png\");"),
+            ("mask: url(a.svg) center / contain no-repeat", "mask: url(\"a.svg\") center center / contain no-repeat;"),
+            ("mask: url(a.svg) content-box padding-box subtract luminance", "mask: url(\"a.svg\") content-box padding-box subtract luminance;"),
+            ("mask: none", "mask: none;"),
+            ("mask: url(a.svg) no-clip", "mask: url(\"a.svg\") no-clip;"),
+        ];
+        for (css, want) in cases {
+            assert_eq!(block(css), want, "{css}");
+        }
     }
 
     /// "Working sites first" line 6a: `grid-template-areas` parses

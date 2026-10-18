@@ -390,6 +390,11 @@ impl<'a> Painter<'a> {
                 self.pop_clips_to(0);
                 self.scene.pop_layer();
             }
+            Op::Mask(fragments) => {
+                self.pop_clips_to(0);
+                self.enter_space(&p.space);
+                self.mask(fragments);
+            }
             Op::Decoration { fragment, sides } => {
                 self.enter_space(&p.space);
                 if self.on_screen(&fragment.rect) {
@@ -452,6 +457,7 @@ impl<'a> Painter<'a> {
                     depth -= 1;
                     continue;
                 }
+                Op::Mask(_) => continue,
                 Op::Decoration { fragment, .. } => {
                     let spread = fragment
                         .style
@@ -798,6 +804,129 @@ impl<'a> Painter<'a> {
             self.scene.pop_layer();
         }
         if isolated {
+            self.scene.pop_layer();
+        }
+    }
+
+    /// Mask what the open group drew (CSS Masking 1 §6): the masked
+    /// element's mask layers, each fragment's, make one mask the group is
+    /// multiplied by (`DestIn`); where no layer paints, the group is gone.
+    fn mask(&mut self, fragments: &[&Fragment]) {
+        let device = KRect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6);
+        let dest_in = vello::peniko::BlendMode::new(Mix::Normal, vello::peniko::Compose::DestIn);
+        self.scene.push_layer(Fill::NonZero, dest_in, 1.0, Affine::IDENTITY, &device);
+        for f in fragments {
+            // Each fragment's layers combine among themselves; fragments
+            // add up.
+            self.scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, Affine::IDENTITY, &device);
+            self.mask_layers(f, &device);
+            self.scene.pop_layer();
+        }
+        self.scene.pop_layer();
+    }
+
+    /// One fragment's mask layers, from the last to the first, each
+    /// composited with those below it by its `mask-composite` (`add` source
+    /// over, `subtract` source out, `intersect` source in, `exclude` xor),
+    /// tiled as a background layer is (`mask-origin`, `-size`,
+    /// `-position`, `-repeat`) and clipped by `mask-clip` (`no-clip`: not
+    /// at all). A layer's mask is the image's alpha, or its luminance
+    /// times alpha for `mask-mode: luminance`; an image not (yet) available
+    /// is transparent black.
+    fn mask_layers(&mut self, f: &Fragment, device: &KRect) {
+        use browser_style::mask::{MaskComposite, MaskMode};
+        use vello::peniko::Compose;
+        let style = &f.style;
+        let geometry = BoxGeometry::new(&f.rect, style, [true; 4]);
+        let padding = &f.padding;
+        let border_box = krect(&f.rect);
+        let bw = &style.border_width;
+        let padding_box = inset_rect(border_box, [bw.top as f64, bw.right as f64, bw.bottom as f64, bw.left as f64]);
+        let content_box = inset_rect(padding_box, [padding.top as f64, padding.right as f64, padding.bottom as f64, padding.left as f64]);
+        let content_inset = [
+            geometry.width[0] + padding.top as f64,
+            geometry.width[1] + padding.right as f64,
+            geometry.width[2] + padding.bottom as f64,
+            geometry.width[3] + padding.left as f64,
+        ];
+        let n = style.mask_images.len();
+        let cycle = |i: usize, len: usize| i % len.max(1);
+        for i in (0..n).rev() {
+            let compose = if i == n - 1 {
+                Compose::SrcOver
+            } else {
+                match style.mask_composite[cycle(i, style.mask_composite.len())] {
+                    MaskComposite::Add => Compose::SrcOver,
+                    MaskComposite::Subtract => Compose::SrcOut,
+                    MaskComposite::Intersect => Compose::SrcIn,
+                    MaskComposite::Exclude => Compose::Xor,
+                }
+            };
+            self.scene.push_layer(Fill::NonZero, vello::peniko::BlendMode::new(Mix::Normal, compose), 1.0, Affine::IDENTITY, device);
+            let luminance = style.mask_mode[cycle(i, style.mask_mode.len())] == MaskMode::Luminance;
+            let source = match style.mask_images[i].chosen(self.scale) {
+                ComputedImage::Url(u) => Url::parse(u).ok().and_then(|u| self.images.get(&u)).map(|img| {
+                    LayerSource::Raster(if luminance { luminance_mask(img) } else { img.clone() })
+                }),
+                ComputedImage::Gradient(g) => Some(LayerSource::Gradient(if luminance { Arc::new(luminance_gradient(g)) } else { g.clone() })),
+                _ => None,
+            };
+            let clip = style.mask_clip[cycle(i, style.mask_clip.len())].map(|b| match b {
+                BackgroundBox::PaddingBox => geometry.inset_path(geometry.width),
+                BackgroundBox::ContentBox => geometry.inset_path(content_inset),
+                _ => geometry.outer_path(),
+            });
+            if let Some(source) = source {
+                let area = match style.mask_origin[cycle(i, style.mask_origin.len())] {
+                    BackgroundBox::PaddingBox => padding_box,
+                    BackgroundBox::ContentBox => content_box,
+                    _ => border_box,
+                };
+                let repeat = style.mask_repeat[cycle(i, style.mask_repeat.len())];
+                let size = style.mask_size[cycle(i, style.mask_size.len())];
+                let x = style.mask_position_x[cycle(i, style.mask_position_x.len())];
+                let y = style.mask_position_y[cycle(i, style.mask_position_y.len())];
+                let intrinsic = match &source {
+                    LayerSource::Raster(img) => Some((img.width as f64, img.height as f64)),
+                    LayerSource::Gradient(_) => None,
+                };
+                if let Some((tw, th)) = tile_size(size, intrinsic, (area.width(), area.height()), repeat) {
+                    let region = clip.as_ref().map_or_else(|| krect(&self.local_visible), |c| c.bounding_box().intersect(krect(&self.local_visible)));
+                    if !region.is_zero_area() {
+                        if let Some(c) = &clip {
+                            self.scene.push_clip_layer(Fill::NonZero, self.transform, c);
+                        }
+                        let xs = tile_starts(repeat.x, area.x0, area.width(), position(x, area.width(), tw), tw, (region.x0, region.x1));
+                        let ys = tile_starts(repeat.y, area.y0, area.height(), position(y, area.height(), th), th, (region.y0, region.y1));
+                        let paint = match &source {
+                            LayerSource::Gradient(g) => gradient_paint(g, tw, th),
+                            LayerSource::Raster(_) => None,
+                        };
+                        for &ty in &ys {
+                            for &tx in &xs {
+                                match &source {
+                                    LayerSource::Raster(img) => {
+                                        let t = self.transform
+                                            * Affine::translate((tx, ty))
+                                            * Affine::scale_non_uniform(tw / img.width as f64, th / img.height as f64);
+                                        self.scene.draw_image(&ImageBrush::new(img.clone()), t);
+                                    }
+                                    LayerSource::Gradient(_) => {
+                                        if let Some((brush, brush_transform)) = &paint {
+                                            let tile = KRect::new(tx, ty, tx + tw, ty + th);
+                                            let bt = Affine::translate((tx, ty)) * *brush_transform;
+                                            self.scene.fill(Fill::NonZero, self.transform, brush, Some(bt), &tile);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if clip.is_some() {
+                            self.scene.pop_layer();
+                        }
+                    }
+                }
+            }
             self.scene.pop_layer();
         }
     }
@@ -1421,6 +1550,49 @@ struct Areas {
 enum LayerSource {
     Raster(ImageData),
     Gradient(Arc<ComputedGradient>),
+}
+
+/// The luminance of a colour as a mask value (CSS Masking 1 §7.2: the
+/// coefficients 0.2125, 0.7154, 0.0721), times its alpha.
+fn luminance(r: f32, g: f32, b: f32, a: f32) -> f32 {
+    (0.2125 * r + 0.7154 * g + 0.0721 * b) * a
+}
+
+/// An image as a luminance mask: each pixel black with its luminance
+/// times alpha as alpha.
+fn luminance_mask(img: &ImageData) -> ImageData {
+    let data = img.data.data();
+    let mut out = Vec::with_capacity(data.len());
+    for px in data.chunks_exact(4) {
+        let (r, g, b, a) = (px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0, px[3] as f32 / 255.0);
+        let a = match img.alpha_type {
+            // Premultiplied colour: undo it first.
+            ImageAlphaType::AlphaPremultiplied if a > 0.0 => luminance(r / a, g / a, b / a, a),
+            ImageAlphaType::AlphaPremultiplied => 0.0,
+            _ => luminance(r, g, b, a),
+        };
+        out.extend_from_slice(&[0, 0, 0, (a.clamp(0.0, 1.0) * 255.0).round() as u8]);
+    }
+    ImageData {
+        data: Blob::new(Arc::new(out)),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width: img.width,
+        height: img.height,
+    }
+}
+
+/// A gradient as a luminance mask: each stop black with its luminance
+/// times alpha as alpha.
+fn luminance_gradient(g: &ComputedGradient) -> ComputedGradient {
+    let mut out = g.clone();
+    for item in &mut out.items {
+        if let ComputedGradientItem::Stop { color, .. } = item {
+            let l = luminance(color.r, color.g, color.b, color.a);
+            *color = Rgba { r: 0.0, g: 0.0, b: 0.0, a: l };
+        }
+    }
+    out
 }
 
 fn inset_rect(r: KRect, inset: [f64; 4]) -> KRect {
@@ -3190,6 +3362,50 @@ mod tests {
     /// Background layers: position, size, repeat modes, origin and clip
     /// (CSS Backgrounds 3 §3), `fixed` against the viewport, the body's
     /// layers on the canvas, and `image-set()` by the device scale.
+    #[test]
+    fn masks_hide_what_their_layers_do_not_cover() {
+        let images = two_by_two();
+        let render = |html: &str| render_with(html, &images, 0.0, 1.0).1;
+        let red = "width:100px;height:60px;background:red";
+        // An image layer: the element (and its child) shows only under the
+        // one 20px tile.
+        let Some(p) = render(&format!(
+            "<body style='margin:0'><div style='{red};mask:url(http://x/i.png) no-repeat 10px 20px / 20px 20px'><div style='height:30px;background:blue'></div></div></body>"
+        )) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        assert!(is_blue(px(&p, 15.0, 25.0)) && is_red(px(&p, 15.0, 35.0)), "under the tile: the child, then the element");
+        assert!(is_white(px(&p, 5.0, 5.0)) && is_white(px(&p, 50.0, 50.0)), "elsewhere: masked out");
+        // A gradient, and the `-webkit-` name.
+        let p = render(&format!(
+            "<body style='margin:0'><div style='{red};-webkit-mask-image:linear-gradient(to right, black 50%, transparent 50%)'></div></body>"
+        ))
+        .expect("gpu");
+        assert!(is_red(px(&p, 20.0, 30.0)) && is_white(px(&p, 80.0, 30.0)));
+        // `mask-clip: content-box`: the padding is masked out.
+        let p = render(
+            "<body style='margin:0'><div style='width:60px;height:40px;padding:20px;background:red;mask-image:linear-gradient(black, black);mask-clip:content-box'></div></body>",
+        )
+        .expect("gpu");
+        assert!(is_white(px(&p, 10.0, 10.0)) && is_red(px(&p, 50.0, 40.0)));
+        // Two layers intersected: the top-left quarter only.
+        let p = render(&format!(
+            "<body style='margin:0'><div style='{red};mask-image:linear-gradient(to right, black 50%, transparent 50%), linear-gradient(black 50%, transparent 50%);mask-composite:intersect'></div></body>"
+        ))
+        .expect("gpu");
+        assert!(is_red(px(&p, 20.0, 10.0)) && is_white(px(&p, 80.0, 10.0)) && is_white(px(&p, 20.0, 50.0)));
+        // `luminance`: white keeps, black removes.
+        let p = render(&format!(
+            "<body style='margin:0'><div style='{red};mask:linear-gradient(to right, white 50%, black 50%) luminance'></div></body>"
+        ))
+        .expect("gpu");
+        assert!(is_red(px(&p, 20.0, 30.0)) && is_white(px(&p, 80.0, 30.0)));
+        // An image that is not there: transparent black, the element gone.
+        let p = render(&format!("<body style='margin:0'><div style='{red};mask-image:url(http://x/missing.png)'></div></body>")).expect("gpu");
+        assert!(is_white(px(&p, 50.0, 30.0)));
+    }
+
     #[test]
     fn background_layers_are_placed_sized_repeated_and_clipped() {
         let images = two_by_two();

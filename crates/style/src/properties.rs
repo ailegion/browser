@@ -2498,6 +2498,14 @@ longhands! {
     BackgroundOrigin: "background-origin" => Vec<BackgroundBox>, false;
     BackgroundClip: "background-clip" => Vec<BackgroundBox>, false;
     BackgroundBlendMode: "background-blend-mode" => Vec<BlendMode>, false;
+    MaskImage: "mask-image" => Vec<ImageValue>, false;
+    MaskMode: "mask-mode" => Vec<crate::mask::MaskMode>, false;
+    MaskRepeat: "mask-repeat" => Vec<BackgroundRepeat>, false;
+    MaskPosition: "mask-position" => Vec<BackgroundPosition>, false;
+    MaskSize: "mask-size" => Vec<BackgroundSize>, false;
+    MaskOrigin: "mask-origin" => Vec<crate::mask::GeometryBox>, false;
+    MaskClip: "mask-clip" => Vec<crate::mask::MaskClip>, false;
+    MaskComposite: "mask-composite" => Vec<crate::mask::MaskComposite>, false;
     FontFamily: "font-family" => Vec<FamilyName>, true;
     FontSize: "font-size" => FontSize, true;
     FontWeight: "font-weight" => FontWeight, true;
@@ -2702,8 +2710,9 @@ pub fn is_shorthand(name: &str) -> bool {
 /// `word-wrap`, `-webkit-box-decoration-break` and the three
 /// `-webkit-background-*` names are the legacy aliases of `gap`,
 /// `overflow-wrap`, `box-decoration-break`, `background-clip`,
-/// `background-origin` and `background-size`, never written).
-pub const SHORTHANDS: [&str; 42] = [
+/// `background-origin` and `background-size`, never written; so are the
+/// `-webkit-mask` names, the aliases of `mask` and its longhands).
+pub const SHORTHANDS: [&str; 51] = [
     "grid",
     "grid-template",
     "grid-area",
@@ -2731,6 +2740,7 @@ pub const SHORTHANDS: [&str; 42] = [
     "overscroll-behavior",
     "background",
     "background-position",
+    "mask",
     "font",
     "overflow",
     "flex-flow",
@@ -2746,6 +2756,14 @@ pub const SHORTHANDS: [&str; 42] = [
     "-webkit-background-clip",
     "-webkit-background-origin",
     "-webkit-background-size",
+    "-webkit-mask",
+    "-webkit-mask-image",
+    "-webkit-mask-position",
+    "-webkit-mask-size",
+    "-webkit-mask-repeat",
+    "-webkit-mask-origin",
+    "-webkit-mask-clip",
+    "-webkit-mask-composite",
 ];
 
 /// One declaration in a block, with its `!important` flag.
@@ -2858,6 +2876,14 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
         PropertyId::BackgroundPositionY => P::BackgroundPositionY(input.parse_comma_separated(|i| parse_position_axis(i, false))?),
         PropertyId::BackgroundBlendMode => P::BackgroundBlendMode(input.parse_comma_separated(parse_blend_mode)?),
         PropertyId::BackgroundSize => P::BackgroundSize(input.parse_comma_separated(parse_background_size)?),
+        PropertyId::MaskImage => P::MaskImage(input.parse_comma_separated(crate::image::parse_image)?),
+        PropertyId::MaskMode => P::MaskMode(input.parse_comma_separated(crate::mask::parse_mode)?),
+        PropertyId::MaskRepeat => P::MaskRepeat(input.parse_comma_separated(parse_background_repeat)?),
+        PropertyId::MaskPosition => P::MaskPosition(input.parse_comma_separated(parse_background_position)?),
+        PropertyId::MaskSize => P::MaskSize(input.parse_comma_separated(parse_background_size)?),
+        PropertyId::MaskOrigin => P::MaskOrigin(input.parse_comma_separated(crate::mask::parse_geometry_box)?),
+        PropertyId::MaskClip => P::MaskClip(input.parse_comma_separated(crate::mask::parse_clip)?),
+        PropertyId::MaskComposite => P::MaskComposite(input.parse_comma_separated(crate::mask::parse_composite)?),
         PropertyId::BackgroundRepeat => P::BackgroundRepeat(input.parse_comma_separated(parse_background_repeat)?),
         PropertyId::BackgroundAttachment => {
             P::BackgroundAttachment(input.parse_comma_separated(parse_background_attachment)?)
@@ -3664,7 +3690,7 @@ fn parse_position_n<'i>(input: &mut Parser<'i, '_>, max: usize) -> Result<Backgr
     })
 }
 
-fn parse_background_size<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundSize, ParseErr<'i>> {
+pub(crate) fn parse_background_size<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundSize, ParseErr<'i>> {
     if let Ok(kw) = input.try_parse(|i| {
         keyword(i, |k| Some(match_ignore_ascii_case! { k,
             "cover" => BackgroundSize::Cover, "contain" => BackgroundSize::Contain, _ => return None }))
@@ -3682,7 +3708,7 @@ fn parse_background_size<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundSiz
     Ok(BackgroundSize::Explicit(x, y))
 }
 
-fn parse_background_repeat<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundRepeat, ParseErr<'i>> {
+pub(crate) fn parse_background_repeat<'i>(input: &mut Parser<'i, '_>) -> Result<BackgroundRepeat, ParseErr<'i>> {
     if let Ok(r) = input.try_parse(|i| {
         keyword(i, |k| Some(match_ignore_ascii_case! { k,
             "repeat-x" => BackgroundRepeat { x: RepeatStyle::Repeat, y: RepeatStyle::NoRepeat },
@@ -4037,6 +4063,14 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "-webkit-background-clip" => &[BackgroundClip],
         "-webkit-background-origin" => &[BackgroundOrigin],
         "-webkit-background-size" => &[BackgroundSize],
+        "mask" | "-webkit-mask" => &[MaskImage, MaskPosition, MaskSize, MaskRepeat, MaskOrigin, MaskClip, MaskComposite, MaskMode],
+        "-webkit-mask-image" => &[MaskImage],
+        "-webkit-mask-position" => &[MaskPosition],
+        "-webkit-mask-size" => &[MaskSize],
+        "-webkit-mask-repeat" => &[MaskRepeat],
+        "-webkit-mask-origin" => &[MaskOrigin],
+        "-webkit-mask-clip" => &[MaskClip],
+        "-webkit-mask-composite" => &[MaskComposite],
         "font" => &[FontStyle, FontVariant, FontWeight, FontStretch, FontSize, LineHeight, FontFamily, FontOpticalSizing, FontVariationSettings],
         "overflow" => &[OverflowX, OverflowY],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
@@ -4238,6 +4272,15 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
                 ]
             }
         },
+        "mask" => crate::mask::parse_shorthand(input, false)?,
+        "-webkit-mask" => crate::mask::parse_shorthand(input, true)?,
+        "-webkit-mask-image" => vec![P::MaskImage(input.parse_comma_separated(crate::image::parse_image)?)],
+        "-webkit-mask-position" => vec![P::MaskPosition(input.parse_comma_separated(parse_background_position)?)],
+        "-webkit-mask-size" => vec![P::MaskSize(input.parse_comma_separated(parse_background_size)?)],
+        "-webkit-mask-repeat" => vec![P::MaskRepeat(input.parse_comma_separated(parse_background_repeat)?)],
+        "-webkit-mask-origin" => vec![P::MaskOrigin(input.parse_comma_separated(crate::mask::parse_geometry_box)?)],
+        "-webkit-mask-clip" => vec![P::MaskClip(input.parse_comma_separated(crate::mask::parse_clip)?)],
+        "-webkit-mask-composite" => vec![P::MaskComposite(input.parse_comma_separated(crate::mask::parse_webkit_composite)?)],
         "-webkit-user-select" => vec![P::UserSelect(parse_user_select(input)?)],
         "-webkit-transform" => vec![P::Transform(parse_transform_list(input)?)],
         "-webkit-transform-origin" => vec![P::TransformOrigin(parse_transform_origin(input)?)],

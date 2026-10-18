@@ -288,10 +288,29 @@ remaining lists as they stand.
       2026-10-18, for Wikipedia's logo and icons): SVG in `<img>`, CSS
       images (`background-image`, `list-style-image`, `content`) and
       `data:` URLs, via `usvg` to vello.
-- [ ] 6c. CSS `mask` (moved up from Phase 5, Style, by the owner,
+- [x] 6c. CSS `mask` (moved up from Phase 5, Style, by the owner,
       2026-10-18, for Wikipedia's icons): `mask-image` (and `-webkit-mask-
       image`) with its `mask-*` longhands and the `mask` shorthand, images
       including SVG.
+      Done 2026-10-18 (SVG mask images draw once 6b decodes SVG; until
+      then an SVG mask is an image not available: transparent). Style
+      (`mask.rs`): `mask-image`, `-mode`, `-repeat`, `-position`, `-size`,
+      `-origin` and `-clip` (`<geometry-box>`, the SVG boxes `border-box`
+      on a CSS box; `no-clip`), `-composite`; the `mask` shorthand (one
+      box sets origin and clip, a second the clip); the `-webkit-mask`
+      names as aliases (`-webkit-mask-composite`'s Porter-Duff names
+      mapped); serialization, the shorthand collapsing back. A mask makes
+      a stacking context. Paint: the masked element's group is closed
+      through a `DestIn` layer of its mask layers (each fragment's),
+      combined by `mask-composite` (add/subtract/intersect/exclude as
+      source over/out/in/xor), tiled as background layers, clipped by
+      `mask-clip`; `luminance` from the CSS Masking coefficients; an image
+      not available transparent. The tab fetches mask images. Tests: style
+      (longhands, shorthand, aliases), paint (an image tile with a child,
+      a gradient through the `-webkit-` name, `mask-clip`, intersect,
+      luminance, a missing image). Timing: tables 50.4–51.9 ms (49.3–50.0
+      before), blocks 14.7–15.4 ms (14.4–15.1), Hacker News relayout
+      39.4–40.2 ms and restyle 2.5–2.6 ms (2.1): slower.
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,
