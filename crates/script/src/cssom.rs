@@ -282,11 +282,12 @@ fn write_inline(target: &JsObject, dom: &mut Dom, decls: Vec<Declaration>) {
     let text = serialize_block(&decls);
     let connected = dom.doc.is_connected(id);
     let Some(e) = dom.doc.get_mut(id).as_element_mut() else { return };
+    let old = e.attr("style").map(str::to_owned);
     e.set_attr("style", &text);
     *data.cache.borrow_mut() = Some((text, decls));
     dom.generation += 1;
     if connected {
-        dom.mutated = true;
+        dom.note_attr(id, "style", old);
     }
 }
 

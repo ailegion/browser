@@ -40,7 +40,8 @@ mod view;
 
 pub use events::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
 pub use fonts::{FaceRef, FontLoadStatus, FontRequest, ScriptFace};
-pub use view::{ImageSizeMap, View};
+pub use dom::DomChange;
+pub use view::{FeatureDelta, ImageSizeMap, View, feature_changes};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -929,6 +930,13 @@ impl ScriptHost {
     /// again, and drops node references the change may have invalidated.
     pub fn take_dom_mutated(&mut self) -> bool {
         self.dom.borrow_mut().take_mutated()
+    }
+
+    /// What the scripts changed since the last call, in order (attribute
+    /// changes with their old values, other tree changes), for a restyle
+    /// of only what they reach.
+    pub fn take_dom_changes(&mut self) -> Vec<DomChange> {
+        self.dom.borrow_mut().take_changes()
     }
 
     /// Dispatch a trusted event of `kind` at `target` as a task (a

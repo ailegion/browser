@@ -30,18 +30,86 @@ use browser_layout::{
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
-    ElementStates, InteractionDeps, Origin, Position, Rule, Sides, StyleMap, Stylesheet, Stylist, Viewport,
-    compute_styles_with,
+    ElementStates, FeatureChange, InteractionDeps, Origin, Position, Rule, Sides, StyleMap, Stylesheet, Stylist, Viewport,
+    compute_styles_with, restyle_mutations,
 };
 use html5ever::{local_name, ns};
 use url::Url;
 
-use crate::dom::{Dom, DomNode, dom, illegal_invocation, wrap};
+use crate::dom::{Dom, DomChange, DomNode, dom, illegal_invocation, wrap};
 use crate::events::{EventTargetRef, PlainTarget, UiClass, UiEventInit, dispatch, new_event};
 use crate::{getter, host_state, js_str, setter};
 
 /// Nested `@import` depth followed, as the tab's loader.
 const MAX_IMPORT_DEPTH: u8 = 6;
+
+/// What a run of DOM attribute changes means for styles: the features
+/// each element changed, for `restyle_mutations`, and whether an attribute
+/// layout reads itself changed (an image's `src`, a cell's `colspan`, a
+/// control's `value`: anything but `class`, `id`, `style`, `title`,
+/// `role`, `tabindex`, `data-*` and `aria-*`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeatureDelta {
+    pub changes: Vec<FeatureChange>,
+    pub layout: bool,
+}
+
+/// The changes after generation `since` (all of them when `None`) as a
+/// feature delta; `None` when one cannot be targeted and the whole
+/// document must be restyled: a tree change, or an attribute of a
+/// `<style>`, `<link>` or `<base>` (the sheets or the base URL), or of a
+/// `<table>` whose attributes style its cells (`border`, `cellpadding`,
+/// `rules`, `frame`).
+pub fn feature_changes(doc: &Document, changes: &[DomChange], since: Option<u64>) -> Option<FeatureDelta> {
+    use browser_style::Feature;
+    let mut delta = FeatureDelta::default();
+    for change in changes {
+        let (element, name, old) = match change {
+            DomChange::Tree { generation } if since.is_none_or(|s| *generation > s) => return None,
+            DomChange::Tree { .. } => continue,
+            DomChange::Attr { generation, .. } if since.is_some_and(|s| *generation <= s) => continue,
+            DomChange::Attr { element, name, old, .. } => (*element, name.as_str(), old.as_deref()),
+        };
+        let Some(e) = doc.element(element) else { continue };
+        if e.name.ns == ns!(html) {
+            let tag = &e.name.local;
+            if *tag == local_name!("style") || *tag == local_name!("link") || *tag == local_name!("base") {
+                return None;
+            }
+            if *tag == local_name!("table") && matches!(name, "border" | "cellpadding" | "rules" | "frame") {
+                return None;
+            }
+        }
+        let new = e.attr(name);
+        if new == old {
+            continue;
+        }
+        let mut features = vec![Feature::Attr(name.to_owned())];
+        match name {
+            "class" => {
+                let before: Vec<&str> = old.unwrap_or("").split_ascii_whitespace().collect();
+                let after: Vec<&str> = new.unwrap_or("").split_ascii_whitespace().collect();
+                for c in before.iter().filter(|c| !after.contains(c)).chain(after.iter().filter(|c| !before.contains(c))) {
+                    features.push(Feature::Class((*c).to_owned()));
+                }
+            }
+            "id" => {
+                features.extend(old.map(|v| Feature::Id(v.to_owned())));
+                features.extend(new.map(|v| Feature::Id(v.to_owned())));
+            }
+            _ => {}
+        }
+        let style_only = matches!(name, "class" | "id" | "style" | "title" | "role" | "tabindex")
+            || name.starts_with("data-")
+            || name.starts_with("aria-");
+        delta.layout |= !style_only;
+        match delta.changes.iter_mut().find(|c| c.element == element) {
+            Some(c) => c.features.extend(features),
+            None => delta.changes.push(FeatureChange { element, features }),
+        }
+    }
+    Some(delta)
+}
 
 /// Intrinsic image sizes by URL, as the tab knows them.
 #[derive(Debug, Clone, Default)]
@@ -132,7 +200,7 @@ impl View {
     /// Make `styles` and `layout` current for the lent document, if
     /// they are not: the cascade with the document's sheets as they are
     /// now, then layout.
-    pub fn ensure_layout(&mut self, doc: &Document, states: &ElementStates, generation: u64) {
+    pub fn ensure_layout(&mut self, doc: &Document, states: &ElementStates, generation: u64, changes: &[DomChange]) {
         if self.clean_generation == Some(generation) && self.layout.is_some() {
             return;
         }
@@ -146,8 +214,29 @@ impl View {
             scale_factor: self.scale,
             prefers_dark: false,
         };
-        self.styles = compute_styles_with(doc, &stylist, &vp, states);
-        self.deps = stylist.interaction_deps();
+        // Styles current before the changes, which are all attribute
+        // changes: restyle what they reach, and lay out again only when
+        // that moved something (or an attribute layout reads changed).
+        let delta = match (self.clean_generation, &self.layout) {
+            (Some(clean), Some(_)) => feature_changes(doc, changes, Some(clean)),
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            let r = restyle_mutations(doc, &stylist, &vp, states, &mut self.styles, &self.deps, &delta.changes);
+            if !r.moved && !delta.layout {
+                if r.repaint
+                    && let (Some(engine), Some(layout)) = (&mut self.engine, &mut self.layout)
+                {
+                    engine.refresh_styles(layout, doc, &self.styles);
+                }
+                self.clean_generation = Some(generation);
+                self.recomputed = true;
+                return;
+            }
+        } else {
+            self.styles = compute_styles_with(doc, &stylist, &vp, states);
+            self.deps = stylist.interaction_deps();
+        }
         let Some(engine) = &mut self.engine else { return };
         let tree = engine.layout_with_scrolls(
             doc,
@@ -548,12 +637,13 @@ pub(crate) fn with_layout<T>(
         states,
         view,
         generation,
+        changes,
         ..
     } = &mut *guard;
     let Some(view) = view.as_mut() else {
         return Ok(None);
     };
-    view.ensure_layout(doc, states, *generation);
+    view.ensure_layout(doc, states, *generation, changes);
     Ok(Some(f(view, doc, quirks)))
 }
 

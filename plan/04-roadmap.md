@@ -461,6 +461,26 @@ remaining lists as they stand.
       pseudo-classes, each equal to a full restyle; a colour class restyles
       at most 3 elements, repaint only. Restyle cost unchanged (Wikipedia
       ~36 ms, iana ~330 ms).
+      Block 2 done 2026-10-18: the script's `Dom` logs its changes
+      (`DomChange`: an attribute with its old value, from `setAttribute`
+      and friends, `id`/`className`, `classList`, `dataset`, `style`; any
+      other change a tree change); `feature_changes` turns attribute
+      changes into features (class differences, old and new id, the
+      attribute) and gives up (whole-document restyle) on a tree change or
+      an attribute of `<style>`, `<link>`, `<base>` or a table's cell-styling
+      attributes; an attribute layout reads (anything but `class`, `id`,
+      `style`, `title`, `role`, `tabindex`, `data-*`, `aria-*`) still lays
+      out again. The tab (`restyle_changes`) and a layout a script forces
+      (`View::ensure_layout`, from the generation its styles were current
+      at) restyle only what the changes reach; paint-only repaints, new
+      background images are fetched. Test
+      `script_attribute_changes_restyle_what_they_reach` (colour class: no
+      layout; width class: layout; a read in the same script sees both; an
+      insertion: full). iana's after-load class pass on 522 rows restyles
+      4,022 elements in 33 ms (330 ms full; its layout still full); load
+      4.35 s (5.9). Timing: tables 51.8–52.5 ms, blocks 14.9–15.0 ms
+      (unchanged), Wikipedia probe 0.73–0.83 s (live resources; one
+      relayout more or less).
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,

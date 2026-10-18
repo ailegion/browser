@@ -53,6 +53,8 @@ pub(crate) struct Dom {
     document: Option<JsObject>,
     /// A script changed the connected tree since the tab last asked.
     pub(crate) mutated: bool,
+    /// What it changed, since the tab last took them.
+    pub(crate) changes: Vec<DomChange>,
     /// The parser is still building the document: nodes it may hold open
     /// must stay in the arena, so nothing is freed while this is set.
     parsing: bool,
@@ -97,6 +99,21 @@ pub(crate) struct Dom {
 /// How many parsed selector lists are kept before the cache is emptied.
 const SELECTOR_CACHE_LIMIT: usize = 512;
 
+/// How many changes the log holds before it collapses into one tree
+/// change.
+const CHANGE_LOG_LIMIT: usize = 4096;
+
+/// One change a script made to the connected tree, for the tab's and the
+/// view's targeted restyle ("Working sites first" 6i). `generation` is the
+/// arena generation the change produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomChange {
+    /// An attribute was set, changed or removed; `old` is its value before.
+    Attr { element: NodeId, name: String, old: Option<String>, generation: u64 },
+    /// Anything else: nodes inserted, removed or moved, text changed.
+    Tree { generation: u64 },
+}
+
 /// The parsed form of `text` from the cache, parsing it once. `None` if
 /// it is not a valid selector list.
 fn cached_selector<'a>(cache: &'a mut HashMap<String, Selectors>, text: &str) -> Option<&'a Selectors> {
@@ -126,6 +143,37 @@ impl Dom {
 
     pub(crate) fn take_mutated(&mut self) -> bool {
         std::mem::take(&mut self.mutated)
+    }
+
+    /// A script set, changed or removed attribute `name` of the connected
+    /// element `element`, which had the value `old`.
+    pub(crate) fn note_attr(&mut self, element: NodeId, name: &str, old: Option<String>) {
+        self.mutated = true;
+        if self.changes.len() >= CHANGE_LOG_LIMIT {
+            self.note_tree();
+            return;
+        }
+        self.changes.push(DomChange::Attr {
+            element,
+            name: name.to_owned(),
+            old,
+            generation: self.generation,
+        });
+    }
+
+    /// A script changed the connected tree otherwise: nodes inserted,
+    /// removed or moved, text changed. Past the log's limit the whole log
+    /// becomes one such change (a full restyle is cheaper then).
+    pub(crate) fn note_tree(&mut self) {
+        self.mutated = true;
+        if self.changes.len() >= CHANGE_LOG_LIMIT {
+            self.changes.clear();
+        }
+        self.changes.push(DomChange::Tree { generation: self.generation });
+    }
+
+    pub(crate) fn take_changes(&mut self) -> Vec<DomChange> {
+        std::mem::take(&mut self.changes)
     }
 
     /// Detach `id`, and free its subtree when nothing can reach it any
@@ -1199,6 +1247,7 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
     dom.generation += 1;
     let connected = dom.doc.is_connected(id);
     let is_element = dom.doc.get(id).is_element();
+    let mut attr_change = None;
     match prop {
         SetProp::TextContent if is_element => replace_children_with_text(&mut dom, id, &text),
         SetProp::InnerHtml if is_element => replace_children_with_html(&mut dom, id, &text),
@@ -1207,12 +1256,16 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
         SetProp::Id | SetProp::ClassName => {
             let name = if matches!(prop, SetProp::Id) { "id" } else { "class" };
             if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
+                attr_change = Some((name, e.attr(name).map(str::to_owned)));
                 e.set_attr(name, &text);
             }
         }
     }
     if connected {
-        dom.mutated = true;
+        match attr_change {
+            Some((name, old)) => dom.note_attr(id, name, old),
+            None => dom.note_tree(),
+        }
     }
     Ok(JsValue::undefined())
 }
@@ -1495,6 +1548,8 @@ fn mutate(
     };
     check_receiver(&dom.doc, id, receiver)?;
     let mut connected = dom.doc.is_connected(id);
+    // An attribute method's attribute and its value before, for the log.
+    let mut attr_change: Option<(String, Option<String>)> = None;
     let out = match method {
         AppendChild | InsertBefore => {
             let child = node_arg(args, 0, &dom.doc)?;
@@ -1614,6 +1669,8 @@ fn mutate(
                 return Ok(Out::Value(JsValue::undefined()));
             };
             let (ns, qualified) = (&strings[0], &strings[1]);
+            let local = qualified.rsplit(':').next().unwrap_or(qualified);
+            attr_change = Some((local.to_ascii_lowercase(), e.attr_ns(ns, qualified).map(str::to_owned)));
             match method {
                 SetAttributeNs => {
                     let local = qualified.rsplit(':').next().unwrap_or(qualified);
@@ -1640,6 +1697,7 @@ fn mutate(
             if !matches!(method, RemoveAttribute) && !valid_attribute_name(&name) {
                 return Err(Fail::Dom("InvalidCharacterError", format!("'{}' is not a valid attribute name", strings[0])));
             }
+            attr_change = Some((name.to_ascii_lowercase(), e.attr(&name).map(str::to_owned)));
             match method {
                 SetAttribute => {
                     e.set_attr(&name, &strings[1]);
@@ -1675,7 +1733,10 @@ fn mutate(
         }
     };
     if connected {
-        dom.mutated = true;
+        match attr_change {
+            Some((name, old)) => dom.note_attr(id, &name, old),
+            None => dom.note_tree(),
+        }
     }
     Ok(out)
 }
@@ -2101,9 +2162,10 @@ fn dataset_set(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
     if dom.doc.contains(id) {
         let connected = dom.doc.is_connected(id);
         if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
+            let old = e.attr(&attr).map(str::to_owned);
             e.set_attr(&attr, &value);
             if connected {
-                dom.mutated = true;
+                dom.note_attr(id, &attr, old);
             }
         }
     }
@@ -2137,9 +2199,10 @@ fn dataset_delete(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         if let Some(e) = dom.doc.get_mut(id).as_element_mut()
             && e.attr(&attr).is_some()
         {
+            let old = e.attr(&attr).map(str::to_owned);
             e.remove_attr(&attr);
             if connected {
-                dom.mutated = true;
+                dom.note_attr(id, &attr, old);
             }
         }
     }
@@ -2378,11 +2441,12 @@ fn token_mutate(
         let serialized = tokens.join(" ");
         let had_attr = class_attr(dom).is_some();
         if (had_attr || !tokens.is_empty()) && class_attr(dom).as_deref() != Some(&serialized) {
+            let old = class_attr(dom);
             if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
                 e.set_attr("class", &serialized);
             }
             if dom.doc.contains(id) && dom.doc.is_connected(id) {
-                dom.mutated = true;
+                dom.note_attr(id, "class", old.map(|s| s.to_string()));
             }
         }
     }

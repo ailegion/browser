@@ -2208,6 +2208,48 @@ impl TabState {
         }
     }
 
+    /// Restyle only what a script's attribute changes reach, when the
+    /// styles are current and every change can be targeted; then lay out
+    /// again if that moved something (or an attribute layout reads
+    /// changed), else repaint with the new styles. `false` when the whole
+    /// document has to be restyled instead.
+    fn restyle_changes(&mut self, changes: &[browser_script::DomChange]) -> bool {
+        if self.needs_style || self.parser.is_some() || self.layout.is_none() {
+            return false;
+        }
+        let Some(doc) = &self.doc else { return false };
+        let Some(delta) = browser_script::feature_changes(doc, changes, None) else { return false };
+        let started = std::time::Instant::now();
+        let stylist = self.stylist();
+        let vp = self.style_viewport();
+        let Some(doc) = &self.doc else { return false };
+        let r = browser_style::restyle_mutations(doc, &stylist, &vp, &self.states, &mut self.styles, &self.deps, &delta.changes);
+        if std::env::var_os("TEMP_STAGES").is_some() {
+            eprintln!(
+                "TEMP restyle_changes: {} elements, styled {} moved {} repaint {} layout-attr {} in {:.1} ms",
+                delta.changes.len(),
+                r.styled,
+                r.moved,
+                r.repaint,
+                delta.layout,
+                started.elapsed().as_secs_f32() * 1000.0
+            );
+        }
+        if r.moved || delta.layout {
+            self.needs_layout = true;
+        } else if r.repaint {
+            if let (Some(layout), Some(engine)) = (&mut self.layout, &mut self.engine) {
+                engine.refresh_styles(layout, doc, &self.styles);
+            }
+            self.needs_paint = true;
+        }
+        // A new style may name an image not fetched yet.
+        if r.repaint {
+            self.fetch_background_images();
+        }
+        true
+    }
+
     /// Start loading `url`. Nothing about the current page changes until
     /// the response commits (`commit`).
     fn navigate(&mut self, url: Url, kind: NavKind) {
@@ -3112,6 +3154,7 @@ impl TabState {
         let requests = host.take_module_requests();
         let host_requests = host.take_requests();
         let mutated = host.take_dom_mutated();
+        let changes = host.take_dom_changes();
         for line in host.take_console() {
             match line.level {
                 ConsoleLevel::Warn | ConsoleLevel::Error => {
@@ -3137,29 +3180,31 @@ impl TabState {
             self.fetch_module_source(url);
         }
         if mutated {
-            self.dom_changed();
+            self.dom_changed(&changes);
         }
         self.apply_host_requests(host_requests);
         self.apply_font_requests();
     }
 
-    /// A script changed the tree: restyle the whole document (per-node
-    /// invalidation is later), lay out and paint again, tell the shell
-    /// (the title may have changed), and drop every node reference the
-    /// change may have made stale: a freed node, or one no longer in the
-    /// document. Hover is found again after layout.
-    fn dom_changed(&mut self) {
+    /// A script changed the tree: restyle what the changes reach (the
+    /// whole document for changes that cannot be targeted), lay out and
+    /// paint again as needed, tell the shell (the title may have changed),
+    /// and drop every node reference the change may have made stale: a
+    /// freed node, or one no longer in the document. Hover is found again
+    /// after layout.
+    fn dom_changed(&mut self, changes: &[browser_script::DomChange]) {
         // A layout the script forced after its last change is current.
-        if !std::mem::take(&mut self.host_layout_fresh) {
+        let fresh = std::mem::take(&mut self.host_layout_fresh);
+        self.state_dirty = true;
+        // A `<style>` or `<link>` the script added, changed or removed.
+        self.sync_stylesheets();
+        if !fresh && !self.restyle_changes(changes) {
             if std::env::var_os("TEMP_STAGES").is_some() {
                 eprintln!("TEMP needs_layout: dom_changed");
             }
             self.needs_style = true;
             self.needs_layout = true;
         }
-        self.state_dirty = true;
-        // A `<style>` or `<link>` the script added, changed or removed.
-        self.sync_stylesheets();
         let live = |doc: &Document, id: NodeId| doc.contains(id) && doc.is_connected(id);
         let (focus_lost, hover_lost, press_control_lost, press_lost) = match (&self.parser, &self.doc) {
             (Some(parser), _) => {
@@ -7710,6 +7755,56 @@ mod tests {
         let (_, color, underline, _) = link_text(&h);
         assert_eq!((color, underline), ([0, 0, 238, 255], false), "the link is plain again");
         assert_eq!(h.style("b").padding.left, browser_style::ComputedLp::Px(10.0));
+    }
+
+    /// A script's attribute changes restyle only what they reach: a colour
+    /// class repaints without layout, a width class lays out again, a read
+    /// in the same script sees the new values, a node insertion restyles
+    /// the whole document.
+    #[test]
+    fn script_attribute_changes_restyle_what_they_reach() {
+        let page = "<!DOCTYPE html><style>.red { color: red } .wide { width: 200px } .blue { color: blue }</style>\
+            <body><button>b</button><span id=s>t</span><p id=p>x</p>\
+            <script>let n = 0; const s = document.getElementById('s'), p = document.getElementById('p'); \
+              document.querySelector('button').onclick = () => { n++; \
+              if (n == 1) s.classList.add('red'); \
+              if (n == 2) p.className = 'wide'; \
+              if (n == 3) { s.setAttribute('class', 'blue'); console.log(getComputedStyle(s).color + ' ' + p.offsetWidth); } \
+              if (n == 4) p.append(document.createElement('i')); }</script>";
+        let mut h = Harness::load(page);
+        h.pump_until(|h| h.state.layout.is_some() && h.state.lifecycle == Lifecycle::Complete);
+        let node = |h: &Harness, id: &str| {
+            let doc = h.state.doc.as_ref().expect("doc");
+            doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id))).expect("element")
+        };
+        let (s, p) = (node(&h, "s"), node(&h, "p"));
+        let layouts = h.state.layouts;
+        h.click("button");
+        h.pump();
+        assert_eq!(h.state.styles[s].color.to_rgba8(), [255, 0, 0, 255]);
+        assert_eq!(h.state.layouts, layouts, "a colour change repaints only");
+        h.click("button");
+        h.pump();
+        assert!(h.state.layouts > layouts, "a width change lays out again");
+        let width = |h: &Harness| {
+            let mut w = None;
+            h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+                if f.node == Some(p) && w.is_none() {
+                    w = Some(f.rect.width);
+                }
+            });
+            w
+        };
+        assert_eq!(width(&h), Some(200.0));
+        h.click("button");
+        h.pump();
+        assert_eq!(console_texts(&h).last().map(String::as_str), Some("rgb(0, 0, 255) 200"), "a read sees the change");
+        assert_eq!(h.state.styles[s].color.to_rgba8(), [0, 0, 255, 255]);
+        let layouts = h.state.layouts;
+        h.click("button");
+        h.pump();
+        assert!(h.state.layouts > layouts, "an insertion lays out again");
+        assert_eq!(width(&h), Some(200.0));
     }
 
     /// An image arriving lays the page out again only when a box takes its
