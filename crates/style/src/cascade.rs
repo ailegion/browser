@@ -489,9 +489,16 @@ impl<'a> Restyler<'a> {
         }
 
         // Style attribute: author origin, beats any selector specificity.
+        // Its `url()`s are relative to the document's base URL.
         let inline_decls: Vec<Declaration> = element
             .attr("style")
-            .map(parse_declaration_block)
+            .map(|css| {
+                let mut decls = parse_declaration_block(css);
+                if let Some(base) = &doc.base_url {
+                    crate::stylesheet::resolve_declaration_urls(&mut decls, base);
+                }
+                decls
+            })
             .unwrap_or_default();
         // Presentational hints from HTML attributes (width/height/align/bgcolor).
         let hints = presentational_hints(doc, id, element);
@@ -1265,6 +1272,45 @@ mod tests {
         assert_eq!(styles[p].color.to_rgba8(), [0, 0, 255, 255]);
         let span = find(&doc, "span");
         assert_eq!(styles[span].color.to_rgba8(), [0, 0, 255, 255]);
+    }
+
+    /// Relative `url()`s are made absolute: a style attribute's against the
+    /// document's base URL, a stylesheet's against the sheet's URL, in
+    /// every image-taking property.
+    #[test]
+    fn relative_urls_resolve_in_style_attributes_and_sheets() {
+        use crate::image::ComputedImage;
+        let mut doc = parse_html(
+            b"<div id=a style='background-image:url(bg.png);mask-image:url(m.svg);cursor:url(c.png), auto'></div><p>t</p>",
+        );
+        doc.base_url = Some(url::Url::parse("https://example.org/dir/page.html").expect("url"));
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        let sheet_url = url::Url::parse("https://cdn.example.org/css/site.css").expect("url");
+        stylist.add_sheet(Arc::new(Stylesheet::parse_with_base(
+            "p { mask-image: url(../i/m.svg); background-image: image-set(url(a.png) 1x, url(b.png) 2x); cursor: url(/c.cur), pointer }",
+            Origin::Author,
+            Some(&sheet_url),
+        )));
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        let url = |i: &ComputedImage| match i {
+            ComputedImage::Url(u) => u.to_string(),
+            other => format!("{other:?}"),
+        };
+        let a = find(&doc, "div");
+        assert_eq!(url(&styles[a].background_images[0]), "https://example.org/dir/bg.png");
+        assert_eq!(url(&styles[a].mask_images[0]), "https://example.org/dir/m.svg");
+        assert_eq!(&*styles[a].cursor.images[0].url, "https://example.org/dir/c.png");
+        let p = find(&doc, "p");
+        assert_eq!(url(&styles[p].mask_images[0]), "https://cdn.example.org/i/m.svg");
+        assert_eq!(&*styles[p].cursor.images[0].url, "https://cdn.example.org/c.cur");
+        match &styles[p].background_images[0] {
+            ComputedImage::ImageSet(set) => {
+                let urls: Vec<String> = set.iter().map(|c| url(&c.image)).collect();
+                assert_eq!(urls, ["https://cdn.example.org/css/a.png", "https://cdn.example.org/css/b.png"]);
+            }
+            other => panic!("image-set: {other:?}"),
+        }
     }
 
     #[test]

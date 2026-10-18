@@ -75,42 +75,10 @@ impl Stylesheet {
     }
 
     fn resolve_urls(&mut self, base: &url::Url) {
-        use crate::properties::{ImageValue, PropertyDeclaration};
         fn walk(rules: &mut [Rule], base: &url::Url) {
             for r in rules {
                 match r {
-                    Rule::Style(s) => {
-                        for d in &mut s.declarations {
-                            match &mut d.value {
-                                DeclaredValue::Value(PropertyDeclaration::BackgroundImage(images)) => {
-                                    for img in images {
-                                        if let ImageValue::Url(u) = img
-                                            && let Ok(abs) = base.join(u)
-                                        {
-                                            *u = Arc::from(abs.as_str());
-                                        }
-                                    }
-                                }
-                                DeclaredValue::Value(PropertyDeclaration::ListStyleImage(ImageValue::Url(u))) => {
-                                    if let Ok(abs) = base.join(u) {
-                                        *u = Arc::from(abs.as_str());
-                                    }
-                                }
-                                // Text that is parsed later, per element: make
-                                // its URLs absolute now, while the sheet is known.
-                                DeclaredValue::Custom {
-                                    value: CustomValue::Raw(raw),
-                                    ..
-                                }
-                                | DeclaredValue::Pending { raw, .. } => {
-                                    if let Some(resolved) = crate::custom::resolve_urls(raw, base) {
-                                        *raw = Arc::from(resolved);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                    Rule::Style(s) => resolve_declaration_urls(&mut s.declarations, base),
                     Rule::Media(_, inner) => walk(inner, base),
                     Rule::FontFace(face) => {
                         let face = Arc::make_mut(face);
@@ -144,6 +112,62 @@ impl Stylesheet {
                 .sum()
         }
         count(&self.rules)
+    }
+}
+
+/// Make every `url()` in `decls` absolute against `base` (a stylesheet's
+/// URL, or the document's for a `style` attribute): background and mask
+/// images (`image-set()` candidates too, and the URLs inside image
+/// functions kept as written), `list-style-image`, `cursor` images, and
+/// the text of custom properties and `var()` values, which is parsed
+/// later per element.
+pub fn resolve_declaration_urls(decls: &mut [Declaration], base: &url::Url) {
+    use crate::properties::{ImageValue, PropertyDeclaration as P};
+    let join = |u: &mut Arc<str>| {
+        if let Ok(abs) = base.join(u) {
+            *u = Arc::from(abs.as_str());
+        }
+    };
+    fn image(img: &mut ImageValue, join: &dyn Fn(&mut Arc<str>), base: &url::Url) {
+        match img {
+            ImageValue::Url(u) => join(u),
+            ImageValue::ImageSet(set) => {
+                for c in Arc::make_mut(set) {
+                    image(&mut c.image, join, base);
+                }
+            }
+            ImageValue::Function(text) => {
+                if let Some(resolved) = crate::custom::resolve_urls(text, base) {
+                    *text = Arc::from(resolved);
+                }
+            }
+            ImageValue::None | ImageValue::Gradient(_) => {}
+        }
+    }
+    for d in decls {
+        match &mut d.value {
+            DeclaredValue::Value(P::BackgroundImage(images) | P::MaskImage(images)) => {
+                for img in images {
+                    image(img, &join, base);
+                }
+            }
+            DeclaredValue::Value(P::ListStyleImage(img)) => image(img, &join, base),
+            DeclaredValue::Value(P::Cursor(c)) => {
+                for i in &mut c.images {
+                    join(&mut i.url);
+                }
+            }
+            DeclaredValue::Custom {
+                value: CustomValue::Raw(raw),
+                ..
+            }
+            | DeclaredValue::Pending { raw, .. } => {
+                if let Some(resolved) = crate::custom::resolve_urls(raw, base) {
+                    *raw = Arc::from(resolved);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

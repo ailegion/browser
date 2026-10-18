@@ -3401,6 +3401,8 @@ impl TabState {
                 sized |= u.as_str() == href;
             }
         });
+        // A marker image gets its box only once it is decoded.
+        sized = sized || self.styles.iter().any(|(_, s)| s.list_style_image.iter().any(|u| &**u == href));
         if sized {
             self.needs_layout = true;
         } else {
@@ -7715,7 +7717,8 @@ mod tests {
     #[test]
     fn only_images_that_size_boxes_relayout() {
         let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'><rect width='20' height='20'/></svg>";
-        let page = "<!DOCTYPE html><style>div{width:10px;height:10px;background:url(/bg.svg)}</style><body><div></div><img src='/i.svg'>";
+        // The background in a `style` attribute, its URL relative.
+        let page = "<!DOCTYPE html><body><div style='width:10px;height:10px;background:url(/bg.svg)'></div><img src='/i.svg'>";
         let server = Server::start(
             &[
                 ("/page", "text/html; charset=utf-8", page),

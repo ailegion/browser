@@ -414,8 +414,17 @@ remaining lists as they stand.
       relayout 124–126 ms (unchanged). (4) An arriving image lays the page
       out again only when an image fragment of that URL exists (an `<img>`,
       a marker image); backgrounds, masks and the rest repaint
-      (`image_arrived`; test `only_images_that_size_boxes_relayout`).
-      Wikipedia probe load 0.72 s (0.80), one full relayout fewer.
+      (`image_arrived`; a `list-style-image` of that URL counts, its box
+      only exists once decoded; test `only_images_that_size_boxes_relayout`).
+      Wikipedia probe load 0.72 s (0.80), one full relayout fewer. (5)
+      Relative `url()`s: a `style` attribute's were never resolved (its
+      images never loaded), a stylesheet's only in `background-image` and
+      `list-style-image`; now one pass (`stylesheet::resolve_declaration_urls`)
+      makes every URL absolute in background and mask images (`image-set()`
+      candidates and image functions too), `list-style-image`, `cursor`
+      images and custom-property/`var()` text, against the sheet's URL or,
+      for a `style` attribute, the document's base URL (test
+      `relative_urls_resolve_in_style_attributes_and_sheets`).
 - [ ] 6e. Generated content (owner, 2026-10-18; not in the plan before,
       and used by most sites): `::before` and `::after` matched in the
       cascade and given boxes; `content` with strings, `url()` images (6b's
