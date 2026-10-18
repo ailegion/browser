@@ -481,6 +481,44 @@ remaining lists as they stand.
       4.35 s (5.9). Timing: tables 51.8–52.5 ms, blocks 14.9–15.0 ms
       (unchanged), Wikipedia probe 0.73–0.83 s (live resources; one
       relayout more or less).
+- [x] 6j. Script-set `<img src>` loads (owner, 2026-10-18, before 6i
+      block 3; found during 6i): images are only collected when the
+      document is set, so an `<img>` a script inserts or whose `src` it
+      changes is never fetched; any connected `<img>` whose source changes
+      is fetched and laid out once it arrives.
+      Done 2026-10-18 for `setAttribute('src')` and insertion: a script's
+      tree change or `src` change on an `<img>` collects the images again
+      (fetched URLs skipped), and the arrival lays out (`dom_changed`; test
+      `script_set_image_sources_load`). The `img.src = …` property is
+      Phase 5's DOM bindings (C) (owner's placement: no reflected
+      attributes exist yet).
+- [x] 6k. Named access on `window` (owner, 2026-10-18; HTML §7.2.2.3):
+      elements with an `id` (and `name` for the listed elements) are
+      properties of `window` (`s.classList` for `<span id=s>`), live with
+      the tree, shadowed by real globals and script variables.
+      Done 2026-10-18 (`dom.rs` `register_window_named_properties`): a
+      `Proxy` between the global object and its prototype answers a name
+      with the HTML element of that `id` or the `embed`/`form`/`img`/
+      `object` of that `name`, a live `HTMLCollection` for several, and
+      falls back on the realm's own `Reflect` functions; it lists the names
+      (`ownKeys`) and refuses definitions and deletions; real globals and
+      variables shadow it. Names are looked up in a per-generation map (no
+      tree walk per missed global); lending a document bumps the generation
+      (the parser may have changed it). Test `window_named_access`. Not
+      verified: whether Chrome also names SVG elements by `id` (HTML says
+      HTML elements; done so). Timing: Wikipedia probe 0.84 s, iana 4.32 s
+      (unchanged).
+- [ ] 6l. `:disabled` inside a disabled `<fieldset>` (owner, 2026-10-18;
+      HTML §4.10.18.2): a form control in a disabled fieldset, outside its
+      first `<legend>`, is disabled (`:disabled`, no focus, no activation).
+- [ ] 6m. Responsive images (owner, 2026-10-18; found during 6j; most
+      sites, Wikipedia included, send their images this way): `srcset`
+      with density (`2x`) and width (`640w`) descriptors and `sizes`
+      (media conditions, lengths, `calc()`), `<picture>` with `<source>`
+      chosen by `media` and `type`, the chosen candidate fetched (HTML's
+      image source selection, the device scale and the layout width),
+      `currentSrc`, the density giving the intrinsic size, and selection
+      run again when the viewport or scale changes.
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,
@@ -2701,6 +2739,26 @@ Exit criteria:
 Goal: fewer broken sites. This phase does not end; items are prioritized by
 what breaks the most pages.
 
+- DOM bindings (owner's 2026-10-18 placement, out of "Working sites
+  first"; found during its line 6j): (A) the HTML element interfaces
+  (`HTMLImageElement`, `HTMLScriptElement`, `HTMLInputElement`, …,
+  `HTMLUnknownElement`, the intermediates) with their tag mapping and
+  prototype chains, so wrappers and `instanceof` follow the spec; (B)
+  reflected IDL attributes by HTML's rules (string, URL, boolean,
+  enumerated, long/unsigned long with limits and defaults, double,
+  `DOMTokenList`) and the global ones (`title`, `lang`, `dir`, `hidden`,
+  `tabIndex`, `accessKey`, `translate`, `draggable`, `inert`,
+  `autofocus`, `nonce`); (C) every element's reflected attributes (`img`,
+  `script`, `link`, `a`/`area` with the URL parts, `iframe`, form
+  controls, tables, lists, media, `meta`, `base`, `details`, `dialog`,
+  `object`, `embed`, the obsolete presentational ones) and the special
+  getters (`option.value`/`label`/`text`, `input.defaultValue`/
+  `defaultChecked`, `form.action`, `script.text`, `img.width`/`height`);
+  (D) script-inserted `<script>` elements run (HTML "prepare the script
+  element" when not parser-inserted: external async by default and
+  `async = false` in insertion order, inline at insertion, modules,
+  `load`/`error`). Until (C), `img.src = …` does not reach the attribute
+  ("Working sites first" 6j covers `setAttribute` and insertion).
 - Layout: tables, floats, `position: sticky`, multi-column, writing modes,
   `aspect-ratio`, `object-fit`. Scroll containers (owner's placement
   2026-10-09): boxes with `overflow: auto`/`scroll` that scroll with the

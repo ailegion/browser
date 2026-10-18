@@ -3205,6 +3205,22 @@ impl TabState {
             self.needs_style = true;
             self.needs_layout = true;
         }
+        // An `<img>` inserted, or given another `src`: fetch what is new
+        // (URLs already fetched are skipped).
+        let images_touched = changes.iter().any(|c| match c {
+            browser_script::DomChange::Tree { .. } => true,
+            browser_script::DomChange::Attr { element, name, .. } => {
+                name == "src"
+                    && self
+                        .doc
+                        .as_ref()
+                        .and_then(|d| d.element(*element))
+                        .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("img"))
+            }
+        });
+        if images_touched {
+            self.collect_images();
+        }
         let live = |doc: &Document, id: NodeId| doc.contains(id) && doc.is_connected(id);
         let (focus_lost, hover_lost, press_control_lost, press_lost) = match (&self.parser, &self.doc) {
             (Some(parser), _) => {
@@ -7805,6 +7821,51 @@ mod tests {
         h.pump();
         assert!(h.state.layouts > layouts, "an insertion lays out again");
         assert_eq!(width(&h), Some(200.0));
+    }
+
+    /// An `<img>` a script inserts, or whose `src` it changes, is fetched
+    /// and laid out once it arrives.
+    #[test]
+    fn script_set_image_sources_load() {
+        let svg = |w: u32| format!("<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='10'><rect width='{w}' height='10'/></svg>");
+        let (a, b) = (svg(20), svg(30));
+        let page = "<!DOCTYPE html><body><button>b</button><img id=i src='/a.svg'>\
+            <script>let n = 0; document.querySelector('button').onclick = () => { n++; \
+              if (n == 1) document.getElementById('i').setAttribute('src', '/b.svg'); \
+              if (n == 2) { const j = document.createElement('img'); j.id = 'j'; j.setAttribute('src', '/c.svg'); document.body.append(j); } }</script>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/a.svg", "image/svg+xml", &a),
+                ("/b.svg", "image/svg+xml", &b),
+                ("/c.svg", "image/svg+xml", &a),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete && h.state.images.get_svg(&server.url("/a.svg")).is_some());
+        let width_of = |h: &Harness, id: &str| {
+            let doc = h.state.doc.as_ref().expect("doc");
+            let node = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))?;
+            let mut w = None;
+            h.state.layout.as_ref()?.root.walk(&mut |f| {
+                if f.node == Some(node) && w.is_none() {
+                    w = Some(f.rect.width);
+                }
+            });
+            w
+        };
+        assert_eq!(width_of(&h, "i"), Some(20.0));
+        h.click("button");
+        let b_url = server.url("/b.svg");
+        h.pump_until(|h| h.state.images.get_svg(&b_url).is_some());
+        h.pump();
+        assert_eq!(width_of(&h, "i"), Some(30.0), "the new source, laid out");
+        h.click("button");
+        let c_url = server.url("/c.svg");
+        h.pump_until(|h| h.state.images.get_svg(&c_url).is_some());
+        h.pump();
+        assert_eq!(width_of(&h, "j"), Some(20.0), "an inserted image");
     }
 
     /// An image arriving lays the page out again only when a box takes its

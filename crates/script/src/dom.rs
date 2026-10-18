@@ -94,6 +94,12 @@ pub(crate) struct Dom {
     pub(crate) styles: HashMap<NodeId, JsObject>,
     /// The private key a declaration proxy answers with its target.
     pub(crate) style_key: Option<boa_engine::JsSymbol>,
+    /// `Reflect`'s functions as the realm made them (the window's named
+    /// properties object falls back on them).
+    reflect: Option<ReflectFns>,
+    /// The window's named objects by name, as of a generation: built once
+    /// after a change, so a global lookup that misses costs no tree walk.
+    named: Option<(u64, HashMap<String, Vec<NodeId>>)>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -131,6 +137,9 @@ pub(crate) type SharedDom = Rc<RefCell<Dom>>;
 
 impl Dom {
     pub(crate) fn lend(&mut self, doc: Document, parsing: bool, states: ElementStates) {
+        // The parser or the tab may have changed it while it was away:
+        // what was cached by generation is stale.
+        self.generation += 1;
         self.doc = doc;
         self.parsing = parsing;
         self.states = states;
@@ -341,6 +350,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     context.register_global_property(js_string!("document"), document, Attribute::ENUMERABLE)?;
     crate::view::register(context)?;
     crate::cssom::register(context)?;
+    register_window_named_properties(context)?;
     Ok(())
 }
 
@@ -1833,6 +1843,9 @@ enum CollectionKind {
     ByTag(DomNode, String),
     ByTagNs(DomNode, String, String),
     Static(Vec<NodeId>),
+    /// The window's named objects with this name (`window[name]` when
+    /// several elements have it).
+    WindowNamed(String),
 }
 
 /// The target behind a collection proxy.
@@ -1898,7 +1911,168 @@ fn collection_members(dom: &Dom, kind: &CollectionKind) -> Vec<NodeId> {
                     .collect()
             })
             .unwrap_or_default(),
+        CollectionKind::WindowNamed(name) => window_named(doc, name),
     }
+}
+
+/// The names an element is a named object of the window under (HTML
+/// §7.2.2.3): an HTML element's `id`, and the `name` of an `embed`,
+/// `form`, `img` or `object` element.
+fn names_of(e: &browser_dom::Element) -> impl Iterator<Item = &str> {
+    let named = e.is_html() && matches!(&*e.name.local, "embed" | "form" | "img" | "object");
+    let id = e.is_html().then(|| e.id()).flatten();
+    [named.then(|| e.attr("name")).flatten(), id].into_iter().flatten().filter(|n| !n.is_empty())
+}
+
+/// The window's named objects called `name`, in tree order.
+fn window_named(doc: &Document, name: &str) -> Vec<NodeId> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    doc.descendants(doc.root())
+        .filter(|&d| doc.element(d).is_some_and(|e| names_of(e).any(|n| n == name)))
+        .collect()
+}
+
+/// The window's named objects called `name` through the per-generation
+/// map.
+fn window_named_cached(dom: &mut Dom, name: &str) -> Vec<NodeId> {
+    if dom.named.as_ref().is_none_or(|(g, _)| *g != dom.generation) {
+        let mut map: HashMap<String, Vec<NodeId>> = HashMap::new();
+        for d in dom.doc.descendants(dom.doc.root()) {
+            let Some(e) = dom.doc.element(d) else { continue };
+            for n in names_of(e) {
+                let ids = map.entry(n.to_owned()).or_default();
+                if ids.last() != Some(&d) {
+                    ids.push(d);
+                }
+            }
+        }
+        dom.named = Some((dom.generation, map));
+    }
+    dom.named.as_ref().and_then(|(_, m)| m.get(name).cloned()).unwrap_or_default()
+}
+
+/// Every name the window's named objects answer to, in tree order, once
+/// each (the supported property names).
+fn window_names(doc: &Document) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for d in doc.descendants(doc.root()) {
+        let Some(e) = doc.element(d) else { continue };
+        for n in names_of(e) {
+            if !names.iter().any(|x| x == n) {
+                names.push(n.to_owned());
+            }
+        }
+    }
+    names
+}
+
+/// `Reflect`'s functions as the realm made them, for the window's named
+/// properties object to fall back on whatever a page does to `Reflect`.
+#[derive(Debug, Clone, Trace, Finalize)]
+struct ReflectFns {
+    get: JsObject,
+    has: JsObject,
+    descriptor: JsObject,
+    own_keys: JsObject,
+}
+
+/// Put the window's named properties object (HTML §7.2.2.3) between the
+/// global object and its prototype: a name no real global or script
+/// variable has reads as the element (or the collection of elements)
+/// with that `id`, or that `name` for `embed`, `form`, `img`, `object`.
+/// Defining or deleting on it fails, as for the interface's object.
+pub(crate) fn register_window_named_properties(context: &mut Context) -> JsResult<()> {
+    let global = context.global_object();
+    let reflect = global.get(js_string!("Reflect"), context)?;
+    let reflect = reflect.as_object().ok_or_else(|| JsNativeError::typ().with_message("no Reflect"))?;
+    let function = |name: &str, context: &mut Context| -> JsResult<JsObject> {
+        reflect
+            .get(JsString::from(name), context)?
+            .as_object()
+            .ok_or_else(|| JsNativeError::typ().with_message("no Reflect function").into())
+    };
+    let fns = ReflectFns {
+        get: function("get", context)?,
+        has: function("has", context)?,
+        descriptor: function("getOwnPropertyDescriptor", context)?,
+        own_keys: function("ownKeys", context)?,
+    };
+    dom(context)?.borrow_mut().reflect = Some(fns);
+    let target = JsObject::with_null_proto();
+    target.set_prototype(global.prototype());
+    let proxy = JsProxy::builder(target)
+        .get(named_get)
+        .has(named_has)
+        .get_own_property_descriptor(named_descriptor)
+        .own_keys(named_keys)
+        .define_property(|_, _, _| Ok(false.into()))
+        .delete_property(|_, _, _| Ok(false.into()))
+        .build(context)?;
+    global.set_prototype(Some(proxy.into()));
+    Ok(())
+}
+
+/// The named object a trap's key stands for, if any: the element, or a
+/// live collection when several have the name.
+fn named_value(args: &[JsValue], context: &mut Context) -> JsResult<Option<JsValue>> {
+    let key = args.get_or_undefined(1);
+    if key.is_symbol() {
+        return Ok(None);
+    }
+    let name = key.to_string(context)?.to_std_string_escaped();
+    let found = window_named_cached(&mut dom(context)?.borrow_mut(), &name);
+    Ok(match found.as_slice() {
+        [] => None,
+        [one] => Some(wrap(*one, context)?),
+        _ => Some(collection_proxy(CollectionKind::WindowNamed(name), context)?),
+    })
+}
+
+fn reflect_fns(context: &mut Context) -> JsResult<ReflectFns> {
+    dom(context)?.borrow().reflect.clone().ok_or_else(|| JsNativeError::typ().with_message("no Reflect").into())
+}
+
+fn named_get(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    if let Some(v) = named_value(args, context)? {
+        return Ok(v);
+    }
+    reflect_fns(context)?.get.call(&JsValue::undefined(), args, context)
+}
+
+fn named_has(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    if named_value(args, context)?.is_some() {
+        return Ok(true.into());
+    }
+    reflect_fns(context)?.has.call(&JsValue::undefined(), &args[..args.len().min(2)], context)
+}
+
+fn named_descriptor(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let fns = reflect_fns(context)?;
+    if let Some(value) = named_value(args, context)? {
+        let desc = ObjectInitializer::new(context)
+            .property(js_string!("value"), value, Attribute::all())
+            .property(js_string!("writable"), true, Attribute::all())
+            .property(js_string!("enumerable"), false, Attribute::all())
+            .property(js_string!("configurable"), true, Attribute::all())
+            .build();
+        return Ok(desc.into());
+    }
+    fns.descriptor.call(&JsValue::undefined(), &args[..args.len().min(2)], context)
+}
+
+fn named_keys(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let fns = reflect_fns(context)?;
+    let names = window_names(&dom(context)?.borrow().doc);
+    let own = fns.own_keys.call(&JsValue::undefined(), &args[..args.len().min(1)], context)?;
+    let own = own.as_object().ok_or_else(illegal_invocation)?.clone();
+    let len = own.get(js_string!("length"), context)?.to_length(context)?;
+    let mut keys: Vec<JsValue> = names.into_iter().map(|n| JsValue::from(JsString::from(n.as_str()))).collect();
+    for i in 0..len {
+        keys.push(own.get(i, context)?);
+    }
+    Ok(JsArray::from_iter(keys, context).into())
 }
 
 /// A `NodeList` or `HTMLCollection`: a `Proxy` whose indexed reads and

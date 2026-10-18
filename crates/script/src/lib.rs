@@ -1326,6 +1326,41 @@ mod tests {
         Url::parse(s).expect("url")
     }
 
+    /// Named access on the window (HTML §7.2.2.3): ids of HTML elements,
+    /// `name` of `embed`/`form`/`img`/`object`, a collection for several,
+    /// live, shadowed by real globals and variables, not definable.
+    #[test]
+    fn window_named_access() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><body><div id=foo></div><img name=pic><p id=dup></p><p id=dup></p>\
+              <span id=taken></span><b id=document></b><form name=f></form><a name=anchor></a>\
+              <svg><circle id=circ /></svg></body>",
+        );
+        h.lend_document(doc, false, Default::default());
+        let s = |h: &mut ScriptHost, src: &str| h.eval_to_string(src).map_err(|e| e.to_string());
+        assert_eq!(
+            s(&mut h, "[foo === document.getElementById('foo'), window.pic === document.querySelector('img'), f.tagName, \
+                       dup instanceof HTMLCollection, dup.length, dup[1] === document.querySelectorAll('p')[1], \
+                       'foo' in window, window.nope === undefined, typeof anchor, typeof circ, document instanceof Document].join('|')").as_deref(),
+            Ok("\"true|true|FORM|true|2|true|true|true|undefined|undefined|true\"")
+        );
+        // Variables and assignments shadow; a missing name is a ReferenceError.
+        assert_eq!(
+            s(&mut h, "var taken = 1; foo = 2; [taken, foo, window.hasOwnProperty('foo')].join('|')").as_deref(),
+            Ok("\"1|2|true\"")
+        );
+        assert!(s(&mut h, "nope").is_err());
+        // Live with the tree; the prototype object refuses definitions.
+        assert_eq!(
+            s(&mut h, "var e = document.createElement('i'); e.id = 'late'; document.body.append(e); var a = typeof late; e.remove(); \
+                       var names = Object.getOwnPropertyNames(Object.getPrototypeOf(window)); \
+                       var refused = false; try { Object.defineProperty(Object.getPrototypeOf(window), 'x', { value: 1 }); } catch (err) { refused = err instanceof TypeError; } \
+                       [a, typeof late, names.includes('pic'), names.includes('dup'), refused].join('|')").as_deref(),
+            Ok("\"object|undefined|true|true|true\"")
+        );
+    }
+
     #[test]
     fn dom_wrappers_traverse_and_read_the_lent_document() {
         let mut h = host();
