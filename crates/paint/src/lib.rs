@@ -456,9 +456,13 @@ impl<'a> Painter<'a> {
                 self.pop_clips_to(0);
                 self.scene.pop_layer();
             }
+            // The mask multiplies the group directly: the clips the space
+            // re-opens are closed again (the group's content is clipped
+            // already), else the mask lands in an empty clip layer and
+            // masks nothing (a rounded `overflow` clip takes one).
             Op::Mask(fragments) => {
-                self.pop_clips_to(0);
                 self.enter_space(&p.space);
+                self.pop_clips_to(0);
                 self.mask(fragments);
             }
             Op::Decoration { fragment, sides } => {
@@ -3513,6 +3517,44 @@ mod tests {
         let p = render("<body style='margin:0'><img src='http://x/t.svg'></body>").expect("gpu");
         let reds = (0..80).flat_map(|x| (0..30).map(move |y| (x as f32, y as f32))).filter(|&(x, y)| is_red(px(&p, x, y))).count();
         assert!(reds > 20, "red text pixels: {reds}");
+    }
+
+    /// Wikipedia's (Codex) icons: a `currentColor` background cut out by
+    /// an SVG mask served by `load.php`.
+    #[test]
+    fn codex_icon_masks_its_background() {
+        let menu = br##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"><title>
+		menu
+	</title><g fill="#000"><path d="M1 3h18v2H1zm0 6h18v2H1zm0 6h18v2H1z"/></g></svg>"##;
+        let mut images = ImageStore::new();
+        images.insert_svg(Url::parse("http://x/menu.svg").expect("url"), decode_svg(menu).expect("svg"));
+        let Some(p) = render_with(
+            "<body style='margin:0'><span style='display:block;width:20px;height:20px;background-color:currentColor;color:red;\
+             mask-image:url(http://x/menu.svg);mask-size:20px;mask-position:50% 50%;mask-repeat:no-repeat'></span></body>",
+            &images,
+            0.0,
+            1.0,
+        )
+        .1
+        else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        assert!(is_red(px(&p, 10.0, 4.0)) && is_red(px(&p, 10.0, 10.0)), "the bars");
+        assert!(is_white(px(&p, 10.0, 7.0)) && is_white(px(&p, 0.5, 4.0)), "between and beside the bars");
+        // The same icon inside rounded `overflow` clips (each a clip layer)
+        // and groups, as in Wikipedia's header buttons.
+        let wrap = "<div style='overflow:hidden;opacity:0.999;border-radius:1px;width:40px;height:40px'>";
+        let html = format!(
+            "<body style='margin:0'>{w}{w}{w}{w}{w}<span style='display:block;width:20px;height:20px;background-color:currentColor;color:red;\
+             mask-image:url(http://x/menu.svg);mask-size:20px;mask-position:50% 50%;mask-repeat:no-repeat'></span>{e}{e}{e}{e}{e}</body>",
+            w = wrap,
+            e = "</div>"
+        );
+        let p = render_with(&html, &images, 0.0, 1.0).1.expect("gpu");
+        assert!(is_red(px(&p, 10.0, 4.0)) && is_red(px(&p, 10.0, 10.0)), "nested: the bars {:?}", px(&p, 10.0, 4.0));
+        assert!(is_white(px(&p, 10.0, 7.0)) && is_white(px(&p, 0.5, 4.0)), "nested: between and beside {:?} {:?}", px(&p, 10.0, 7.0), px(&p, 0.5, 4.0));
     }
 
     #[test]
