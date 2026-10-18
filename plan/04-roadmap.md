@@ -284,10 +284,24 @@ remaining lists as they stand.
       lines, the `grid-template` area form). Timing: tables 49.3–50.0 ms
       (48.0 before), blocks 14.4–15.1 ms (13.5), Hacker News relayout
       38.9–41.2 ms (38.5–39.7): slower, not attributed.
-- [ ] 6b. SVG images (moved up from Phase 5, Images, by the owner,
+- [x] 6b. SVG images (moved up from Phase 5, Images, by the owner,
       2026-10-18, for Wikipedia's logo and icons): SVG in `<img>`, CSS
       images (`background-image`, `list-style-image`, `content`) and
       `data:` URLs, via `usvg` to vello.
+      Done 2026-10-18. Paint (`decode_svg`, `ImageStore::insert_svg`,
+      `draw_svg`): an image response that is not a raster image is parsed
+      as SVG (or SVGZ) by `usvg` and turned into a vello scene by
+      `vello_svg` once; its size is the root's width/height (its viewBox
+      without them); wherever images are drawn (`<img>` and the image
+      fragments of list markers and `content`, background layers, mask
+      layers) the scene is appended scaled to the destination and clipped
+      to it, vector at any scale. As an image it loads nothing else
+      (external `href`s not followed); text through `fontdb`, the installed
+      fonts read once on the first SVG with text. Tests: paint (an `<img>`
+      at its size and scaled, a tiled background, a circle mask, a
+      viewBox-only SVG's size, SVG text drawn, non-SVG refused). Timing:
+      tables 50.5–51.6 ms (50.4–51.9 before), blocks 14.5 ms (14.7–15.4),
+      Hacker News relayout 41.1–42.1 ms (39.4–40.2): Hacker News slower.
 - [x] 6c. CSS `mask` (moved up from Phase 5, Style, by the owner,
       2026-10-18, for Wikipedia's icons): `mask-image` (and `-webkit-mask-
       image`) with its `mask-*` longhands and the `mask` shorthand, images

@@ -42,6 +42,11 @@ winit = "0.30"
 wgpu = "29"
 vello = "0.10.0"
 parley = "0.11.1"
+# SVG images ("Working sites first" line 6b): usvg parses an SVG into a
+# tree (text through its fontdb), vello_svg turns that tree into vello
+# drawing; resvg's raster path is never pulled (plan/03-crates.md).
+usvg = "0.48"
+vello_svg = "0.11"
 # Same version as parley's. `fontconfig-dlopen` makes the Linux fontconfig
 # binding load the system library at runtime instead of probing it with
 # pkg-config at build time (plan/03-crates.md, "OS bindings on Linux").

@@ -42,6 +42,12 @@ can only panic.
 | `read-fonts` | 0.41.0 | 0/0 | forbids unsafe | Font tables |
 | `harfrust` | 0.12.0 | 0/0 | forbids unsafe | Shaping |
 | `wuff` | 0.2.9 | 0 (source search, 2026-10-18; geiger not re-run) | none | WOFF/WOFF2 web fonts; added for "Working sites first" line 6 |
+| `usvg` | 0.48.1 | 0 (source search, 2026-10-18; geiger not re-run) | none | SVG images (line 6b); `vello_svg` 0.11.0 0 too |
+| `roxmltree` | 0.21.1 | 0 (source search) | none | SVG's XML |
+| `simplecss`, `svgtypes` | 0.2.2, 0.16.1 | `unsafe` on 1 source line each | unsafe | SVG's CSS and attribute values |
+| `tiny-skia-path`, `strict-num` | 0.12.0, 0.1.1 | `unsafe` on 3 and 8 source lines | unsafe | SVG path geometry (no rasterizer) |
+| `fontdb` | 0.24.0 | `unsafe` on 6 source lines (memory mapping through `memmap2`) | unsafe | SVG text's fonts |
+| `imagesize`, `data-url` | 0.15.0, 0.3.2 | 0 (source search) | none | SVG's embedded images |
 | `zune-core` | 0.5.3 | 0/0 | none | |
 | `url` | 2.5.8 | 4/4 | unsafe | Tiny |
 | `idna` | 1.1.0 | 31/31 | unsafe | |

@@ -49,7 +49,8 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `boa_gc` | 0.22.0 | GC traits for DOM wrappers | |
 | `boa_runtime` | 0.22.0 | `console` and basics | Starting point for bindings |
 | `image` | 0.25.10 | Image decoding | `default-features = false`, features `png`, `jpeg`, `gif`, `webp`. Decoders: `png` 0.18.1, `zune-jpeg` 0.5.15, `gif` 0.14.2, `image-webp` 0.2.4. Final: `zune-jpeg` kept for speed (O1 resolved 2026-10-16) |
-| `usvg` | not added | SVG parse to a tree we paint with vello | Phase 5; never pull `resvg`'s raster path |
+| `usvg` | 0.48.1 | SVG parse to a tree we paint with vello | Added 2026-10-18 for "Working sites first" line 6b (SVG images; moved up from Phase 5 by the owner). Default features: `text` (through `fontdb`, which reads the installed fonts once, memory-mapped, on the first SVG with text), `system-fonts`, `memmap-fonts`. `resvg`'s raster path is not pulled. Brings `roxmltree`, `simplecss`, `svgtypes`, `tiny-skia-path` (paths only, no rasterizer), `fontdb`, `strict-num`, `imagesize`, `data-url`, `flate2` (SVGZ, already in the tree) |
+| `vello_svg` | 0.11.0 | A `usvg` tree as vello drawing | Added 2026-10-18 with `usvg`: Linebender's own adapter, on our vello 0.10 / peniko 0.6.1 / kurbo 0.13.1. An SVG image is turned into a vello scene once and appended, scaled, wherever it is drawn (`<img>`, background and mask layers) |
 | `url` | 2.5.8 | URL parsing (with `idna`) | `serde` feature on in `ipc-types` |
 | `encoding_rs` | 0.8.42 | Legacy encodings | |
 | `data-url` | 0.3.2 | `data:` URLs | |

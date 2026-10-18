@@ -2485,6 +2485,11 @@ impl TabState {
                     self.images.insert(url, img);
                     self.needs_layout = true;
                     self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
+                } else if let Some(svg) = browser_paint::decode_svg(&p.body) {
+                    // An SVG image: kept as vector drawing (line 6b).
+                    self.images.insert_svg(url, svg);
+                    self.needs_layout = true;
+                    self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
                 }
             }
             PendingKind::Font { url } => {

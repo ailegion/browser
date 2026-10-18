@@ -14,6 +14,9 @@ browser-dom.workspace = true
 browser-layout.workspace = true
 browser-style.workspace = true
 vello.workspace = true
+# SVG images: parsed by usvg, drawn through vello_svg.
+usvg.workspace = true
+vello_svg.workspace = true
 # Glyph outlines for `background-clip: text`; the version vello uses.
 skrifa.workspace = true
 url.workspace = true

@@ -44,10 +44,28 @@ use vello::{Glyph, Scene};
 pub use offscreen::render_offscreen;
 pub use vello::peniko;
 
-/// Decoded images, keyed by resolved URL.
-#[derive(Debug, Default, Clone)]
+/// Decoded images, keyed by resolved URL: raster images as pixels, SVG
+/// images as vector drawing ("Working sites first" line 6b).
+#[derive(Default, Clone)]
 pub struct ImageStore {
     images: HashMap<Url, ImageData>,
+    svgs: HashMap<Url, SvgImage>,
+}
+
+impl std::fmt::Debug for ImageStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageStore").field("images", &self.images.len()).field("svgs", &self.svgs.len()).finish()
+    }
+}
+
+/// An SVG image: its drawing as a vello scene in its own units, and its
+/// size in CSS pixels.
+#[derive(Clone)]
+#[allow(missing_debug_implementations, reason = "a vello scene has no Debug")]
+pub struct SvgImage {
+    scene: Arc<Scene>,
+    pub width: f32,
+    pub height: f32,
 }
 
 impl ImageStore {
@@ -59,11 +77,16 @@ impl ImageStore {
         self.images.insert(url, image);
     }
 
+    pub fn insert_svg(&mut self, url: Url, image: SvgImage) {
+        self.svgs.insert(url, image);
+    }
+
     /// Every image's intrinsic size, for a layout run elsewhere.
     pub fn sizes(&self) -> HashMap<Url, (f32, f32)> {
         self.images
             .iter()
             .map(|(u, i)| (u.clone(), (i.width as f32, i.height as f32)))
+            .chain(self.svgs.iter().map(|(u, s)| (u.clone(), (s.width, s.height))))
             .collect()
     }
 
@@ -71,16 +94,20 @@ impl ImageStore {
         self.images.get(url)
     }
 
+    pub fn get_svg(&self, url: &Url) -> Option<&SvgImage> {
+        self.svgs.get(url)
+    }
+
     pub fn contains(&self, url: &Url) -> bool {
-        self.images.contains_key(url)
+        self.images.contains_key(url) || self.svgs.contains_key(url)
     }
 
     pub fn len(&self) -> usize {
-        self.images.len()
+        self.images.len() + self.svgs.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.images.is_empty()
+        self.images.is_empty() && self.svgs.is_empty()
     }
 }
 
@@ -89,7 +116,46 @@ impl browser_layout::ImageSizes for ImageStore {
         self.images
             .get(url)
             .map(|i| (i.width as f32, i.height as f32))
+            .or_else(|| self.svgs.get(url).map(|s| (s.width, s.height)))
     }
+}
+
+/// The fonts SVG text is set in: the installed fonts, read once.
+fn svg_fonts() -> Arc<usvg::fontdb::Database> {
+    static FONTS: std::sync::OnceLock<Arc<usvg::fontdb::Database>> = std::sync::OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        })
+        .clone()
+}
+
+/// Decode an SVG (or gzipped SVGZ) document as an image. As an image it
+/// loads nothing else: external references are not followed (HTML's SVG
+/// as image, Secure Animated Mode). `None` when it is not one.
+pub fn decode_svg(bytes: &[u8]) -> Option<SvgImage> {
+    let head = bytes.get(..bytes.len().min(512)).unwrap_or_default();
+    let gz = head.starts_with(&[0x1f, 0x8b]);
+    if !gz && !String::from_utf8_lossy(head).contains("<svg") && !String::from_utf8_lossy(bytes).contains("<svg") {
+        return None;
+    }
+    let mut options = usvg::Options { resources_dir: None, ..usvg::Options::default() };
+    // Text needs fonts; read them only for an SVG that has text.
+    if gz || String::from_utf8_lossy(bytes).contains("<text") {
+        options.fontdb = svg_fonts();
+    }
+    // Only `data:` images inside are drawn.
+    options.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    let tree = usvg::Tree::from_data(bytes, &options).ok()?;
+    let size = tree.size();
+    let (width, height) = (size.width(), size.height());
+    if !(width > 0.0 && height > 0.0) {
+        return None;
+    }
+    let scene = vello_svg::render_tree(&tree);
+    Some(SvgImage { scene: Arc::new(scene), width, height })
 }
 
 /// Decode PNG, JPEG, GIF or WebP bytes into straight-alpha RGBA8.
@@ -734,10 +800,17 @@ impl<'a> Painter<'a> {
             let x = style.background_position_x[cycle(i, style.background_position_x.len())];
             let y = style.background_position_y[cycle(i, style.background_position_y.len())];
             let source = match image {
-                ComputedImage::Url(u) => match Url::parse(u).ok().and_then(|u| self.images.get(&u)) {
-                    Some(img) => LayerSource::Raster(img.clone()),
-                    None => continue,
-                },
+                ComputedImage::Url(u) => {
+                    let url = Url::parse(u).ok();
+                    match (
+                        url.as_ref().and_then(|u| self.images.get(u)),
+                        url.as_ref().and_then(|u| self.images.get_svg(u)),
+                    ) {
+                        (Some(img), _) => LayerSource::Raster(img.clone()),
+                        (None, Some(svg)) => LayerSource::Svg(svg.clone()),
+                        (None, None) => continue,
+                    }
+                }
                 ComputedImage::Gradient(g) => LayerSource::Gradient(g.clone()),
                 _ => continue,
             };
@@ -758,6 +831,7 @@ impl<'a> Painter<'a> {
             };
             let intrinsic = match &source {
                 LayerSource::Raster(img) => Some((img.width as f64, img.height as f64)),
+                LayerSource::Svg(svg) => Some((svg.width as f64, svg.height as f64)),
                 LayerSource::Gradient(_) => None,
             };
             let Some((tw, th)) = tile_size(size, intrinsic, (area.width(), area.height()), repeat) else { continue };
@@ -780,7 +854,7 @@ impl<'a> Painter<'a> {
             }
             let paint = match &source {
                 LayerSource::Gradient(g) => gradient_paint(g, tw, th),
-                LayerSource::Raster(_) => None,
+                LayerSource::Raster(_) | LayerSource::Svg(_) => None,
             };
             for &ty in &ys {
                 for &tx in &xs {
@@ -791,6 +865,7 @@ impl<'a> Painter<'a> {
                                 * Affine::scale_non_uniform(tw / img.width as f64, th / img.height as f64);
                             self.scene.draw_image(&ImageBrush::new(img.clone()), t);
                         }
+                        LayerSource::Svg(svg) => self.draw_svg(svg, tx, ty, tw, th),
                         LayerSource::Gradient(_) => {
                             if let Some((brush, brush_transform)) = &paint {
                                 let tile = KRect::new(tx, ty, tx + tw, ty + th);
@@ -865,8 +940,11 @@ impl<'a> Painter<'a> {
             self.scene.push_layer(Fill::NonZero, vello::peniko::BlendMode::new(Mix::Normal, compose), 1.0, Affine::IDENTITY, device);
             let luminance = style.mask_mode[cycle(i, style.mask_mode.len())] == MaskMode::Luminance;
             let source = match style.mask_images[i].chosen(self.scale) {
-                ComputedImage::Url(u) => Url::parse(u).ok().and_then(|u| self.images.get(&u)).map(|img| {
-                    LayerSource::Raster(if luminance { luminance_mask(img) } else { img.clone() })
+                ComputedImage::Url(u) => Url::parse(u).ok().and_then(|u| {
+                    self.images
+                        .get(&u)
+                        .map(|img| LayerSource::Raster(if luminance { luminance_mask(img) } else { img.clone() }))
+                        .or_else(|| self.images.get_svg(&u).map(|svg| LayerSource::Svg(svg.clone())))
                 }),
                 ComputedImage::Gradient(g) => Some(LayerSource::Gradient(if luminance { Arc::new(luminance_gradient(g)) } else { g.clone() })),
                 _ => None,
@@ -888,6 +966,7 @@ impl<'a> Painter<'a> {
                 let y = style.mask_position_y[cycle(i, style.mask_position_y.len())];
                 let intrinsic = match &source {
                     LayerSource::Raster(img) => Some((img.width as f64, img.height as f64)),
+                    LayerSource::Svg(svg) => Some((svg.width as f64, svg.height as f64)),
                     LayerSource::Gradient(_) => None,
                 };
                 if let Some((tw, th)) = tile_size(size, intrinsic, (area.width(), area.height()), repeat) {
@@ -900,7 +979,7 @@ impl<'a> Painter<'a> {
                         let ys = tile_starts(repeat.y, area.y0, area.height(), position(y, area.height(), th), th, (region.y0, region.y1));
                         let paint = match &source {
                             LayerSource::Gradient(g) => gradient_paint(g, tw, th),
-                            LayerSource::Raster(_) => None,
+                            LayerSource::Raster(_) | LayerSource::Svg(_) => None,
                         };
                         for &ty in &ys {
                             for &tx in &xs {
@@ -911,6 +990,7 @@ impl<'a> Painter<'a> {
                                             * Affine::scale_non_uniform(tw / img.width as f64, th / img.height as f64);
                                         self.scene.draw_image(&ImageBrush::new(img.clone()), t);
                                     }
+                                    LayerSource::Svg(svg) => self.draw_svg(svg, tx, ty, tw, th),
                                     LayerSource::Gradient(_) => {
                                         if let Some((brush, brush_transform)) = &paint {
                                             let tile = KRect::new(tx, ty, tx + tw, ty + th);
@@ -1513,7 +1593,25 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// An SVG image drawn into the rectangle at (`x`, `y`), `w` by `h`:
+    /// its drawing scaled to it, clipped to it (the image's viewport).
+    fn draw_svg(&mut self, svg: &SvgImage, x: f64, y: f64, w: f64, h: f64) {
+        if !(w > 0.0 && h > 0.0) {
+            return;
+        }
+        let dest = KRect::new(x, y, x + w, y + h);
+        self.scene.push_clip_layer(Fill::NonZero, self.transform, &dest);
+        let t = self.transform * Affine::translate((x, y)) * Affine::scale_non_uniform(w / svg.width as f64, h / svg.height as f64);
+        self.scene.append(&svg.scene, Some(t));
+        self.scene.pop_layer();
+    }
+
     fn image(&mut self, rect: &Rect, style: &ComputedStyle, url: &Url) {
+        if let Some(svg) = self.images.get_svg(url).cloned() {
+            let content = content_box(rect, style);
+            self.draw_svg(&svg, content.x as f64, content.y as f64, content.width as f64, content.height as f64);
+            return;
+        }
         let Some(img) = self.images.get(url) else {
             return;
         };
@@ -1550,6 +1648,7 @@ struct Areas {
 enum LayerSource {
     Raster(ImageData),
     Gradient(Arc<ComputedGradient>),
+    Svg(SvgImage),
 }
 
 /// The luminance of a colour as a mask value (CSS Masking 1 §7.2: the
@@ -3362,6 +3461,44 @@ mod tests {
     /// Background layers: position, size, repeat modes, origin and clip
     /// (CSS Backgrounds 3 §3), `fixed` against the viewport, the body's
     /// layers on the canvas, and `image-set()` by the device scale.
+    #[test]
+    fn svg_images_draw_in_img_backgrounds_and_masks() {
+        // Left half red, right half blue, 20×20.
+        let halves = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="10" height="20" fill="red"/><rect x="10" width="10" height="20" fill="blue"/></svg>"#;
+        // A black circle filling a 10×10 viewBox (no width/height: the
+        // viewBox's size).
+        let circle = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="5"/></svg>"#;
+        let text = br#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="30"><text x="2" y="24" font-size="24" fill="red">Wiki</text></svg>"#;
+        assert!(decode_svg(b"not an svg").is_none() && decode_svg(b"<svg").is_none());
+        let halves = decode_svg(halves).expect("svg");
+        assert_eq!((halves.width, halves.height), (20.0, 20.0));
+        let circle = decode_svg(circle).expect("viewBox svg");
+        assert_eq!((circle.width, circle.height), (10.0, 10.0));
+        let mut images = ImageStore::new();
+        images.insert_svg(Url::parse("http://x/h.svg").expect("url"), halves);
+        images.insert_svg(Url::parse("http://x/c.svg").expect("url"), circle);
+        images.insert_svg(Url::parse("http://x/t.svg").expect("url"), decode_svg(text).expect("text svg"));
+        let render = |html: &str| render_with(html, &images, 0.0, 1.0).1;
+        // In an <img>, at its intrinsic size and scaled: sharp halves.
+        let Some(p) = render("<body style='margin:0'><img src='http://x/h.svg'><br><img src='http://x/h.svg' style='width:80px;height:40px'></body>") else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        assert!(is_red(px(&p, 5.0, 10.0)) && is_blue(px(&p, 15.0, 10.0)) && is_white(px(&p, 25.0, 10.0)), "20×20 at its size");
+        let y = 30.0;
+        assert!(is_red(px(&p, 38.0, y)) && is_blue(px(&p, 42.0, y)) && is_blue(px(&p, 78.0, y)), "scaled to 80×40, the edge at 40");
+        // As a background, tiled.
+        let p = render("<body style='margin:0'><div style='width:40px;height:20px;background:url(http://x/h.svg)'></div></body>").expect("gpu");
+        assert!(is_red(px(&p, 25.0, 10.0)) && is_blue(px(&p, 35.0, 10.0)), "the second tile");
+        // As a mask: the circle keeps the middle, hides the corners.
+        let p = render("<body style='margin:0'><div style='width:40px;height:40px;background:red;mask:url(http://x/c.svg) 0 0 / 40px 40px'></div></body>").expect("gpu");
+        assert!(is_red(px(&p, 20.0, 20.0)) && is_white(px(&p, 2.0, 2.0)) && is_white(px(&p, 38.0, 38.0)));
+        // Text is drawn (in some installed font).
+        let p = render("<body style='margin:0'><img src='http://x/t.svg'></body>").expect("gpu");
+        let reds = (0..80).flat_map(|x| (0..30).map(move |y| (x as f32, y as f32))).filter(|&(x, y)| is_red(px(&p, x, y))).count();
+        assert!(reds > 20, "red text pixels: {reds}");
+    }
+
     #[test]
     fn masks_hide_what_their_layers_do_not_cover() {
         let images = two_by_two();
