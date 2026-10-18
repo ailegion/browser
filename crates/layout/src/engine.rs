@@ -6735,17 +6735,19 @@ mod generated_content {
     fn a_clearfix_after_contains_floats_and_positioned_befores_take_the_element_as_containing_block() {
         let (doc, tree) = layout(
             "<body style='margin:0'><div id=c><i style='float:left;width:10px;height:40px'></i></div>\
-             <div id=e><i style='float:left;width:10px;height:40px'></i><b style='display:block;clear:both'></b></div>\
+             <div id=e><i style='float:left;width:10px;height:40px'></i><b style='display:table;clear:both'></b></div>\
+             <div id=o><i style='float:left;width:10px;height:30px'></i><b style='display:flow-root;clear:left'></b></div>\
              <div id=r style='position:relative;margin-left:100px;width:50px;height:50px'></div></body>",
-            "#c::after { content: \"\"; display: block; clear: both }
+            "#c::after { content: \"\"; display: table; clear: both }
              #r::before { content: \"\"; position: absolute; left: 5px; top: 6px; width: 7px; height: 8px }",
             &(),
         );
-        assert_eq!(rect_of(&tree, by_id(&doc, "e")).height, 40.0, "a real element clears the float");
+        assert_eq!(rect_of(&tree, by_id(&doc, "e")).height, 40.0, "a real table clears the float");
+        assert_eq!(rect_of(&tree, by_id(&doc, "o")).height, 30.0, "so does an empty flow-root");
         assert_eq!(rect_of(&tree, by_id(&doc, "c")).height, 40.0, "the ::after clears the float inside");
         let r = by_id(&doc, "r");
         let before = doc.pseudo_element(r, PseudoKind::Before).expect("node");
-        assert_eq!(rect_of(&tree, before), Rect::new(105.0, 86.0, 7.0, 8.0));
+        assert_eq!(rect_of(&tree, before), Rect::new(105.0, 116.0, 7.0, 8.0));
     }
 
     #[test]

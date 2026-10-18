@@ -428,7 +428,7 @@ remaining lists as they stand.
       images and custom-property/`var()` text, against the sheet's URL or,
       for a `style` attribute, the document's base URL (test
       `relative_urls_resolve_in_style_attributes_and_sheets`).
-- [ ] 6e. Generated content (owner, 2026-10-18; not in the plan before,
+- [x] 6e. Generated content (owner, 2026-10-18; not in the plan before,
       and used by most sites): `::before` and `::after` matched in the
       cascade and given boxes; `content` with strings, `url()` images (6b's
       `content` part), `attr()`, counters (`counter()`, `counters()`,
@@ -444,8 +444,7 @@ remaining lists as they stand.
       CLDR (best guesses for Chrome, not verified against it); the rarely
       used parts in Phase 5, Style; pseudo-elements as nodes of their own
       (a core change, owner's go).
-      Built 2026-10-18, not ticked (the owner rules on the table clearance
-      found below). DOM (`NodeKind::PseudoElement`, `PseudoKind`): a
+      Done 2026-10-18. DOM (`NodeKind::PseudoElement`, `PseudoKind`): a
       `::before`/`::after` node whose parent is its element, in no child
       list (tree walks, `textContent`, serialization, `cloneNode`,
       `querySelector` and mutation records never meet it), recorded on the
@@ -512,13 +511,14 @@ remaining lists as they stand.
       images and gradients, Wikipedia's `.hlist` " · ", checkboxes,
       restyled colours), paint (a gradient), tab (`getComputedStyle`,
       `attr()` following its attribute, rects, a click on a pseudo box,
-      `:hover::after`, a fetched `content` image). Found, not part of 6e:
-      a `display: table` box (and any box starting its own formatting
-      context) gets no clearance, as the vendored taffy computes it only
-      for boxes in the same formatting context, so the common clearfix
-      `::after { content: ""; display: table; clear: both }` does not
-      clear floats (nor does a real table with `clear`); a string
-      `list-style-type` shows no marker (as before). Timing: tables
+      `:hover::after`, a fetched `content` image). Found and fixed (owner's
+      go): the common clearfix `::after { content: ""; display: table;
+      clear: both }` did not clear floats (nor did a real empty table or
+      flow-root with `clear`): the vendored taffy let an empty box that
+      starts its own formatting context collapse through, so its place
+      below the floats added no height (taffy patch, `03-crates.md`;
+      test: a real table, a flow-root, the `::after`). Found, not part of
+      6e: a string `list-style-type` shows no marker (as before). Timing: tables
       49.7 ms (50.8 before), blocks 14.0 ms (14.5); Wikipedia load
       0.84 s (0.74–0.80), restyle 38 ms (35), relayout 121–123 ms
       (115–117), 105 pseudo nodes; iana load 7.86 s (5.19–6.08, live),

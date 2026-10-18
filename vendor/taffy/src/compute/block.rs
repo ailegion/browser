@@ -1413,7 +1413,14 @@ fn perform_final_layout_on_in_flow_children(
             }
 
             item.computed_size = item_layout.size;
-            item.can_be_collapsed_through = item_layout.margins_can_collapse_through && !has_clearance;
+            // A box that establishes its own formatting context (a table, a
+            // scroll container, a flow-root) is never collapsed through, even
+            // empty: it keeps its place, below the floats it cleared or
+            // avoided, and the container's height takes it in (CSS 2.1 §8.3.1,
+            // §9.5.2; the clearfix `::after { display: table; clear: both }`).
+            // Our addition to the vendored taffy.
+            item.can_be_collapsed_through =
+                item_layout.margins_can_collapse_through && !has_clearance && item.is_in_same_bfc;
             item.static_position = if item.is_in_same_bfc {
                 let uncleared_y = committed_y_offset + active_collapsible_margin_set.resolve();
                 Point {
