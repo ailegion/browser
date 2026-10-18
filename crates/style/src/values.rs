@@ -113,104 +113,499 @@ pub fn css_number(v: f32) -> String {
     s.to_owned()
 }
 
-/// A `calc()` sum of lengths and percentages, kept as its terms so it can
-/// be serialized; `+`/`-` are folded into the signs.
+/// A math function (CSS Values 4 §10; "Working sites first" line 6f):
+/// `calc()`, `min()`, `max()` or `clamp()` of lengths, percentages and
+/// numbers with `+`, `-`, `*`, `/`, kept as written for the CSSOM.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Calc {
-    pub terms: Vec<CalcTerm>,
+    pub node: CalcNode,
 }
 
-/// One operand of a `calc()` sum, with the sign of the `+`/`-` before it.
+/// A node of a math expression.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CalcTerm {
-    pub negative: bool,
-    pub value: CalcValue,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum CalcValue {
+pub enum CalcNode {
+    Number(f32),
     Length(Length),
     Percent(f32),
-    /// A nested `calc()`, folded on its own before it joins the sum.
-    Nested(Calc),
+    /// Terms, each subtracted (`true`) or added.
+    Sum(Vec<(bool, CalcNode)>),
+    /// Factors, each a divisor (`true`) or a multiplier.
+    Product(Vec<(bool, CalcNode)>),
+    Min(Vec<CalcNode>),
+    Max(Vec<CalcNode>),
+    Clamp(Box<[CalcNode; 3]>),
+    /// A nested `calc()` or parentheses.
+    Calc(Box<CalcNode>),
+}
+
+/// What a math expression resolves to: a number or a length (where a
+/// percentage is a length too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalcKind {
+    Number,
+    Length,
+}
+
+impl CalcNode {
+    /// The expression's type, or `None` when the operands do not combine
+    /// (a length plus a number, a length times a length, a division by a
+    /// length): such an expression does not parse (§10.8).
+    fn kind(&self) -> Option<CalcKind> {
+        match self {
+            CalcNode::Number(_) => Some(CalcKind::Number),
+            CalcNode::Length(_) | CalcNode::Percent(_) => Some(CalcKind::Length),
+            CalcNode::Sum(terms) | CalcNode::Product(terms) if terms.is_empty() => None,
+            CalcNode::Sum(terms) => {
+                let first = terms[0].1.kind()?;
+                terms.iter().all(|(_, t)| t.kind() == Some(first)).then_some(first)
+            }
+            CalcNode::Product(factors) => {
+                let mut lengths = 0;
+                for (divide, f) in factors {
+                    match f.kind()? {
+                        CalcKind::Length if *divide => return None,
+                        CalcKind::Length => lengths += 1,
+                        CalcKind::Number => {}
+                    }
+                }
+                match lengths {
+                    0 => Some(CalcKind::Number),
+                    1 => Some(CalcKind::Length),
+                    _ => None,
+                }
+            }
+            CalcNode::Min(args) | CalcNode::Max(args) => {
+                let first = args.first()?.kind()?;
+                args.iter().all(|a| a.kind() == Some(first)).then_some(first)
+            }
+            CalcNode::Clamp(args) => {
+                let k = args[0].kind()?;
+                (args[1].kind() == Some(k) && args[2].kind() == Some(k)).then_some(k)
+            }
+            CalcNode::Calc(inner) => inner.kind(),
+        }
+    }
+
+    /// Whether a percentage appears anywhere.
+    pub fn has_percent(&self) -> bool {
+        match self {
+            CalcNode::Percent(_) => true,
+            CalcNode::Number(_) | CalcNode::Length(_) => false,
+            CalcNode::Sum(v) | CalcNode::Product(v) => v.iter().any(|(_, n)| n.has_percent()),
+            CalcNode::Min(v) | CalcNode::Max(v) => v.iter().any(CalcNode::has_percent),
+            CalcNode::Clamp(a) => a.iter().any(CalcNode::has_percent),
+            CalcNode::Calc(n) => n.has_percent(),
+        }
+    }
+
+    /// The value in pixels (or the number), lengths through `ctx` when
+    /// given (else they must already be pixels), percentages of `basis`
+    /// (`None`: a percentage makes the whole `None`). `min`/`max`/`clamp`
+    /// as defined (clamp's minimum wins over its maximum).
+    pub fn eval(&self, ctx: Option<&LengthContext>, basis: Option<f32>) -> Option<f32> {
+        Some(match self {
+            CalcNode::Number(n) => *n,
+            CalcNode::Length(l) => match ctx {
+                Some(ctx) => l.to_px(ctx),
+                None => l.parts().0,
+            },
+            CalcNode::Percent(p) => p / 100.0 * basis?,
+            CalcNode::Sum(terms) => {
+                let mut acc = 0.0;
+                for (neg, t) in terms {
+                    let v = t.eval(ctx, basis)?;
+                    acc += if *neg { -v } else { v };
+                }
+                acc
+            }
+            CalcNode::Product(factors) => {
+                let mut acc = 1.0;
+                for (divide, f) in factors {
+                    let v = f.eval(ctx, basis)?;
+                    acc = if *divide { acc / v } else { acc * v };
+                }
+                acc
+            }
+            CalcNode::Min(args) => {
+                let mut acc = f32::INFINITY;
+                for a in args {
+                    acc = acc.min(a.eval(ctx, basis)?);
+                }
+                acc
+            }
+            CalcNode::Max(args) => {
+                let mut acc = f32::NEG_INFINITY;
+                for a in args {
+                    acc = acc.max(a.eval(ctx, basis)?);
+                }
+                acc
+            }
+            CalcNode::Clamp(a) => {
+                let (lo, v, hi) = (a[0].eval(ctx, basis)?, a[1].eval(ctx, basis)?, a[2].eval(ctx, basis)?);
+                v.min(hi).max(lo)
+            }
+            CalcNode::Calc(n) => n.eval(ctx, basis)?,
+        })
+    }
+
+    /// A single value: the number and its unit (`""` for a number, `"%"`).
+    fn leaf(&self) -> Option<(f32, &'static str)> {
+        match self {
+            CalcNode::Number(n) => Some((*n, "")),
+            CalcNode::Percent(p) => Some((*p, "%")),
+            CalcNode::Length(l) => Some(l.parts()),
+            _ => None,
+        }
+    }
+
+    fn from_leaf(v: f32, unit: &'static str, like: &CalcNode) -> CalcNode {
+        match like {
+            CalcNode::Number(_) => CalcNode::Number(v),
+            CalcNode::Percent(_) => CalcNode::Percent(v),
+            CalcNode::Length(l) => CalcNode::Length(l.with_value(v)),
+            _ => {
+                debug_assert!(unit.is_empty());
+                CalcNode::Number(v)
+            }
+        }
+    }
+
+    /// The expression simplified (CSS Values 4 §10.12): nested `calc()`
+    /// unwrapped, sums flattened with like units added and sorted (number,
+    /// percentage, lengths by unit, then the rest), numbers multiplied in,
+    /// `min`/`max`/`clamp` of like units computed. Absolute units become
+    /// `px`; with `ctx` (computed values) every length does.
+    fn simplify(&self, ctx: Option<&LengthContext>) -> CalcNode {
+        match self {
+            CalcNode::Number(_) | CalcNode::Percent(_) => self.clone(),
+            CalcNode::Length(l) => CalcNode::Length(match (ctx, l) {
+                (Some(ctx), l) => Length::Px(l.to_px(ctx)),
+                (None, Length::Pt(_) | Length::Pc(_) | Length::In(_) | Length::Cm(_) | Length::Mm(_) | Length::Q(_)) => {
+                    Length::Px(l.to_px(&LengthContext::ABSOLUTE))
+                }
+                (None, l) => *l,
+            }),
+            CalcNode::Calc(n) => n.simplify(ctx),
+            CalcNode::Sum(terms) => {
+                fn flatten(out: &mut Vec<(bool, CalcNode)>, neg: bool, node: CalcNode) {
+                    match node {
+                        CalcNode::Sum(inner) => {
+                            for (n, c) in inner {
+                                flatten(out, neg ^ n, c);
+                            }
+                        }
+                        other => out.push((neg, other)),
+                    }
+                }
+                let mut flat = Vec::new();
+                for (neg, t) in terms {
+                    flatten(&mut flat, *neg, t.simplify(ctx));
+                }
+                // Like units added, in their first node's form.
+                let mut leaves: Vec<(f32, &'static str, CalcNode)> = Vec::new();
+                let mut rest = Vec::new();
+                for (neg, n) in flat {
+                    match n.leaf() {
+                        Some((v, unit)) => {
+                            let v = if neg { -v } else { v };
+                            match leaves.iter_mut().find(|e| e.1 == unit) {
+                                Some(e) => e.0 += v,
+                                None => leaves.push((v, unit, n)),
+                            }
+                        }
+                        None => rest.push((neg, n)),
+                    }
+                }
+                let rank = |unit: &str| match unit {
+                    "" => 0,
+                    "%" => 1,
+                    _ => 2,
+                };
+                leaves.sort_by(|a, b| rank(a.1).cmp(&rank(b.1)).then_with(|| a.1.cmp(b.1)));
+                let mut out: Vec<(bool, CalcNode)> =
+                    leaves.into_iter().map(|(v, unit, like)| (false, CalcNode::from_leaf(v, unit, &like))).collect();
+                out.extend(rest);
+                if out.len() == 1 && !out[0].0 {
+                    return out.pop().map(|(_, n)| n).unwrap_or(CalcNode::Number(0.0));
+                }
+                CalcNode::Sum(out)
+            }
+            CalcNode::Product(factors) => {
+                fn flatten(num: &mut f32, rest: &mut Vec<(bool, CalcNode)>, divide: bool, node: CalcNode) {
+                    match node {
+                        CalcNode::Number(n) => *num = if divide { *num / n } else { *num * n },
+                        CalcNode::Product(inner) if !divide => {
+                            for (d, c) in inner {
+                                flatten(num, rest, d, c);
+                            }
+                        }
+                        other => rest.push((divide, other)),
+                    }
+                }
+                let mut num = 1.0;
+                let mut rest = Vec::new();
+                for (divide, f) in factors {
+                    flatten(&mut num, &mut rest, *divide, f.simplify(ctx));
+                }
+                let scale = |n: &CalcNode| n.leaf().map(|(v, unit)| CalcNode::from_leaf(v * num, unit, n));
+                match rest.as_slice() {
+                    [] => return CalcNode::Number(num),
+                    [(false, only)] => {
+                        if let Some(leaf) = scale(only) {
+                            return leaf;
+                        }
+                        if num == 1.0 {
+                            return only.clone();
+                        }
+                        // A number times a sum of values: the sum, scaled.
+                        if let CalcNode::Sum(terms) = only {
+                            if terms.iter().all(|(_, t)| t.leaf().is_some()) {
+                                return CalcNode::Sum(
+                                    terms
+                                        .iter()
+                                        .map(|(neg, t)| {
+                                            let (v, unit) = t.leaf().unwrap_or((0.0, ""));
+                                            let v = if *neg { -v } else { v };
+                                            (false, CalcNode::from_leaf(v * num, unit, t))
+                                        })
+                                        .collect(),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                let mut out = Vec::new();
+                if num != 1.0 {
+                    out.push((false, CalcNode::Number(num)));
+                }
+                out.extend(rest);
+                CalcNode::Product(out)
+            }
+            CalcNode::Min(args) | CalcNode::Max(args) => {
+                let min = matches!(self, CalcNode::Min(_));
+                let args: Vec<CalcNode> = args.iter().map(|a| a.simplify(ctx)).collect();
+                if args.len() == 1 {
+                    return args.into_iter().next().unwrap_or(CalcNode::Number(0.0));
+                }
+                let first = args[0].leaf();
+                if let Some((_, unit)) = first {
+                    if args.iter().all(|a| a.leaf().is_some_and(|l| l.1 == unit)) {
+                        let mut best = &args[0];
+                        for a in &args[1..] {
+                            let (v, b) = (a.leaf().map_or(0.0, |l| l.0), best.leaf().map_or(0.0, |l| l.0));
+                            if (min && v < b) || (!min && v > b) {
+                                best = a;
+                            }
+                        }
+                        return best.clone();
+                    }
+                }
+                if min { CalcNode::Min(args) } else { CalcNode::Max(args) }
+            }
+            CalcNode::Clamp(a) => {
+                let [lo, v, hi] = [a[0].simplify(ctx), a[1].simplify(ctx), a[2].simplify(ctx)];
+                if let (Some(l), Some(m), Some(h)) = (lo.leaf(), v.leaf(), hi.leaf()) {
+                    if l.1 == m.1 && m.1 == h.1 {
+                        return CalcNode::from_leaf(m.0.min(h.0).max(l.0), m.1, &v);
+                    }
+                }
+                CalcNode::Clamp(Box::new([lo, v, hi]))
+            }
+        }
+    }
+
+    /// Serialize a simplified expression at the top (§10.13): a value or
+    /// a sum or product inside `calc()`, a function as itself.
+    fn css_root(&self) -> String {
+        match self {
+            CalcNode::Sum(_) | CalcNode::Product(_) => format!("calc({})", self.css_inner()),
+            CalcNode::Calc(n) => n.css_root(),
+            _ if self.leaf().is_some() => format!("calc({})", self.css_term()),
+            _ => self.css_term(),
+        }
+    }
+
+    /// As a function's argument: a sum or product without parentheses.
+    fn css_arg(&self) -> String {
+        match self {
+            CalcNode::Sum(_) | CalcNode::Product(_) => self.css_inner(),
+            _ => self.css_term(),
+        }
+    }
+
+    /// As an operand of a sum or product: a sum or product in parentheses.
+    fn css_term(&self) -> String {
+        let join = |v: &[CalcNode]| v.iter().map(CalcNode::css_arg).collect::<Vec<_>>().join(", ");
+        match self {
+            CalcNode::Number(n) => css_number(*n),
+            CalcNode::Length(l) => l.to_css(),
+            CalcNode::Percent(p) => format!("{}%", css_number(*p)),
+            CalcNode::Sum(_) | CalcNode::Product(_) => format!("({})", self.css_inner()),
+            CalcNode::Min(v) => format!("min({})", join(v)),
+            CalcNode::Max(v) => format!("max({})", join(v)),
+            CalcNode::Clamp(a) => format!("clamp({})", join(&a[..])),
+            CalcNode::Calc(n) => n.css_term(),
+        }
+    }
+
+    fn css_inner(&self) -> String {
+        let mut s = String::new();
+        match self {
+            CalcNode::Sum(terms) => {
+                for (i, (neg, t)) in terms.iter().enumerate() {
+                    // A negative value after the first is subtracted.
+                    let (neg, t) = match t.leaf() {
+                        Some((v, unit)) if i > 0 && v < 0.0 => (!neg, CalcNode::from_leaf(-v, unit, t)),
+                        _ => (*neg, t.clone()),
+                    };
+                    if i > 0 {
+                        s.push_str(if neg { " - " } else { " + " });
+                        s.push_str(&t.css_term());
+                    } else if neg {
+                        s.push_str(&format!("(-1 * {})", t.css_term()));
+                    } else {
+                        s.push_str(&t.css_term());
+                    }
+                }
+            }
+            CalcNode::Product(factors) => {
+                for (i, (divide, f)) in factors.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(if *divide { " / " } else { " * " });
+                    } else if *divide {
+                        s.push_str("1 / ");
+                    }
+                    s.push_str(&f.css_term());
+                }
+            }
+            other => s.push_str(&other.css_term()),
+        }
+        s
+    }
 }
 
 impl Calc {
-    /// The value the engine uses: terms of one unit (or all percentages)
-    /// sum; a sum of mixed units keeps its first operand until layout
-    /// can take a `calc()` (roadmap item 4a). A nested `calc()` is
-    /// folded on its own first.
-    fn fold(&self) -> LengthPercentage {
-        let value = |t: &CalcTerm| match &t.value {
-            CalcValue::Length(l) => LengthPercentage::Length(*l),
-            CalcValue::Percent(p) => LengthPercentage::Percent(*p),
-            CalcValue::Nested(c) => c.fold(),
-        };
-        let mut iter = self.terms.iter();
-        let mut acc = match iter.next() {
-            Some(t) => value(t),
-            None => LengthPercentage::ZERO,
-        };
-        for next in iter {
-            let op = if next.negative { -1.0 } else { 1.0 };
-            acc = match (acc, value(next)) {
-                (LengthPercentage::Length(a), LengthPercentage::Length(b)) if a.parts().1 == b.parts().1 => {
-                    LengthPercentage::Length(a.with_value(a.parts().0 + op * b.parts().0))
-                }
-                (LengthPercentage::Percent(a), LengthPercentage::Percent(b)) => LengthPercentage::Percent(a + op * b),
-                (a, _) => a,
-            };
-        }
-        acc
-    }
-
-    /// Sum every term into `percent` and `lengths` by unit, nested sums
-    /// flattened, signs applied.
-    fn collect(&self, sign: f32, percent: &mut Option<f32>, lengths: &mut Vec<(&'static str, f32)>) {
-        for t in &self.terms {
-            let s = if t.negative { -sign } else { sign };
-            match &t.value {
-                CalcValue::Percent(p) => *percent = Some(percent.unwrap_or(0.0) + s * p),
-                CalcValue::Length(l) => {
-                    let (v, unit) = l.parts();
-                    match lengths.iter_mut().find(|(u, _)| *u == unit) {
-                        Some(slot) => slot.1 += s * v,
-                        None => lengths.push((unit, s * v)),
-                    }
-                }
-                CalcValue::Nested(c) => c.collect(s, percent, lengths),
-            }
-        }
-    }
-
-    /// Serialize per CSS Values 4: like terms summed, percentages first,
-    /// then lengths by unit, inside `calc()`.
+    /// Serialize as the CSSOM does (§10.13): simplified, absolute units in
+    /// `px`, relative units kept.
     pub fn to_css(&self) -> String {
-        let mut percent: Option<f32> = None;
-        let mut lengths: Vec<(&'static str, f32)> = Vec::new();
-        self.collect(1.0, &mut percent, &mut lengths);
-        lengths.sort_by(|a, b| a.0.cmp(b.0));
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(p) = percent {
-            parts.push(format!("{}%", css_number(p)));
+        self.node.simplify(None).css_root()
+    }
+
+    /// The computed value: pixels when no percentage is involved, a
+    /// percentage when that is all that remains, else the simplified
+    /// expression with its lengths in pixels, kept to layout.
+    fn to_computed(&self, ctx: &LengthContext) -> ComputedLp {
+        let node = self.node.simplify(Some(ctx));
+        match node {
+            CalcNode::Percent(p) => ComputedLp::Percent(p),
+            _ if !node.has_percent() => ComputedLp::Px(node.eval(None, None).unwrap_or(0.0)),
+            node => ComputedLp::Calc(CalcHandle::intern(node, false)),
         }
-        for (unit, v) in lengths {
-            parts.push(format!("{}{unit}", css_number(v)));
+    }
+}
+
+/// A computed math expression involving percentages, interned: the
+/// computed values stay `Copy`, and layout resolves the expression against
+/// its basis (`CalcHandle::resolve`). A handle for a property that takes
+/// no negative values (`width`, `padding`) clamps its result at zero
+/// (§10.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CalcHandle(u32);
+
+type CalcTable = (Vec<(CalcNode, bool)>, std::collections::HashMap<String, u32>);
+
+fn calc_table() -> &'static std::sync::RwLock<CalcTable> {
+    static TABLE: std::sync::OnceLock<std::sync::RwLock<CalcTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(Default::default)
+}
+
+impl CalcHandle {
+    fn intern(node: CalcNode, non_negative: bool) -> CalcHandle {
+        let key = format!("{non_negative}{node:?}");
+        if let Some(&i) = calc_table().read().ok().and_then(|t| t.1.get(&key).copied()).as_ref() {
+            return CalcHandle(i);
         }
-        let mut out = String::from("calc(");
-        for (i, p) in parts.iter().enumerate() {
-            if i == 0 {
-                out.push_str(p);
-            } else if let Some(rest) = p.strip_prefix('-') {
-                out.push_str(" - ");
-                out.push_str(rest);
-            } else {
-                out.push_str(" + ");
-                out.push_str(p);
+        let mut t = calc_table().write().unwrap_or_else(|e| e.into_inner());
+        if let Some(&i) = t.1.get(&key) {
+            return CalcHandle(i);
+        }
+        let i = t.0.len() as u32;
+        t.0.push((node, non_negative));
+        t.1.insert(key, i);
+        CalcHandle(i)
+    }
+
+    /// The same expression, its result clamped at zero.
+    pub fn non_negative(self) -> CalcHandle {
+        let node = {
+            let t = calc_table().read().unwrap_or_else(|e| e.into_inner());
+            match t.0.get(self.0 as usize) {
+                Some((_, true)) | None => return self,
+                Some((node, false)) => node.clone(),
+            }
+        };
+        CalcHandle::intern(node, true)
+    }
+
+    /// A sum of a percentage and pixels, as its two parts.
+    pub(crate) fn linear(self) -> Option<(f32, f32)> {
+        let t = calc_table().read().unwrap_or_else(|e| e.into_inner());
+        let Some((CalcNode::Sum(terms), _)) = t.0.get(self.0 as usize) else { return None };
+        let (mut percent, mut px) = (0.0, 0.0);
+        for (neg, term) in terms {
+            let sign = if *neg { -1.0 } else { 1.0 };
+            match term {
+                CalcNode::Percent(p) => percent += sign * p,
+                CalcNode::Length(Length::Px(v)) => px += sign * v,
+                _ => return None,
             }
         }
-        out.push(')');
-        out
+        Some((percent, px))
+    }
+
+    /// `percent% + self` or `percent% - self`, simplified (a position from
+    /// the center or the end edge).
+    pub(crate) fn offset_from(self, percent: f32, subtract: bool) -> CalcHandle {
+        let node = {
+            let t = calc_table().read().unwrap_or_else(|e| e.into_inner());
+            match t.0.get(self.0 as usize) {
+                Some((node, _)) => node.clone(),
+                None => return self,
+            }
+        };
+        let sum = CalcNode::Sum(vec![(false, CalcNode::Percent(percent)), (subtract, node)]);
+        CalcHandle::intern(sum.simplify(None), false)
+    }
+
+    /// The expression's value for a percentage basis.
+    pub fn resolve(self, basis: f32) -> f32 {
+        let t = calc_table().read().unwrap_or_else(|e| e.into_inner());
+        match t.0.get(self.0 as usize) {
+            Some((n, non_negative)) => {
+                let v = n.eval(None, Some(basis)).unwrap_or(0.0);
+                if *non_negative { v.max(0.0) } else { v }
+            }
+            None => 0.0,
+        }
+    }
+
+    /// The handle as an opaque non-zero, 8-aligned token (taffy's calc
+    /// values), and back.
+    pub fn token(self) -> usize {
+        (self.0 as usize + 1) << 3
+    }
+
+    pub fn from_token(token: usize) -> CalcHandle {
+        CalcHandle(((token >> 3).max(1) - 1) as u32)
+    }
+
+    /// The computed expression as CSS (`getComputedStyle`).
+    pub fn to_css(self) -> String {
+        let t = calc_table().read().unwrap_or_else(|e| e.into_inner());
+        t.0.get(self.0 as usize)
+            .map(|(n, _)| n.css_root())
+            .unwrap_or_else(|| "0px".to_owned())
     }
 }
 
@@ -221,6 +616,12 @@ pub struct LengthContext {
     pub root_font_size: f32,
     pub viewport_width: f32,
     pub viewport_height: f32,
+}
+
+impl LengthContext {
+    /// For the absolute units, which need nothing.
+    const ABSOLUTE: LengthContext =
+        LengthContext { font_size: 16.0, root_font_size: 16.0, viewport_width: 0.0, viewport_height: 0.0 };
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,19 +635,11 @@ pub enum LengthPercentage {
 impl LengthPercentage {
     pub const ZERO: LengthPercentage = LengthPercentage::Length(Length::ZERO);
 
-    /// The engine's value: a plain length or percentage.
-    pub fn folded(&self) -> LengthPercentage {
-        match self {
-            LengthPercentage::Calc(c) => c.fold(),
-            other => other.clone(),
-        }
-    }
-
     pub fn to_computed(&self, ctx: &LengthContext) -> ComputedLp {
-        match self.folded() {
+        match self {
             LengthPercentage::Length(l) => ComputedLp::Px(l.to_px(ctx)),
-            LengthPercentage::Percent(p) => ComputedLp::Percent(p),
-            LengthPercentage::Calc(_) => ComputedLp::ZERO,
+            LengthPercentage::Percent(p) => ComputedLp::Percent(*p),
+            LengthPercentage::Calc(c) => c.to_computed(ctx),
         }
     }
 
@@ -273,10 +666,10 @@ impl LengthPercentageAuto {
             LengthPercentageAuto::Auto => ComputedLpAuto::Auto,
             LengthPercentageAuto::Length(l) => ComputedLpAuto::Px(l.to_px(ctx)),
             LengthPercentageAuto::Percent(p) => ComputedLpAuto::Percent(*p),
-            LengthPercentageAuto::Calc(c) => match c.fold() {
-                LengthPercentage::Length(l) => ComputedLpAuto::Px(l.to_px(ctx)),
-                LengthPercentage::Percent(p) => ComputedLpAuto::Percent(p),
-                LengthPercentage::Calc(_) => ComputedLpAuto::Px(0.0),
+            LengthPercentageAuto::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(ctx) {
+                ComputedLp::Px(v) => ComputedLpAuto::Px(v),
+                ComputedLp::Percent(p) => ComputedLpAuto::Percent(p),
+                ComputedLp::Calc(h) => ComputedLpAuto::Calc(h),
             },
         }
     }
@@ -291,11 +684,13 @@ impl LengthPercentageAuto {
     }
 }
 
-/// Computed length-or-percentage: lengths are in px.
+/// Computed length-or-percentage: lengths are in px; a math expression
+/// with percentages is resolved against the basis (`Calc`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ComputedLp {
     Px(f32),
     Percent(f32),
+    Calc(CalcHandle),
 }
 
 impl ComputedLp {
@@ -304,6 +699,22 @@ impl ComputedLp {
         match self {
             ComputedLp::Px(v) => v,
             ComputedLp::Percent(p) => p / 100.0 * basis,
+            ComputedLp::Calc(h) => h.resolve(basis),
+        }
+    }
+
+    /// Whether the value depends on a percentage basis.
+    pub fn has_percent(self) -> bool {
+        !matches!(self, ComputedLp::Px(_))
+    }
+
+    /// For a property that takes no negative values: a math function's
+    /// result clamped at zero (§10.12).
+    pub fn non_negative(self) -> ComputedLp {
+        match self {
+            ComputedLp::Px(v) => ComputedLp::Px(v.max(0.0)),
+            ComputedLp::Percent(p) => ComputedLp::Percent(p.max(0.0)),
+            ComputedLp::Calc(h) => ComputedLp::Calc(h.non_negative()),
         }
     }
 }
@@ -312,6 +723,7 @@ impl ComputedLp {
 pub enum ComputedLpAuto {
     Px(f32),
     Percent(f32),
+    Calc(CalcHandle),
     #[default]
     Auto,
 }
@@ -321,6 +733,7 @@ impl ComputedLpAuto {
         match self {
             ComputedLpAuto::Px(v) => Some(v),
             ComputedLpAuto::Percent(p) => Some(p / 100.0 * basis),
+            ComputedLpAuto::Calc(h) => Some(h.resolve(basis)),
             ComputedLpAuto::Auto => None,
         }
     }
@@ -354,10 +767,12 @@ impl SizeValue {
             SizeValue::Auto => ComputedSize::Auto,
             SizeValue::Length(l) => ComputedSize::Px(l.to_px(ctx)),
             SizeValue::Percent(p) => ComputedSize::Percent(*p),
-            SizeValue::Calc(c) => match c.fold() {
-                LengthPercentage::Length(l) => ComputedSize::Px(l.to_px(ctx)),
-                LengthPercentage::Percent(p) => ComputedSize::Percent(p),
-                LengthPercentage::Calc(_) => ComputedSize::Px(0.0),
+            // A size can not be negative: a math function's result is
+            // clamped to the range (CSS Values 4 §10.12).
+            SizeValue::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(ctx) {
+                ComputedLp::Px(v) => ComputedSize::Px(v.max(0.0)),
+                ComputedLp::Percent(p) => ComputedSize::Percent(p.max(0.0)),
+                ComputedLp::Calc(h) => ComputedSize::Calc(h.non_negative()),
             },
             SizeValue::MinContent => ComputedSize::MinContent,
             SizeValue::MaxContent => ComputedSize::MaxContent,
@@ -386,6 +801,9 @@ pub enum ComputedSize {
     Auto,
     Px(f32),
     Percent(f32),
+    /// A math expression with percentages, resolved against the basis
+    /// (never below zero).
+    Calc(CalcHandle),
     MinContent,
     MaxContent,
     FitContent,
@@ -522,37 +940,97 @@ pub fn parse_length_percentage<'i>(
             .ok_or_else(|| location.new_unexpected_token_error(Token::Ident(unit))),
         Token::Percentage { unit_value, .. } => Ok(LengthPercentage::Percent(unit_value * 100.0)),
         Token::Number { value, .. } if value == 0.0 => Ok(LengthPercentage::ZERO),
-        Token::Function(ref name) if name.eq_ignore_ascii_case("calc") => {
-            // Minimal calc: lengths and percentages joined by `+`/`-`, kept
-            // as written (`Calc::fold` gives the engine's value). Anything
-            // else is rejected.
-            let terms = input.parse_nested_block(parse_simple_calc)?;
-            Ok(LengthPercentage::Calc(Calc { terms }))
+        Token::Function(ref name) if is_math_function(name) => {
+            let name = name.to_ascii_lowercase();
+            let node = input.parse_nested_block(|i| parse_math_function(&name, i))?;
+            if node.kind() != Some(CalcKind::Length) {
+                return Err(location.new_custom_error(()));
+            }
+            Ok(LengthPercentage::Calc(Calc { node }))
         }
         t => Err(location.new_unexpected_token_error(t)),
     }
 }
 
-fn parse_simple_calc<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<CalcTerm>, ParseErr<'i>> {
-    fn term(lp: LengthPercentage, negative: bool) -> CalcTerm {
-        let value = match lp {
-            LengthPercentage::Length(l) => CalcValue::Length(l),
-            LengthPercentage::Percent(p) => CalcValue::Percent(p),
-            LengthPercentage::Calc(c) => CalcValue::Nested(c),
-        };
-        CalcTerm { negative, value }
+fn is_math_function(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "calc" | "min" | "max" | "clamp" | "-webkit-calc")
+}
+
+/// The arguments of a math function, `name` its (lowercased) name.
+fn parse_math_function<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<CalcNode, ParseErr<'i>> {
+    match name {
+        "calc" | "-webkit-calc" => Ok(CalcNode::Calc(Box::new(parse_calc_sum(input)?))),
+        "min" | "max" => {
+            let args = input.parse_comma_separated(parse_calc_sum)?;
+            Ok(if name == "min" { CalcNode::Min(args) } else { CalcNode::Max(args) })
+        }
+        _ => {
+            let a = parse_calc_sum(input)?;
+            input.expect_comma()?;
+            let b = parse_calc_sum(input)?;
+            input.expect_comma()?;
+            let c = parse_calc_sum(input)?;
+            Ok(CalcNode::Clamp(Box::new([a, b, c])))
+        }
     }
-    let mut terms = vec![term(parse_length_percentage(input)?, false)];
-    while !input.is_exhausted() {
-        let location = input.current_source_location();
-        let negative = match input.next()?.clone() {
-            Token::Delim('+') => false,
-            Token::Delim('-') => true,
-            t => return Err(location.new_unexpected_token_error(t)),
+}
+
+/// `<calc-sum> = <calc-product> [ [ '+' | '-' ] <calc-product> ]*`.
+fn parse_calc_sum<'i>(input: &mut Parser<'i, '_>) -> Result<CalcNode, ParseErr<'i>> {
+    let mut terms = vec![(false, parse_calc_product(input)?)];
+    loop {
+        let state = input.state();
+        let neg = match input.next() {
+            Ok(Token::Delim('+')) => false,
+            Ok(Token::Delim('-')) => true,
+            _ => {
+                input.reset(&state);
+                break;
+            }
         };
-        terms.push(term(parse_length_percentage(input)?, negative));
+        terms.push((neg, parse_calc_product(input)?));
     }
-    Ok(terms)
+    Ok(if terms.len() == 1 { terms.pop().map(|t| t.1).unwrap_or(CalcNode::Number(0.0)) } else { CalcNode::Sum(terms) })
+}
+
+/// `<calc-product> = <calc-value> [ [ '*' | '/' ] <calc-value> ]*`.
+fn parse_calc_product<'i>(input: &mut Parser<'i, '_>) -> Result<CalcNode, ParseErr<'i>> {
+    let mut factors = vec![(false, parse_calc_value(input)?)];
+    loop {
+        let state = input.state();
+        let divide = match input.next() {
+            Ok(Token::Delim('*')) => false,
+            Ok(Token::Delim('/')) => true,
+            _ => {
+                input.reset(&state);
+                break;
+            }
+        };
+        factors.push((divide, parse_calc_value(input)?));
+    }
+    Ok(if factors.len() == 1 { factors.pop().map(|f| f.1).unwrap_or(CalcNode::Number(1.0)) } else { CalcNode::Product(factors) })
+}
+
+/// `<calc-value>`: a number, length or percentage, a parenthesized sum,
+/// a nested math function, or the constants `e` and `pi`.
+fn parse_calc_value<'i>(input: &mut Parser<'i, '_>) -> Result<CalcNode, ParseErr<'i>> {
+    let location = input.current_source_location();
+    let token = input.next()?.clone();
+    match token {
+        Token::Number { value, .. } => Ok(CalcNode::Number(value)),
+        Token::Percentage { unit_value, .. } => Ok(CalcNode::Percent(unit_value * 100.0)),
+        Token::Dimension { value, unit, .. } => length_from_unit(value, &unit)
+            .map(CalcNode::Length)
+            .ok_or_else(|| location.new_unexpected_token_error(Token::Ident(unit))),
+        Token::ParenthesisBlock => Ok(CalcNode::Calc(Box::new(input.parse_nested_block(parse_calc_sum)?))),
+        Token::Function(ref name) if is_math_function(name) => {
+            let name = name.to_ascii_lowercase();
+            input.parse_nested_block(|i| parse_math_function(&name, i))
+        }
+        Token::Ident(ref id) if id.eq_ignore_ascii_case("e") => Ok(CalcNode::Number(std::f32::consts::E)),
+        Token::Ident(ref id) if id.eq_ignore_ascii_case("pi") => Ok(CalcNode::Number(std::f32::consts::PI)),
+        t => Err(location.new_unexpected_token_error(t)),
+    }
 }
 
 pub fn parse_length_percentage_auto<'i>(
@@ -947,15 +1425,90 @@ mod tests {
         assert_eq!(lp("calc(1px + 2px)").map(|v| v.to_css()).as_deref(), Some("calc(3px)"));
         assert_eq!(lp("calc(10px - 5%)").map(|v| v.to_css()).as_deref(), Some("calc(-5% + 10px)"));
         assert_eq!(lp("calc(1em + 2px - 1px)").map(|v| v.to_css()).as_deref(), Some("calc(1em + 1px)"));
-        // The engine's value: one unit sums, mixed units keep the first.
         let ctx = LengthContext { font_size: 10.0, root_font_size: 10.0, viewport_width: 100.0, viewport_height: 100.0 };
         assert_eq!(lp("calc(1px + 2px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(3.0)));
-        assert_eq!(lp("calc(10px + 5%)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(10.0)));
-        assert_eq!(lp("calc(5% + 10px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Percent(5.0)));
         assert_eq!(lp("calc(1em + 1em)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(20.0)));
         assert_eq!(lp("calc(3em - 1em)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(20.0)));
         assert_eq!(lp("calc(1em + calc(1em + 1em))").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(30.0)));
-        assert_eq!(lp("calc(1em + 1px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(10.0)));
+        assert_eq!(lp("calc(1em + 1px)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Px(11.0)));
+        assert_eq!(lp("calc(50%)").map(|v| v.to_computed(&ctx)), Some(ComputedLp::Percent(50.0)));
+        let calc = |s: &str| match lp(s).map(|v| v.to_computed(&ctx)) {
+            Some(ComputedLp::Calc(h)) => (h.to_css(), h.resolve(200.0)),
+            other => panic!("{s}: {other:?}"),
+        };
+        assert_eq!(calc("calc(10px + 5%)"), ("calc(5% + 10px)".to_owned(), 20.0));
+        assert_eq!(calc("calc(100% - 2em)"), ("calc(100% - 20px)".to_owned(), 180.0));
+        assert_eq!(calc("min(1em, 10%)"), ("min(10px, 10%)".to_owned(), 10.0));
+        assert_eq!(calc("max(1em, 10%)"), ("max(10px, 10%)".to_owned(), 20.0));
+        assert_eq!(calc("clamp(5px, 50%, 2em)"), ("clamp(5px, 50%, 20px)".to_owned(), 20.0));
+        assert_eq!(calc("calc(2 * (10% + 1px))"), ("calc(20% + 2px)".to_owned(), 42.0));
+        assert_eq!(calc("calc((10% + 4px) / 2)"), ("calc(5% + 2px)".to_owned(), 12.0));
+    }
+
+    /// CSS Values 4 §10: math functions, typed, simplified and serialized
+    /// as WPT's `minmax-length-percent-serialize.html` expects.
+    #[test]
+    fn math_functions_parse_simplify_and_serialize() {
+        let ctx = LengthContext { font_size: 16.0, root_font_size: 16.0, viewport_width: 800.0, viewport_height: 600.0 };
+        let specified = |s: &str| lp(s).map(|v| v.to_css()).unwrap_or_else(|| "invalid".to_owned());
+        let computed = |s: &str| match lp(s).map(|v| v.to_computed(&ctx)) {
+            Some(ComputedLp::Px(v)) => format!("{}px", css_number(v)),
+            Some(ComputedLp::Percent(p)) => format!("{}%", css_number(p)),
+            Some(ComputedLp::Calc(h)) => h.to_css(),
+            None => "invalid".to_owned(),
+        };
+        let cases = [
+            ("min(1px)", "calc(1px)", "1px"),
+            ("max(1px)", "calc(1px)", "1px"),
+            ("min(1% + 1px)", "calc(1% + 1px)", "calc(1% + 1px)"),
+            ("min(1px + 1%)", "calc(1% + 1px)", "calc(1% + 1px)"),
+            ("max(1px + 1%)", "calc(1% + 1px)", "calc(1% + 1px)"),
+            ("min(1px, 2px)", "calc(1px)", "1px"),
+            ("min(20px, 10%)", "min(20px, 10%)", "min(20px, 10%)"),
+            ("min(1em, 10%)", "min(1em, 10%)", "min(16px, 10%)"),
+            ("min(10%, 20px)", "min(10%, 20px)", "min(10%, 20px)"),
+            ("min(10%, 1em)", "min(10%, 1em)", "min(10%, 16px)"),
+            ("max(20px, 10%)", "max(20px, 10%)", "max(20px, 10%)"),
+            ("max(1em, 10%)", "max(1em, 10%)", "max(16px, 10%)"),
+            ("max(10%, 20px)", "max(10%, 20px)", "max(10%, 20px)"),
+            ("max(10%, 1em)", "max(10%, 1em)", "max(10%, 16px)"),
+            ("min(10% + 30px, 5em + 5%)", "min(10% + 30px, 5% + 5em)", "min(10% + 30px, 5% + 80px)"),
+            ("max(10% + 30px, 5em + 5%)", "max(10% + 30px, 5% + 5em)", "max(10% + 30px, 5% + 80px)"),
+            (
+                "calc(min(10% + 1px) + max(1em + 10%) + min(10% + 20px))",
+                "calc(30% + 1em + 21px)",
+                "calc(30% + 37px)",
+            ),
+            ("calc(1em + max(10% + 20px) + 5% + min(1em + 10%) + 10px)", "calc(25% + 2em + 30px)", "calc(25% + 62px)"),
+            (
+                "max((min(10%, 30px) + 10px) * 2 + 10px, 5em + 5%)",
+                "max(10px + (2 * (10px + min(10%, 30px))), 5% + 5em)",
+                "max(10px + (2 * (10px + min(10%, 30px))), 5% + 80px)",
+            ),
+            // Wikipedia's icon size: font-relative and absolute units sum to
+            // pixels when styles are computed.
+            ("calc(max(calc(1rem + 4px), 10px))", "max(4px + 1rem, 10px)", "20px"),
+            ("calc(1rem + 4px)", "calc(4px + 1rem)", "20px"),
+            ("calc(1in + 1px)", "calc(97px)", "97px"),
+            ("calc(10vw - 2 * 1em)", "calc(-2em + 10vw)", "48px"),
+            ("clamp(10px, 1em, 12px)", "clamp(10px, 1em, 12px)", "12px"),
+            ("clamp(20px, 1em, 12px)", "clamp(20px, 1em, 12px)", "20px"),
+            ("clamp(10px, 11px, 12px)", "calc(11px)", "11px"),
+            ("calc(100px / 4)", "calc(25px)", "25px"),
+            ("calc(pi * 0)", "invalid", "invalid"),
+            ("-webkit-calc(1px + 1px)", "calc(2px)", "2px"),
+            // Typing (§10.8): a length plus a number, a length times a
+            // length, a division by a length do not parse.
+            ("calc(1px + 1)", "invalid", "invalid"),
+            ("calc(1px * 1px)", "invalid", "invalid"),
+            ("calc(1px / 1px)", "invalid", "invalid"),
+            ("calc(2)", "invalid", "invalid"),
+            ("min(1px, 1)", "invalid", "invalid"),
+        ];
+        for (input, spec, comp) in cases {
+            assert_eq!(specified(input), spec, "specified {input}");
+            assert_eq!(computed(input), comp, "computed {input}");
+        }
         let c = |s: &str| {
             let mut input = ParserInput::new(s);
             let mut parser = Parser::new(&mut input);

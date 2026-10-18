@@ -819,6 +819,7 @@ pub fn rounded_contains_inset(rect: &Rect, style: &ComputedStyle, inset: [f32; 4
                 let p = p.max(0.0) / 100.0;
                 (p * w, p * h)
             }
+            browser_style::ComputedLp::Calc(c) => (c.resolve(w).max(0.0), c.resolve(h).max(0.0)),
         }
     };
     let mut radii = [

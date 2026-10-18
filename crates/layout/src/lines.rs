@@ -316,6 +316,7 @@ fn place_line(
             ComputedVerticalAlign::Length(ComputedLp::Px(px)) => px,
             // A percentage of the box's own line height.
             ComputedVerticalAlign::Length(ComputedLp::Percent(p)) => p / 100.0 * own.line_height,
+            ComputedVerticalAlign::Length(ComputedLp::Calc(h)) => h.resolve(own.line_height),
         };
         if edge[node].is_some() {
             pos[node] = 0.0;

@@ -45,7 +45,7 @@ pub use serialize::{UsedGrid, UsedTracks, UsedValues, resolved_value, serialize_
 pub use stylesheet::{
     Origin, Rule, StyleRule, Stylesheet, parse_cssom_block, parse_declaration_block, parse_declaration_value,
 };
-pub use values::{ComputedLp, ComputedLpAuto, ComputedSize, Rgba, css_number};
+pub use values::{CalcHandle, ComputedLp, ComputedLpAuto, ComputedSize, Rgba, css_number};
 
 /// Parse error type used by all value parsers; the custom payload is unit
 /// because a failed declaration is simply dropped.

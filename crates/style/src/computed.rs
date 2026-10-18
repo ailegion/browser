@@ -110,10 +110,51 @@ pub struct AppliedDecoration {
 
 /// One axis of a computed `background-position`: a percentage of the
 /// box plus a pixel offset (`right 10px` is 100% and -10px).
+/// A math function that does not split into those two (`min(10px, 50%)`)
+/// is kept whole in `calc` (`percent` and `px` then zero).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PositionOffset {
     pub percent: f32,
     pub px: f32,
+    pub calc: Option<crate::values::CalcHandle>,
+}
+
+impl PositionOffset {
+    pub const fn new(percent: f32, px: f32) -> PositionOffset {
+        PositionOffset { percent, px, calc: None }
+    }
+
+    /// The offset in pixels against `basis` (for `background-position`,
+    /// the area minus the tile).
+    pub fn resolve(self, basis: f32) -> f32 {
+        match self.calc {
+            Some(h) => h.resolve(basis),
+            None => self.px + self.percent / 100.0 * basis,
+        }
+    }
+
+    pub(crate) fn from_lp(v: ComputedLp) -> PositionOffset {
+        match v {
+            ComputedLp::Px(px) => PositionOffset::new(0.0, px),
+            ComputedLp::Percent(percent) => PositionOffset::new(percent, 0.0),
+            ComputedLp::Calc(h) => match h.linear() {
+                Some((percent, px)) => PositionOffset::new(percent, px),
+                None => PositionOffset { percent: 0.0, px: 0.0, calc: Some(h) },
+            },
+        }
+    }
+
+    /// `<edge> <offset>`: keywords become percentages, an offset from the
+    /// end edge is subtracted (`right min(…)` is `calc(100% - min(…))`).
+    pub(crate) fn from_edge(edge: PositionEdge, off: PositionOffset) -> PositionOffset {
+        match (edge, off.calc) {
+            (PositionEdge::Start, _) => off,
+            (PositionEdge::Center, None) => PositionOffset::new(50.0 + off.percent, off.px),
+            (PositionEdge::End, None) => PositionOffset::new(100.0 - off.percent, -off.px),
+            (PositionEdge::Center, Some(h)) => PositionOffset { calc: Some(h.offset_from(50.0, false)), ..off },
+            (PositionEdge::End, Some(h)) => PositionOffset { calc: Some(h.offset_from(100.0, true)), ..off },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -527,15 +568,15 @@ impl ComputedStyle {
             will_change: WillChange::default(),
             transform: Vec::new(),
             transform_origin: (
-                PositionOffset { percent: 50.0, px: 0.0 },
-                PositionOffset { percent: 50.0, px: 0.0 },
+                PositionOffset::new(50.0, 0.0),
+                PositionOffset::new(50.0, 0.0),
                 0.0,
             ),
             transform_box: TransformBox::ViewBox,
             transform_style: TransformStyle::Flat,
             backface_visibility: BackfaceVisibility::Visible,
             perspective: None,
-            perspective_origin: (PositionOffset { percent: 50.0, px: 0.0 }, PositionOffset { percent: 50.0, px: 0.0 }),
+            perspective_origin: (PositionOffset::new(50.0, 0.0), PositionOffset::new(50.0, 0.0)),
             translate: None,
             rotate: None,
             scale: None,
@@ -823,25 +864,11 @@ fn resolve<'a>(decls: &DeclaredValues<'a>, id: PropertyId) -> Resolved<'a> {
 /// A `background-position` axis as computed: keywords become
 /// percentages, an offset from the end edge is subtracted.
 pub(crate) fn position_offset(c: &PositionComponent, ctx: &LengthContext) -> PositionOffset {
-    let lp = |v: &LengthPercentage| match v.to_computed(ctx) {
-        ComputedLp::Px(px) => PositionOffset { percent: 0.0, px },
-        ComputedLp::Percent(percent) => PositionOffset { percent, px: 0.0 },
-    };
+    let lp = |v: &LengthPercentage| PositionOffset::from_lp(v.to_computed(ctx));
     match c {
         PositionComponent::Length(v) => lp(v),
         PositionComponent::Keyword(edge, offset) => {
-            let off = offset.as_ref().map(lp).unwrap_or_default();
-            match edge {
-                PositionEdge::Start => off,
-                PositionEdge::Center => PositionOffset {
-                    percent: 50.0 + off.percent,
-                    px: off.px,
-                },
-                PositionEdge::End => PositionOffset {
-                    percent: 100.0 - off.percent,
-                    px: -off.px,
-                },
-            }
+            PositionOffset::from_edge(*edge, offset.as_ref().map(lp).unwrap_or_default())
         }
     }
 }
@@ -870,10 +897,8 @@ pub fn compute(
             match fs {
                 FontSize::Length(l) => l.to_px(&parent_ctx),
                 FontSize::Percent(p) => parent.font_size * p / 100.0,
-                FontSize::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(&parent_ctx) {
-                    ComputedLp::Px(px) => px,
-                    ComputedLp::Percent(p) => parent.font_size * p / 100.0,
-                },
+                // Percentages of the parent's font size.
+                FontSize::Calc(c) => LengthPercentage::Calc(c.clone()).to_computed(&parent_ctx).resolve(parent.font_size),
                 FontSize::Keyword(k) => {
                     const SIZES: [f32; 8] = [9.0, 10.0, 13.0, 16.0, 18.0, 24.0, 32.0, 48.0];
                     SIZES[(*k as usize).min(7)]
@@ -913,6 +938,13 @@ pub fn compute(
     let lpa = |v: &LengthPercentageAuto| v.to_computed(&ctx);
     let lp = |v: &LengthPercentage| v.to_computed(&ctx);
     let size = |v: &SizeValue| v.to_computed(&ctx);
+    // `scroll-padding` takes no negative values (§10.12 clamps a math
+    // function's result).
+    let lpa_non_negative = |v: &LengthPercentageAuto| match v.to_computed(&ctx) {
+        ComputedLpAuto::Px(px) => ComputedLpAuto::Px(px.max(0.0)),
+        ComputedLpAuto::Calc(h) => ComputedLpAuto::Calc(h.non_negative()),
+        other => other,
+    };
 
     pick!(display, Display, Display, |v| v.computed());
     pick!(position, Position, Position, |v| *v);
@@ -947,10 +979,12 @@ pub fn compute(
     side!(margin.right, MarginRight, MarginRight, |v| lpa(v));
     side!(margin.bottom, MarginBottom, MarginBottom, |v| lpa(v));
     side!(margin.left, MarginLeft, MarginLeft, |v| lpa(v));
-    side!(padding.top, PaddingTop, PaddingTop, |v| lp(v));
-    side!(padding.right, PaddingRight, PaddingRight, |v| lp(v));
-    side!(padding.bottom, PaddingBottom, PaddingBottom, |v| lp(v));
-    side!(padding.left, PaddingLeft, PaddingLeft, |v| lp(v));
+    // Padding, radii and gaps take no negative values: a math function's
+    // result is clamped at zero (CSS Values 4 §10.12).
+    side!(padding.top, PaddingTop, PaddingTop, |v| lp(v).non_negative());
+    side!(padding.right, PaddingRight, PaddingRight, |v| lp(v).non_negative());
+    side!(padding.bottom, PaddingBottom, PaddingBottom, |v| lp(v).non_negative());
+    side!(padding.left, PaddingLeft, PaddingLeft, |v| lp(v).non_negative());
 
     side!(border_style.top, BorderTopStyle, BorderTopStyle, |v| *v);
     side!(border_style.right, BorderRightStyle, BorderRightStyle, |v| *v);
@@ -1000,10 +1034,10 @@ pub fn compute(
         }
     }
 
-    side!(border_radius.top, BorderTopLeftRadius, BorderTopLeftRadius, |v| lp(&v.x));
-    side!(border_radius.right, BorderTopRightRadius, BorderTopRightRadius, |v| lp(&v.x));
-    side!(border_radius.bottom, BorderBottomRightRadius, BorderBottomRightRadius, |v| lp(&v.x));
-    side!(border_radius.left, BorderBottomLeftRadius, BorderBottomLeftRadius, |v| lp(&v.x));
+    side!(border_radius.top, BorderTopLeftRadius, BorderTopLeftRadius, |v| lp(&v.x).non_negative());
+    side!(border_radius.right, BorderTopRightRadius, BorderTopRightRadius, |v| lp(&v.x).non_negative());
+    side!(border_radius.bottom, BorderBottomRightRadius, BorderBottomRightRadius, |v| lp(&v.x).non_negative());
+    side!(border_radius.left, BorderBottomLeftRadius, BorderBottomLeftRadius, |v| lp(&v.x).non_negative());
 
     pick!(width, Width, Width, |v| size(v));
     pick!(height, Height, Height, |v| size(v));
@@ -1051,6 +1085,7 @@ pub fn compute(
                     Some(v) => match lp(v) {
                         ComputedLp::Px(px) => ComputedLpAuto::Px(px),
                         ComputedLp::Percent(p) => ComputedLpAuto::Percent(p),
+                        ComputedLp::Calc(h) => ComputedLpAuto::Calc(h),
                     },
                 };
                 ComputedBackgroundSize::Explicit(one(x), one(y))
@@ -1079,6 +1114,7 @@ pub fn compute(
                     Some(v) => match lp(v) {
                         ComputedLp::Px(px) => ComputedLpAuto::Px(px),
                         ComputedLp::Percent(p) => ComputedLpAuto::Percent(p),
+                        ComputedLp::Calc(h) => ComputedLpAuto::Calc(h),
                     },
                 };
                 ComputedBackgroundSize::Explicit(one(x), one(y))
@@ -1123,6 +1159,7 @@ pub fn compute(
             LineHeightValue::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(&ctx) {
                 ComputedLp::Px(px) => LineHeight::Px(px),
                 ComputedLp::Percent(p) => LineHeight::Px(out.font_size * p / 100.0),
+                ComputedLp::Calc(h) => LineHeight::Px(h.resolve(out.font_size)),
             },
         },
         Resolved::Inherit => parent.line_height,
@@ -1188,6 +1225,7 @@ pub fn compute(
         LetterSpacingValue::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(&ctx) {
             ComputedLp::Px(px) => LetterSpacing::Px(px),
             ComputedLp::Percent(_) => LetterSpacing::Normal,
+            ComputedLp::Calc(_) => LetterSpacing::Normal,
         },
     });
     pick!(word_break, WordBreak, WordBreak, |v| *v);
@@ -1210,8 +1248,8 @@ pub fn compute(
     pick!(flex_grow, FlexGrow, FlexGrow, |v| *v);
     pick!(flex_shrink, FlexShrink, FlexShrink, |v| *v);
     pick!(flex_basis, FlexBasis, FlexBasis, |v| size(v));
-    pick!(row_gap, RowGap, RowGap, |v| lp(v));
-    pick!(column_gap, ColumnGap, ColumnGap, |v| lp(v));
+    pick!(row_gap, RowGap, RowGap, |v| lp(v).non_negative());
+    pick!(column_gap, ColumnGap, ColumnGap, |v| lp(v).non_negative());
     pick!(opacity, Opacity, Opacity, |v| *v);
 
     pick!(scrollbar_width, ScrollbarWidth, ScrollbarWidth, |v| *v);
@@ -1230,10 +1268,10 @@ pub fn compute(
     side!(scroll_margin.right, ScrollMarginRight, ScrollMarginRight, |v| v.to_px(&ctx));
     side!(scroll_margin.bottom, ScrollMarginBottom, ScrollMarginBottom, |v| v.to_px(&ctx));
     side!(scroll_margin.left, ScrollMarginLeft, ScrollMarginLeft, |v| v.to_px(&ctx));
-    side!(scroll_padding.top, ScrollPaddingTop, ScrollPaddingTop, |v| lpa(v));
-    side!(scroll_padding.right, ScrollPaddingRight, ScrollPaddingRight, |v| lpa(v));
-    side!(scroll_padding.bottom, ScrollPaddingBottom, ScrollPaddingBottom, |v| lpa(v));
-    side!(scroll_padding.left, ScrollPaddingLeft, ScrollPaddingLeft, |v| lpa(v));
+    side!(scroll_padding.top, ScrollPaddingTop, ScrollPaddingTop, |v| lpa_non_negative(v));
+    side!(scroll_padding.right, ScrollPaddingRight, ScrollPaddingRight, |v| lpa_non_negative(v));
+    side!(scroll_padding.bottom, ScrollPaddingBottom, ScrollPaddingBottom, |v| lpa_non_negative(v));
+    side!(scroll_padding.left, ScrollPaddingLeft, ScrollPaddingLeft, |v| lpa_non_negative(v));
     pick!(scroll_snap_type, ScrollSnapType, ScrollSnapType, |v| *v);
     pick!(scroll_snap_align, ScrollSnapAlign, ScrollSnapAlign, |v| *v);
     pick!(scroll_snap_stop, ScrollSnapStop, ScrollSnapStop, |v| *v);

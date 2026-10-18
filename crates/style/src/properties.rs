@@ -1573,7 +1573,7 @@ impl ScrollMarginValue {
             ScrollMarginValue::Calc(c) => match LengthPercentage::Calc(c.clone()).to_computed(ctx) {
                 ComputedLp::Px(px) => px,
                 // Unreachable: percentages are refused at parse time.
-                ComputedLp::Percent(_) => 0.0,
+                ComputedLp::Percent(_) | ComputedLp::Calc(_) => 0.0,
             },
         }
     }
@@ -3396,13 +3396,9 @@ fn parse_overscroll_behavior<'i>(input: &mut Parser<'i, '_>) -> Result<Overscrol
         "none" => OverscrollBehavior::None, _ => return None }))
 }
 
-/// Whether a `calc()` has a percentage anywhere in its sum.
+/// Whether a math function has a percentage anywhere.
 fn calc_has_percent(c: &Calc) -> bool {
-    c.terms.iter().any(|t| match &t.value {
-        CalcValue::Percent(_) => true,
-        CalcValue::Length(_) => false,
-        CalcValue::Nested(n) => calc_has_percent(n),
-    })
+    c.node.has_percent()
 }
 
 /// `<length>`: a length or a `calc()` of lengths; percentages, bare or

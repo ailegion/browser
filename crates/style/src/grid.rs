@@ -293,6 +293,7 @@ impl GridLength for ComputedLp {
         match self {
             ComputedLp::Px(v) => format!("{}px", css_number(*v)),
             ComputedLp::Percent(p) => format!("{}%", css_number(*p)),
+            ComputedLp::Calc(h) => h.to_css(),
         }
     }
 }

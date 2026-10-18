@@ -139,25 +139,10 @@ impl ComputedPositionComponent {
     /// As a percentage of the box plus pixels, for painting.
     pub fn to_offset(self) -> crate::computed::PositionOffset {
         use crate::computed::PositionOffset;
-        let lp = |v: ComputedLp| match v {
-            ComputedLp::Px(px) => PositionOffset { percent: 0.0, px },
-            ComputedLp::Percent(percent) => PositionOffset { percent, px: 0.0 },
-        };
         match self {
-            ComputedPositionComponent::Length(v) => lp(v),
+            ComputedPositionComponent::Length(v) => PositionOffset::from_lp(v),
             ComputedPositionComponent::Keyword(edge, offset) => {
-                let off = offset.map(lp).unwrap_or_default();
-                match edge {
-                    PositionEdge::Start => off,
-                    PositionEdge::Center => PositionOffset {
-                        percent: 50.0 + off.percent,
-                        px: off.px,
-                    },
-                    PositionEdge::End => PositionOffset {
-                        percent: 100.0 - off.percent,
-                        px: -off.px,
-                    },
-                }
+                PositionOffset::from_edge(edge, offset.map(PositionOffset::from_lp).unwrap_or_default())
             }
         }
     }
@@ -652,11 +637,15 @@ fn computed_lp_css(v: ComputedLp) -> String {
     match v {
         ComputedLp::Px(p) => format!("{}px", css_number(p)),
         ComputedLp::Percent(p) => format!("{}%", css_number(p)),
+        ComputedLp::Calc(h) => h.to_css(),
     }
 }
 
 /// A computed `background-position` axis as the CSSOM prints it.
 pub fn position_offset_css(o: crate::computed::PositionOffset) -> String {
+    if let Some(h) = o.calc {
+        return h.to_css();
+    }
     if o.px == 0.0 {
         format!("{}%", css_number(o.percent))
     } else if o.percent == 0.0 {

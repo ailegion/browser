@@ -985,6 +985,7 @@ fn lp_css(v: ComputedLp) -> String {
     match v {
         ComputedLp::Px(p) => px(p),
         ComputedLp::Percent(p) => format!("{}%", css_number(p)),
+        ComputedLp::Calc(h) => h.to_css(),
     }
 }
 
@@ -992,6 +993,7 @@ fn lpa_css(v: ComputedLpAuto) -> String {
     match v {
         ComputedLpAuto::Px(p) => px(p),
         ComputedLpAuto::Percent(p) => format!("{}%", css_number(p)),
+        ComputedLpAuto::Calc(h) => h.to_css(),
         ComputedLpAuto::Auto => "auto".to_owned(),
     }
 }
@@ -1001,6 +1003,7 @@ fn size_css(v: ComputedSize) -> String {
         ComputedSize::Auto => "auto".to_owned(),
         ComputedSize::Px(p) => px(p),
         ComputedSize::Percent(p) => format!("{}%", css_number(p)),
+        ComputedSize::Calc(h) => h.to_css(),
         ComputedSize::MinContent => "min-content".to_owned(),
         ComputedSize::MaxContent => "max-content".to_owned(),
         ComputedSize::FitContent => "fit-content".to_owned(),
@@ -1119,6 +1122,7 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
                     ComputedLpAuto::Auto => "auto".to_owned(),
                     ComputedLpAuto::Px(p) => px(p),
                     ComputedLpAuto::Percent(p) => format!("{}%", css_number(p)),
+                    ComputedLpAuto::Calc(h) => h.to_css(),
                 };
                 if matches!(y, ComputedLpAuto::Auto) { one(x) } else { format!("{} {}", one(x), one(y)) }
             }
@@ -1237,7 +1241,7 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::TransformOrigin => {
             let (w, h) = rendered.map_or((0.0, 0.0), |u| (u.width, u.height));
             let (x, y, z) = style.transform_origin;
-            let mut s = format!("{} {}", px(x.px + x.percent / 100.0 * w), px(y.px + y.percent / 100.0 * h));
+            let mut s = format!("{} {}", px(x.resolve(w)), px(y.resolve(h)));
             if z != 0.0 {
                 s.push(' ');
                 s.push_str(&px(z));
@@ -1257,7 +1261,7 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::PerspectiveOrigin => {
             let (w, h) = rendered.map_or((0.0, 0.0), |u| (u.width, u.height));
             let (x, y) = style.perspective_origin;
-            format!("{} {}", px(x.px + x.percent / 100.0 * w), px(y.px + y.percent / 100.0 * h))
+            format!("{} {}", px(x.resolve(w)), px(y.resolve(h)))
         }
         Id::Translate => match style.translate {
             None => "none".to_owned(),

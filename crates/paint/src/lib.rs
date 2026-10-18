@@ -1754,6 +1754,8 @@ fn tile_size(
             let resolve = |v: ComputedLpAuto, basis: f64| match v {
                 ComputedLpAuto::Px(px) => Some(px as f64),
                 ComputedLpAuto::Percent(p) => Some(p as f64 / 100.0 * basis),
+                // No negative sizes: a math function's result is clamped.
+                ComputedLpAuto::Calc(h) => Some((h.resolve(basis as f32) as f64).max(0.0)),
                 ComputedLpAuto::Auto => None,
             };
             let (x, y) = (resolve(x, aw), resolve(y, ah));
@@ -1790,7 +1792,10 @@ fn tile_size(
 /// Where a layer's first tile starts within its positioning area (§3.6):
 /// the percentage of the area's leftover space plus the pixel offset.
 fn position(o: PositionOffset, area: f64, tile: f64) -> f64 {
-    (area - tile) * o.percent as f64 / 100.0 + o.px as f64
+    match o.calc {
+        Some(h) => h.resolve((area - tile) as f32) as f64,
+        None => (area - tile) * o.percent as f64 / 100.0 + o.px as f64,
+    }
 }
 
 /// The tiles' start coordinates along one axis of a positioning area
@@ -2073,6 +2078,7 @@ fn lp_px(v: ComputedLp, basis: f64) -> f64 {
     match v {
         ComputedLp::Px(p) => p as f64,
         ComputedLp::Percent(p) => p as f64 / 100.0 * basis,
+        ComputedLp::Calc(h) => h.resolve(basis as f32) as f64,
     }
 }
 
@@ -2082,7 +2088,11 @@ fn gradient_center(position: &Option<browser_style::ComputedGradientPosition>, w
     match position {
         Some(p) => {
             let p = p.to_offsets();
-            (w * p.x.percent as f64 / 100.0 + p.x.px as f64, h * p.y.percent as f64 / 100.0 + p.y.px as f64)
+            let axis = |o: PositionOffset, len: f64| match o.calc {
+                Some(c) => c.resolve(len as f32) as f64,
+                None => len * o.percent as f64 / 100.0 + o.px as f64,
+            };
+            (axis(p.x, w), axis(p.y, h))
         }
         None => (w / 2.0, h / 2.0),
     }
@@ -2163,6 +2173,9 @@ fn resolve_stops(items: &[ComputedGradientItem], length: f64, interpolation: Opt
             if length > 0.0 { *px as f64 / length } else { 0.0 }
         }
         ComputedGradientPos::Lp(ComputedLp::Percent(p)) => *p as f64 / 100.0,
+        ComputedGradientPos::Lp(ComputedLp::Calc(h)) => {
+            if length > 0.0 { h.resolve(length as f32) as f64 / length } else { h.resolve(0.0) as f64 }
+        }
         ComputedGradientPos::Angle(a) => *a as f64 / 360.0,
     };
     // (position, colour; a hint has none)
@@ -2466,6 +2479,9 @@ impl BoxGeometry {
                 browser_style::ComputedLp::Percent(p) => {
                     let p = (p.max(0.0) / 100.0) as f64;
                     (p * w, p * h)
+                }
+                browser_style::ComputedLp::Calc(c) => {
+                    (c.resolve(w as f32).max(0.0) as f64, c.resolve(h as f32).max(0.0) as f64)
                 }
             }
         };

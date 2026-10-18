@@ -244,6 +244,7 @@ impl LayoutEngine {
         let specified = match s.width {
             ComputedSize::Px(px) => Some(border_box(px, edges_h)),
             ComputedSize::Percent(pc) => Some(border_box(pc / 100.0 * cw, edges_h)),
+            ComputedSize::Calc(h) => Some(border_box(h.resolve(cw), edges_h)),
             ComputedSize::MinContent => Some(intrinsic_widths(self, node).0),
             ComputedSize::MaxContent => Some(intrinsic_widths(self, node).1),
             _ => None,
@@ -272,6 +273,7 @@ impl LayoutEngine {
         let limit = |v: ComputedSize| match v {
             ComputedSize::Px(px) => Some(border_box(px, edges_h)),
             ComputedSize::Percent(pc) => Some(border_box(pc / 100.0 * cw, edges_h)),
+            ComputedSize::Calc(h) => Some(border_box(h.resolve(cw), edges_h)),
             _ => None,
         };
         if let Some(max) = limit(s.max_width) {
@@ -288,6 +290,7 @@ impl LayoutEngine {
         let limit_v = |v: ComputedSize| match v {
             ComputedSize::Px(px) => Some(border_box(px, edges_v)),
             ComputedSize::Percent(pc) => Some(border_box(pc / 100.0 * ch, edges_v)),
+            ComputedSize::Calc(h) => Some(border_box(h.resolve(ch), edges_v)),
             _ => None,
         };
         let clamp_v = |h: f32| {

@@ -2,7 +2,7 @@
 
 use browser_style::grid::{GridLine, TrackBreadth, TrackList, TrackSize};
 use browser_style::{
-    AlignValue, BoxSizing, Clear, ComputedLp, ComputedLpAuto, ComputedSize, ComputedStyle, Direction, Display,
+    AlignValue, BoxSizing, CalcHandle, Clear, ComputedLp, ComputedLpAuto, ComputedSize, ComputedStyle, Direction, Display,
     FlexDirection, FlexWrap, Float, Overflow, Position,
 };
 use taffy::prelude::*;
@@ -11,10 +11,27 @@ use taffy::{GridPlacement, MinMax};
 
 use crate::boxes::ScrollPlan;
 
+/// A math expression with percentages as taffy's opaque calc value (our
+/// interned handle's token), resolved by `resolve_calc` against the basis
+/// taffy passes.
+fn calc_ptr(h: CalcHandle) -> *const () {
+    std::ptr::without_provenance(h.token())
+}
+
+fn resolve_calc(ptr: *const (), basis: f32) -> f32 {
+    CalcHandle::from_token(ptr.addr()).resolve(basis)
+}
+
+/// Point taffy at `resolve_calc` (once per process).
+pub(crate) fn install_calc_resolver() {
+    taffy::tree::set_calc_resolver(resolve_calc);
+}
+
 fn lp(v: ComputedLp) -> LengthPercentage {
     match v {
         ComputedLp::Px(px) => LengthPercentage::length(px),
         ComputedLp::Percent(p) => LengthPercentage::percent(p / 100.0),
+        ComputedLp::Calc(h) => LengthPercentage::calc(calc_ptr(h)),
     }
 }
 
@@ -22,6 +39,7 @@ fn lpa(v: ComputedLpAuto) -> LengthPercentageAuto {
     match v {
         ComputedLpAuto::Px(px) => LengthPercentageAuto::length(px),
         ComputedLpAuto::Percent(p) => LengthPercentageAuto::percent(p / 100.0),
+        ComputedLpAuto::Calc(h) => LengthPercentageAuto::calc(calc_ptr(h)),
         ComputedLpAuto::Auto => LengthPercentageAuto::auto(),
     }
 }
@@ -31,6 +49,7 @@ fn dimension(v: ComputedSize) -> Dimension {
         ComputedSize::Auto | ComputedSize::None => Dimension::auto(),
         ComputedSize::Px(px) => Dimension::length(px),
         ComputedSize::Percent(p) => Dimension::percent(p / 100.0),
+        ComputedSize::Calc(h) => Dimension::calc(calc_ptr(h)),
         ComputedSize::MinContent => Dimension::min_content(),
         ComputedSize::MaxContent | ComputedSize::FitContent => Dimension::max_content(),
     }
@@ -41,6 +60,7 @@ fn min_max(v: ComputedSize) -> LengthPercentageAuto {
         ComputedSize::Auto | ComputedSize::None => LengthPercentageAuto::auto(),
         ComputedSize::Px(px) => LengthPercentageAuto::length(px),
         ComputedSize::Percent(p) => LengthPercentageAuto::percent(p / 100.0),
+        ComputedSize::Calc(h) => LengthPercentageAuto::calc(calc_ptr(h)),
         // Content keywords in min/max are rare; treat as unconstrained.
         _ => LengthPercentageAuto::auto(),
     }
@@ -98,6 +118,7 @@ fn min_breadth(b: &TrackBreadth<ComputedLp>) -> MinTrackSizingFunction {
     match b {
         TrackBreadth::Length(ComputedLp::Px(px)) => MinTrackSizingFunction::length(*px),
         TrackBreadth::Length(ComputedLp::Percent(p)) => MinTrackSizingFunction::percent(*p / 100.0),
+        TrackBreadth::Length(ComputedLp::Calc(h)) => MinTrackSizingFunction::calc(calc_ptr(*h)),
         // A flexible minimum is not valid; a lone `fr` track's minimum is
         // `auto` (CSS Grid 1 §7.2.4).
         TrackBreadth::Flex(_) | TrackBreadth::Auto => MinTrackSizingFunction::auto(),
@@ -110,6 +131,7 @@ fn max_breadth(b: &TrackBreadth<ComputedLp>) -> MaxTrackSizingFunction {
     match b {
         TrackBreadth::Length(ComputedLp::Px(px)) => MaxTrackSizingFunction::length(*px),
         TrackBreadth::Length(ComputedLp::Percent(p)) => MaxTrackSizingFunction::percent(*p / 100.0),
+        TrackBreadth::Length(ComputedLp::Calc(h)) => MaxTrackSizingFunction::calc(calc_ptr(*h)),
         TrackBreadth::Flex(f) => MaxTrackSizingFunction::fr(*f),
         TrackBreadth::Auto => MaxTrackSizingFunction::auto(),
         TrackBreadth::MinContent => MaxTrackSizingFunction::min_content(),
@@ -135,6 +157,10 @@ fn track(t: &TrackSize<ComputedLp>) -> TrackSizingFunction {
             max: match l {
                 ComputedLp::Px(px) => MaxTrackSizingFunction::fit_content_px(*px),
                 ComputedLp::Percent(p) => MaxTrackSizingFunction::fit_content_percent(*p / 100.0),
+                // A limit with a percentage in a math function: roadmap
+                // line 5's later part (taffy has no calc fit-content); the
+                // limit is taken as zero until then.
+                ComputedLp::Calc(_) => MaxTrackSizingFunction::fit_content_px(0.0),
             },
         },
     }

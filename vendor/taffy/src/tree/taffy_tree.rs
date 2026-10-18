@@ -34,6 +34,18 @@ use crate::compute::grid::DetailedGridInfo;
 #[cfg(feature = "detailed_layout_info")]
 use crate::tree::layout::DetailedLayoutInfo;
 
+/// The embedder's resolver for `calc()` values (browser patch: upstream's
+/// `TaffyTree` resolves every calc value to zero).
+#[cfg(feature = "calc")]
+static CALC_RESOLVER: std::sync::OnceLock<fn(*const (), f32) -> f32> = std::sync::OnceLock::new();
+
+/// Set, once per process, how `TaffyTree` resolves a `calc()` handle
+/// against its percentage basis.
+#[cfg(feature = "calc")]
+pub fn set_calc_resolver(resolve: fn(*const (), f32) -> f32) {
+    let _ = CALC_RESOLVER.set(resolve);
+}
+
 /// The error Taffy generates on invalid operations
 pub type TaffyResult<T> = Result<T, TaffyError>;
 
@@ -391,7 +403,12 @@ where
     }
 
     #[inline(always)]
-    fn resolve_calc_value(&self, _val: *const (), _basis: f32) -> f32 {
+    fn resolve_calc_value(&self, val: *const (), basis: f32) -> f32 {
+        #[cfg(feature = "calc")]
+        if let Some(resolve) = CALC_RESOLVER.get() {
+            return resolve(val, basis);
+        }
+        let _ = (val, basis);
         0.0
     }
 

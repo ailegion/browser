@@ -150,6 +150,7 @@ const MAX_FLOAT_PASSES: usize = 3;
 impl LayoutEngine {
     /// Loads system fonts. Takes noticeable time; do it once.
     pub fn new() -> Self {
+        crate::convert::install_calc_resolver();
         Self {
             fonts: FontContext::new(),
             lcx: LayoutContext::new(),
@@ -1575,6 +1576,7 @@ pub(crate) fn image_size_for(style: &ComputedStyle, intrinsic: Option<(f32, f32)
     let resolve_in = |s: ComputedSize, basis: Option<f32>| match s {
         ComputedSize::Px(px) => Some(px),
         ComputedSize::Percent(p) => basis.map(|b| p / 100.0 * b),
+        ComputedSize::Calc(h) => basis.map(|b| h.resolve(b)),
         _ => None,
     };
     let resolve = |s: ComputedSize| resolve_in(s, basis);
@@ -5277,6 +5279,44 @@ mod tests {
         let underline = underline.expect("underline turned on");
         assert!(underline.y > 0.0 && underline.thickness > 0.0, "{underline:?}");
         assert_eq!(underline.color.to_rgba8(), [0, 255, 0, 255]);
+    }
+
+    /// "Working sites first" line 6f: math functions resolve to pixels at
+    /// style time, or against the containing block in layout when they
+    /// mix in a percentage.
+    #[test]
+    fn math_functions_size_boxes() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div id=a style='width:calc(100% - 20px);height:1px'></div>\
+             <div id=b style='width:min(100%, 300px);height:1px'></div>\
+             <div style='width:200px'><div id=c style='width:min(100%, 300px);height:1px'></div></div>\
+             <div id=d style='width:calc(1rem + 4px);height:1px'></div>\
+             <div id=e style='width:calc(max(calc(var(--f, 1rem) + 4px), 10px));height:1px'></div>\
+             <div id=f style='width:calc(10px - 50%);height:1px'></div>\
+             <div style='width:100px'><div id=g style='width:100px;padding-left:calc(10% + 5px);height:1px'></div></div>\
+             <div id=m style='margin-left:calc(10% - 5px);width:clamp(10px, 50%, 120px);height:1px'></div>\
+             <div style='position:relative;width:400px;height:100px'>\
+               <div id=h style='position:absolute;left:calc(50% - 10px);top:0;width:calc(25% + 2px);height:1px'></div></div>\
+             <div style='display:flex;width:400px'><div id=i style='flex:0 0 calc(50% - 50px);height:1px'></div></div>\
+             <div style='display:grid;width:400px;grid-template-columns:calc(25% + 10px) 1fr'>\
+               <div id=j style='height:1px'></div><div id=k style='height:1px'></div></div>\
+             </body>",
+            "",
+        );
+        let b = |id: &str| box_of(&tree, by_id(&doc, id));
+        assert_eq!(b("a").width, 780.0);
+        assert_eq!(b("b").width, 300.0);
+        assert_eq!(b("c").width, 200.0);
+        assert_eq!(b("d").width, 20.0);
+        assert_eq!(b("e").width, 20.0);
+        assert_eq!(b("f").width, 0.0, "a negative size is clamped at zero");
+        assert_eq!(b("g").width, 115.0, "100px and calc(10% + 5px) of 100px padding");
+        assert_eq!((b("m").x, b("m").width), (75.0, 120.0));
+        let h = b("h");
+        assert_eq!((h.x, h.width), (190.0, 102.0));
+        assert_eq!(b("i").width, 150.0);
+        assert_eq!((b("j").width, b("k").x, b("k").width), (110.0, 110.0, 290.0));
     }
 
     #[test]

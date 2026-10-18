@@ -206,8 +206,8 @@ pub fn transform_matrix(style: &ComputedStyle, width: f32, height: f32) -> Optio
 pub fn box_matrix(style: &ComputedStyle, width: f32, height: f32) -> Option<Matrix4> {
     let m = transform_matrix(style, width, height)?;
     let (ox, oy, oz) = style.transform_origin;
-    let ox = f64::from(ox.px + ox.percent / 100.0 * width);
-    let oy = f64::from(oy.px + oy.percent / 100.0 * height);
+    let ox = f64::from(ox.resolve(width));
+    let oy = f64::from(oy.resolve(height));
     Some(Matrix4::translate(ox, oy, f64::from(oz)).mul(&m).mul(&Matrix4::translate(-ox, -oy, -f64::from(oz))))
 }
 

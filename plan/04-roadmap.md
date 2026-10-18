@@ -179,7 +179,12 @@ remaining lists as they stand.
 - [x] 5. From 4a block 7 (grid): grid-template-rows/columns with
       lengths, fr, repeat, minmax, auto; gap; auto placement; line
       spans. Later: auto-fill/fit, alignment keywords, subgrid (named
-      areas: line 6a).
+      areas: line 6a), `fit-content()` tracks whose limit is a math
+      function with a percentage (`fit-content(calc(50% - 10px))`; taffy
+      has no calc fit-content: a tag carrying our handle and the calc
+      resolver passed to its grid track code; owner's 2026-10-18
+      placement, rarely used; until then such a track sizes as
+      `fit-content(0)`).
       Done 2026-10-18. Style (`crates/style/src/grid.rs`): `display:
       grid`/`inline-grid` are their own computed values (they computed
       to `block`/`inline-block`); `grid-template-columns`/`-rows` (`none`
@@ -348,6 +353,45 @@ remaining lists as they stand.
       tests, mixed operators, general-enclosed, `@import`). Timing: tables
       51.4–51.8 ms (50.5–51.6 before), blocks 14.6–14.8 ms (14.5), Hacker
       News relayout 40.6–42.1 ms (41.1–42.1).
+- [x] 6f. Complete `calc()` (owner, 2026-10-18, before 6e; Wikipedia's
+      icon sizes are `calc(max(calc(1rem + 4px), 10px))`, and a sum of
+      mixed units kept only its first term): sums of absolute,
+      font-relative and viewport units resolved to pixels when styles are
+      computed; `min()`, `max()`, `clamp()`, `*` and `/` (top level and
+      inside `calc()`); sums mixing lengths with percentages kept to
+      layout and resolved against the containing block there.
+      Done 2026-10-18 (`fit-content()` grid tracks with a percentage in a
+      math function: line 5's later part, owner's placement). Style
+      (`values.rs`): `CalcNode` trees for `calc()`, `-webkit-calc()`,
+      `min()`, `max()`, `clamp()` with `+ - * /`, parentheses, nesting,
+      `e` and `pi`, typed per CSS Values 4 §10.8 (a length plus a number,
+      a length times a length, a division by a length do not parse);
+      simplified per §10.12 (nested `calc()` unwrapped, like units added,
+      terms sorted number, percentage, units by name, numbers multiplied
+      in, `min`/`max`/`clamp` of like units computed, absolute units in
+      `px`) and serialized per §10.13 (WPT
+      `minmax-length-percent-serialize.html`'s cases), specified and
+      computed. Computed: no percentage gives pixels, a lone percentage a
+      percentage, else the simplified tree with pixel lengths interned as
+      a `CalcHandle` (`ComputedLp`, `ComputedLpAuto`, `ComputedSize`
+      `Calc`); properties that take no negative values (sizes, padding,
+      radii, gaps, `scroll-padding`, `background-size`/`mask-size`) clamp
+      the result at zero. Layout: handles go to taffy as calc values,
+      resolved against the basis taffy passes (taffy patch, `03-crates.md`);
+      our own code resolves them (absolutely positioned sizes, replaced
+      sizes, `vertical-align`, radii); a table cell's width with a
+      percentage in a math function counts as `auto` (CSS Tables 3).
+      Paint: background/mask positions (`PositionOffset::calc`, `right
+      min(…)` as `calc(100% - min(…))`), sizes, gradient stops,
+      `transform-origin`. Tests: style (WPT's serialization cases,
+      Wikipedia's icon size, typing errors, clamp, products and
+      quotients), layout (widths, padding, margins, an absolutely
+      positioned box, `flex-basis`, a grid track). Wikipedia's icons are
+      20×20 (16 before). Timing: tables 50.9–52.6 ms (51.4–51.8 before),
+      blocks 14.6–15.3 ms (14.6–14.8), Hacker News restyle 3.5–4.5 ms
+      (2.5–2.6 at 6c) and relayout 27.3–29.2 ms (40.6–42.1): restyle
+      slower; HN's stylesheet and scripts are fetched live, so the two
+      runs are not of the same page bytes.
 - [ ] 6e. Generated content (owner, 2026-10-18; not in the plan before,
       and used by most sites): `::before` and `::after` matched in the
       cascade and given boxes; `content` with strings, `url()` images (6b's
