@@ -1880,6 +1880,8 @@ impl TabState {
             self.script.as_ref().and_then(ScriptHost::next_wake),
             self.frame_due,
             self.web_fonts.next_wake(),
+            // A `document.fonts` task is due.
+            (self.web_fonts.dirty && self.script.is_some()).then(std::time::Instant::now),
         ]
         .into_iter()
         .flatten()
@@ -1903,6 +1905,9 @@ impl TabState {
         if self.web_fonts.tick(now) {
             self.needs_layout = true;
         }
+        // `document.fonts`: its promises and events run as a task here,
+        // never from inside rendering or a network handler.
+        self.report_fonts();
         // Script timers, then an animation frame if one is due: each
         // callback is a task with its own microtask checkpoint.
         if self
@@ -2355,8 +2360,11 @@ impl TabState {
             let parsed = self.parser.is_none() && self.doc.is_some() && self.script.is_some();
             let deferred_done = self.scripts.deferred.is_empty() && !self.scripts.running_deferred;
             let fetched = self.nav.is_none() && self.pending.is_empty();
-            // `document.fonts.ready` waits for the document to be parsed.
-            self.web_fonts.dirty = true;
+            // `document.fonts.ready` waits for the document to be parsed:
+            // a step of the lifecycle is news for it.
+            if parsed && self.lifecycle != Lifecycle::Complete {
+                self.web_fonts.dirty = true;
+            }
             match self.lifecycle {
                 Lifecycle::Loading if parsed => {
                     self.lifecycle = Lifecycle::Interactive;
@@ -2367,16 +2375,6 @@ impl TabState {
                     self.fire_lifecycle_event(EventTargetRef::Document, "DOMContentLoaded", true);
                 }
                 Lifecycle::ContentLoaded if parsed && deferred_done && fetched => {
-                    // The fetches styling and layout start (background
-                    // images, the web fonts the text uses) are the
-                    // document's too: style and lay it out first, and
-                    // `load` waits for what that requests.
-                    if self.needs_style || self.needs_layout {
-                        self.settle();
-                        if !self.pending.is_empty() {
-                            return;
-                        }
-                    }
                     self.lifecycle = Lifecycle::Complete;
                     self.fire_lifecycle_event(EventTargetRef::Document, "readystatechange", false);
                     self.fire_lifecycle_event(EventTargetRef::Window, "load", false);
@@ -3453,12 +3451,15 @@ impl TabState {
             statuses.push((browser_script::FaceRef::Script(s.id), self.face_status(&s.rule, Some(s.id))));
         }
         let fetching = self.pending.values().any(|p| matches!(p.kind, PendingKind::Font { .. }));
-        let settled = !matches!(self.lifecycle, Lifecycle::Loading)
-            && self.parser.is_none()
-            && !self.needs_style
-            && !self.needs_layout
-            && self.layout.is_some()
-            && !fetching;
+        // Once settled, it stays so (the flag only lets `ready` resolve the
+        // first time; later rounds must not run scripts for it).
+        let settled = self.web_fonts.reported.as_ref().is_some_and(|r| r.2)
+            || (!matches!(self.lifecycle, Lifecycle::Loading)
+                && self.parser.is_none()
+                && !self.needs_style
+                && !self.needs_layout
+                && self.layout.is_some()
+                && !fetching);
         let keys: Vec<usize> = css.iter().map(face_key).collect();
         let report = (keys, statuses, settled);
         if self.web_fonts.reported.as_ref() == Some(&report) {
@@ -3535,7 +3536,9 @@ impl TabState {
         if let Some(engine) = &mut self.engine {
             engine.sync_web_faces(&faces);
         }
-        self.web_fonts.dirty = true;
+        if !faces.is_empty() || !self.web_fonts.script.is_empty() {
+            self.web_fonts.dirty = true;
+        }
         // Script faces in the set whose data is here (bytes a script gave,
         // or loaded before): registered now.
         for (order, face) in faces.iter().enumerate() {
@@ -3809,12 +3812,6 @@ impl TabState {
         let mut again = self.fire_pointer_move();
         again |= self.fire_view_events();
         if again {
-            self.settle();
-        }
-        // `document.fonts`: the faces' states and `ready`, after layout
-        // (which asks for the fonts the text uses).
-        self.report_fonts();
-        if self.needs_style || self.needs_layout {
             self.settle();
         }
         self.report_caret();
@@ -7074,6 +7071,8 @@ mod tests {
         );
         let mut h = Harness::load_url(server.url("/page"));
         h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        // The fonts the layout asks for, through their fallbacks.
+        h.pump_until(|h| server.requests("/after-local.ttf").len() == 1 && !h.state.pending.values().any(|p| matches!(p.kind, PendingKind::Font { .. })));
         h.pump();
         assert_eq!(run_js(&mut h, "loaded"), "true");
         let origin = server.base.origin().ascii_serialization();
@@ -7349,7 +7348,7 @@ mod tests {
         for p in ["/b.ttf", "/s.ttf", "/f.ttf", "/o.ttf"] {
             server.release(p);
         }
-        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.pump_until(|h| shown(h).get("block") == Some(&(false, true)) && !h.state.pending.values().any(|p| matches!(p.kind, PendingKind::Font { .. })));
         h.pump();
         let s = shown(&h);
         assert_eq!(s["block"], (false, true));

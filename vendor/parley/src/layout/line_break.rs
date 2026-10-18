@@ -183,6 +183,10 @@ pub struct BreakerState {
     /// a next box that does not fit breaks here too, so the boxes move to
     /// the next line with the content they are glued to.
     pending_attach: Option<PrevBoundaryState>,
+    /// Browser patch: the break position an `AttachedToPrevious` box last
+    /// broke back to. Breaking back to it again would lay the same line
+    /// out again forever; the box overflows instead.
+    attach_reset: Option<(usize, usize, usize)>,
 }
 
 impl Default for BreakerState {
@@ -202,6 +206,7 @@ impl Default for BreakerState {
             prev_boundary: None,
             emergency_boundary: None,
             pending_attach: None,
+            attach_reset: None,
         }
     }
 }
@@ -656,6 +661,31 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                             // it (an earlier break opportunity), or it
                             // overflows with that content. No break
                             // opportunity on either side of it.
+                            // A break opportunity at the line's start keeps
+                            // nothing on the line: breaking there would start
+                            // the same line again, forever. The box then
+                            // overflows with its content, as text does at a
+                            // line's start.
+                            let last = self.state.attach_reset;
+                            let keeps = |b: &PrevBoundaryState| {
+                                (!b.state.items.is_empty() || !b.state.clusters.is_empty())
+                                    && last != Some((b.item_idx, b.run_idx, b.cluster_idx))
+                            };
+                            if !self.state.prev_boundary.as_ref().is_some_and(keeps) {
+                                self.state.prev_boundary = None;
+                            }
+                            if !self.state.emergency_boundary.as_ref().is_some_and(keeps) {
+                                self.state.emergency_boundary = None;
+                            }
+                            let reset_to = self
+                                .state
+                                .prev_boundary
+                                .as_ref()
+                                .or(self.state.emergency_boundary.as_ref())
+                                .map(|b| (b.item_idx, b.run_idx, b.cluster_idx));
+                            if !(fits || self.state.line.text_wrap_mode != TextWrapMode::Wrap) && reset_to.is_some() {
+                                self.state.attach_reset = reset_to;
+                            }
                             if fits || self.state.line.text_wrap_mode != TextWrapMode::Wrap {
                                 self.state
                                     .append_inline_box_to_line(next_x, height_contribution);
@@ -686,9 +716,19 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         _ => {}
                     }
 
+                    // Browser patch: attached boxes that begin the line, then
+                    // this box: moving them to the next line would start the
+                    // same line again, forever; at a line's start a box that
+                    // does not fit overflows.
+                    let after_attached_start = self
+                        .state
+                        .pending_attach
+                        .as_ref()
+                        .is_some_and(|p| p.state.items.is_empty() && p.state.clusters.is_empty());
+
                     // If the box fits on the current line (or we are at the start of the current line)
                     // then simply move on to the next item
-                    if fits || self.state.line.text_wrap_mode != TextWrapMode::Wrap {
+                    if fits || self.state.line.text_wrap_mode != TextWrapMode::Wrap || after_attached_start {
                         // println!("BOX FITS");
 
                         self.state
