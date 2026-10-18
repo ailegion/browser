@@ -233,6 +233,20 @@ impl SelfLayout for Atomic {
     }
 
     fn layout(&mut self, engine: &mut LayoutEngine, sizing: Sizing, _known_height: Option<f32>, _cb: Option<f32>) -> Size<f32> {
+        // Shrink-to-fit into a line (CSS 2.1 §10.3.9) gives the same box
+        // for every line width beyond the box's min- and max-content
+        // contributions, unless something in the box resolves against the
+        // line's width (a percentage size, padding or margin): ask the
+        // clamped width, so the lines measured at many widths share one
+        // layout of it.
+        let sizing = match sizing {
+            Sizing::FitInto(w) if !depends_on_line_width(&self.node.style) => {
+                let min = self.min_content(engine);
+                let max = self.max_content(engine).max(min);
+                Sizing::FitInto(w.clamp(min, max))
+            }
+            other => other,
+        };
         if let Some(i) = self.results.iter().position(|(s, _)| *s == sizing) {
             self.selected = Some(i);
         } else {
@@ -257,6 +271,36 @@ impl SelfLayout for Atomic {
 
 const ATOMIC_RESULTS: usize = 8;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: measure every cell by laying it out (the shortcut off).
+    pub(crate) static NO_SHORTCUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an atomic box's own size or place resolves against its line's
+/// width: a percentage (or a math function with one) in its width, its
+/// min/max width, its padding, its margins or its insets.
+fn depends_on_line_width(s: &browser_style::ComputedStyle) -> bool {
+    use browser_style::{ComputedLpAuto, ComputedSize};
+    let size = |v: ComputedSize| matches!(v, ComputedSize::Percent(_) | ComputedSize::Calc(_));
+    let lpa = |v: ComputedLpAuto| matches!(v, ComputedLpAuto::Percent(_) | ComputedLpAuto::Calc(_));
+    let p = &s.padding;
+    let m = &s.margin;
+    let i = &s.inset;
+    lpa(i.top) || lpa(i.right) || lpa(i.bottom) || lpa(i.left)
+        || size(s.width)
+        || size(s.min_width)
+        || size(s.max_width)
+        || p.top.has_percent()
+        || p.right.has_percent()
+        || p.bottom.has_percent()
+        || p.left.has_percent()
+        || lpa(m.top)
+        || lpa(m.right)
+        || lpa(m.bottom)
+        || lpa(m.left)
+}
+
 /// A table cell: laid out with its border box at the width its columns
 /// give it (`Exactly`), its height from its content; no margins.
 impl SelfLayout for CellBox {
@@ -280,11 +324,31 @@ impl SelfLayout for CellBox {
                 height: None,
             },
         };
+        // A width the table gave it before in this layout (its other
+        // pass, another of its widths): the same layout again.
+        let key = match run {
+            Run::Width { border_box: Some(bb), cb, height: None } => Some((bb, cb)),
+            _ => None,
+        };
+        #[cfg(test)]
+        let key = key.filter(|_| !NO_SHORTCUT.with(std::cell::Cell::get));
+        if let Some(r) = key.and_then(|k| self.done.iter().find(|(d, _)| *d == k)).map(|(_, r)| r.clone()) {
+            let size = Size {
+                width: r.width,
+                height: r.height,
+            };
+            self.last = Some(r);
+            return size;
+        }
+        crate::engine::count(|c| *c.cell_layouts += 1);
         let r = engine.layout_independent(&mut self.node, Role::Cell, run);
         let size = Size {
             width: r.width,
             height: r.height,
         };
+        if let Some(k) = key {
+            self.done.push((k, r.clone()));
+        }
         self.last = Some(r);
         size
     }
@@ -297,11 +361,53 @@ impl CellBox {
             return;
         }
         self.measured = true;
+        if let Some((min, max)) = self.intrinsic_from_text(engine) {
+            self.min_content = min;
+            self.max_content = max.max(min);
+            return;
+        }
         let min = self.layout(engine, Sizing::MinContent, None, None).width;
         let max = self.layout(engine, Sizing::MaxContent, None, None).width;
         self.min_content = min;
         self.max_content = max.max(min);
         self.last = None;
+    }
+
+    /// A cell holding one run of inline content and nothing else (no
+    /// marker, no scrolling, no out-of-flow box, no percentage padding):
+    /// its intrinsic widths are its text's plus its horizontal padding and
+    /// borders, which is what its own intrinsic layout would answer
+    /// (a block's min/max-content width is its content's plus its edges),
+    /// without laying the cell out twice for them.
+    fn intrinsic_from_text(&mut self, engine: &mut LayoutEngine) -> Option<(f32, f32)> {
+        use crate::boxes::BoxKind;
+        #[cfg(test)]
+        if NO_SHORTCUT.with(std::cell::Cell::get) {
+            return None;
+        }
+        let node = &mut self.node;
+        if !matches!(node.kind, BoxKind::Block) || node.marker.is_some() || node.scroll.is_some() || node.control.is_some() || node.children.len() != 1 {
+            return None;
+        }
+        let s = node.style.clone();
+        let p = &s.padding;
+        if p.left.has_percent() || p.right.has_percent() {
+            return None;
+        }
+        let child = &mut node.children[0];
+        if child.hangs {
+            return None;
+        }
+        let BoxKind::Inline(content) = &mut child.kind else { return None };
+        if !content.oofs.is_empty() {
+            return None;
+        }
+        let min = content.min_content(engine);
+        let max = content.max_content(engine);
+        let edges = p.left.resolve(0.0) + p.right.resolve(0.0) + s.border_width.left + s.border_width.right;
+        // Rounded as taffy rounds the cell's own intrinsic layout (its
+        // border box at the origin).
+        Some(((min + edges).round(), (max + edges).round()))
     }
 }
 

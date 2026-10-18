@@ -107,6 +107,9 @@ pub(crate) struct CellBox {
     pub measured: bool,
     /// The cell's last layout, taken by the table that asked for it.
     pub last: Option<crate::engine::SubtreeResult>,
+    /// Its layouts at a border-box width and containing block width, for
+    /// the table's other layouts in this layout that give it the same.
+    pub done: Vec<((f32, f32), crate::engine::SubtreeResult)>,
 }
 
 /// How a scroll container's box is laid out (roadmap 4a (4s)): which
@@ -599,6 +602,9 @@ pub(crate) struct InlineContent {
     pub first_formatted_line: bool,
     /// The next document-order number for an atomic or inline box edge.
     next_seq: u32,
+    /// Its paragraphs as shaped for the last width laid out, kept for the
+    /// other widths of this layout (`engine::Shaped`).
+    pub shaped: Option<crate::engine::Shaped>,
 }
 
 /// The laid-out `text-overflow` marker of an inline root.
@@ -623,6 +629,7 @@ impl InlineContent {
             marker_len: 0,
             first_formatted_line: true,
             next_seq: 0,
+            shaped: None,
         };
         // A block container's override applies to all of its inline
         // content: the paragraph is wrapped in it (`finish` closes it).
@@ -951,6 +958,7 @@ impl InlineContent {
         self.spans = spans;
         if changed {
             self.cache.clear();
+            self.shaped = None;
         }
         changed
     }
@@ -1791,6 +1799,7 @@ impl BoxBuilder<'_> {
             max_content: 0.0,
             measured: false,
             last: None,
+            done: Vec::new(),
         }
     }
 }
@@ -2335,6 +2344,7 @@ mod tests {
             marker_len: 0,
             first_formatted_line: true,
             next_seq: 0,
+            shaped: None,
         };
 let img_index = 9;
         c.atomics.push(Atomic::new(

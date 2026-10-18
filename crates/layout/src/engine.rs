@@ -699,6 +699,11 @@ impl LayoutEngine {
             text_build_ms = ms(c.text_build),
             text_kib = c.text_bytes / 1024,
             text_reused = c.text_reused,
+            text_built_min = c.text_built_min,
+            text_built_max = c.text_built_max,
+            table_layouts = c.table_layouts,
+            cell_layouts = c.cell_layouts,
+            independent_layouts = c.independent_layouts,
             boxes_ms = ms(t_boxes),
             taffy_tree_ms = ms(t_taffy_tree),
             passes = pass,
@@ -809,6 +814,11 @@ impl LayoutEngine {
     /// min-content width, in the line less its margins), or its own width
     /// when it has one.
     pub(crate) fn atomic_result(&mut self, atomic: &mut Atomic, sizing: Sizing) -> AtomicResult {
+        counters(|c| match sizing {
+            Sizing::MinContent => c.atomic_min += 1,
+            Sizing::MaxContent => c.atomic_max += 1,
+            _ => c.atomic_fit += 1,
+        });
         // The containing block's width, when definite.
         let basis = match sizing {
             Sizing::MinContent | Sizing::MaxContent => None,
@@ -949,6 +959,7 @@ impl LayoutEngine {
     /// how its root sits in its container (`Role`), `run` what it is laid
     /// out for (`Run`).
     pub(crate) fn layout_independent(&mut self, node: &mut BoxNode, role: Role, run: Run) -> SubtreeResult {
+        counters(|c| c.independent_layouts += 1);
         self.prepare_markers(node);
         // The plans this layout leaves are its own: the container's are
         // put back after (`SubtreeResult::plans`).
@@ -1304,9 +1315,19 @@ impl LayoutEngine {
     /// Make sure an inline root has a parley layout for its final width.
     fn finalize_inline(&mut self, content: &mut InlineContent, width: f32) {
         let key = LineWidth::definite(width);
+        if !content.cache.iter().any(|l| l.key == key) {
+            counters(|c| c.finalize_misses += 1);
+        }
         self.ensure_layout(content, key);
-        // Keep only the final layout.
-        content.cache.retain(|l| l.key == key);
+        // Keep the final layout, and the intrinsic ones: the same text is
+        // measured again (a cell for each width its table is laid out at,
+        // a line for each width it is asked), and its min- and max-content
+        // layouts do not depend on any of those widths.
+        content.cache.retain(|l| l.key == key || matches!(l.key, LineWidth::MinContent | LineWidth::MaxContent));
+        // The fragments take the first: the final one.
+        if let Some(pos) = content.cache.iter().position(|l| l.key == key) {
+            content.cache.swap(0, pos);
+        }
         // The `text-overflow` marker, in the container's font.
         let marker = content.text_overflow_marker().map(str::to_owned);
         content.ellipsis = marker.map(|marker| {
@@ -1533,6 +1554,7 @@ pub(crate) enum Run {
 /// (outside it), the fragment with its border box at (0, 0), the first
 /// and last baselines from the border box's top, and the scroll container
 /// plans of the boxes in the fragment as this layout left them.
+#[derive(Clone)]
 pub(crate) struct SubtreeResult {
     pub width: f32,
     pub height: f32,
@@ -1727,6 +1749,11 @@ impl LayoutEngine {
         let started = std::time::Instant::now();
         let text_len = content.text.len();
         let _count = CountOnDrop(started, text_len);
+        counters(|c| match key {
+            LineWidth::MinContent => c.text_built_min += 1,
+            LineWidth::MaxContent => c.text_built_max += 1,
+            LineWidth::Definite(_) => {}
+        });
         let max_width = key.max_advance();
         // The inline boxes' edges for this width: percentages against the
         // containing block's width, zero while an intrinsic size is
@@ -1736,14 +1763,20 @@ impl LayoutEngine {
             .iter()
             .map(|b| ResolvedEdges::resolve(&b.style, max_width.unwrap_or(0.0)))
             .collect();
-        let (mut paragraphs, mut height) = build_paragraphs(content, &mut self.fonts, &mut self.lcx, &mut self.decor, max_width, &edges);
+        let mut shaped = content.shaped.take();
+        let (mut paragraphs, mut height) =
+            build_paragraphs(content, &mut shaped, &mut self.fonts, &mut self.lcx, &mut self.decor, max_width, &edges);
         let ranges: Vec<std::ops::Range<usize>> = paragraphs
             .iter()
             .flat_map(|p| small_caps_to_synthesize(&p.layout, content, &mut self.smcp, p.range.start))
             .collect();
         if !ranges.is_empty() && content.synthesize_small_caps(&ranges) {
-            (paragraphs, height) = build_paragraphs(content, &mut self.fonts, &mut self.lcx, &mut self.decor, max_width, &edges);
+            // New text: shaped again.
+            shaped = None;
+            (paragraphs, height) =
+                build_paragraphs(content, &mut shaped, &mut self.fonts, &mut self.lcx, &mut self.decor, max_width, &edges);
         }
+        content.shaped = shaped;
         if content.cache.len() >= 4 {
             content.cache.remove(0);
         }
@@ -1772,6 +1805,41 @@ struct Counters {
     text_build: std::time::Duration,
     text_bytes: usize,
     text_reused: u32,
+    /// Of the text layouts built, those for a min- or max-content width.
+    text_built_min: u32,
+    text_built_max: u32,
+    /// Final text layouts not measured before (a width taffy rounded).
+    finalize_misses: u32,
+    /// Paragraphs laid out from shaping kept from another width.
+    text_reshaped_saved: u32,
+    /// Atomic inline-level boxes laid out, by question: min-content,
+    /// max-content, a line width.
+    atomic_min: u32,
+    atomic_max: u32,
+    atomic_fit: u32,
+    /// Table layouts computed (not taken from a table's cache), the cell
+    /// layouts they and the intrinsic measures ran, and nested layouts
+    /// (`layout_independent`) of any kind.
+    table_layouts: u32,
+    cell_layouts: u32,
+    independent_layouts: u32,
+}
+
+/// The timing log's counters, for the other layout modules.
+pub(crate) fn count(f: impl FnOnce(&mut CountersMut)) {
+    counters(|c| {
+        let mut m = CountersMut {
+            table_layouts: &mut c.table_layouts,
+            cell_layouts: &mut c.cell_layouts,
+        };
+        f(&mut m);
+    });
+}
+
+/// What the other layout modules count.
+pub(crate) struct CountersMut<'a> {
+    pub table_layouts: &'a mut u32,
+    pub cell_layouts: &'a mut u32,
 }
 
 thread_local! {
@@ -1849,6 +1917,7 @@ fn paragraph_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
 /// on every line it is broken over.
 fn build_paragraphs(
     content: &InlineContent,
+    shaped: &mut Option<Shaped>,
     fonts: &mut FontContext,
     lcx: &mut LayoutContext<Brush>,
     decor: &mut Decorator,
@@ -1864,8 +1933,29 @@ fn build_paragraphs(
     // it from where the previous one stopped.
     let mut first_span = 0;
     let n_atomics = content.atomics.len();
+    // The shaped paragraphs of an earlier width serve this one when what
+    // shaping takes besides the text and styles, the inline boxes' sizes
+    // and edges, is the same: only the line breaking and alignment below
+    // depend on the width.
+    let atomic_sizes: Vec<(f32, f32)> =
+        content.atomics.iter().map(|a| a.result().map(|r| (r.width, r.height)).unwrap_or((0.0, 0.0))).collect();
+    let reuse = shaped
+        .as_ref()
+        .filter(|s| s.atomics == atomic_sizes && s.edges == edges && s.paragraphs.len() == ranges.len())
+        .map(|s| s.paragraphs.clone());
+    #[cfg(test)]
+    let reuse = reuse.filter(|_| !crate::formatting::NO_SHORTCUT.with(std::cell::Cell::get));
+    let mut fresh: Vec<parley::Layout<Brush>> = Vec::new();
     for (pi, range) in ranges.into_iter().enumerate() {
         let base = range.start;
+        if let Some(layouts) = &reuse {
+            counters(|c| c.text_reshaped_saved += 1);
+            let layout = layouts[pi].clone();
+            let (h, p) = break_and_align(layout, content, decor, fonts, max_width, pi, base, range, y);
+            y = y.max(h);
+            paragraphs.push(p);
+            continue;
+        }
         let slice = &content.text[range.clone()];
         let mut builder = lcx.ranged_builder(fonts, slice, 1.0, true);
         push_style(&mut builder, container, None);
@@ -1956,47 +2046,83 @@ fn build_paragraphs(
                 end: e.end(rtl),
             });
         }
-        let mut layout = builder.build(slice);
-        // `text-indent` (CSS Text 3 §8.1): a percentage of the container's
-        // inline size (none while measuring intrinsic sizes). The lines it
-        // is scoped to: the container's first formatted line, and with
-        // `each-line` each line after a forced break, which starts a
-        // paragraph here; `hanging` indents the others instead.
-        let indent = container.text_indent;
-        let amount = indent.length.resolve(max_width.unwrap_or(0.0));
-        if amount != 0.0 {
-            let scoped = (pi == 0 && content.first_formatted_line) || (pi > 0 && indent.each_line);
-            layout.set_text_indent(
-                amount,
-                parley::IndentOptions { each_line: indent.each_line, hanging: indent.hanging, continuation: !scoped },
-            );
-        }
-        // Spans that may not wrap carry `TextWrapMode::NoWrap`
-        // (`push_style`), so the width goes to parley in every case.
-        let wrap = container.white_space.allows_wrap();
-        let (height, lines) = match max_width {
-            Some(width) if width > 0.0 && !content.floats.is_empty() => {
-                break_around_floats(&mut layout, width, wrap, &content.floats, content, decor, fonts, base, y)
-            }
-            _ => {
-                layout.break_all_lines(max_width);
-                let (lines, height) = place_lines(&layout, content, decor, fonts, None, base, y);
-                (height, lines)
-            }
-        };
-        let alignment = match container.text_align {
-            TextAlign::Start => Alignment::Start,
-            TextAlign::Left => Alignment::Left,
-            TextAlign::Right => Alignment::Right,
-            TextAlign::Center => Alignment::Center,
-            TextAlign::Justify => Alignment::Justify,
-            TextAlign::End => Alignment::End,
-        };
-        layout.align(alignment, AlignmentOptions::default());
-        y = y.max(height);
-        paragraphs.push(Paragraph { range, layout, lines });
+        let layout = builder.build(slice);
+        fresh.push(layout.clone());
+        let (h, p) = break_and_align(layout, content, decor, fonts, max_width, pi, base, range, y);
+        y = y.max(h);
+        paragraphs.push(p);
+    }
+    if reuse.is_none() {
+        *shaped = Some(Shaped {
+            atomics: atomic_sizes,
+            edges: edges.to_vec(),
+            paragraphs: fresh,
+        });
     }
     (paragraphs, y)
+}
+
+/// An inline root's shaped paragraphs (before line breaking), with the
+/// inline boxes' sizes and edges they were shaped with: kept for the
+/// other widths the root is laid out at in one layout.
+pub(crate) struct Shaped {
+    atomics: Vec<(f32, f32)>,
+    edges: Vec<ResolvedEdges>,
+    paragraphs: Vec<parley::Layout<Brush>>,
+}
+
+/// Indent, line-break, place and align one shaped paragraph at
+/// `max_width`, its lines from `y`: its height and the paragraph.
+#[allow(clippy::too_many_arguments)]
+fn break_and_align(
+    mut layout: parley::Layout<Brush>,
+    content: &InlineContent,
+    decor: &mut Decorator,
+    fonts: &mut FontContext,
+    max_width: Option<f32>,
+    pi: usize,
+    base: usize,
+    range: std::ops::Range<usize>,
+    y: f32,
+) -> (f32, Paragraph) {
+    let container = &content.container;
+    // `text-indent` (CSS Text 3 §8.1): a percentage of the container's
+    // inline size (none while measuring intrinsic sizes). The lines it
+    // is scoped to: the container's first formatted line, and with
+    // `each-line` each line after a forced break, which starts a
+    // paragraph here; `hanging` indents the others instead.
+    let indent = container.text_indent;
+    let amount = indent.length.resolve(max_width.unwrap_or(0.0));
+    if amount != 0.0 {
+        let scoped = (pi == 0 && content.first_formatted_line) || (pi > 0 && indent.each_line);
+        layout.set_text_indent(
+            amount,
+            parley::IndentOptions { each_line: indent.each_line, hanging: indent.hanging, continuation: !scoped },
+        );
+    }
+    // Spans that may not wrap carry `TextWrapMode::NoWrap`
+    // (`push_style`), so the width goes to parley in every case.
+    let wrap = container.white_space.allows_wrap();
+    let (height, lines) = match max_width {
+        Some(width) if width > 0.0 && !content.floats.is_empty() => {
+            break_around_floats(&mut layout, width, wrap, &content.floats, content, decor, fonts, base, y)
+        }
+        _ => {
+            layout.break_all_lines(max_width);
+            let (lines, height) = place_lines(&layout, content, decor, fonts, None, base, y);
+            (height, lines)
+        }
+    };
+    let alignment = match container.text_align {
+        TextAlign::Start => Alignment::Start,
+        TextAlign::Left => Alignment::Left,
+        TextAlign::Right => Alignment::Right,
+        TextAlign::Center => Alignment::Center,
+        TextAlign::Justify => Alignment::Justify,
+        TextAlign::End => Alignment::End,
+    };
+    layout.align(alignment, AlignmentOptions::default());
+    (height, Paragraph { range, layout, lines })
 }
 
 /// A box's transform (4a block 6), relative to its border box's top-left
@@ -7003,6 +7129,79 @@ mod generated_content {
         engine.refresh_styles(&mut tree, &doc, &styles);
         let blue = [0, 0, 255, 255];
         assert_eq!(colors(&tree), vec![("\u{2022} ".to_owned(), blue), ("\u{2022} ".to_owned(), blue), ("x".to_owned(), blue)]);
+    }
+
+    /// The cell shortcut (`CellBox::intrinsic_from_text`) and the atomic
+    /// width clamping give the very layout the full measures give: every
+    /// fragment's place and size equal.
+    #[test]
+    fn layout_shortcuts_change_nothing() {
+        let html = "<body style='margin:0;font-size:15px'>\
+            <table style='width:100%'><tr><td>short</td><td style='padding:3px 9px;border:2px solid'>a longer cell that wraps somewhere</td>\
+            <td style='white-space:nowrap'>no wrap here at all</td><td><a href=#>link <b style='padding:0 4px'>bold</b></a> tail</td></tr>\
+            <tr><td><span style='display:inline-block;width:20px;height:5px'></span> icon</td><td colspan=2>spanning cell with words</td>\
+            <td style='padding-left:10%'>percent padding</td></tr></table>\
+            <table><tr><td>auto table</td><td><a href=#>x</a></td></tr></table>\
+            <div style='width:300px'><table><tr><td>squeezed into a narrow box with plenty of words to break</td><td>b</td></tr></table></div>\
+            <p>line with <span class=i></span> an icon and more words to wrap in a paragraph that is long enough</p></body>";
+        let css = "a::before { content: ''; display: inline-block; width: 12px; height: 12px }
+                   .i { display: inline-block; width: 30px; height: 10px; margin: 0 3px }";
+        let rects = |tree: &LayoutTree| {
+            let mut out = Vec::new();
+            tree.root.walk(&mut |f| out.push((f.node, f.rect)));
+            out
+        };
+        let (_, fast) = layout(html, css, &());
+        crate::formatting::NO_SHORTCUT.with(|c| c.set(true));
+        let (_, full) = layout(html, css, &());
+        crate::formatting::NO_SHORTCUT.with(|c| c.set(false));
+        assert_eq!(rects(&fast), rects(&full));
+    }
+
+    /// The shortcuts on real pages saved with their stylesheets inlined:
+    /// `LAYOUT_PAGES=<dir of .html> cargo test -p browser-layout --release
+    /// shortcuts_on_saved_pages -- --ignored --nocapture`. Each page laid
+    /// out at 1024 and 800 wide with and without them: every fragment
+    /// equal, and the time of each.
+    #[test]
+    #[ignore]
+    fn shortcuts_on_saved_pages() {
+        let Ok(dir) = std::env::var("LAYOUT_PAGES") else { return };
+        let mut paths: Vec<_> = std::fs::read_dir(&dir).expect("pages dir").filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for path in paths.into_iter().filter(|p| p.extension().is_some_and(|e| e == "html")) {
+            let bytes = std::fs::read(&path).expect("page");
+            let mut doc = browser_dom::parse_html(&bytes);
+            let mut stylist = Stylist::new();
+            stylist.add_sheet(ua_stylesheet());
+            for id in doc.descendants(doc.root()) {
+                if doc.element(id).is_some_and(|e| &*e.name.local == "style") {
+                    stylist.add_sheet(Arc::new(Stylesheet::parse(&doc.text_content(id), Origin::Author)));
+                }
+            }
+            for width in [1024.0, 800.0] {
+                let vp = Viewport { width, height: 768.0, ..Viewport::default() };
+                let styles = compute_styles(&doc, &stylist, &vp);
+                sync_pseudo_elements(&mut doc, &styles);
+                let run = |off: bool| {
+                    crate::formatting::NO_SHORTCUT.with(|c| c.set(off));
+                    let mut engine = LayoutEngine::new();
+                    let started = std::time::Instant::now();
+                    let tree = engine.layout(&doc, &styles, width, 768.0, &());
+                    let spent = started.elapsed();
+                    let mut rects = Vec::new();
+                    tree.root.walk(&mut |f| rects.push((f.node, f.rect)));
+                    (rects, spent)
+                };
+                let (fast, fast_t) = run(false);
+                eprintln!("  counters: {:?}", COUNTERS.with(std::cell::Cell::get));
+                let (full, full_t) = run(true);
+                crate::formatting::NO_SHORTCUT.with(|c| c.set(false));
+                let differ = fast.iter().zip(&full).filter(|(a, b)| a != b).count() + fast.len().abs_diff(full.len());
+                eprintln!("{} at {width}: {} fragments, {differ} differ; with the shortcuts {fast_t:?}, without {full_t:?}", path.display(), fast.len());
+                assert_eq!(differ, 0, "{} at {width}", path.display());
+            }
+        }
     }
 
     #[test]

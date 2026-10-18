@@ -468,6 +468,7 @@ pub(crate) fn layout_at(engine: &mut LayoutEngine, table: &mut TableBox, width: 
     if let Some(i) = table.layouts.iter().position(|l| l.key == key) {
         return i;
     }
+    crate::engine::count(|c| *c.table_layouts += 1);
     let style = table.style.clone();
     let available = table.available_width;
     let e = edges(&style, available);
