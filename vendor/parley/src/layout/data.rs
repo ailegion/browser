@@ -390,6 +390,11 @@ impl<B: Brush> LayoutData<B> {
         &mut self,
         font: FontData,
         font_size: f32,
+        // Patch (plan/03-crates.md): the style's own size (before a web
+        // face's `size-adjust`, which `font_size` includes) and the face's
+        // metric overrides.
+        style_font_size: f32,
+        face_metrics: fontique::FaceMetrics,
         font_attrs: fontique::Attributes,
         synthesis: fontique::Synthesis,
         glyph_buffer: &harfrust::GlyphBuffer,
@@ -419,7 +424,17 @@ impl<B: Brush> LayoutData<B> {
         let metrics = {
             let font = &self.fonts[font_index];
             let font_ref = skrifa::FontRef::from_index(font.data.as_ref(), font.index).unwrap();
-            skrifa::metrics::Metrics::new(&font_ref, skrifa::prelude::Size::new(font_size), coords)
+            let mut m = skrifa::metrics::Metrics::new(&font_ref, skrifa::prelude::Size::new(font_size), coords);
+            if let Some(a) = face_metrics.ascent {
+                m.ascent = a * font_size;
+            }
+            if let Some(d) = face_metrics.descent {
+                m.descent = -d * font_size;
+            }
+            if let Some(g) = face_metrics.line_gap {
+                m.leading = g * font_size;
+            }
+            m
         };
         let units_per_em = metrics.units_per_em as f32;
 
@@ -443,7 +458,7 @@ impl<B: Brush> LayoutData<B> {
             let style = &self.styles[style_index as usize];
             let line_height = match style.line_height {
                 LineHeight::Absolute(value) => value,
-                LineHeight::FontSizeRelative(value) => value * font_size,
+                LineHeight::FontSizeRelative(value) => value * style_font_size,
                 LineHeight::MetricsRelative(value) => {
                     (metrics.ascent - metrics.descent + metrics.leading) * value
                 }

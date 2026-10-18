@@ -35,9 +35,11 @@
 mod cssom;
 mod dom;
 mod events;
+mod fonts;
 mod view;
 
 pub use events::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
+pub use fonts::{FaceRef, FontLoadStatus, FontRequest, ScriptFace};
 pub use view::{ImageSizeMap, View};
 
 use std::cell::{Cell, RefCell};
@@ -780,6 +782,7 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     // `document` and the node classes; `Document.prototype` carries the
     // document properties of item 3.1 and reads `location` from the global.
     dom::register(context)?;
+    fonts::register(context)?;
     Ok(())
 }
 
@@ -1005,6 +1008,34 @@ impl ScriptHost {
     /// What scripts asked of the document or tab since the last call.
     pub fn take_requests(&mut self) -> Vec<HostRequest> {
         std::mem::take(&mut self.host.borrow_mut().requests)
+    }
+
+    /// The tab's font loading, for `document.fonts` (`fonts.rs`): the
+    /// document's `@font-face` rules in order (by the tab's key for each),
+    /// the load state of faces, and whether the document's layout has
+    /// settled with no font fetch pending (`ready` may resolve). Settles
+    /// `loaded` promises and fires the set's events as a task. The
+    /// document must be lent.
+    pub fn sync_fonts(
+        &mut self,
+        css: &[(usize, std::sync::Arc<browser_style::fontface::FontFaceRule>)],
+        statuses: &[(FaceRef, FontLoadStatus)],
+        settled: bool,
+    ) {
+        if let Err(err) = fonts::sync(css, statuses, settled, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.microtask_checkpoint();
+    }
+
+    /// What scripts asked of font loading since the last call.
+    pub fn take_font_requests(&mut self) -> Vec<FontRequest> {
+        fonts::take_requests(&mut self.context)
+    }
+
+    /// The faces scripts made (not errored), in or out of `document.fonts`.
+    pub fn script_faces(&mut self) -> Vec<ScriptFace> {
+        fonts::script_faces(&mut self.context)
     }
 
     /// Run a classic script as a task: evaluate it, then a microtask

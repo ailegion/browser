@@ -457,17 +457,18 @@ pub fn match_font(
 /// their descriptor ranges (CSS Fonts 4 §5.2): width, then style, then
 /// weight, each step keeping the faces nearest in its order of
 /// preference. `auto` descriptors match as the normal value. Among equal
-/// faces the last registered wins.
+/// faces the latest rule wins (the query then offers every face of its
+/// composite, `Query::matches_with`).
 fn match_faces(set: &[FontInfo], width: FontWidth, style: FontStyle, weight: FontWeight) -> Option<usize> {
     use crate::FaceStyle;
     // The ranges a font is matched by.
-    let ranges = |f: &FontInfo| {
-        let face = f.face().copied().unwrap_or_default();
-        (
+    let ranges = |f: &FontInfo| match f.face() {
+        Some(face) => (
             face.width.unwrap_or((100.0, 100.0)),
             face.style.unwrap_or(FaceStyle::Normal),
             face.weight.unwrap_or((400.0, 400.0)),
-        )
+        ),
+        None => ((100.0, 100.0), FaceStyle::Normal, (400.0, 400.0)),
     };
     let mut candidates: SmallVec<[usize; 16]> = (0..set.len()).collect();
     let keep_best = |candidates: &mut SmallVec<[usize; 16]>, key: &dyn Fn(usize) -> (u8, f32)| {
@@ -575,7 +576,7 @@ fn match_faces(set: &[FontInfo], width: FontWidth, style: FontStyle, weight: Fon
             (2, wt - hi)
         }
     });
-    candidates.last().copied()
+    candidates.iter().copied().max_by_key(|&i| set[i].face().map_or(0, |f| f.order))
 }
 
 fn oblique_angle(style: FontStyle) -> Option<f32> {

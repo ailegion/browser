@@ -3,10 +3,11 @@
 
 //! Query support.
 
-use crate::{Charmap, CharmapIndex};
+use crate::{Charmap, CharmapIndex, FaceMetrics};
 
 use super::super::{Collection, SourceCache};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use parlance::Script;
 
@@ -141,13 +142,32 @@ impl<'a> Query<'a> {
                 continue;
             };
             let mut best_index = None;
-            if let Some(font) = load_font(
-                family_info,
-                self.attributes,
-                &mut family.best,
-                false,
-                self.source_cache,
-            ) {
+            let best = load_font(family_info, self.attributes, &mut family.best, Pick::Best, self.source_cache)
+                .map(|font| font.family.1);
+            // A web family: every face of the best face's composite, the
+            // latest rule first, and no other face of the family.
+            if let Some(face) = best.and_then(|index| family_info.fonts()[index].face()) {
+                let composite = family.composite.get_or_insert_with(|| {
+                    let matched = face.matched();
+                    let mut faces: Vec<(u32, usize)> = family_info
+                        .fonts()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, f)| f.face().filter(|d| d.matched() == matched).map(|d| (d.order, i)))
+                        .collect();
+                    faces.sort_by(|a, b| b.cmp(a));
+                    faces.into_iter().map(|(_, i)| (i, Entry::Vacant)).collect()
+                });
+                for (i, entry) in composite.iter_mut() {
+                    if let Some(font) = load_font(family_info, self.attributes, entry, Pick::Index(*i), self.source_cache) {
+                        if f(font) == QueryStatus::Stop {
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(font) = load_font(family_info, self.attributes, &mut family.best, Pick::Best, self.source_cache) {
                 best_index = Some(font.family.1);
                 if f(font) == QueryStatus::Stop {
                     return;
@@ -162,7 +182,7 @@ impl<'a> Query<'a> {
                 family_info,
                 self.attributes,
                 &mut family.default,
-                true,
+                Pick::Default,
                 self.source_cache,
             ) {
                 if f(font) == QueryStatus::Stop {
@@ -235,20 +255,34 @@ pub struct QueryFont {
     pub synthesis: Synthesis,
     /// Data used for constructing a character map for this font.
     pub charmap_index: CharmapIndex,
+    /// Patch (plan/03-crates.md): a web face's `unicode-range`; its
+    /// [Charmap] maps nothing outside it.
+    pub unicode_range: Option<Arc<[(u32, u32)]>>,
+    /// Patch (plan/03-crates.md): a web face's `size-adjust` and metric
+    /// overrides (the default for any other font).
+    pub face_metrics: FaceMetrics,
 }
 
 impl QueryFont {
     /// Attempts to construct a [Charmap] for this font.
     pub fn charmap(&self) -> Option<Charmap<'_>> {
-        self.charmap_index.charmap(self.blob.as_ref())
+        Some(self.charmap_index.charmap(self.blob.as_ref())?.limited_to(self.unicode_range.as_deref()))
     }
+}
+
+/// Which font of a family `load_font` loads.
+#[derive(Copy, Clone)]
+enum Pick {
+    Best,
+    Default,
+    Index(usize),
 }
 
 fn load_font<'a>(
     family: &FamilyInfo,
     attributes: Attributes,
     font: &'a mut Entry<QueryFont>,
-    is_default: bool,
+    pick: Pick,
     source_cache: &mut SourceCache,
 ) -> Option<&'a QueryFont> {
     match font {
@@ -258,10 +292,10 @@ fn load_font<'a>(
             // Set to error in case we fail. This simplifies
             // the following code.
             *status = Entry::Error;
-            let family_index = if is_default {
-                family.default_font_index()
-            } else {
-                family.match_index(attributes.width, attributes.style, attributes.weight, true)?
+            let family_index = match pick {
+                Pick::Default => family.default_font_index(),
+                Pick::Best => family.match_index(attributes.width, attributes.style, attributes.weight, true)?,
+                Pick::Index(i) => i,
             };
             let font_info = family.fonts().get(family_index)?;
             let blob = font_info.load(Some(source_cache))?;
@@ -274,6 +308,8 @@ fn load_font<'a>(
                 index: blob_index,
                 synthesis,
                 charmap_index: font_info.charmap_index(),
+                unicode_range: font_info.face().and_then(|f| f.unicode_range.clone()),
+                face_metrics: font_info.face().map(|f| f.metrics()).unwrap_or_default(),
             });
             if let Entry::Ok(font) = status {
                 Some(font)
@@ -290,6 +326,10 @@ struct CachedFamily {
     family: Entry<FamilyInfo>,
     best: Entry<QueryFont>,
     default: Entry<QueryFont>,
+    // Patch (plan/03-crates.md): the faces of a web family's composite
+    // face (equal descriptors, told apart by `unicode-range`), latest rule
+    // first; `None` until the best face is known.
+    composite: Option<Vec<(usize, Entry<QueryFont>)>>,
 }
 
 impl CachedFamily {
@@ -299,12 +339,14 @@ impl CachedFamily {
             family: Entry::Vacant,
             best: Entry::Vacant,
             default: Entry::Vacant,
+            composite: None,
         }
     }
 
     fn clear_fonts(&mut self) {
         self.best = Entry::Vacant;
         self.default = Entry::Vacant;
+        self.composite = None;
     }
 }
 

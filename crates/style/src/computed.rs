@@ -89,6 +89,8 @@ pub struct DecorationFont {
     pub weight: u16,
     pub style: FontStyle,
     pub stretch: f32,
+    pub optical_sizing: FontOpticalSizing,
+    pub variations: Arc<[([u8; 4], f32)]>,
 }
 
 /// The lines one decorating box draws on the text inside it, with that
@@ -184,6 +186,9 @@ pub struct ComputedStyle {
     pub font_variant: FontVariant,
     /// `font-stretch` as a percentage.
     pub font_stretch: f32,
+    pub font_optical_sizing: FontOpticalSizing,
+    /// `font-variation-settings`; empty is `normal`.
+    pub font_variation_settings: Arc<[([u8; 4], f32)]>,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
     pub direction: Direction,
@@ -423,6 +428,8 @@ impl ComputedStyle {
             font_style: FontStyle::Normal,
             font_variant: FontVariant::Normal,
             font_stretch: 100.0,
+            font_optical_sizing: FontOpticalSizing::Auto,
+            font_variation_settings: Arc::from(Vec::new()),
             line_height: LineHeight::Normal,
             text_align: TextAlign::Start,
             direction: Direction::Ltr,
@@ -533,6 +540,8 @@ impl ComputedStyle {
         self.font_style = p.font_style;
         self.font_variant = p.font_variant;
         self.font_stretch = p.font_stretch;
+        self.font_optical_sizing = p.font_optical_sizing;
+        self.font_variation_settings = p.font_variation_settings.clone();
         self.line_height = p.line_height;
         self.text_align = p.text_align;
         self.direction = p.direction;
@@ -660,6 +669,8 @@ impl ComputedStyle {
             || self.font_style != other.font_style
             || self.font_variant != other.font_variant
             || self.font_stretch != other.font_stretch
+            || self.font_optical_sizing != other.font_optical_sizing
+            || self.font_variation_settings != other.font_variation_settings
             || self.line_height != other.line_height
             || self.text_align != other.text_align
             || self.direction != other.direction
@@ -1023,6 +1034,8 @@ pub fn compute(
     pick!(font_style, FontStyle, FontStyle, |v| v.computed());
     pick!(font_variant, FontVariant, FontVariant, |v| *v);
     pick!(font_stretch, FontStretch, FontStretch, |v| v.percent());
+    pick!(font_optical_sizing, FontOpticalSizing, FontOpticalSizing, |v| *v);
+    pick!(font_variation_settings, FontVariationSettings, FontVariationSettings, |v| Arc::from(v.clone()));
 
     out.font_weight = match resolve(decls, PropertyId::FontWeight) {
         Resolved::Specified(PropertyDeclaration::FontWeight(w)) => match *w {
@@ -1101,6 +1114,8 @@ pub fn compute(
                     weight: out.font_weight,
                     style: out.font_style,
                     stretch: out.font_stretch,
+                    optical_sizing: out.font_optical_sizing,
+                    variations: out.font_variation_settings.clone(),
                 },
             });
             Arc::from(list)

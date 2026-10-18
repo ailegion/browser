@@ -62,7 +62,7 @@ pub use charmap::{Charmap, CharmapIndex};
 pub use collection::{Collection, CollectionOptions, Query, QueryFamily, QueryFont, QueryStatus};
 pub use fallback::FallbackKey;
 pub use family::{FamilyId, FamilyInfo};
-pub use font::{AxisInfo, FaceDescriptors, FaceStyle, FontInfo, FontInfoOverride, Synthesis};
+pub use font::{AxisInfo, FaceDescriptors, FaceMetrics, FaceStyle, FontInfo, FontInfoOverride, Synthesis};
 pub use impl_fontconfig::FromFontconfig;
 pub use parlance::{FontStyle, FontWeight, FontWidth, GenericFamily, Language, Script};
 pub use source::{SourceId, SourceInfo, SourceKind};

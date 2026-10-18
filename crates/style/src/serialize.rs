@@ -66,6 +66,8 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
             FontStyleValue::Oblique(Some(deg)) => format!("oblique {}deg", css_number(*deg)),
         },
         P::FontVariant(v) => v.keyword().to_owned(),
+        P::FontOpticalSizing(o) => o.keyword().to_owned(),
+        P::FontVariationSettings(v) => variation_settings_css(v),
         P::FontStretch(s) => s.to_css(),
         P::LineHeight(l) => line_height_css(l),
         P::TextAlign(t) => t.keyword().to_owned(),
@@ -338,6 +340,26 @@ fn font_size_css(s: &FontSize) -> String {
     }
 }
 
+/// `font-variation-settings`: `normal`, or `"tag" value` pairs.
+fn variation_settings_css(v: &[([u8; 4], f32)]) -> String {
+    if v.is_empty() {
+        return "normal".to_owned();
+    }
+    v.iter()
+        .map(|(tag, value)| {
+            let mut s = String::from("\"");
+            for &b in tag {
+                if b == b'"' || b == b'\\' {
+                    s.push('\\');
+                }
+                s.push(b as char);
+            }
+            format!("{s}\" {}", css_number(*value))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn line_height_css(l: &LineHeightValue) -> String {
     match l {
         LineHeightValue::Normal => "normal".to_owned(),
@@ -508,6 +530,11 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
         "font" => {
             let (style, variant, weight, stretch, size, line_height, family) =
                 (v(0), v(1), v(2), v(3), v(4), v(5), v(6));
+            // The longhands the shorthand only resets: other values have
+            // no shorthand form.
+            if v(7) != "auto" || v(8) != "normal" {
+                return None;
+            }
             // The shorthand takes only the keyword stretches.
             if stretch.ends_with('%') && stretch != "100%" {
                 return None;
@@ -983,6 +1010,8 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::FontWeight => style.font_weight.to_string(),
         Id::FontStyle => style.font_style.keyword().to_owned(),
         Id::FontVariant => style.font_variant.keyword().to_owned(),
+        Id::FontOpticalSizing => style.font_optical_sizing.keyword().to_owned(),
+        Id::FontVariationSettings => variation_settings_css(&style.font_variation_settings),
         Id::FontStretch => format!("{}%", css_number(style.font_stretch)),
         Id::LineHeight => match style.line_height {
             LineHeight::Normal => "normal".to_owned(),
@@ -1167,6 +1196,44 @@ mod tests {
 
     fn block(css: &str) -> String {
         serialize_block(&parse_cssom_block(css))
+    }
+
+    /// "Working sites first" line 6: `font-optical-sizing` and
+    /// `font-variation-settings` parse, refuse bad tags, keep the last of a
+    /// repeated tag, serialize, and are reset by `font` (which then only
+    /// collapses back while they are initial).
+    #[test]
+    fn font_variation_properties_parse_and_serialize() {
+        let cases = [
+            ("font-optical-sizing: NONE", "font-optical-sizing: none;"),
+            ("font-optical-sizing: auto", "font-optical-sizing: auto;"),
+            ("font-optical-sizing: 1", ""),
+            ("font-variation-settings: normal", "font-variation-settings: normal;"),
+            ("font-variation-settings: \"wght\" 650, 'wdth' 80.5", "font-variation-settings: \"wght\" 650, \"wdth\" 80.5;"),
+            ("font-variation-settings: \"wght\" 300, \"wdth\" 80, \"wght\" 700", "font-variation-settings: \"wdth\" 80, \"wght\" 700;"),
+            ("font-variation-settings: \"wgh\" 300", ""),
+            ("font-variation-settings: \"wght\"", ""),
+            ("font-variation-settings: wght 300", ""),
+            ("font: 12px serif", "font: 12px serif;"),
+        ];
+        for (css, want) in cases {
+            assert_eq!(block(css), want, "{css}");
+        }
+        assert_eq!(
+            block("font: 12px serif; font-variation-settings: \"wght\" 500"),
+            "font-style: normal; font-variant: normal; font-weight: 400; font-stretch: normal; font-size: 12px; line-height: normal; font-family: serif; font-optical-sizing: auto; font-variation-settings: \"wght\" 500;",
+            "not initial: no shorthand"
+        );
+        // Computed: inherited.
+        use crate::{Stylist, Viewport, cascade::compute_styles, ua::ua_stylesheet};
+        let doc = browser_dom::parse_html(b"<div style='font-optical-sizing: none; font-variation-settings: \"slnt\" -10'><p id=p>x</p></div>");
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        let p = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "p")).expect("p");
+        let s = styles.get(p).expect("style");
+        assert_eq!(resolved_value(s, PropertyId::FontOpticalSizing, None), "none");
+        assert_eq!(resolved_value(s, PropertyId::FontVariationSettings, None), "\"slnt\" -10");
     }
 
     /// "Working sites first" line 5: the grid properties parse, refuse

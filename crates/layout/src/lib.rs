@@ -529,6 +529,11 @@ pub struct TextFragment {
     pub embolden: bool,
     /// Synthetic italic skew in degrees, if the font has no italic face.
     pub skew: Option<f32>,
+    /// The glyphs are not drawn: the text waits for a web font in its
+    /// `font-display` block period, set meanwhile in an invisible fallback
+    /// (CSS Fonts 4 §4.9). Set by the tab after layout
+    /// (`LayoutTree::set_invisible_text`).
+    pub invisible: bool,
     /// The decoration lines on this text, one per line of every
     /// decorating box around it, outermost box first.
     pub decorations: Vec<Decoration>,
@@ -926,6 +931,19 @@ impl Fragment {
             c.walk(f);
         }
     }
+
+    fn mark_invisible(&mut self, hidden: &impl Fn(&ComputedStyle, &str) -> bool) -> bool {
+        let mut changed = false;
+        if let FragmentContent::Text(t) = &mut self.content {
+            let h = hidden(&self.style, &t.text[t.range.clone()]);
+            changed = h != t.invisible;
+            t.invisible = h;
+        }
+        for c in &mut self.children {
+            changed |= c.mark_invisible(hidden);
+        }
+        changed
+    }
 }
 
 /// The result of laying out a document.
@@ -961,6 +979,14 @@ pub struct LayoutTree {
 }
 
 impl LayoutTree {
+    /// Mark the text fragments `hidden` names (by their element's style
+    /// and their text) invisible and the others visible: text waiting for a
+    /// web font in its `font-display` block period. True when any changed
+    /// (a repaint is due).
+    pub fn set_invisible_text(&mut self, hidden: impl Fn(&ComputedStyle, &str) -> bool) -> bool {
+        self.root.mark_invisible(&hidden)
+    }
+
     /// The scroll container state of an element, if it is one.
     pub fn scroller(&self, node: NodeId) -> Option<&ScrollInfo> {
         self.scrollers.get(&node)

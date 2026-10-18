@@ -462,12 +462,16 @@ fn shape_item<'a, B: Brush>(
             buffer.set_language(lang);
         }
 
+        // Patch (plan/03-crates.md): a web face's `size-adjust` scales the
+        // size its text is set at.
+        let face_metrics = font.font.face_metrics;
+        let size = item.size * face_metrics.size_adjust;
         let glyph_buffer = harf_shaper.shape(
             buffer,
             ShapeOptions::new()
                 .plan(Some(shaper_plan))
                 .features(&scx.features)
-                .point_size(Some(item.size)),
+                .point_size(Some(size)),
         );
 
         // Extract relevant CharInfo slice for this segment
@@ -480,7 +484,9 @@ fn shape_item<'a, B: Brush>(
         // Push harfrust-shaped run for the entire segment
         layout.data.push_run(
             FontData::new(font.font.blob.clone(), font.font.index),
+            size,
             item.size,
+            face_metrics,
             font.attrs,
             font.font.synthesis,
             &glyph_buffer,

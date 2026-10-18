@@ -535,6 +535,54 @@ impl FontVariant {
     }
 }
 
+/// `font-optical-sizing` (CSS Fonts 4 §7.3): `auto` sets a font's
+/// optical-size axis (`opsz`) to the font size, `none` leaves it at the
+/// font's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontOpticalSizing {
+    #[default]
+    Auto,
+    None,
+}
+
+impl FontOpticalSizing {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            FontOpticalSizing::Auto => "auto",
+            FontOpticalSizing::None => "none",
+        }
+    }
+}
+
+/// `font-variation-settings` (CSS Fonts 4 §7.2): axis tags and their
+/// values, in order, a later setting of a tag replacing an earlier one;
+/// empty is `normal`.
+pub type FontVariationSettings = Vec<([u8; 4], f32)>;
+
+/// `normal` or `<string> <number>`, comma separated. A tag is four
+/// characters from U+20 to U+7E.
+fn parse_font_variation_settings<'i>(input: &mut Parser<'i, '_>) -> Result<FontVariationSettings, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("normal")).is_ok() {
+        return Ok(Vec::new());
+    }
+    let list = input.parse_comma_separated(|i| {
+        let location = i.current_source_location();
+        let tag = i.expect_string()?.clone();
+        let bytes = tag.as_bytes();
+        if bytes.len() != 4 || !bytes.iter().all(|b| (0x20..=0x7E).contains(b)) {
+            return Err(location.new_custom_error(()));
+        }
+        let value = i.expect_number()?;
+        Ok(([bytes[0], bytes[1], bytes[2], bytes[3]], value))
+    })?;
+    let mut out: FontVariationSettings = Vec::with_capacity(list.len());
+    for (tag, value) in list {
+        out.retain(|(t, _)| *t != tag);
+        out.push((tag, value));
+    }
+    Ok(out)
+}
+
 /// `font-stretch`: a keyword or a percentage; computed as a percentage.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FontStretch {
@@ -2456,6 +2504,8 @@ longhands! {
     FontStyle: "font-style" => FontStyleValue, true;
     FontVariant: "font-variant" => FontVariant, true;
     FontStretch: "font-stretch" => FontStretch, true;
+    FontOpticalSizing: "font-optical-sizing" => FontOpticalSizing, true;
+    FontVariationSettings: "font-variation-settings" => FontVariationSettings, true;
     LineHeight: "line-height" => LineHeightValue, true;
     TextAlign: "text-align" => TextAlignValue, true;
     Direction: "direction" => Direction, true;
@@ -2820,6 +2870,9 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
         PropertyId::FontVariant => P::FontVariant(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "normal" => FontVariant::Normal, "small-caps" => FontVariant::SmallCaps, _ => return None }))?),
         PropertyId::FontStretch => P::FontStretch(parse_font_stretch(input)?),
+        PropertyId::FontOpticalSizing => P::FontOpticalSizing(keyword(input, |k| Some(match_ignore_ascii_case! { k,
+            "auto" => FontOpticalSizing::Auto, "none" => FontOpticalSizing::None, _ => return None }))?),
+        PropertyId::FontVariationSettings => P::FontVariationSettings(parse_font_variation_settings(input)?),
         PropertyId::LineHeight => P::LineHeight(parse_line_height(input)?),
         PropertyId::TextAlign => P::TextAlign(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "start" => TextAlignValue::Start, "left" => TextAlignValue::Left, "right" => TextAlignValue::Right,
@@ -3982,7 +4035,7 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "-webkit-background-clip" => &[BackgroundClip],
         "-webkit-background-origin" => &[BackgroundOrigin],
         "-webkit-background-size" => &[BackgroundSize],
-        "font" => &[FontStyle, FontVariant, FontWeight, FontStretch, FontSize, LineHeight, FontFamily],
+        "font" => &[FontStyle, FontVariant, FontWeight, FontStretch, FontSize, LineHeight, FontFamily, FontOpticalSizing, FontVariationSettings],
         "overflow" => &[OverflowX, OverflowY],
         "flex" => &[FlexGrow, FlexShrink, FlexBasis],
         "flex-flow" => &[FlexDirection, FlexWrap],
@@ -4621,6 +4674,8 @@ fn parse_font<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclaration>
             P::FontSize(FontSize::Length(Length::Px(13.0))),
             P::LineHeight(LineHeightValue::Normal),
             P::FontFamily(vec![FamilyName::Ident("system-ui".to_owned())]),
+            P::FontOpticalSizing(FontOpticalSizing::Auto),
+            P::FontVariationSettings(Vec::new()),
         ]);
     }
     let mut style = FontStyleValue::Normal;
@@ -4671,6 +4726,10 @@ fn parse_font<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<PropertyDeclaration>
         P::FontSize(size),
         P::LineHeight(line_height),
         P::FontFamily(family),
+        // The shorthand resets the other font longhands (CSS Fonts 4
+        // §2.8).
+        P::FontOpticalSizing(FontOpticalSizing::Auto),
+        P::FontVariationSettings(Vec::new()),
     ])
 }
 
@@ -4746,7 +4805,11 @@ mod tests {
     #[test]
     fn font_shorthand() {
         let v = parse("font", "italic bold 12px/1.5 \"Helvetica Neue\", Arial, sans-serif");
-        assert_eq!(v.len(), 7);
+        // The seven it sets, and `font-optical-sizing` and
+        // `font-variation-settings` it resets.
+        assert_eq!(v.len(), 9);
+        assert_eq!(v[7], DeclaredValue::Value(PropertyDeclaration::FontOpticalSizing(FontOpticalSizing::Auto)));
+        assert_eq!(v[8], DeclaredValue::Value(PropertyDeclaration::FontVariationSettings(Vec::new())));
         assert!(matches!(v[6], DeclaredValue::Value(PropertyDeclaration::FontFamily(ref f)) if &*font_family_computed(f) == "\"Helvetica Neue\", \"Arial\", sans-serif"));
         let v = parse("font", "small-caps condensed 12px serif");
         assert_eq!(v[1], DeclaredValue::Value(PropertyDeclaration::FontVariant(FontVariant::SmallCaps)));

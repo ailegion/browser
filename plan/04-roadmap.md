@@ -213,7 +213,52 @@ remaining lists as they stand.
       conversion changes nothing measurable).
 - [ ] 6. Web fonts (new 4a entry): `@font-face` with url()+format,
       fetched through net, used by parley, system fallback until loaded.
-      Later: unicode-range, font-display, local().
+      Owner's 2026-10-18 scope (the parts sites use often): also
+      `unicode-range`, `font-display`, `local()` sources, the metric
+      descriptors `size-adjust`/`ascent-override`/`descent-override`/
+      `line-gap-override`, `document.fonts`/`FontFace` (CSS Font Loading),
+      and the properties `font-optical-sizing` and
+      `font-variation-settings`. The rarely used parts are in Phase 5,
+      Style.
+      Built 2026-10-18 (not ticked: the owner's call on the parts listed
+      in the report is pending). Style (`fontface.rs`): `@font-face` with
+      `src` (`url()` with `format()`/`tech()`, `local()`), `font-weight`/
+      `-style`/`-stretch` (`font-width`) ranges and `auto` (the initial),
+      `unicode-range`, `font-display`, `size-adjust`, the three metric
+      overrides; CSS Fonts 4 §5.2 matching with ranges and oblique angles
+      (`best_face`); `font-optical-sizing`, `font-variation-settings`
+      (inherited, reset by `font`). Fonts: fetched in CORS mode with
+      credentials only to the document's origin, `Access-Control-Allow-
+      Origin` checked; a failed source gives way to the next; WOFF/WOFF2
+      decoded (`wuff`); only the faces the laid-out text needs are
+      fetched, per character (composite faces by `unicode-range`, the
+      latest rule first; an installed family ends the walk only where it
+      has the glyph); `local()` by full or PostScript name; a declared
+      family hides an installed one of that name; `load` waits for the
+      fonts the first layout asks for. Matching and synthesis by the
+      descriptors (vendored fontique, `03-crates.md`): variations clamped
+      to the ranges, faux bold only for 600+ text in a face stopping below
+      600, faux slant only for slanted text in an upright face; `opsz` set
+      to the font size under `font-optical-sizing: auto`;
+      `font-variation-settings` over the weight's variations. `size-adjust`
+      and the overrides through the vendored parley; the decoration and
+      strut metrics take the first face whose range holds U+0020 and are
+      dropped when web fonts change. `font-display`: invisible text in the
+      block period (`block`/`auto` 3 s, `fallback`/`optional` 100 ms,
+      `swap` none), swap period (`fallback` 3 s, `optional` none), a face
+      arriving after it loaded but unused (`TextFragment::invisible`,
+      tab timers). Script (`fonts.rs`): `FontFace` (from a URL or bytes;
+      descriptors; `status`, `loaded`, `load()`), `document.fonts`
+      (set-like; `status`, `ready`, `check`, `load`; `loading`,
+      `loadingdone`, `loadingerror`), `FontFaceSetLoadEvent`. Tests: style
+      (descriptors, matching, properties), layout (registration, WOFF,
+      matching and synthesis, clamping, hiding, unicode-range, size-adjust
+      and overrides, local(), variations and opsz), tab (loading, CORS,
+      credentials, src fallback, hiding, unicode-range fetches, local(),
+      font-display periods, the Font Loading API). Timing: tables 47.6–
+      49.2 ms (47.6 before), blocks 13.8–14.2 ms (13.8), Hacker News
+      relayout 39.0–39.9 ms (38.4–39.1), Wikipedia 178.6–181.9 ms
+      (175.8–181.0).
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,
@@ -2437,7 +2482,12 @@ what breaks the most pages.
   applying to them (today they move only the page).
 - Style: transitions and animations wired to rAF, `@font-face` web fonts,
   `filter`, `backdrop-filter`, `mask`, `clip-path`, gradients, shadows,
-  selector-based invalidation for performance.
+  selector-based invalidation for performance. Web-font parts rarely used
+  by sites (owner's 2026-10-18 split from "Working sites first" line 6):
+  the `font-feature-settings` and `font-variation-settings` descriptors of
+  `@font-face`, one face out of a font collection file (`format(
+  collection)`, `.ttc`), `font-style: oblique <angle>` with an explicit
+  angle, and the `font-synthesis` property (and its longhands).
 - Images: SVG via `usvg` to vello, `<picture>` and `srcset`, lazy loading.
 - Web APIs: `WebSocket`, Canvas 2D on vello, `postMessage`, `iframe`
   (each frame is its own document on the same tab thread), `Web Workers`

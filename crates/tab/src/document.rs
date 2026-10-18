@@ -181,8 +181,147 @@ struct Pending {
 /// in a list may be fetched instead).
 #[derive(Default)]
 struct WebFonts {
+    /// The font URLs fetched (or being fetched).
     requested: std::collections::HashSet<Url>,
-    failed: std::collections::HashSet<Url>,
+    /// The sources that could not be used: an error, a CORS refusal, data
+    /// that is no font, a `local()` name no installed font has.
+    failed: std::collections::HashSet<Source>,
+    /// The faces registered (by `face_key`).
+    loaded: std::collections::HashSet<usize>,
+    /// When each face began loading, and its `font-display`: the periods
+    /// count from then.
+    started: HashMap<usize, (std::time::Instant, browser_style::fontface::FontDisplay)>,
+    /// The faces whose swap period ended before they loaded: failed for
+    /// the document (the fallback stays).
+    timed_out: std::collections::HashSet<usize>,
+    /// The faces whose block period has ended (their text is drawn).
+    unblocked: std::collections::HashSet<usize>,
+    /// Every face the document has had, kept so a face's key (its
+    /// address) is never another face's while the document lives.
+    seen: Vec<Arc<browser_style::fontface::FontFaceRule>>,
+    /// The faces scripts made (`new FontFace`), in `document.fonts` or
+    /// not, as the script host last listed them.
+    script: Vec<browser_script::ScriptFace>,
+    /// The font data of script faces, by id: bytes a script gave (checked
+    /// to be a font) or a response that loaded the face; kept so a face
+    /// added to the set later, or whose descriptors changed, registers
+    /// from it.
+    script_data: HashMap<u64, Arc<[u8]>>,
+    /// Script faces made from bytes that are no font.
+    script_failed: std::collections::HashSet<u64>,
+    /// Faces a script asked to load (`FontFace.load()`,
+    /// `document.fonts.load()`), used by text or not: `@font-face` faces
+    /// by key, script faces by id.
+    forced_css: std::collections::HashSet<usize>,
+    forced_script: std::collections::HashSet<u64>,
+    /// Faces whose data arrived after their swap period: loaded (as the
+    /// script sees them) but not used.
+    late: std::collections::HashSet<usize>,
+    /// Something font loading reports changed since `document.fonts` was
+    /// last told.
+    dirty: bool,
+    /// What `document.fonts` was last told.
+    reported: Option<(Vec<usize>, Vec<(browser_script::FaceRef, browser_script::FontLoadStatus)>, bool)>,
+}
+
+/// A face's identity: the address of its rule (kept alive in
+/// `WebFonts::seen`).
+fn face_key(face: &Arc<browser_style::fontface::FontFaceRule>) -> usize {
+    Arc::as_ptr(face) as usize
+}
+
+/// The block and swap periods of `font-display` (CSS Fonts 4 §4.9); `None`
+/// is an infinite swap period. `auto` is `block`, as in browsers.
+fn display_periods(display: browser_style::fontface::FontDisplay) -> (std::time::Duration, Option<std::time::Duration>) {
+    use browser_style::fontface::FontDisplay as D;
+    use std::time::Duration;
+    match display {
+        D::Auto | D::Block => (Duration::from_secs(3), None),
+        D::Swap => (Duration::ZERO, None),
+        D::Fallback => (Duration::from_millis(100), Some(Duration::from_secs(3))),
+        D::Optional => (Duration::from_millis(100), Some(Duration::ZERO)),
+    }
+}
+
+/// One `src` entry of an `@font-face` rule, as loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Source {
+    Url(Url),
+    /// `local()`, its name lowercased.
+    Local(String),
+}
+
+impl WebFonts {
+    /// Whether text waiting for the face at `order` is in its block
+    /// period (invisible): from the face's start (now, for a face not yet
+    /// started) until the period ends.
+    fn blocking(&self, key: usize, display: browser_style::fontface::FontDisplay, now: std::time::Instant) -> bool {
+        let (block, _) = display_periods(display);
+        match self.started.get(&key) {
+            Some((start, _)) => now < *start + block,
+            None => !block.is_zero(),
+        }
+    }
+
+    /// The next instant a period of a face still loading ends (its text
+    /// becomes visible, or the face is given up).
+    fn next_wake(&self) -> Option<std::time::Instant> {
+        self.started
+            .iter()
+            .filter(|(o, _)| !self.loaded.contains(o) && !self.timed_out.contains(o))
+            .filter_map(|(o, (start, display))| {
+                let (block, swap) = display_periods(*display);
+                if !self.unblocked.contains(o) {
+                    Some(*start + block)
+                } else {
+                    swap.map(|s| *start + block + s)
+                }
+            })
+            .min()
+    }
+
+    /// Move the faces still loading along their periods; true when text
+    /// changes (becomes visible, or falls back for good).
+    fn tick(&mut self, now: std::time::Instant) -> bool {
+        let mut changed = false;
+        for (o, (start, display)) in &self.started {
+            if self.loaded.contains(o) || self.timed_out.contains(o) {
+                continue;
+            }
+            let (block, swap) = display_periods(*display);
+            if now >= *start + block && !self.unblocked.contains(o) {
+                self.unblocked.insert(*o);
+                changed = true;
+            }
+            if swap.is_some_and(|s| now >= *start + block + s) {
+                self.timed_out.insert(*o);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Whether the face at `order` loads too late to be used: its swap
+    /// period has ended.
+    fn expired(&self, key: usize, display: browser_style::fontface::FontDisplay, now: std::time::Instant) -> bool {
+        let (block, swap) = display_periods(display);
+        self.timed_out.contains(&key)
+            || swap.zip(self.started.get(&key)).is_some_and(|(swap, (start, _))| now >= *start + block + swap)
+    }
+
+    /// The source a face loads from: its first usable one that has not
+    /// failed (a failed source gives way to the next, CSS Fonts 4 §4.3.1);
+    /// `None` when none is left.
+    fn source_of(&self, face: &browser_style::fontface::FontFaceRule) -> Option<Source> {
+        use browser_style::fontface::FontSource;
+        face.sources.iter().find_map(|s| {
+            let source = match s {
+                FontSource::Local(name) => Source::Local(name.to_lowercase()),
+                FontSource::Url { .. } => Source::Url(Url::parse(face.loadable_url(s)?).ok()?),
+            };
+            (!self.failed.contains(&source)).then_some(source)
+        })
+    }
 }
 
 /// The stages of a document's load, as `document.readyState` and the
@@ -1736,6 +1875,7 @@ impl TabState {
             self.scroll_animation_wake(),
             self.script.as_ref().and_then(ScriptHost::next_wake),
             self.frame_due,
+            self.web_fonts.next_wake(),
         ]
         .into_iter()
         .flatten()
@@ -1753,6 +1893,12 @@ impl TabState {
         self.bar_repeat_tick(now);
         self.pan_tick(now);
         self.scroll_animations_tick(now);
+        // A web font's block period ended (its text is drawn in the
+        // fallback) or its swap period (the fallback stays for good): the
+        // fonts are walked again after the next layout.
+        if self.web_fonts.tick(now) {
+            self.needs_layout = true;
+        }
         // Script timers, then an animation frame if one is due: each
         // callback is a task with its own microtask checkpoint.
         if self
@@ -2027,9 +2173,9 @@ impl TabState {
             "restyle for interaction"
         );
         if result.moved {
+            // A state may ask for another face (bold on hover): the layout
+            // that follows asks for it.
             self.needs_layout = true;
-            // A state may ask for another face (bold on hover).
-            self.fetch_web_fonts();
         } else if result.repaint {
             // Paint-only (colours, backgrounds, decorations): the boxes
             // stay where they are and take the new styles.
@@ -2205,6 +2351,8 @@ impl TabState {
             let parsed = self.parser.is_none() && self.doc.is_some() && self.script.is_some();
             let deferred_done = self.scripts.deferred.is_empty() && !self.scripts.running_deferred;
             let fetched = self.nav.is_none() && self.pending.is_empty();
+            // `document.fonts.ready` waits for the document to be parsed.
+            self.web_fonts.dirty = true;
             match self.lifecycle {
                 Lifecycle::Loading if parsed => {
                     self.lifecycle = Lifecycle::Interactive;
@@ -2215,13 +2363,12 @@ impl TabState {
                     self.fire_lifecycle_event(EventTargetRef::Document, "DOMContentLoaded", true);
                 }
                 Lifecycle::ContentLoaded if parsed && deferred_done && fetched => {
-                    // The fetches the cascade starts (web fonts text uses,
-                    // background images) are the document's too: style it
-                    // first, and `load` waits for what that requests.
-                    if self.needs_style {
-                        self.restyle_all();
-                        self.needs_style = false;
-                        self.needs_layout = true;
+                    // The fetches styling and layout start (background
+                    // images, the web fonts the text uses) are the
+                    // document's too: style and lay it out first, and
+                    // `load` waits for what that requests.
+                    if self.needs_style || self.needs_layout {
+                        self.settle();
                         if !self.pending.is_empty() {
                             return;
                         }
@@ -2344,25 +2491,58 @@ impl TabState {
                 let ok = (p.status == 0 || (200..300).contains(&p.status)) && self.cors_allows(&url, p.final_url.as_ref(), &p.headers);
                 let mut registered = false;
                 if ok {
-                    let faces = self.stylist().font_faces(&self.style_viewport());
-                    // The faces loading from this URL: it is their first
-                    // loadable source that has not failed.
-                    let failed = &self.web_fonts.failed;
-                    let current = |f: &browser_style::fontface::FontFaceRule| {
-                        f.loadable_sources().filter_map(|u| Url::parse(u).ok()).find(|u| !failed.contains(u))
-                    };
-                    if let Some(engine) = &mut self.engine {
-                        for face in faces.iter().filter(|f| current(f).as_ref() == Some(&url)) {
-                            registered |= engine.register_web_font(&p.body, face);
+                    let faces = self.document_faces();
+                    // The faces loading from this URL: it is their current
+                    // source (the first usable one that has not failed).
+                    // Script faces out of the set are among them when a
+                    // script loads them.
+                    let source = Source::Url(url.clone());
+                    let now = std::time::Instant::now();
+                    let font_data = LayoutEngine::is_font_data(&p.body);
+                    let body: Arc<[u8]> = Arc::from(p.body.as_slice());
+                    let outside: Vec<Arc<browser_style::fontface::FontFaceRule>> = self
+                        .web_fonts
+                        .script
+                        .iter()
+                        .filter(|s| !s.in_set && self.web_fonts.forced_script.contains(&s.id))
+                        .map(|s| s.rule.clone())
+                        .collect();
+                    for (order, face) in faces.iter().map(Some).enumerate().chain(outside.iter().map(|f| (usize::MAX, Some(f)))) {
+                        let Some(face) = face else { continue };
+                        let key = face_key(face);
+                        if self.web_fonts.loaded.contains(&key) || self.web_fonts.source_of(face).as_ref() != Some(&source) {
+                            continue;
+                        }
+                        if !font_data {
+                            continue;
+                        }
+                        if let Some(id) = self.script_face_id(face) {
+                            self.web_fonts.script_data.insert(id, body.clone());
+                            registered = true;
+                        }
+                        // Arrived after its swap period: loaded, not used.
+                        if self.web_fonts.expired(key, face.display, now) {
+                            self.web_fonts.timed_out.insert(key);
+                            self.web_fonts.late.insert(key);
+                            registered = true;
+                            continue;
+                        }
+                        if order == usize::MAX {
+                            continue;
+                        }
+                        if self.engine.as_mut().is_some_and(|e| e.register_web_font(&p.body, face, order as u32)) {
+                            self.web_fonts.loaded.insert(key);
+                            registered = true;
                         }
                     }
+                    self.web_fonts.dirty = true;
                 }
                 if registered {
                     self.needs_layout = true;
                 } else {
                     tracing::debug!(tab = self.id.0, url = url.as_str(), "web font failed");
-                    self.web_fonts.failed.insert(url);
-                    // A family later in a list may be a web font to use.
+                    self.web_fonts.failed.insert(Source::Url(url));
+                    // The face's next source, or a family later in a list.
                     self.fetch_web_fonts();
                 }
             }
@@ -2937,6 +3117,7 @@ impl TabState {
             self.dom_changed();
         }
         self.apply_host_requests(host_requests);
+        self.apply_font_requests();
     }
 
     /// A script changed the tree: restyle the whole document (per-node
@@ -3202,80 +3383,354 @@ impl TabState {
         }
     }
 
-    /// Fetch the web fonts the document's text uses ("Working sites
-    /// first" line 6), as browsers fetch them: for each font a rendered
-    /// text asks for (its family list, style, weight and stretch), the
-    /// first family in the list that is a web font family, an installed
-    /// family or a generic family decides; for a web font family the one
-    /// face CSS Fonts 4 §5.2 matches is fetched. Until it arrives (or if
-    /// it fails) the next families in the list are used.
-    fn fetch_web_fonts(&mut self) {
-        use browser_style::fontface::{best_face, family_names, is_generic_family};
-        let Some(doc) = &self.doc else { return };
-        let faces = self.stylist().font_faces(&self.style_viewport());
-        // Every family the document declares hides an installed one of
-        // that name, loaded or not.
-        if let Some(engine) = &mut self.engine {
-            let names: Vec<&str> = faces.iter().map(|f| &*f.family).collect();
-            engine.declare_web_families(&names);
+    /// The document's faces, in the order font matching takes them: the
+    /// `@font-face` rules that apply (document order), then the faces a
+    /// script added to `document.fonts` (in the order added).
+    fn document_faces(&mut self) -> Vec<Arc<browser_style::fontface::FontFaceRule>> {
+        let mut faces = self.stylist().font_faces(&self.style_viewport());
+        if let Some(host) = &mut self.script {
+            self.web_fonts.script = host.script_faces();
         }
-        if faces.is_empty() {
+        faces.extend(self.web_fonts.script.iter().filter(|s| s.in_set).map(|s| s.rule.clone()));
+        faces
+    }
+
+    /// The script face whose rule `face` is.
+    fn script_face_id(&self, face: &Arc<browser_style::fontface::FontFaceRule>) -> Option<u64> {
+        self.web_fonts.script.iter().find(|s| Arc::ptr_eq(&s.rule, face)).map(|s| s.id)
+    }
+
+    /// The load state of a face, as `FontFace.status` reports it.
+    fn face_status(&self, face: &Arc<browser_style::fontface::FontFaceRule>, script: Option<u64>) -> browser_script::FontLoadStatus {
+        use browser_script::FontLoadStatus as S;
+        let key = face_key(face);
+        let w = &self.web_fonts;
+        if w.loaded.contains(&key) || w.late.contains(&key) || script.is_some_and(|id| w.script_data.contains_key(&id)) {
+            return S::Loaded;
+        }
+        if script.is_some_and(|id| w.script_failed.contains(&id)) {
+            return S::Error;
+        }
+        let wanted = w.started.contains_key(&key)
+            || w.forced_css.contains(&key)
+            || script.is_some_and(|id| w.forced_script.contains(&id));
+        match w.source_of(face) {
+            Some(Source::Url(url)) if w.requested.contains(&url) => S::Loading,
+            Some(_) if wanted => S::Loading,
+            None if wanted || face.sources.iter().any(|s| match s {
+                browser_style::fontface::FontSource::Local(n) => w.failed.contains(&Source::Local(n.to_lowercase())),
+                browser_style::fontface::FontSource::Url { url, .. } => {
+                    Url::parse(url).is_ok_and(|u| w.failed.contains(&Source::Url(u)))
+                }
+            }) =>
+            {
+                S::Error
+            }
+            _ => S::Unloaded,
+        }
+    }
+
+    /// Tell `document.fonts` what changed: the `@font-face` faces, every
+    /// face's load state, and whether the document has settled (parsed,
+    /// styled, laid out, no font fetch pending) so `ready` may resolve.
+    fn report_fonts(&mut self) {
+        if !std::mem::take(&mut self.web_fonts.dirty) || self.script.is_none() || self.doc.is_none() {
             return;
         }
-        // The source a face loads from: its first loadable one that has not
-        // failed (a failed source gives way to the next, CSS Fonts 4 §4.3).
-        let failed = &self.web_fonts.failed;
-        let source_of = |f: &browser_style::fontface::FontFaceRule| {
-            f.loadable_sources().filter_map(|u| Url::parse(u).ok()).find(|u| !failed.contains(u))
-        };
-        let mut families: HashMap<String, Vec<&Arc<browser_style::fontface::FontFaceRule>>> = HashMap::new();
+        let css = self.stylist().font_faces(&self.style_viewport());
+        if let Some(host) = &mut self.script {
+            self.web_fonts.script = host.script_faces();
+        }
+        let mut statuses = Vec::new();
+        for face in &css {
+            statuses.push((browser_script::FaceRef::Css(face_key(face)), self.face_status(face, None)));
+        }
+        for s in &self.web_fonts.script {
+            statuses.push((browser_script::FaceRef::Script(s.id), self.face_status(&s.rule, Some(s.id))));
+        }
+        let fetching = self.pending.values().any(|p| matches!(p.kind, PendingKind::Font { .. }));
+        let settled = !matches!(self.lifecycle, Lifecycle::Loading)
+            && self.parser.is_none()
+            && !self.needs_style
+            && !self.needs_layout
+            && self.layout.is_some()
+            && !fetching;
+        let keys: Vec<usize> = css.iter().map(face_key).collect();
+        let report = (keys, statuses, settled);
+        if self.web_fonts.reported.as_ref() == Some(&report) {
+            return;
+        }
+        let css_list: Vec<(usize, Arc<browser_style::fontface::FontFaceRule>)> = css.iter().map(|f| (face_key(f), f.clone())).collect();
+        for f in &css {
+            if !self.web_fonts.seen.iter().any(|s| Arc::ptr_eq(s, f)) {
+                self.web_fonts.seen.push(f.clone());
+            }
+        }
+        let (_, statuses, settled) = &report;
+        let (statuses, settled) = (statuses.clone(), *settled);
+        self.web_fonts.reported = Some(report);
+        self.sync_document_info();
+        self.with_script(|host| host.sync_fonts(&css_list, &statuses, settled));
+        self.after_script();
+    }
+
+    /// What scripts asked of font loading: faces to load now, and the
+    /// bytes of faces made from a buffer (checked here: a font loads the
+    /// face, anything else errors it).
+    fn apply_font_requests(&mut self) {
+        let Some(host) = &mut self.script else { return };
+        let requests = host.take_font_requests();
+        if requests.is_empty() {
+            return;
+        }
+        for r in requests {
+            match r {
+                browser_script::FontRequest::Load(browser_script::FaceRef::Css(key)) => {
+                    self.web_fonts.forced_css.insert(key);
+                }
+                browser_script::FontRequest::Load(browser_script::FaceRef::Script(id)) => {
+                    self.web_fonts.forced_script.insert(id);
+                }
+                browser_script::FontRequest::Data { id, bytes } => {
+                    if LayoutEngine::is_font_data(&bytes) {
+                        self.web_fonts.script_data.insert(id, bytes);
+                    } else {
+                        self.web_fonts.script_failed.insert(id);
+                    }
+                }
+            }
+        }
+        self.web_fonts.dirty = true;
+        self.fetch_web_fonts();
+    }
+
+    /// Fetch the web fonts the document's text uses ("Working sites
+    /// first" line 6), as browsers fetch them: for every character the
+    /// last layout set, in its element's font (family list, style, weight,
+    /// stretch), the families of the list are tried in order. A generic
+    /// family ends the walk; an installed family ends it when its font has
+    /// the character; an `@font-face` family takes the composite face CSS
+    /// Fonts 4 §5.2 matches (its faces equal in descriptors, the latest
+    /// rule first) and the first face whose `unicode-range` holds the
+    /// character: loaded with the glyph, it is used; loaded without it,
+    /// the next face is tried; still loading, the character waits for it;
+    /// not yet asked for, it is fetched (or taken from an installed font
+    /// for `local()`). Until a face arrives, or if it fails, the next
+    /// families in the list are used.
+    fn fetch_web_fonts(&mut self) {
+        use browser_style::fontface::{FontFaceRule, best_face, family_names, is_generic_family};
+        let faces = self.document_faces();
         for f in &faces {
-            families.entry(f.family.to_lowercase()).or_default().push(f);
+            if !self.web_fonts.seen.iter().any(|s| Arc::ptr_eq(s, f)) {
+                self.web_fonts.seen.push(f.clone());
+            }
         }
-        // The fonts rendered text asks for: elements with text of their
-        // own, and the controls that show text.
-        let mut wanted: Vec<(Arc<str>, browser_style::FontStyle, u16, u32)> = Vec::new();
-        let mut seen: std::collections::HashSet<(usize, u8, u16, u32)> = std::collections::HashSet::new();
-        for id in doc.descendants(doc.root()) {
-            let Some(e) = doc.element(id) else { continue };
-            let shows_text = matches!(&*e.name.local, "input" | "textarea" | "select" | "button")
-                || doc.children(id).any(|c| matches!(&doc.get(c).kind, browser_dom::NodeKind::Text(t) if !t.trim().is_empty()));
-            if !shows_text {
+        // Every family the document declares hides an installed one of
+        // that name, loaded or not; registered fonts follow their faces'
+        // positions.
+        if let Some(engine) = &mut self.engine {
+            engine.sync_web_faces(&faces);
+        }
+        self.web_fonts.dirty = true;
+        // Script faces in the set whose data is here (bytes a script gave,
+        // or loaded before): registered now.
+        for (order, face) in faces.iter().enumerate() {
+            let Some(id) = self.script_face_id(face) else { continue };
+            let key = face_key(face);
+            if self.web_fonts.loaded.contains(&key) {
                 continue;
             }
-            let Some(s) = self.styles.get(id) else { continue };
-            if s.display.is_none() {
+            let Some(data) = self.web_fonts.script_data.get(&id).cloned() else { continue };
+            if self.engine.as_mut().is_some_and(|e| e.register_web_font(&data, face, order as u32)) {
+                self.web_fonts.loaded.insert(key);
+                self.needs_layout = true;
+            }
+        }
+        if faces.is_empty() && self.web_fonts.forced_script.is_empty() {
+            return;
+        }
+        // The characters each font of the layout's text is asked for.
+        let mut runs: HashMap<(usize, u8, u16, u32), (Arc<str>, browser_style::FontStyle, u16, f32, std::collections::BTreeSet<char>)> =
+            HashMap::new();
+        if let Some(tree) = &self.layout {
+            tree.root.walk(&mut |f| {
+                if let browser_layout::FragmentContent::Text(t) = &f.content {
+                    let s = &f.style;
+                    let key = (Arc::as_ptr(&s.font_family) as *const u8 as usize, s.font_style as u8, s.font_weight, s.font_stretch.to_bits());
+                    let run = runs
+                        .entry(key)
+                        .or_insert_with(|| (s.font_family.clone(), s.font_style, s.font_weight, s.font_stretch, Default::default()));
+                    run.4.extend(t.text[t.range.clone()].chars());
+                }
+            });
+        }
+        let mut families: HashMap<String, Vec<(u32, &Arc<FontFaceRule>)>> = HashMap::new();
+        for (i, f) in faces.iter().enumerate() {
+            families.entry(f.family.to_lowercase()).or_default().push((i as u32, f));
+        }
+        let state = &self.web_fonts;
+        let now = std::time::Instant::now();
+        let mut fetch: Vec<Url> = Vec::new();
+        let mut locals: Vec<(u32, String)> = Vec::new();
+        // The faces that begin loading now, and the characters of each run
+        // that wait for a face in its block period (drawn invisibly).
+        let mut starting: Vec<(usize, browser_style::fontface::FontDisplay)> = Vec::new();
+        let mut blocked: HashMap<(usize, u8, u16, u32), std::collections::HashSet<char>> = HashMap::new();
+        let Some(engine) = self.engine.as_mut() else { return };
+        for (key, (list, style, weight, stretch, chars)) in runs {
+            let names = family_names(&list);
+            for c in chars {
+                for (name, quoted) in &names {
+                    if !quoted && is_generic_family(name) {
+                        break;
+                    }
+                    if let Some(family) = families.get(&name.to_lowercase()) {
+                        // The faces that can still load (a face whose every
+                        // source failed, or whose swap period ended before
+                        // it loaded, is no face).
+                        let usable: Vec<(u32, &Arc<FontFaceRule>, Option<Source>)> = family
+                            .iter()
+                            .filter(|(_, f)| !state.timed_out.contains(&face_key(f)))
+                            .filter_map(|&(o, f)| {
+                                let source = state.source_of(f);
+                                (source.is_some() || state.loaded.contains(&face_key(f))).then_some((o, f, source))
+                            })
+                            .collect();
+                        let rules: Vec<&FontFaceRule> = usable.iter().map(|(_, f, _)| &***f).collect();
+                        let Some(best) = best_face(&rules, style, f32::from(weight), stretch) else { continue };
+                        let matched = usable[best].1.matched();
+                        let mut composite: Vec<&(u32, &Arc<FontFaceRule>, Option<Source>)> =
+                            usable.iter().filter(|(_, f, _)| f.matched() == matched).collect();
+                        composite.sort_by(|a, b| b.0.cmp(&a.0));
+                        let mut settled = false;
+                        for (order, face, source) in composite {
+                            if !face.covers(u32::from(c)) {
+                                continue;
+                            }
+                            let fk = face_key(face);
+                            if state.loaded.contains(&fk) {
+                                if engine.web_face_has_char(face, c) {
+                                    settled = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            match source {
+                                Some(Source::Url(url)) => {
+                                    if !state.requested.contains(url) && !fetch.contains(url) {
+                                        fetch.push(url.clone());
+                                    }
+                                    if !state.started.contains_key(&fk) && !starting.iter().any(|(k, _)| *k == fk) {
+                                        starting.push((fk, face.display));
+                                    }
+                                    if state.blocking(fk, face.display, now) {
+                                        blocked.entry(key).or_default().insert(c);
+                                    }
+                                }
+                                Some(Source::Local(local)) => {
+                                    if !locals.iter().any(|(o, _)| o == order) {
+                                        locals.push((*order, local.clone()));
+                                    }
+                                }
+                                None => continue,
+                            }
+                            settled = true;
+                            break;
+                        }
+                        if settled {
+                            break;
+                        }
+                        continue;
+                    }
+                    if engine.family_has_char(name, style, weight, stretch, c) {
+                        break;
+                    }
+                }
+            }
+        }
+        // Faces a script asked to load, used by text or not: an
+        // `@font-face` face, or a script face (in the set or not; out of
+        // it, a `local()` font only reports loaded, the face is not used).
+        let mut forced: Vec<(Option<u32>, &Arc<FontFaceRule>)> = faces
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| state.forced_css.contains(&face_key(f)))
+            .map(|(i, f)| (Some(i as u32), f))
+            .collect();
+        for s in state.script.iter().filter(|s| state.forced_script.contains(&s.id) && !state.script_data.contains_key(&s.id)) {
+            forced.push((faces.iter().position(|f| Arc::ptr_eq(f, &s.rule)).map(|i| i as u32), &s.rule));
+        }
+        let mut local_out_of_set: Vec<usize> = Vec::new();
+        let mut locals_failed_out_of_set: Vec<String> = Vec::new();
+        for (order, face) in forced {
+            let fk = face_key(face);
+            if state.loaded.contains(&fk) || state.late.contains(&fk) || state.timed_out.contains(&fk) {
                 continue;
             }
-            let key = (Arc::as_ptr(&s.font_family) as *const u8 as usize, s.font_style as u8, s.font_weight, s.font_stretch.to_bits());
-            if seen.insert(key) {
-                wanted.push((s.font_family.clone(), s.font_style, s.font_weight, s.font_stretch.to_bits()));
+            match state.source_of(face) {
+                Some(Source::Url(url)) => {
+                    if !state.requested.contains(&url) && !fetch.contains(&url) {
+                        fetch.push(url);
+                    }
+                    if !state.started.contains_key(&fk) && !starting.iter().any(|(k, _)| *k == fk) {
+                        starting.push((fk, face.display));
+                    }
+                }
+                Some(Source::Local(name)) => match order {
+                    Some(o) if !locals.iter().any(|(x, _)| *x == o) => locals.push((o, name)),
+                    Some(_) => {}
+                    None => {
+                        if engine.has_local_font(&name) {
+                            local_out_of_set.push(fk);
+                        } else {
+                            locals_failed_out_of_set.push(name);
+                        }
+                    }
+                },
+                None => {}
             }
         }
-        let mut urls: Vec<Url> = Vec::new();
-        for (list, style, weight, stretch) in wanted {
-            for (name, quoted) in family_names(&list) {
-                if !quoted && is_generic_family(&name) {
-                    break;
-                }
-                if let Some(family) = families.get(&name.to_lowercase()) {
-                    // A face none of whose sources can load is no face: the
-                    // match is among the others; a family with none left
-                    // passes to the next name in the list.
-                    let usable: Vec<(&browser_style::fontface::FontFaceRule, Url)> =
-                        family.iter().filter_map(|f| source_of(f).map(|u| (&***f, u))).collect();
-                    let rules: Vec<&browser_style::fontface::FontFaceRule> = usable.iter().map(|(f, _)| *f).collect();
-                    let Some(i) = best_face(&rules, style, f32::from(weight), f32::from_bits(stretch)) else { continue };
-                    urls.push(usable[i].1.clone());
-                    break;
-                }
-                if self.engine.as_mut().is_some_and(|e| e.has_font_family(&name)) {
-                    break;
-                }
+        for fk in local_out_of_set {
+            self.web_fonts.late.insert(fk);
+        }
+        let mut local_changed = false;
+        for name in locals_failed_out_of_set {
+            self.web_fonts.failed.insert(Source::Local(name));
+            local_changed = true;
+        }
+        for (key, display) in starting {
+            self.web_fonts.started.insert(key, (now, display));
+        }
+        // Text waiting in a block period is drawn invisibly; the rest is
+        // drawn (a period that ended, a face that arrived).
+        if let Some(tree) = &mut self.layout {
+            let changed = tree.set_invisible_text(|s, text| {
+                let key = (Arc::as_ptr(&s.font_family) as *const u8 as usize, s.font_style as u8, s.font_weight, s.font_stretch.to_bits());
+                blocked.get(&key).is_some_and(|set| text.chars().any(|c| set.contains(&c)))
+            });
+            if changed {
+                self.needs_paint = true;
             }
         }
-        for url in urls {
-            if !matches!(url.scheme(), "http" | "https" | "data") || !self.web_fonts.requested.insert(url.clone()) {
+        // `local()` sources: the installed font of that full or PostScript
+        // name, registered at once; none of that name, the next source.
+        for (order, name) in locals {
+            let face = &faces[order as usize];
+            if self.engine.as_mut().is_some_and(|e| e.register_local_font(&name, face, order)) {
+                self.web_fonts.loaded.insert(face_key(face));
+                self.needs_layout = true;
+            } else {
+                self.web_fonts.failed.insert(Source::Local(name.to_lowercase()));
+                local_changed = true;
+            }
+        }
+        for url in fetch {
+            if !matches!(url.scheme(), "http" | "https" | "data") {
+                self.web_fonts.failed.insert(Source::Url(url));
+                local_changed = true;
+                continue;
+            }
+            if !self.web_fonts.requested.insert(url.clone()) {
                 continue;
             }
             let mut request = self.subresource(url.clone());
@@ -3288,6 +3743,11 @@ impl TabState {
                 request.credentials = browser_net::Credentials::SameOrigin(origin);
             }
             self.fetch(request, PendingKind::Font { url });
+        }
+        // A source that could not be used gives way to the next one now
+        // (each round fails at least one more source, so this ends).
+        if local_changed {
+            self.fetch_web_fonts();
         }
     }
 
@@ -3345,6 +3805,12 @@ impl TabState {
         let mut again = self.fire_pointer_move();
         again |= self.fire_view_events();
         if again {
+            self.settle();
+        }
+        // `document.fonts`: the faces' states and `ready`, after layout
+        // (which asks for the fonts the text uses).
+        self.report_fonts();
+        if self.needs_style || self.needs_layout {
             self.settle();
         }
         self.report_caret();
@@ -3413,10 +3879,10 @@ impl TabState {
             deps = ?self.deps,
             "restyle"
         );
-        // Background images and the web fonts text uses only become known
-        // after the cascade; their arrival triggers layout again.
+        // Background images only become known after the cascade (the web
+        // fonts after the layout, which knows the characters each font
+        // sets); their arrival triggers layout again.
         self.fetch_background_images();
-        self.fetch_web_fonts();
     }
 
     fn relayout(&mut self) {
@@ -3442,6 +3908,7 @@ impl TabState {
         );
         self.layout = Some(tree);
         self.after_layout();
+        self.fetch_web_fonts();
     }
 
     /// What follows a new layout, the tab's own or one a script forced:
@@ -6535,9 +7002,20 @@ mod tests {
                 use read_fonts::TableProvider;
                 // A single font that draws the test text (not a symbol font).
                 let Ok(read_fonts::FileRef::Font(f)) = read_fonts::FileRef::new(d) else { return false };
-                f.cmap().is_ok_and(|cmap| "usedclosopn".chars().all(|c| cmap.map_codepoint(c).is_some()))
+                f.cmap().is_ok_and(|cmap| "usedclosopnhiubmrtaf".chars().all(|c| cmap.map_codepoint(c).is_some_and(|g| g.to_u32() != 0)))
             })
             .expect("an installed single-font file");
+        // The served font's full name, for `local()`.
+        let full_name = {
+            use read_fonts::TableProvider;
+            let f = read_fonts::FontRef::new(&ttf).expect("font");
+            let name = f.name().expect("name table");
+            name.name_record()
+                .iter()
+                .filter(|r| r.name_id() == read_fonts::types::NameId::FULL_NAME)
+                .find_map(|r| r.string(name.string_data()).ok().map(|s| s.chars().collect::<String>()))
+                .expect("a full name")
+        };
         // An installed family whose fonts are not the served one.
         let installed = names
             .iter()
@@ -6566,9 +7044,14 @@ mod tests {
             "<!DOCTYPE html><script>document.cookie = 'k=v'; var loaded = false; addEventListener('load', () => loaded = true)</script>\
              <style>@font-face {{ font-family: Used; src: url(/missing.ttf), url(/bad.ttf) format('woff2'), url(/used.ttf) }} \
              @font-face {{ font-family: Unused; src: url(/unused.ttf) }} @font-face {{ font-family: \"{installed}\"; src: url(/gone.ttf) }} \
+             @font-face {{ font-family: Sub; src: url(/latin.ttf); unicode-range: U+0000-00FF }} \
+             @font-face {{ font-family: Sub; src: url(/cyrillic.ttf); unicode-range: U+0400-04FF }} \
+             @font-face {{ font-family: LocMiss; src: local(\"No Such Font Anywhere\"), url(/after-local.ttf) }} \
+             @font-face {{ font-family: LocHit; src: local(\"{full_name}\"), url(/never.ttf) }} \
              @font-face {{ font-family: Closed; src: url({}) }} @font-face {{ font-family: Open; src: url({}) format('truetype') }}</style>\
              <p style='font-family: Used'>used</p><p style='font-family: Closed, Used'>closed</p><p style='font-family: Open'>open</p>\
-             <p style='font-family: \"{installed}\", Used'>hidden</p><div style='font-family: Unused'><span></span></div>",
+             <p style='font-family: \"{installed}\", Used'>hidden</p><div style='font-family: Unused'><span></span></div>\
+             <p style='font-family: Sub'>sub</p><p style='font-family: LocMiss'>locmiss</p><p style='font-family: LocHit'>lochit</p>",
             other.url("/closed.ttf"),
             other.url("/open.ttf")
         );
@@ -6577,6 +7060,10 @@ mod tests {
                 ("/page".to_owned(), vec![("Content-Type".to_owned(), "text/html; charset=utf-8".to_owned())], page.into_bytes()),
                 ("/used.ttf".to_owned(), font(None), ttf.clone()),
                 ("/bad.ttf".to_owned(), font(None), b"not a font".to_vec()),
+                ("/latin.ttf".to_owned(), font(None), ttf.clone()),
+                ("/cyrillic.ttf".to_owned(), font(None), ttf.clone()),
+                ("/after-local.ttf".to_owned(), font(None), ttf.clone()),
+                ("/never.ttf".to_owned(), font(None), ttf.clone()),
                 ("/unused.ttf".to_owned(), font(None), ttf.clone()),
             ],
             &[],
@@ -6624,9 +7111,241 @@ mod tests {
             "an @font-face family named like an installed one hides it; it failed, so the next family shows: {fonts:?}"
         );
         assert_eq!(server.requests("/gone.ttf").len(), 1);
+        // unicode-range: only the subset the text uses is fetched.
+        assert_eq!(server.requests("/latin.ttf").len(), 1);
+        assert!(server.requests("/cyrillic.ttf").is_empty(), "no Cyrillic text");
+        assert_eq!(fonts.get("sub"), Some(&true));
+        // local(): a name no installed font has gives way to the next
+        // source; an installed font's full name is used without a fetch.
+        assert_eq!(server.requests("/after-local.ttf").len(), 1);
+        assert_eq!(fonts.get("locmiss"), Some(&true));
+        assert!(server.requests("/never.ttf").is_empty(), "the local font is used");
+        assert_eq!(fonts.get("lochit"), Some(&true), "{fonts:?}");
         // Refused leaves Closed unregistered: a page that names only it
         // shows the fallback.
         assert!(!h.state.engine.as_mut().expect("engine").has_font_family("Closed"));
+    }
+
+    /// CSS Font Loading: `document.fonts` holds the `@font-face` faces in
+    /// document order, then the faces scripts add; the set's events and
+    /// `ready` follow the loads; `check` and `load` match a `font`
+    /// shorthand and a text; `FontFace` from a URL or from bytes loads
+    /// and, in the set, is used by text; descriptors parse, serialize and
+    /// refuse what does not parse.
+    #[test]
+    fn document_fonts_and_font_face() {
+        let mut collection = fontique::Collection::new(fontique::CollectionOptions::default());
+        let mut cache = fontique::SourceCache::default();
+        let names: Vec<String> = collection.family_names().map(str::to_owned).collect();
+        let ttf = names
+            .iter()
+            .filter_map(|n| collection.family_by_name(n))
+            .flat_map(|fam| fam.fonts().to_vec())
+            .filter_map(|f| f.load(Some(&mut cache)))
+            .map(|b| b.data().to_vec())
+            .filter(|d| {
+                use read_fonts::TableProvider;
+                let Ok(read_fonts::FileRef::Font(f)) = read_fonts::FileRef::new(d) else { return false };
+                f.cmap().is_ok_and(|cmap| "usedbytesviaurl".chars().all(|c| cmap.map_codepoint(c).is_some_and(|g| g.to_u32() != 0)))
+            })
+            .min_by_key(Vec::len)
+            .expect("an installed single-font file");
+        let b64 = {
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut s = String::new();
+            for chunk in ttf.chunks(3) {
+                let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+                for i in 0..4 {
+                    if i <= chunk.len() {
+                        s.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                    } else {
+                        s.push('=');
+                    }
+                }
+            }
+            s
+        };
+        let font = vec![("Content-Type".to_owned(), "font/ttf".to_owned())];
+        let page = "<!DOCTYPE html><style>\
+             @font-face { font-family: Used; src: url(/used.ttf) } \
+             @font-face { font-family: Spare; src: url(/spare.ttf); font-weight: 700 }</style>\
+             <script>var log = []; \
+               document.fonts.addEventListener('loading', e => log.push('loading:' + e.fontfaces.map(f => f.family).join(','))); \
+               document.fonts.onloadingdone = e => log.push('done:' + e.fontfaces.map(f => f.family).join(',')); \
+               document.fonts.addEventListener('loadingerror', e => log.push('error:' + e.fontfaces.map(f => f.family).join(','))); \
+               document.fonts.ready.then(s => log.push('ready:' + (s === document.fonts) + ':' + s.status));</script>\
+             <p style='font-family: Used, monospace'>used</p><p style='font-family: ViaUrl, monospace'>viaurl</p>\
+             <p style='font-family: Bytes, monospace'>bytes</p>";
+        let server = Server::start_with(
+            vec![
+                ("/page".to_owned(), vec![("Content-Type".to_owned(), "text/html; charset=utf-8".to_owned())], page.as_bytes().to_vec()),
+                ("/used.ttf".to_owned(), font.clone(), ttf.clone()),
+                ("/spare.ttf".to_owned(), font.clone(), ttf.clone()),
+                ("/via.ttf".to_owned(), font.clone(), ttf.clone()),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.pump_for(std::time::Duration::from_millis(50));
+        h.pump();
+        assert_eq!(run_js(&mut h, "log.join(' | ')"), "\"loading:Used | done:Used | ready:true:loaded\"");
+        assert_eq!(
+            run_js(&mut h, "[document.fonts.size, [...document.fonts].map(f => f.family + ':' + f.status).join(',')].join(' ')"),
+            "\"2 Used:loaded,Spare:unloaded\""
+        );
+        assert_eq!(
+            run_js(&mut h, "[document.fonts.check('16px Used'), document.fonts.check('bold 16px Spare'), document.fonts.check('16px NoSuch, serif')].join()"),
+            "\"true,false,true\""
+        );
+        assert_eq!(run_js(&mut h, "try { document.fonts.check('bogus') } catch (e) { e.name }"), "\"SyntaxError\"");
+        let css_face = "[...document.fonts][0]";
+        assert_eq!(run_js(&mut h, &format!("try {{ document.fonts.add({css_face}) }} catch (e) {{ e.name }}")), "\"InvalidModificationError\"");
+        assert_eq!(run_js(&mut h, &format!("document.fonts.delete({css_face})")), "false");
+        assert_eq!(run_js(&mut h, &format!("{css_face}.weight + '/' + [...document.fonts][1].weight + '/' + {css_face}.unicodeRange + '/' + {css_face}.display")), "\"normal/700/U+0-10FFFF/auto\"");
+
+        // load(): the faces a font and text would use; the set switches to
+        // loading and back.
+        // Pump until the script expression has the value.
+        let wait = |h: &mut Harness, expr: &str, want: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while run_js(h, expr) != want {
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {expr} == {want}: {}", run_js(h, "log.join(' | ')"));
+                h.pump_for(std::time::Duration::from_millis(10));
+                h.pump();
+            }
+        };
+        run_js(&mut h, "log = []; document.fonts.load('bold 16px Spare').then(fs => log.push('loaded:' + fs.length + ':' + fs[0].family + ':' + fs[0].status))");
+        wait(&mut h, "log.length", "3");
+        assert_eq!(run_js(&mut h, "log.join(' | ')"), "\"loading:Spare | done:Spare | loaded:1:Spare:loaded\"");
+        assert_eq!(server.requests("/spare.ttf").len(), 1, "loaded because asked, no text uses it");
+
+        // A script face from a URL, added to the set: used by its text.
+        run_js(
+            &mut h,
+            "log = []; var via = new FontFace('ViaUrl', 'url(/via.ttf)'); document.fonts.add(via); \
+             via.load().then(f => log.push('via:' + (f === via) + ':' + f.status))",
+        );
+        wait(&mut h, "log.includes('via:true:loaded')", "true");
+        // A face from bytes: a font loads; anything else errors.
+        run_js(
+            &mut h,
+            &format!(
+                "var bin = atob('{b64}'); var buf = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i); \
+                 var bytes = new FontFace('Bytes', buf.buffer); document.fonts.add(bytes); \
+                 bytes.loaded.then(f => log.push('bytes:' + f.status)); \
+                 var bad = new FontFace('Bad', new Uint8Array([1, 2, 3])); bad.loaded.catch(e => log.push('bad:' + e.name + ':' + bad.status))"
+            ),
+        );
+        wait(&mut h, "log.filter(l => l.startsWith('b')).length", "2");
+        h.pump();
+        let log = run_js(&mut h, "log.filter(l => l.startsWith('b')).sort().join(' | ')");
+        assert_eq!(log, "\"bad:NetworkError:error | bytes:loaded\"");
+        let mut fonts: HashMap<String, bool> = HashMap::new();
+        h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+            if let browser_layout::FragmentContent::Text(t) = &f.content {
+                fonts.insert(t.text[t.range.clone()].to_owned(), t.font.data.data() == &ttf[..]);
+            }
+        });
+        assert_eq!(fonts.get("viaurl"), Some(&true), "{fonts:?}");
+        assert_eq!(fonts.get("bytes"), Some(&true), "{fonts:?}");
+        assert_eq!(run_js(&mut h, "document.fonts.size + ':' + document.fonts.has(via) + ':' + document.fonts.delete(via) + ':' + document.fonts.size"), "\"4:true:true:3\"");
+
+        // Descriptors: parsed and serialized; a bad one errors the face
+        // (no throw) and a bad setter throws.
+        assert_eq!(
+            run_js(
+                &mut h,
+                "var x = new FontFace('X', 'url(x.woff2)', {weight: '300 500', unicodeRange: 'U+0-7F, U+100', display: 'swap', style: 'oblique 10deg', sizeAdjust: '90%'}); \
+                 [x.weight, x.unicodeRange, x.display, x.style, x.sizeAdjust, x.stretch, x.status].join('/')"
+            ),
+            "\"300 500/U+0-7F, U+100/swap/oblique 10deg/90%/normal/unloaded\""
+        );
+        assert_eq!(run_js(&mut h, "var y = new FontFace('Y', 'url(y)', {weight: 'heavy'}); y.status"), "\"error\"");
+        assert_eq!(run_js(&mut h, "try { x.weight = 'heavy'; 'no' } catch (e) { e.name + ':' + x.weight }"), "\"SyntaxError:300 500\"");
+        assert_eq!(run_js(&mut h, "try { new FontFace('Z') } catch (e) { e.name }"), "\"TypeError\"");
+    }
+
+    /// `font-display`: while a face loads, its text is invisible during the
+    /// block period (`block`: 3 s; `fallback`, `optional`: 100 ms; `swap`:
+    /// none) and shown in the fallback after it; a face arriving in its
+    /// swap period swaps in (`swap`, `fallback`), one arriving after it
+    /// does not (`optional`: no swap period).
+    #[test]
+    fn font_display_blocks_swaps_and_gives_up() {
+        let mut collection = fontique::Collection::new(fontique::CollectionOptions::default());
+        let mut cache = fontique::SourceCache::default();
+        let names: Vec<String> = collection.family_names().map(str::to_owned).collect();
+        let ttf = names
+            .iter()
+            .filter_map(|n| collection.family_by_name(n))
+            .flat_map(|fam| fam.fonts().to_vec())
+            .filter_map(|f| f.load(Some(&mut cache)))
+            .map(|b| b.data().to_vec())
+            .find(|d| {
+                use read_fonts::TableProvider;
+                let Ok(read_fonts::FileRef::Font(f)) = read_fonts::FileRef::new(d) else { return false };
+                f.cmap().is_ok_and(|cmap| "blockswapfallbackoptional".chars().all(|c| cmap.map_codepoint(c).is_some_and(|g| g.to_u32() != 0)))
+            })
+            .expect("an installed single-font file");
+        let font = vec![("Content-Type".to_owned(), "font/ttf".to_owned())];
+        let page = "<!DOCTYPE html><style>\
+             @font-face { font-family: B; src: url(/b.ttf); font-display: block } \
+             @font-face { font-family: S; src: url(/s.ttf); font-display: swap } \
+             @font-face { font-family: F; src: url(/f.ttf); font-display: fallback } \
+             @font-face { font-family: O; src: url(/o.ttf); font-display: optional }</style>\
+             <p style='font-family: B, monospace'>block</p><p style='font-family: S, monospace'>swap</p>\
+             <p style='font-family: F, monospace'>fallback</p><p style='font-family: O, monospace'>optional</p>";
+        let server = Server::start_with(
+            vec![
+                ("/page".to_owned(), vec![("Content-Type".to_owned(), "text/html; charset=utf-8".to_owned())], page.as_bytes().to_vec()),
+                ("/b.ttf".to_owned(), font.clone(), ttf.clone()),
+                ("/s.ttf".to_owned(), font.clone(), ttf.clone()),
+                ("/f.ttf".to_owned(), font.clone(), ttf.clone()),
+                ("/o.ttf".to_owned(), font.clone(), ttf.clone()),
+            ],
+            &["/b.ttf", "/s.ttf", "/f.ttf", "/o.ttf"],
+        );
+        // Each paragraph's text: (invisible, in the web font).
+        let shown = |h: &Harness| {
+            let mut out: HashMap<String, (bool, bool)> = HashMap::new();
+            if let Some(tree) = &h.state.layout {
+                tree.root.walk(&mut |f| {
+                    if let browser_layout::FragmentContent::Text(t) = &f.content {
+                        out.insert(t.text[t.range.clone()].to_owned(), (t.invisible, t.font.data.data() == &ttf[..]));
+                    }
+                });
+            }
+            out
+        };
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| shown(h).len() == 4 && server.requests("/o.ttf").len() == 1);
+        let s = shown(&h);
+        assert_eq!(s["block"], (true, false), "block: invisible while loading");
+        assert_eq!(s["swap"], (false, false), "swap: the fallback at once");
+        assert_eq!(s["fallback"], (true, false), "fallback: a short block period");
+        assert_eq!(s["optional"], (true, false));
+        // Past 100 ms: fallback and optional show their fallback; block
+        // still waits.
+        h.pump_for(std::time::Duration::from_millis(250));
+        h.pump();
+        let s = shown(&h);
+        assert_eq!(s["block"], (true, false));
+        assert_eq!(s["fallback"], (false, false));
+        assert_eq!(s["optional"], (false, false));
+        // The fonts arrive (within fallback's 3 s swap period): swap and
+        // fallback swap in, optional's swap period is over, block's text
+        // shows in its face.
+        for p in ["/b.ttf", "/s.ttf", "/f.ttf", "/o.ttf"] {
+            server.release(p);
+        }
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.pump();
+        let s = shown(&h);
+        assert_eq!(s["block"], (false, true));
+        assert_eq!(s["swap"], (false, true));
+        assert_eq!(s["fallback"], (false, true));
+        assert_eq!(s["optional"], (false, false), "too late: the fallback stays");
     }
 
     #[test]

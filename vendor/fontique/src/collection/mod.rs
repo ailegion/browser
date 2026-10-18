@@ -759,6 +759,9 @@ impl CommonData {
     ) {
         super::scan::scan_memory(font_data, |scanned_font| {
             scratch_family_name.clear();
+            if info_override.and_then(|o| o.index).is_some_and(|i| i != scanned_font.index) {
+                return;
+            }
 
             let family_name =
                 if let Some(override_family_name) = info_override.and_then(|o| o.family_name) {

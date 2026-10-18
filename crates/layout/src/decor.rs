@@ -75,6 +75,8 @@ pub(crate) fn font_of(style: &ComputedStyle) -> DecorationFont {
         weight: style.font_weight,
         style: style.font_style,
         stretch: style.font_stretch,
+        optical_sizing: style.font_optical_sizing,
+        variations: style.font_variation_settings.clone(),
     }
 }
 
@@ -85,6 +87,8 @@ struct FontKey {
     weight: u16,
     style: u8,
     stretch: u32,
+    optical_sizing: bool,
+    variations: Box<[([u8; 4], u32)]>,
 }
 
 impl FontKey {
@@ -99,8 +103,23 @@ impl FontKey {
                 FontStyle::Oblique => 2,
             },
             stretch: f.stretch.to_bits(),
+            optical_sizing: f.optical_sizing == browser_style::FontOpticalSizing::Auto,
+            variations: f.variations.iter().map(|(t, v)| (*t, v.to_bits())).collect(),
         }
     }
+}
+
+/// The variations a font of `font` is set with: those font matching asks
+/// for, then the optical size (`font-optical-sizing: auto`, unless the
+/// settings name `opsz`), then `font-variation-settings`, a later one
+/// winning per axis (as the text's runs).
+fn variations_of(font: &DecorationFont, synthesis: &[(skrifa::Tag, f32)]) -> Vec<(skrifa::Tag, f32)> {
+    let mut out: Vec<(skrifa::Tag, f32)> = synthesis.to_vec();
+    if font.optical_sizing == browser_style::FontOpticalSizing::Auto && !font.variations.iter().any(|(t, _)| t == b"opsz") {
+        out.push((skrifa::Tag::new(b"opsz"), font.size.max(0.0)));
+    }
+    out.extend(font.variations.iter().map(|(t, v)| (skrifa::Tag::new(t), *v)));
+    out
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -133,6 +152,12 @@ pub(crate) struct Decorator {
 }
 
 impl Decorator {
+    /// Forget the cached font metrics: the fonts a family resolves to
+    /// changed (a web font registered or cleared).
+    pub(crate) fn forget_metrics(&mut self) {
+        self.metrics.clear();
+    }
+
     /// The lines on `text`, whose element's style is `style`: one per
     /// line of every decorating box in `style.decorations`, outermost
     /// box first. `text.baseline` must be set.
@@ -236,8 +261,28 @@ impl Decorator {
                 },
                 FontWeight::new(font.weight as f32),
             ));
+            // The first available font: the first whose `unicode-range`
+            // does not exclude U+0020 (CSS Fonts 4 §5.5), at its face's
+            // `size-adjust` and with its metric overrides.
             query.matches_with(|f| {
-                found = font_metrics(f.blob.as_ref(), f.index, f.synthesis.variation_settings(), font.size);
+                if f.unicode_range.as_ref().is_some_and(|r| !r.iter().any(|&(a, b)| a <= 0x20 && 0x20 <= b)) {
+                    return QueryStatus::Continue;
+                }
+                let fm = f.face_metrics;
+                let size = font.size * fm.size_adjust;
+                let vars = variations_of(font, f.synthesis.variation_settings());
+                found = font_metrics(f.blob.as_ref(), f.index, &vars, size).map(|mut m| {
+                    if let Some(a) = fm.ascent {
+                        m.ascent = a * size;
+                    }
+                    if let Some(d) = fm.descent {
+                        m.descent = d * size;
+                    }
+                    if let Some(g) = fm.line_gap {
+                        m.leading = g * size;
+                    }
+                    m
+                });
                 QueryStatus::Stop
             });
         }

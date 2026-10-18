@@ -262,6 +262,30 @@ impl EventData {
     }
 }
 
+/// A trusted, non-bubbling, non-cancelable event of `kind` with the
+/// prototype `proto` and `value` in its value slot (what `CustomEvent`
+/// keeps `detail` in): the events other modules define their own class
+/// for (`FontFaceSetLoadEvent`, its `fontfaces`).
+pub(crate) fn trusted_event_with_value(kind: &str, proto: JsObject, value: JsValue, context: &mut Context) -> JsResult<JsObject> {
+    let now = now_ms(context)?;
+    let mut data = EventData::new(kind.to_owned(), false, false, false, true, now);
+    data.detail = value;
+    Ok(JsObject::from_proto_and_data(proto, data))
+}
+
+/// `new X(type, init)` for such a class: the `Event` part from the
+/// arguments, `value` in the value slot.
+pub(crate) fn constructed_event_with_value(args: &[JsValue], proto: JsObject, value: JsValue, context: &mut Context) -> JsResult<JsObject> {
+    let mut data = EventData::from_args(args, context)?;
+    data.detail = value;
+    Ok(JsObject::from_proto_and_data(proto, data))
+}
+
+/// The value slot of an event made by the two functions above.
+pub(crate) fn event_value(this: &JsValue) -> Option<JsValue> {
+    this.as_object().and_then(|o| o.downcast_ref::<EventData>().map(|d| d.detail.clone()))
+}
+
 fn now_ms(context: &mut Context) -> JsResult<f64> {
     let shared = dom(context)?;
     let started = shared.borrow().events.started;
@@ -442,10 +466,11 @@ fn init_media_event(class: &mut ClassBuilder<'_>) -> JsResult<()> {
 }
 
 /// Put `on<type>` accessors on one object (`visualViewport`, a
-/// `MediaQueryList`); the names must be among `HANDLER_NAMES`.
+/// `MediaQueryList`, `document.fonts`); the names must be among
+/// `HANDLER_NAMES` or `OWN_HANDLER_NAMES`.
 pub(crate) fn add_handler_properties(object: &JsObject, names: &[&str], context: &mut Context) -> JsResult<()> {
     for name in names {
-        let Some(index) = HANDLER_NAMES.iter().position(|n| n == name) else {
+        let Some(index) = HANDLER_NAMES.iter().chain(OWN_HANDLER_NAMES).position(|n| n == name) else {
             continue;
         };
         let get = getter(context, name, NativeFunction::from_copy_closure_with_captures(handler_get, index as u8));
@@ -1088,7 +1113,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
 }
 
 /// Make `Sub` inherit from `Base`: its prototype and its constructor.
-fn inherit<Sub: Class, Base: Class>(context: &mut Context) {
+pub(crate) fn inherit<Sub: Class, Base: Class>(context: &mut Context) {
     let sub = context.get_global_class::<Sub>();
     let base = context.get_global_class::<Base>();
     if let (Some(sub), Some(base)) = (sub, base) {
@@ -1553,9 +1578,15 @@ fn invoke(
 
 fn handler_kind(index: u8) -> &'static str {
     HANDLER_NAMES
-        .get(index as usize)
+        .iter()
+        .chain(OWN_HANDLER_NAMES)
+        .nth(index as usize)
         .map_or("", |n| &n[2..])
 }
+
+/// `on<type>` handlers only some objects have (not `Element`, `Document`
+/// or `window`): indexed after `HANDLER_NAMES`.
+const OWN_HANDLER_NAMES: &[&str] = &["onloading", "onloadingdone", "onloadingerror"];
 
 /// `on<type>="code"` on an element: compile it (once per source text)
 /// and make it the target's handler listener, unless the property was

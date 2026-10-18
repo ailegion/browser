@@ -1276,6 +1276,9 @@ impl<'a> Painter<'a> {
         let origin = self.transform * Affine::translate((rect.x as f64, rect.y as f64));
         let brush = color(t.color);
         let glyph_transform = t.skew.map(|deg| Affine::skew((-deg as f64).to_radians().tan(), 0.0));
+        // Text waiting for a web font in its block period: the fallback's
+        // glyphs take their place, invisibly.
+        let glyphs: &[_] = if t.invisible { &[] } else { &t.glyphs };
         self.scene
             .draw_glyphs(&t.font)
             .font_size(t.font_size)
@@ -1286,7 +1289,7 @@ impl<'a> Painter<'a> {
             .hint(true)
             .draw(
                 Fill::NonZero,
-                t.glyphs.iter().map(|g| Glyph {
+                glyphs.iter().map(|g| Glyph {
                     id: g.id,
                     x: g.x,
                     y: g.y,
@@ -1596,6 +1599,7 @@ fn text_clip_path(f: &Fragment) -> BezPath {
     }
     fn collect(f: &Fragment, path: &mut BezPath) {
         if let FragmentContent::Text(t) = &f.content
+            && !t.invisible
             && let Ok(font) = skrifa::FontRef::from_index(t.font.data.as_ref(), t.font.index)
         {
             let outlines = font.outline_glyphs();

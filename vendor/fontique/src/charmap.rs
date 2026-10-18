@@ -46,6 +46,7 @@ impl CharmapIndex {
             subtable,
             is_symbol: self.is_symbol,
             is_mac_roman: self.is_mac_roman,
+            unicode_range: None,
         })
     }
 }
@@ -56,13 +57,34 @@ pub struct Charmap<'a> {
     subtable: CmapSubtable<'a>,
     is_symbol: bool,
     is_mac_roman: bool,
+    // Patch (plan/03-crates.md): a web face's `unicode-range`; code
+    // points outside it map to nothing.
+    unicode_range: Option<&'a [(u32, u32)]>,
+}
+
+impl<'a> Charmap<'a> {
+    /// Patch (plan/03-crates.md): the same map, limited to `ranges`.
+    pub fn limited_to(mut self, ranges: Option<&'a [(u32, u32)]>) -> Self {
+        self.unicode_range = ranges;
+        self
+    }
 }
 
 impl Charmap<'_> {
     /// Returns the glyph identifier for the given codepoint.
     pub fn map(&self, codepoint: impl Into<u32>) -> Option<u32> {
+        let c = codepoint.into();
+        if let Some(ranges) = self.unicode_range {
+            if !crate::font::covers(ranges, c) {
+                return None;
+            }
+        }
+        self.map_any(c)
+    }
+
+    fn map_any(&self, codepoint: u32) -> Option<u32> {
         const ASCII_MAX: u32 = 0x7F;
-        let mut c = codepoint.into();
+        let mut c = codepoint;
         // The Mac Roman encoding requires special processing for codepoints
         // above the ASCII range.
         if self.is_mac_roman && c > ASCII_MAX {
@@ -92,7 +114,7 @@ impl Charmap<'_> {
             // Windows seems to do, and that's hinted about at:
             // https://docs.microsoft.com/en-us/typography/opentype/spec/recom
             // under "Non-Standard (Symbol) Fonts".
-            return self.map(0xF000 + c);
+            return self.map_any(0xF000 + c);
         }
         result.map(|gid| gid.to_u32())
     }

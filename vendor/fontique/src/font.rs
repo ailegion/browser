@@ -8,6 +8,7 @@ use crate::CharmapIndex;
 use super::source::{SourceInfo, SourceKind};
 use super::{Blob, source_cache::SourceCache};
 use crate::{FontStyle, FontWeight, FontWidth};
+use alloc::sync::Arc;
 use core::fmt;
 use read_fonts::{FontRef, TableProvider as _, types::Tag};
 use smallvec::SmallVec;
@@ -33,7 +34,7 @@ pub struct FontInfo {
 /// The `@font-face` descriptors a web font is registered with (CSS Fonts 4
 /// §4.4). `None` is `auto`: matched as the normal value, and the font's
 /// own axis ranges are the only clamp of its variations.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FaceDescriptors {
     /// The weight range, both ends inclusive.
     pub weight: Option<(f32, f32)>,
@@ -41,6 +42,70 @@ pub struct FaceDescriptors {
     pub width: Option<(f32, f32)>,
     /// The style.
     pub style: Option<FaceStyle>,
+    /// The `unicode-range`: inclusive code point ranges, sorted; `None`
+    /// is every code point. The face is used only for the characters in
+    /// it, even where the font has glyphs for others.
+    pub unicode_range: Option<Arc<[(u32, u32)]>>,
+    /// The rule's position among the document's `@font-face` rules: of
+    /// faces with the same descriptors the later rule is tried first.
+    pub order: u32,
+    /// `size-adjust` as a factor (`None`: 1).
+    pub size_adjust: Option<f32>,
+    /// `ascent-override`, `descent-override`, `line-gap-override` as
+    /// fractions of the adjusted font size (`None`: the font's own).
+    pub ascent_override: Option<f32>,
+    pub descent_override: Option<f32>,
+    pub line_gap_override: Option<f32>,
+}
+
+/// Patch (plan/03-crates.md): what a web face's descriptors change in the
+/// size and metrics of text set in it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FaceMetrics {
+    /// The factor on the used font size (`size-adjust`).
+    pub size_adjust: f32,
+    /// Ascent, descent (positive, below the baseline) and line gap as
+    /// fractions of the adjusted size, where overridden.
+    pub ascent: Option<f32>,
+    pub descent: Option<f32>,
+    pub line_gap: Option<f32>,
+}
+
+impl Default for FaceMetrics {
+    fn default() -> Self {
+        Self { size_adjust: 1.0, ascent: None, descent: None, line_gap: None }
+    }
+}
+
+impl FaceDescriptors {
+    /// The size and metric changes of the face.
+    pub fn metrics(&self) -> FaceMetrics {
+        FaceMetrics {
+            size_adjust: self.size_adjust.unwrap_or(1.0),
+            ascent: self.ascent_override,
+            descent: self.descent_override,
+            line_gap: self.line_gap_override,
+        }
+    }
+}
+
+impl FaceDescriptors {
+    /// The descriptors faces are matched by: faces equal in these form
+    /// one composite face, told apart by `unicode_range`.
+    pub fn matched(&self) -> (Option<(f32, f32)>, Option<FaceStyle>, Option<(f32, f32)>) {
+        (self.weight, self.style, self.width)
+    }
+
+    /// Whether the face is used for `c`.
+    pub fn covers(&self, c: u32) -> bool {
+        self.unicode_range.as_ref().is_none_or(|r| covers(r, c))
+    }
+}
+
+/// Whether sorted inclusive ranges hold `c`.
+pub(crate) fn covers(ranges: &[(u32, u32)], c: u32) -> bool {
+    let i = ranges.partition_point(|r| r.1 < c);
+    ranges.get(i).is_some_and(|r| r.0 <= c)
 }
 
 /// The `font-style` descriptor of a face.
@@ -395,7 +460,7 @@ impl FontInfo {
             self.weight = weight;
         }
         if let Some(face) = info_override.face {
-            self.face = Some(face);
+            self.face = Some(face.clone());
         }
         if let Some(axes) = info_override.axes {
             // This is O(n^2) but no font should have enough axes for that to
@@ -600,5 +665,8 @@ pub struct FontInfoOverride<'a> {
     /// Patch (plan/03-crates.md): the `@font-face` descriptors; a font
     /// with them is matched and synthesized by them (see
     /// [`FaceDescriptors`]).
-    pub face: Option<FaceDescriptors>,
+    pub face: Option<&'a FaceDescriptors>,
+    /// Patch (plan/03-crates.md): register only the font at this index of
+    /// a collection (`None`: every font in the data).
+    pub index: Option<u32>,
 }

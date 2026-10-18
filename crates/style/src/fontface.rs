@@ -28,7 +28,7 @@ pub enum FontSource {
 }
 
 /// An `@font-face` rule's descriptors.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FontFaceRule {
     pub family: Arc<str>,
     pub sources: Vec<FontSource>,
@@ -41,6 +41,32 @@ pub struct FontFaceRule {
     pub style: Option<FaceStyle>,
     /// The stretch range, in percent; `None` is `auto`.
     pub stretch: Option<(f32, f32)>,
+    /// The `unicode-range`: inclusive code point ranges, sorted and
+    /// merged; `None` is the initial `U+0-10FFFF`.
+    pub unicode_range: Option<Arc<[(u32, u32)]>>,
+    /// `font-display`.
+    pub display: FontDisplay,
+    /// `size-adjust` as a factor; `None` is the initial 100%.
+    pub size_adjust: Option<f32>,
+    /// `ascent-override`, `descent-override`, `line-gap-override` as
+    /// fractions of the used font size; `None` is `normal` (the font's
+    /// own metric).
+    pub ascent_override: Option<f32>,
+    pub descent_override: Option<f32>,
+    pub line_gap_override: Option<f32>,
+}
+
+/// `font-display` (CSS Fonts 4 §4.9): how long text waits, invisible,
+/// for the face (the block period) and how long after that the face may
+/// still swap in when it arrives (the swap period).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontDisplay {
+    #[default]
+    Auto,
+    Block,
+    Swap,
+    Fallback,
+    Optional,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,7 +81,14 @@ impl FontFaceRule {
     /// whose format (if given) is one it decodes and whose `tech()` it
     /// supports. A source that fails to load gives way to the next.
     pub fn loadable_sources(&self) -> impl Iterator<Item = &Arc<str>> {
-        self.sources.iter().filter_map(|s| match s {
+        self.sources.iter().filter_map(|s| self.loadable_url(s))
+    }
+
+    /// The URL of a `url()` source this engine can load: no `format()`, or
+    /// one it decodes, and a `tech()` it supports. `None` for other
+    /// sources (and for `local()`).
+    pub fn loadable_url<'a>(&self, source: &'a FontSource) -> Option<&'a Arc<str>> {
+        match source {
             FontSource::Url { url, format, tech_supported } => {
                 let ok = match format.as_deref() {
                     None => true,
@@ -64,12 +97,27 @@ impl FontFaceRule {
                 (ok && *tech_supported).then_some(url)
             }
             FontSource::Local(_) => None,
-        })
+        }
     }
 
     /// The first loadable source.
     pub fn loadable_source(&self) -> Option<&Arc<str>> {
         self.loadable_sources().next()
+    }
+
+    /// Whether the face is used for the code point `c` (its
+    /// `unicode-range`).
+    pub fn covers(&self, c: u32) -> bool {
+        self.unicode_range.as_ref().is_none_or(|r| {
+            let i = r.partition_point(|x| x.1 < c);
+            r.get(i).is_some_and(|x| x.0 <= c)
+        })
+    }
+
+    /// The descriptors faces are matched by: faces equal in these form one
+    /// composite face, told apart by `unicode-range` (CSS Fonts 4 §4.5).
+    pub fn matched(&self) -> (Option<(f32, f32)>, Option<FaceStyle>, Option<(f32, f32)>) {
+        (self.weight, self.style, self.stretch)
     }
 
     /// The weight, style and stretch the face is matched by (`auto` as
@@ -80,6 +128,109 @@ impl FontFaceRule {
             self.style.unwrap_or(FaceStyle::Normal),
             self.stretch.unwrap_or((100.0, 100.0)),
         )
+    }
+}
+
+// ----- one descriptor at a time (the `FontFace` interface) -----
+
+/// The family of `new FontFace(family, …)` and `FontFace.family = `: a
+/// `<family-name>` alone; `None` when the text is not one.
+pub fn parse_family(text: &str) -> Option<Arc<str>> {
+    let mut input = cssparser::ParserInput::new(text);
+    let mut parser = Parser::new(&mut input);
+    parser
+        .parse_entirely(|i| parse_family_name(i).map_err(|_| i.new_custom_error::<(), ()>(())))
+        .ok()
+}
+
+/// Set the descriptor `name` (its CSS name: `src`, `font-style`,
+/// `font-weight`, `font-stretch`, `unicode-range`, `font-display`,
+/// `size-adjust`, `ascent-override`, `descent-override`,
+/// `line-gap-override`) of `rule` from `value`, as `@font-face` parses it;
+/// `src` URLs resolve against `base`. False (and `rule` unchanged) when
+/// the value does not parse.
+pub fn set_descriptor(rule: &mut FontFaceRule, name: &str, value: &str, base: Option<&url::Url>) -> bool {
+    let mut parser = Descriptors::default();
+    let css = format!("{name}: {value}");
+    let mut input = cssparser::ParserInput::new(&css);
+    let mut p = Parser::new(&mut input);
+    let mut ok = false;
+    for item in RuleBodyParser::new(&mut p, &mut parser) {
+        ok = item.is_ok();
+    }
+    if !ok {
+        return false;
+    }
+    match name {
+        "src" => {
+            let Some(mut sources) = parser.sources else { return false };
+            if let Some(base) = base {
+                for s in &mut sources {
+                    if let FontSource::Url { url, .. } = s
+                        && let Ok(abs) = base.join(url)
+                    {
+                        *url = Arc::from(abs.as_str());
+                    }
+                }
+            }
+            rule.sources = sources;
+        }
+        "font-style" => rule.style = parser.style.flatten(),
+        "font-weight" => rule.weight = parser.weight.flatten(),
+        "font-stretch" | "font-width" => rule.stretch = parser.stretch.flatten(),
+        "unicode-range" => rule.unicode_range = parser.unicode_range,
+        "font-display" => rule.display = parser.display,
+        "size-adjust" => rule.size_adjust = parser.size_adjust,
+        "ascent-override" => rule.ascent_override = parser.ascent_override,
+        "descent-override" => rule.descent_override = parser.descent_override,
+        "line-gap-override" => rule.line_gap_override = parser.line_gap_override,
+        _ => return false,
+    }
+    true
+}
+
+/// The serialization of the descriptor `name` of `rule` (what a
+/// `FontFace` attribute returns); an absent descriptor is its initial
+/// value as the `FontFace` interface reports it.
+pub fn descriptor_css(rule: &FontFaceRule, name: &str) -> String {
+    use crate::values::css_number;
+    let range = |r: Option<(f32, f32)>, unit: &str, normal: &str| match r {
+        None => normal.to_owned(),
+        Some((a, b)) if a == b => format!("{}{unit}", css_number(a)),
+        Some((a, b)) => format!("{}{unit} {}{unit}", css_number(a), css_number(b)),
+    };
+    let percent = |v: Option<f32>| v.map_or("normal".to_owned(), |v| format!("{}%", css_number(v * 100.0)));
+    match name {
+        "font-style" => match rule.style {
+            None | Some(FaceStyle::Normal) => "normal".to_owned(),
+            Some(FaceStyle::Italic) => "italic".to_owned(),
+            Some(FaceStyle::Oblique(a, b)) if a == 14.0 && b == 14.0 => "oblique".to_owned(),
+            Some(FaceStyle::Oblique(a, b)) if a == b => format!("oblique {}deg", css_number(a)),
+            Some(FaceStyle::Oblique(a, b)) => format!("oblique {}deg {}deg", css_number(a), css_number(b)),
+        },
+        "font-weight" => range(rule.weight, "", "normal"),
+        "font-stretch" => range(rule.stretch, "%", "normal"),
+        "unicode-range" => match &rule.unicode_range {
+            None => "U+0-10FFFF".to_owned(),
+            Some(r) => r
+                .iter()
+                .map(|&(a, b)| if a == b { format!("U+{a:X}") } else { format!("U+{a:X}-{b:X}") })
+                .collect::<Vec<_>>()
+                .join(", "),
+        },
+        "font-display" => match rule.display {
+            FontDisplay::Auto => "auto",
+            FontDisplay::Block => "block",
+            FontDisplay::Swap => "swap",
+            FontDisplay::Fallback => "fallback",
+            FontDisplay::Optional => "optional",
+        }
+        .to_owned(),
+        "size-adjust" => rule.size_adjust.map_or("100%".to_owned(), |v| format!("{}%", css_number(v * 100.0))),
+        "ascent-override" => percent(rule.ascent_override),
+        "descent-override" => percent(rule.descent_override),
+        "line-gap-override" => percent(rule.line_gap_override),
+        _ => String::new(),
     }
 }
 
@@ -100,6 +251,12 @@ pub fn parse_font_face_block(input: &mut Parser<'_, '_>) -> Option<FontFaceRule>
         weight: parser.weight.flatten(),
         style: parser.style.flatten(),
         stretch: parser.stretch.flatten(),
+        unicode_range: parser.unicode_range,
+        display: parser.display,
+        size_adjust: parser.size_adjust,
+        ascent_override: parser.ascent_override,
+        descent_override: parser.descent_override,
+        line_gap_override: parser.line_gap_override,
     })
 }
 
@@ -111,6 +268,32 @@ struct Descriptors {
     weight: Option<Option<(f32, f32)>>,
     style: Option<Option<FaceStyle>>,
     stretch: Option<Option<(f32, f32)>>,
+    unicode_range: Option<Arc<[(u32, u32)]>>,
+    display: FontDisplay,
+    size_adjust: Option<f32>,
+    ascent_override: Option<f32>,
+    descent_override: Option<f32>,
+    line_gap_override: Option<f32>,
+}
+
+/// A `<percentage [0,∞]>` as a fraction.
+fn parse_fraction<'i>(input: &mut Parser<'i, '_>) -> Result<f32, ParseError<'i, ()>> {
+    let location = input.current_source_location();
+    match input.next()?.clone() {
+        Token::Percentage { unit_value, .. } if unit_value >= 0.0 => Ok(unit_value),
+        t => Err(location.new_unexpected_token_error(t)),
+    }
+}
+
+/// `normal` (`None`) or a `<percentage [0,∞]>`.
+fn parse_metric_override<'i>(input: &mut Parser<'i, '_>) -> Result<Option<f32>, ParseError<'i, ()>> {
+    if input.try_parse(|i| i.expect_ident_matching("normal")).is_ok() {
+        input.expect_exhausted()?;
+        return Ok(None);
+    }
+    let v = parse_fraction(input)?;
+    input.expect_exhausted()?;
+    Ok(Some(v))
 }
 
 impl<'i> DeclarationParser<'i> for Descriptors {
@@ -141,8 +324,50 @@ impl<'i> DeclarationParser<'i> for Descriptors {
                 let s = parse_auto(input, |i| parse_range(i, parse_stretch))?;
                 self.stretch = Some(s);
             },
-            // `unicode-range`, `font-display`, `font-feature-settings`,
-            // `ascent-override` and the like: a later part of web fonts.
+            "unicode-range" => {
+                let list = input.parse_comma_separated(|i| {
+                    let r = cssparser::UnicodeRange::parse(i)?;
+                    // A range past the last code point or reversed is
+                    // invalid.
+                    if r.start > r.end || r.end > 0x10FFFF {
+                        return Err(i.new_custom_error(()));
+                    }
+                    Ok((r.start, r.end))
+                })?;
+                let mut list = list;
+                list.sort_unstable();
+                let mut merged: Vec<(u32, u32)> = Vec::with_capacity(list.len());
+                for (a, b) in list {
+                    match merged.last_mut() {
+                        Some(last) if a <= last.1.saturating_add(1) => last.1 = last.1.max(b),
+                        _ => merged.push((a, b)),
+                    }
+                }
+                self.unicode_range = Some(Arc::from(merged));
+            },
+            "font-display" => {
+                let id = input.expect_ident()?.clone();
+                let d = match_ignore_ascii_case! { &id,
+                    "auto" => FontDisplay::Auto,
+                    "block" => FontDisplay::Block,
+                    "swap" => FontDisplay::Swap,
+                    "fallback" => FontDisplay::Fallback,
+                    "optional" => FontDisplay::Optional,
+                    _ => return Err(input.new_custom_error(())),
+                };
+                input.expect_exhausted()?;
+                self.display = d;
+            },
+            "size-adjust" => {
+                let v = parse_fraction(input)?;
+                input.expect_exhausted()?;
+                self.size_adjust = Some(v);
+            },
+            "ascent-override" => self.ascent_override = parse_metric_override(input)?,
+            "descent-override" => self.descent_override = parse_metric_override(input)?,
+            "line-gap-override" => self.line_gap_override = parse_metric_override(input)?,
+            // `font-feature-settings` and `font-variation-settings`: Phase
+            // 5, Style (rarely used).
             _ => {
                 while input.next().is_ok() {}
             },
@@ -505,15 +730,29 @@ mod tests {
         assert_eq!((g[0].weight, g[0].style, g[0].stretch), (None, Some(FaceStyle::Oblique(10.0, 20.0)), Some((50.0, 200.0))));
         assert_eq!((g[1].weight, g[1].style), (Some((300.0, 300.0)), None), "an out-of-range value is a parse error: the earlier one stays");
         assert_eq!(g[0].matched_ranges().0, (400.0, 400.0), "auto matches as normal");
+        let h = faces(
+            "@font-face { font-family: L; src: url(l.woff2); unicode-range: U+0100-024F, U+0000-00FF, U+4??, U+1E00; font-display: swap; \
+               size-adjust: 90%; ascent-override: 95%; descent-override: normal; line-gap-override: 0% }\
+             @font-face { font-family: M; src: url(m.woff2); unicode-range: U+110000; font-display: soon; size-adjust: -5% }",
+        );
+        assert_eq!(h[0].unicode_range.as_deref(), Some(&[(0, 0x24F), (0x400, 0x4FF), (0x1E00, 0x1E00)][..]), "sorted, merged, wildcards");
+        assert!(h[0].covers(0x41) && h[0].covers(0x4AF) && !h[0].covers(0x500) && !h[0].covers(0x1E01));
+        assert_eq!(h[0].display, FontDisplay::Swap);
+        assert_eq!((h[0].size_adjust, h[0].ascent_override, h[0].descent_override, h[0].line_gap_override), (Some(0.9), Some(0.95), None, Some(0.0)));
+        assert_eq!(
+            (h[1].unicode_range.is_none(), h[1].display, h[1].size_adjust),
+            (true, FontDisplay::Auto, None),
+            "invalid values are parse errors: the initial values stay"
+        );
     }
 
     fn face(weight: (f32, f32), style: FaceStyle, stretch: (f32, f32)) -> FontFaceRule {
         FontFaceRule {
             family: Arc::from("F"),
-            sources: Vec::new(),
             weight: Some(weight),
             style: Some(style),
             stretch: Some(stretch),
+            ..Default::default()
         }
     }
 
