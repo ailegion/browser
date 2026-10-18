@@ -224,6 +224,9 @@ pub(crate) struct BoxNode {
     /// line); its fragment is moved left of the content edge by its
     /// width.
     pub hangs: bool,
+    /// For an element's box: the nesting depth the builder built it at,
+    /// so incremental layout (`incremental.rs`) builds it again exactly.
+    pub depth: usize,
 }
 
 impl BoxNode {
@@ -239,6 +242,7 @@ impl BoxNode {
             scroll: None,
             marker: None,
             hangs: false,
+            depth: 0,
         }
     }
 
@@ -1381,7 +1385,50 @@ impl BoxBuilder<'_> {
     /// `will-change` promising one (CSS Transforms 1 §3).
     /// Build a block-level or atomic box for an element.
     fn build_element(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
-        self.build_element_box(id, style, depth)
+        let mut b = self.build_element_box(id, style, depth);
+        b.depth = depth;
+        b
+    }
+
+    /// Incremental layout: the box of element (or pseudo-element) `id`
+    /// built again at the depth it was built at (an in-flow, atomic or
+    /// out-of-flow element box). `None` when it has no box now.
+    pub(crate) fn rebuild_element(&self, id: NodeId, depth: usize) -> Option<BoxNode> {
+        let style = self.style_of(id)?;
+        if style.display.is_none() {
+            return None;
+        }
+        Some(self.build_element(id, style, depth))
+    }
+
+    /// Incremental layout: a table cell's box built again.
+    pub(crate) fn rebuild_cell(&self, id: NodeId, depth: usize) -> Option<CellBox> {
+        let style = self.style_of(id)?;
+        (style.display == Display::TableCell).then(|| self.build_cell(id, style, depth))
+    }
+
+    /// Incremental layout: a table caption's box built again (a caption
+    /// that is a table is laid out as a block, as `build_table` does).
+    pub(crate) fn rebuild_caption(&self, id: NodeId, depth: usize) -> Option<BoxNode> {
+        let style = self.style_of(id)?;
+        if style.display != Display::TableCaption {
+            return None;
+        }
+        let mut caption = self.build_element(id, style, depth);
+        if let BoxKind::Table(_) = caption.kind {
+            caption = BoxNode::new(BoxKind::Block, Some(id), caption.style.clone());
+            caption.depth = depth;
+        }
+        Some(caption)
+    }
+
+    /// The generated content worked out for this build.
+    pub(crate) fn take_generated(&mut self) -> Generated {
+        std::mem::take(&mut self.generated)
+    }
+
+    pub(crate) fn generated(&self) -> &Generated {
+        &self.generated
     }
 
     fn build_element_box(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
@@ -1783,6 +1830,7 @@ impl BoxBuilder<'_> {
 
     fn cell_box(&self, node: Option<NodeId>, style: Arc<ComputedStyle>, children: &[Kid], depth: usize) -> CellBox {
         let mut b = BoxNode::new(BoxKind::Block, node, style.clone());
+        b.depth = depth;
         b.children = if depth < MAX_DEPTH { self.build_children_from(children, &style, depth + 1) } else { Vec::new() };
         b.anonymous = node.is_none();
         b.plan_scrolling();

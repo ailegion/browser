@@ -643,6 +643,27 @@ remaining lists as they stand.
       image source selection, the device scale and the layout width),
       `currentSrc`, the density giving the intrinsic size, and selection
       run again when the viewport or scale changes.
+- [x] 6n. Large-page speed (owner, 2026-10-19; iana.org/protocols took
+      ~20 s to load in the release shell and did not scroll). Timing log
+      kept for good: a `perf` line per tab batch (events by kind, script,
+      restyle, layout, paint, why each restyle or layout was asked, heap),
+      per shell frame (render, input-to-frame latency, heap) and per layout
+      (phases, taffy runs, measures, text layouts built/reused/reshaped,
+      table and cell layouts, atomics, boxes rebuilt); the counting
+      allocator (`browser-platform`) for heap figures in the shell and the
+      tests; the probe's "read down the page" scroll sequence; the
+      browser opens at 1280×720 (owner). Found: iana's 8 tables at 1024 px
+      cost 2–4 s per layout, every cell laid out several times, its text
+      shaped ~12 times. Fixed, output unchanged (every fragment equal on
+      iana and Wikipedia at 1024 and 800, `shortcuts_on_saved_pages`): an
+      atomic that does not depend on its line's width is laid out once per
+      clamped width (§10.3.9); an inline root keeps its intrinsic line
+      layouts; a cell of one inline run takes its intrinsic widths from its
+      text; an inline root keeps its shaped paragraphs within a layout and
+      only breaks and aligns lines for another width; a cell keeps its
+      results per width. iana load in the shell 14.5 s → 8.1 s, its
+      layouts 2.9–4.0 s → 0.9–1.4 s; Wikipedia relayout 121 → 62 ms; heap
+      peak on iana during a layout 503 → 630 MiB (freed after).
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,
@@ -2863,7 +2884,9 @@ Exit criteria:
 Goal: fewer broken sites. This phase does not end; items are prioritized by
 what breaks the most pages.
 
-- Incremental layout (owner's 2026-10-18 placement; found with "Working
+- Incremental layout: brought forward by the owner on 2026-10-19, design
+  in `07-incremental-layout.md` (go given), blocks B1–B4; B1 done
+  2026-10-19 (record there). Original placement: (owner's 2026-10-18 placement; found with "Working
   sites first" 6i: every layout-affecting change lays out the whole page,
   ~550 ms on iana.org/protocols' 79,526 nodes, ~120 ms on Wikipedia's Main
   Page, and a web font arriving after load does the same). A core change

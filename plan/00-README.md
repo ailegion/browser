@@ -69,3 +69,4 @@ than writing it. When none exists, write it.
 | `04-roadmap.md` | Phases 0 to 5 with exit criteria |
 | `05-risks-and-open-items.md` | Risks and the few genuinely open implementation details |
 | `06-unsafe-baseline.md` | Per-crate unsafe counts from Phase 0; compare at every phase boundary |
+| `07-incremental-layout.md` | Design of incremental layout (B), for the owner's go |

@@ -68,6 +68,10 @@ pub struct LayoutEngine {
     /// The installed fonts by full and PostScript name, lowercased, for
     /// `local()` sources; read the first time one is asked for.
     local_names: Option<HashMap<String, (fontique::Blob<u8>, u32)>>,
+    /// Incremental layout (`incremental.rs`): the box tree of the last
+    /// layout, and what changed since (unknown until told).
+    kept: Option<crate::incremental::KeptBoxes>,
+    changes: crate::incremental::BoxChanges,
 }
 
 /// A web font registered for the current document.
@@ -162,7 +166,27 @@ impl LayoutEngine {
             web_fonts: Vec::new(),
             web_families: Vec::new(),
             local_names: None,
+            kept: None,
+            changes: crate::incremental::BoxChanges::Unknown,
         }
+    }
+
+    /// Incremental layout: since the last layout, the computed styles of
+    /// `elements` changed (in any value) or their attributes did, and the
+    /// children of `parents` changed. The next layout rebuilds only the
+    /// boxes these can affect.
+    pub fn note_box_changes(&mut self, elements: &[NodeId], parents: &[NodeId]) {
+        if let crate::incremental::BoxChanges::Known { elements: e, parents: p } = &mut self.changes {
+            e.extend_from_slice(elements);
+            p.extend_from_slice(parents);
+        }
+    }
+
+    /// Incremental layout: something changed that is not described (a
+    /// new document, a full restyle, an image's size): the next layout
+    /// builds every box.
+    pub fn note_unknown_box_change(&mut self) {
+        self.changes = crate::incremental::BoxChanges::Unknown;
     }
 
     /// Register a web font's data ("Working sites first" line 6): a
@@ -493,6 +517,8 @@ impl LayoutEngine {
         viewport_height: f32,
         images: &dyn ImageSizes,
     ) -> LayoutTree {
+        // Any document: every box built.
+        self.note_unknown_box_change();
         self.layout_with_scrolls(doc, styles, viewport_width, viewport_height, images, &HashMap::new(), (0.0, 0.0))
     }
 
@@ -518,7 +544,39 @@ impl LayoutEngine {
         let t_start = std::time::Instant::now();
         COUNTERS.with(|c| c.set(Counters::default()));
         let vo = viewport_overflow(doc, styles);
-        let builder = BoxBuilder::new(doc, styles, images, vo.source);
+        let mut builder = BoxBuilder::new(doc, styles, images, vo.source);
+        // The boxes: the kept tree with what changed rebuilt
+        // (`incremental.rs`), else every box built.
+        let changes = std::mem::replace(
+            &mut self.changes,
+            crate::incremental::BoxChanges::Known { elements: Vec::new(), parents: Vec::new() },
+        );
+        let mut kept = self.kept.take();
+        let incremental = match &mut kept {
+            Some(k) => crate::incremental::rebuild(k, &mut self.oofs, &builder, doc, &changes, vo.source),
+            None => false,
+        };
+        let html_box = if incremental {
+            let mut root = kept.take().map(|k| k.root);
+            if let Some(r) = &mut root {
+                crate::incremental::reset(r);
+            }
+            for o in &mut self.oofs {
+                if let Some(n) = &mut o.node {
+                    crate::incremental::reset(n);
+                }
+            }
+            root
+        } else {
+            counters(|c| c.full = true);
+            // What a failed rebuild left in the list goes.
+            builder.oofs.borrow_mut().clear();
+            let root = builder.build_root();
+            // The absolutely positioned and fixed boxes, out of their flows.
+            self.oofs = builder.oofs.take();
+            root
+        };
+        let generated = builder.take_generated();
         let root_style = Arc::new(ComputedStyle::initial());
         let viewport_rect = Rect::new(0.0, 0.0, viewport_width, viewport_height);
         let empty_viewport = |overflow: ViewportOverflow| ScrollInfo {
@@ -538,7 +596,7 @@ impl LayoutEngine {
             rtl: false,
             offset: (0.0, 0.0),
         };
-        let Some(mut html) = builder.build_root() else {
+        let Some(mut html) = html_box else {
             let mut empty = LayoutTree {
                 root: Fragment {
                     rect: viewport_rect,
@@ -580,8 +638,6 @@ impl LayoutEngine {
             caret_room: false,
         });
 
-        // The absolutely positioned and fixed boxes, out of their flows.
-        self.oofs = builder.oofs.take();
         let t_boxes = t_start.elapsed();
         self.prepare_markers(&mut html);
 
@@ -704,6 +760,8 @@ impl LayoutEngine {
             table_layouts = c.table_layouts,
             cell_layouts = c.cell_layouts,
             independent_layouts = c.independent_layouts,
+            full_box_build = c.full,
+            boxes_rebuilt = c.boxes_rebuilt,
             boxes_ms = ms(t_boxes),
             taffy_tree_ms = ms(t_taffy_tree),
             passes = pass,
@@ -714,6 +772,39 @@ impl LayoutEngine {
             oofs = self.oofs.len(),
             "layout phases"
         );
+        // The boxes stay for the next layout, without what this layout
+        // left on them (its line layouts, shaping, results), which the
+        // next one does not use.
+        crate::incremental::reset(&mut html);
+        for o in &mut self.oofs {
+            if let Some(n) = &mut o.node {
+                crate::incremental::reset(n);
+            }
+        }
+        self.kept = Some(crate::incremental::KeptBoxes {
+            root: html,
+            generated,
+            viewport_source: vo.source,
+        });
+        // `BROWSER_VERIFY_LAYOUT=1`: an incremental layout checked against
+        // a full one, any difference logged with the changes behind it.
+        if incremental && std::env::var_os("BROWSER_VERIFY_LAYOUT").is_some() {
+            self.note_unknown_box_change();
+            let full = self.layout_with_scrolls(doc, styles, viewport_width, viewport_height, images, scrolls, page_scroll);
+            let rects = |t: &LayoutTree| {
+                let mut v = Vec::new();
+                t.root.walk(&mut |f| v.push((f.node, f.rect)));
+                v
+            };
+            let (a, b) = (rects(&out), rects(&full));
+            let differ = a.iter().zip(&b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len());
+            if differ > 0 {
+                let first = a.iter().zip(&b).find(|(x, y)| x != y);
+                tracing::warn!(target: "perf", differ, ?first, ?changes, "incremental layout differs from a full layout");
+            } else {
+                tracing::info!(target: "perf", fragments = a.len(), "incremental layout verified");
+            }
+        }
         out
     }
 
@@ -1823,6 +1914,10 @@ struct Counters {
     table_layouts: u32,
     cell_layouts: u32,
     independent_layouts: u32,
+    /// Incremental layout: the element boxes rebuilt (0 with `full`), and
+    /// whether the whole tree was built.
+    boxes_rebuilt: u32,
+    full: bool,
 }
 
 /// The timing log's counters, for the other layout modules.
@@ -1831,6 +1926,7 @@ pub(crate) fn count(f: impl FnOnce(&mut CountersMut)) {
         let mut m = CountersMut {
             table_layouts: &mut c.table_layouts,
             cell_layouts: &mut c.cell_layouts,
+            boxes_rebuilt: &mut c.boxes_rebuilt,
         };
         f(&mut m);
     });
@@ -1840,6 +1936,7 @@ pub(crate) fn count(f: impl FnOnce(&mut CountersMut)) {
 pub(crate) struct CountersMut<'a> {
     pub table_layouts: &'a mut u32,
     pub cell_layouts: &'a mut u32,
+    pub boxes_rebuilt: &'a mut u32,
 }
 
 thread_local! {
@@ -7227,5 +7324,183 @@ mod generated_content {
         assert!(doc.pseudo_element(k, PseudoKind::Before).is_some());
         assert_eq!(text_in(&tree, k), "X");
         assert!(doc.pseudo_element(by_id(&doc, "i"), PseudoKind::Before).is_none());
+    }
+}
+
+/// Incremental layout, block B1: after each kind of change, the layout of
+/// the kept box tree with what changed rebuilt equals a full layout.
+#[cfg(test)]
+mod incremental_layout {
+    use super::*;
+    use browser_style::{Origin, Stylesheet, Stylist, Viewport, compute_styles, sync_pseudo_elements, ua::ua_stylesheet};
+
+    fn by_id(doc: &Document, id: &str) -> NodeId {
+        doc.descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+            .unwrap_or_else(|| panic!("element #{id}"))
+    }
+
+    /// What a layout shows: each fragment's element, box and colour.
+    fn shown(tree: &LayoutTree) -> Vec<(Option<NodeId>, Rect, [u8; 4])> {
+        let mut out = Vec::new();
+        tree.root.walk(&mut |f| {
+            let color = match &f.content {
+                FragmentContent::Text(t) => t.color.to_rgba8(),
+                _ => f.style.background_color.to_rgba8(),
+            };
+            out.push((f.node, f.rect, color));
+        });
+        out
+    }
+
+    /// Lay `html` out, apply `change` (which returns the elements whose
+    /// attributes it changed and the parents whose children it changed),
+    /// restyle, tell the engine what changed, lay out again; the result
+    /// must equal a fresh full layout. Returns the boxes rebuilt counter
+    /// (whether it really was incremental).
+    fn check(html: &str, css: &str, change: impl FnOnce(&mut Document) -> (Vec<NodeId>, Vec<NodeId>)) -> bool {
+        let mut doc = browser_dom::parse_html(html.as_bytes());
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(css, Origin::Author)));
+        let vp = Viewport::default();
+        let styles = compute_styles(&doc, &stylist, &vp);
+        sync_pseudo_elements(&mut doc, &styles);
+        let mut engine = LayoutEngine::new();
+        let none = HashMap::new();
+        let _ = engine.layout_with_scrolls(&doc, &styles, 800.0, 600.0, &(), &none, (0.0, 0.0));
+        let (attrs, parents) = change(&mut doc);
+        let new_styles = compute_styles(&doc, &stylist, &vp);
+        sync_pseudo_elements(&mut doc, &new_styles);
+        // The elements whose style changed, as a restyle reports them.
+        let mut changed: Vec<NodeId> = new_styles
+            .iter()
+            .filter(|(id, s)| styles.get(*id).is_none_or(|old| **old != ***s))
+            .map(|(id, _)| id)
+            .collect();
+        changed.extend(attrs);
+        engine.note_box_changes(&changed, &parents);
+        let incremental = engine.layout_with_scrolls(&doc, &new_styles, 800.0, 600.0, &(), &none, (0.0, 0.0));
+        let was_incremental = !COUNTERS.with(std::cell::Cell::get).full;
+        let full = LayoutEngine::new().layout(&doc, &new_styles, 800.0, 600.0, &());
+        assert_eq!(shown(&incremental), shown(&full), "incremental layout differs from a full one");
+        was_incremental
+    }
+
+    const PAGE: &str = "<body><div id=wrap><p id=p class=a>text <span id=s>in a span</span> more</p>\
+        <ul id=list><li id=l1>one</li><li id=l2>two</li></ul>\
+        <table><tr><td id=c1>cell one</td><td id=c2><i id=ci>cell two</i></td></tr></table>\
+        <div id=box style='position:relative'><span id=ib style='display:inline-block'>inline block</span>\
+        <b id=abs style='position:absolute;left:5px;top:5px'>abs</b></div>\
+        <div id=fl><i style='float:left;width:30px;height:30px'></i><em id=fe>beside the float</em></div>\
+        <ol id=counted><li class=c id=k1>a</li><li class=c id=k2>b</li></ol></div></body>";
+    const CSS: &str = ".a { width: 300px } .b { width: 200px; color: rgb(255, 0, 0) } .red { color: rgb(255, 0, 0) }
+        .blk { display: block } .tag::after { content: attr(data-t) } .c::before { content: counter(list-item) \"/\" }
+        .wide { padding-left: 40px }";
+
+    fn set_attr(doc: &mut Document, id: NodeId, name: &str, value: &str) {
+        if let Some(e) = doc.get_mut(id).as_element_mut() {
+            e.set_attr(name, value);
+        }
+    }
+
+    #[test]
+    fn a_class_toggle_rebuilds_its_part() {
+        assert!(check(PAGE, CSS, |doc| {
+            let p = by_id(doc, "p");
+            set_attr(doc, p, "class", "b");
+            (vec![p], vec![])
+        }));
+    }
+
+    #[test]
+    fn a_colour_only_change_shows_the_new_colour() {
+        assert!(check(PAGE, CSS, |doc| {
+            let s = by_id(doc, "s");
+            set_attr(doc, s, "class", "red");
+            (vec![s], vec![])
+        }));
+    }
+
+    #[test]
+    fn a_display_change_rebuilds_the_parent() {
+        assert!(check(PAGE, CSS, |doc| {
+            let s = by_id(doc, "s");
+            set_attr(doc, s, "class", "blk");
+            (vec![s], vec![])
+        }));
+    }
+
+    #[test]
+    fn inserting_and_removing_list_items_renumbers() {
+        assert!(check(PAGE, CSS, |doc| {
+            let list = by_id(doc, "list");
+            let li = doc.create_html_element("li");
+            let t = doc.create_text("zero");
+            doc.append_child(li, t);
+            let first = by_id(doc, "l1");
+            doc.insert_before(first, li);
+            (vec![], vec![list])
+        }));
+        assert!(check(PAGE, CSS, |doc| {
+            let list = by_id(doc, "list");
+            let l1 = by_id(doc, "l1");
+            doc.remove_subtree(l1);
+            (vec![], vec![list])
+        }));
+    }
+
+    #[test]
+    fn a_text_change_relayouts_its_lines() {
+        assert!(check(PAGE, CSS, |doc| {
+            let s = by_id(doc, "s");
+            let t = doc.first_child(s).expect("text");
+            if let browser_dom::NodeKind::Text(text) = &mut doc.get_mut(t).kind {
+                *text = "a much longer text in the span than before, enough to wrap onto more lines in the paragraph".to_owned();
+            }
+            (vec![], vec![s])
+        }));
+    }
+
+    #[test]
+    fn generated_content_follows_attributes_and_counters() {
+        assert!(check(PAGE, CSS, |doc| {
+            let s = by_id(doc, "s");
+            set_attr(doc, s, "class", "tag");
+            set_attr(doc, s, "data-t", "!");
+            (vec![s], vec![])
+        }));
+        // A list item inserted before others: their counters move.
+        assert!(check(PAGE, CSS, |doc| {
+            let ol = by_id(doc, "counted");
+            let li = doc.create_html_element("li");
+            set_attr(doc, li, "class", "c");
+            let k1 = by_id(doc, "k1");
+            doc.insert_before(k1, li);
+            (vec![li], vec![ol])
+        }));
+    }
+
+    #[test]
+    fn table_cells_inline_blocks_positioned_and_floats() {
+        for id in ["ci", "c1", "ib", "abs", "fe"] {
+            assert!(
+                check(PAGE, CSS, |doc| {
+                    let n = by_id(doc, id);
+                    set_attr(doc, n, "class", "wide");
+                    (vec![n], vec![])
+                }),
+                "#{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_change_to_the_body_builds_everything() {
+        assert!(!check(PAGE, CSS, |doc| {
+            let body = doc.body().expect("body");
+            set_attr(doc, body, "class", "wide");
+            (vec![body], vec![])
+        }));
     }
 }

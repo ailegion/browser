@@ -21,6 +21,7 @@ mod decor;
 mod engine;
 mod formatting;
 mod generated;
+mod incremental;
 mod lines;
 mod positioned;
 pub mod selection;

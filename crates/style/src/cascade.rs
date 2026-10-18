@@ -211,7 +211,7 @@ pub fn compute_styles_with(
 }
 
 /// What an incremental restyle did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Restyled {
     /// A layout-affecting value changed (`ComputedStyle::layout_differs`),
     /// so layout has to run again.
@@ -221,6 +221,9 @@ pub struct Restyled {
     pub repaint: bool,
     /// Elements whose style was recomputed.
     pub styled: usize,
+    /// The elements whose computed style changed (in any value), in the
+    /// order they were restyled: what incremental layout rebuilds.
+    pub changed: Vec<NodeId>,
 }
 
 /// One interaction state changed on the `changed` elements, under `deps`.
@@ -434,6 +437,7 @@ fn run_jobs(
         result.moved |= moved;
     }
     result.styled = restyler.styled;
+    result.changed = std::mem::take(&mut restyler.changed);
     result
 }
 
@@ -492,6 +496,8 @@ struct Restyler<'a> {
     /// Elements whose own state changed: always recomputed. Sorted.
     must: &'a [NodeId],
     styled: usize,
+    /// The elements whose computed style changed.
+    changed: Vec<NodeId>,
 }
 
 impl<'a> Restyler<'a> {
@@ -523,6 +529,7 @@ impl<'a> Restyler<'a> {
             initial: Arc::new(ComputedStyle::initial()),
             must,
             styled: 0,
+            changed: Vec::new(),
         }
     }
 
@@ -586,6 +593,7 @@ impl<'a> Restyler<'a> {
                     styles.insert(id, Arc::new(computed));
                     changed = true;
                     changed_here = true;
+                    self.changed.push(id);
                 }
             }
             if descendants || changed_here {

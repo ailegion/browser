@@ -251,6 +251,13 @@ impl View {
             let r = restyle_mutations(doc, &stylist, &vp, states, &mut self.styles, &self.deps, &delta.changes, &delta.trees);
             // `::before`/`::after` boxes that came or went: their nodes.
             let pseudos = sync_pseudo_elements(doc, &self.styles);
+            // Incremental layout: the boxes these changes reach.
+            if let Some(engine) = &mut self.engine {
+                let mut elements = r.changed.clone();
+                elements.extend(delta.changes.iter().map(|c| c.element));
+                let parents: Vec<NodeId> = delta.trees.iter().map(|t| t.parent).collect();
+                engine.note_box_changes(&elements, &parents);
+            }
             if !r.moved && !delta.layout && !pseudos {
                 if r.repaint
                     && let (Some(engine), Some(layout)) = (&mut self.engine, &mut self.layout)
@@ -265,6 +272,9 @@ impl View {
             self.styles = compute_styles_with(doc, &stylist, &vp, states);
             self.deps = stylist.interaction_deps();
             sync_pseudo_elements(doc, &self.styles);
+            if let Some(engine) = &mut self.engine {
+                engine.note_unknown_box_change();
+            }
         }
         let Some(engine) = &mut self.engine else { return };
         let tree = engine.layout_with_scrolls(

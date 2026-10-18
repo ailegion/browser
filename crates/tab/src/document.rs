@@ -438,6 +438,9 @@ pub(crate) struct TabState {
     layouts: u64,
     /// What the current batch of events costs (the `perf` log line).
     perf: BatchPerf,
+    /// A change the engine could not be told about (it was lent to a
+    /// script): it builds every box at its next layout.
+    box_changes_unknown: bool,
     scene: Scene,
     /// The view lent to scripts: the viewport and what it needs to lay
     /// out; its caches live on between runs.
@@ -623,8 +626,16 @@ struct BatchPerf {
 }
 
 impl TabState {
-    /// Ask for layout, saying why (the timing log lists the reasons).
+    /// Ask for layout, saying why (the timing log lists the reasons). What
+    /// changed is not described: every box is built again.
     fn want_layout(&mut self, why: &'static str) {
+        self.note_unknown_box_change();
+        self.want_layout_noted(why);
+    }
+
+    /// Ask for layout after the changes were told to the engine
+    /// (`note_box_changes`): only their boxes are built again.
+    fn want_layout_noted(&mut self, why: &'static str) {
         self.needs_layout = true;
         if !self.perf.why.contains(&why) {
             self.perf.why.push(why);
@@ -633,9 +644,27 @@ impl TabState {
 
     /// Ask for a full restyle (and so layout), saying why.
     fn want_style(&mut self, why: &'static str) {
+        self.note_unknown_box_change();
         self.needs_style = true;
         if !self.perf.why.contains(&why) {
             self.perf.why.push(why);
+        }
+    }
+
+    /// Incremental layout: tell the engine which elements' styles or
+    /// attributes changed and which parents' children did.
+    fn note_box_changes(&mut self, elements: &[NodeId], parents: &[NodeId]) {
+        match &mut self.engine {
+            Some(engine) => engine.note_box_changes(elements, parents),
+            None => self.box_changes_unknown = true,
+        }
+    }
+
+    /// Incremental layout: something changed that is not described.
+    fn note_unknown_box_change(&mut self) {
+        match &mut self.engine {
+            Some(engine) => engine.note_unknown_box_change(),
+            None => self.box_changes_unknown = true,
         }
     }
 
@@ -732,6 +761,7 @@ impl TabState {
             layout: None,
             layouts: 0,
             perf: BatchPerf::default(),
+            box_changes_unknown: false,
             scene: Scene::new(),
             view: View::default(),
             window_size: (viewport.width, viewport.height),
@@ -2325,10 +2355,13 @@ impl TabState {
         self.perf.restyle += started.elapsed();
         self.perf.partial_restyles += 1;
         self.perf.styled += result.styled;
+        // The boxes of the restyled elements are built again at the next
+        // layout, even when only paint changed (they carry the styles).
+        self.note_box_changes(&result.changed, &[]);
         if result.moved || pseudos {
             // A state may ask for another face (bold on hover): the layout
             // that follows asks for it.
-            self.want_layout(if result.moved { "hover/focus/active restyle moved a box" } else { "hover/focus/active pseudo-element came or went" });
+            self.want_layout_noted(if result.moved { "hover/focus/active restyle moved a box" } else { "hover/focus/active pseudo-element came or went" });
         } else if result.repaint {
             // Paint-only (colours, backgrounds, decorations): the boxes
             // stay where they are and take the new styles.
@@ -2389,8 +2422,15 @@ impl TabState {
         self.perf.restyle += started.elapsed();
         self.perf.partial_restyles += 1;
         self.perf.styled += r.styled;
+        // The boxes to build again: the restyled elements, those whose
+        // attributes changed (a `src`, a `colspan`, a control's value),
+        // and the parents whose children changed.
+        let mut elements = r.changed.clone();
+        elements.extend(delta.changes.iter().map(|c| c.element));
+        let parents: Vec<NodeId> = delta.trees.iter().map(|t| t.parent).collect();
+        self.note_box_changes(&elements, &parents);
         if r.moved || delta.layout || pseudos {
-            self.want_layout(if r.moved {
+            self.want_layout_noted(if r.moved {
                 "script change restyle moved a box"
             } else if delta.layout {
                 "script changed an attribute layout reads"
@@ -2964,6 +3004,11 @@ impl TabState {
         }
         let Some(mut view) = host.reclaim_view() else { return };
         self.engine = view.engine.take();
+        if std::mem::take(&mut self.box_changes_unknown)
+            && let Some(engine) = &mut self.engine
+        {
+            engine.note_unknown_box_change();
+        }
         self.styles = std::mem::take(&mut view.styles);
         self.layout = view.layout.take();
         self.scrolls = std::mem::take(&mut view.element_scrolls);
@@ -4176,6 +4221,10 @@ impl TabState {
         let vp = self.style_viewport();
         self.styles = compute_styles_with(doc, &stylist, &vp, &self.states);
         self.deps = stylist.interaction_deps();
+        // Every style computed afresh: every box built afresh.
+        if let Some(engine) = &mut self.engine {
+            engine.note_unknown_box_change();
+        }
         tracing::debug!(
             tab = self.id.0,
             nodes = doc.node_count(),
