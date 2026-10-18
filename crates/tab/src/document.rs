@@ -231,7 +231,11 @@ fn face_key(face: &Arc<browser_style::fontface::FontFaceRule>) -> usize {
 }
 
 /// The block and swap periods of `font-display` (CSS Fonts 4 §4.9); `None`
-/// is an infinite swap period. `auto` is `block`, as in browsers.
+/// is an infinite swap period. `auto` is `block`, as in browsers. As the
+/// WPT `css-fonts/font-display` reference has it: `block` hides the text
+/// for 3 s, `swap` not at all, `fallback` for 100 ms and swaps within 3 s
+/// after; `optional` shows the fallback at once and takes the face only if
+/// it arrives almost at once (within 100 ms).
 fn display_periods(display: browser_style::fontface::FontDisplay) -> (std::time::Duration, Option<std::time::Duration>) {
     use browser_style::fontface::FontDisplay as D;
     use std::time::Duration;
@@ -239,7 +243,7 @@ fn display_periods(display: browser_style::fontface::FontDisplay) -> (std::time:
         D::Auto | D::Block => (Duration::from_secs(3), None),
         D::Swap => (Duration::ZERO, None),
         D::Fallback => (Duration::from_millis(100), Some(Duration::from_secs(3))),
-        D::Optional => (Duration::from_millis(100), Some(Duration::ZERO)),
+        D::Optional => (Duration::ZERO, Some(Duration::from_millis(100))),
     }
 }
 
@@ -7266,11 +7270,12 @@ mod tests {
         assert_eq!(run_js(&mut h, "try { new FontFace('Z') } catch (e) { e.name }"), "\"TypeError\"");
     }
 
-    /// `font-display`: while a face loads, its text is invisible during the
-    /// block period (`block`: 3 s; `fallback`, `optional`: 100 ms; `swap`:
-    /// none) and shown in the fallback after it; a face arriving in its
-    /// swap period swaps in (`swap`, `fallback`), one arriving after it
-    /// does not (`optional`: no swap period).
+    /// `font-display`, as the WPT `css-fonts/font-display` reference has
+    /// it: while a face loads, its text is invisible during the block
+    /// period (`block`: 3 s; `fallback`: 100 ms; `swap`, `optional`: none)
+    /// and shown in the fallback after it; a face arriving in its swap
+    /// period swaps in (`swap`, `fallback`; `optional` only within 100 ms),
+    /// one arriving after it does not.
     #[test]
     fn font_display_blocks_swaps_and_gives_up() {
         let mut collection = fontique::Collection::new(fontique::CollectionOptions::default());
@@ -7293,9 +7298,11 @@ mod tests {
              @font-face { font-family: B; src: url(/b.ttf); font-display: block } \
              @font-face { font-family: S; src: url(/s.ttf); font-display: swap } \
              @font-face { font-family: F; src: url(/f.ttf); font-display: fallback } \
-             @font-face { font-family: O; src: url(/o.ttf); font-display: optional }</style>\
+             @font-face { font-family: O; src: url(/o.ttf); font-display: optional } \
+             @font-face { font-family: Q; src: url(/q.ttf); font-display: optional }</style>\
              <p style='font-family: B, monospace'>block</p><p style='font-family: S, monospace'>swap</p>\
-             <p style='font-family: F, monospace'>fallback</p><p style='font-family: O, monospace'>optional</p>";
+             <p style='font-family: F, monospace'>fallback</p><p style='font-family: O, monospace'>optional</p>\
+             <p style='font-family: Q, monospace'>soon</p>";
         let server = Server::start_with(
             vec![
                 ("/page".to_owned(), vec![("Content-Type".to_owned(), "text/html; charset=utf-8".to_owned())], page.as_bytes().to_vec()),
@@ -7303,6 +7310,7 @@ mod tests {
                 ("/s.ttf".to_owned(), font.clone(), ttf.clone()),
                 ("/f.ttf".to_owned(), font.clone(), ttf.clone()),
                 ("/o.ttf".to_owned(), font.clone(), ttf.clone()),
+                ("/q.ttf".to_owned(), font.clone(), ttf.clone()),
             ],
             &["/b.ttf", "/s.ttf", "/f.ttf", "/o.ttf"],
         );
@@ -7319,12 +7327,14 @@ mod tests {
             out
         };
         let mut h = Harness::load_url(server.url("/page"));
-        h.pump_until(|h| shown(h).len() == 4 && server.requests("/o.ttf").len() == 1);
+        h.pump_until(|h| shown(h).len() == 5 && server.requests("/o.ttf").len() == 1);
         let s = shown(&h);
         assert_eq!(s["block"], (true, false), "block: invisible while loading");
         assert_eq!(s["swap"], (false, false), "swap: the fallback at once");
         assert_eq!(s["fallback"], (true, false), "fallback: a short block period");
-        assert_eq!(s["optional"], (true, false));
+        assert_eq!(s["optional"], (false, false), "optional: the fallback at once");
+        // An optional face that arrives at once is used.
+        h.pump_until(|h| shown(h).get("soon") == Some(&(false, true)));
         // Past 100 ms: fallback and optional show their fallback; block
         // still waits.
         h.pump_for(std::time::Duration::from_millis(250));

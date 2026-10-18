@@ -211,7 +211,7 @@ remaining lists as they stand.
       tab (resolved tracks). Timing: tables 47–50 ms, blocks 14 ms (run
       to run ±3 ms; line 4 measured 45.4/12.9 once; disabling the grid
       conversion changes nothing measurable).
-- [ ] 6. Web fonts (new 4a entry): `@font-face` with url()+format,
+- [x] 6. Web fonts (new 4a entry): `@font-face` with url()+format,
       fetched through net, used by parley, system fallback until loaded.
       Owner's 2026-10-18 scope (the parts sites use often): also
       `unicode-range`, `font-display`, `local()` sources, the metric
@@ -220,8 +220,9 @@ remaining lists as they stand.
       and the properties `font-optical-sizing` and
       `font-variation-settings`. The rarely used parts are in Phase 5,
       Style.
-      Built 2026-10-18 (not ticked: the owner's call on the parts listed
-      in the report is pending). Style (`fontface.rs`): `@font-face` with
+      Built 2026-10-18. ELSEWHERE (owner, 2026-10-18): live `document.fonts`
+      iteration and descriptor write-back to `@font-face` rules, Phase 5,
+      Style. Style (`fontface.rs`): `@font-face` with
       `src` (`url()` with `format()`/`tech()`, `local()`), `font-weight`/
       `-style`/`-stretch` (`font-width`) ranges and `auto` (the initial),
       `unicode-range`, `font-display`, `size-adjust`, the three metric
@@ -243,11 +244,14 @@ remaining lists as they stand.
       `font-variation-settings` over the weight's variations. `size-adjust`
       and the overrides through the vendored parley; the decoration and
       strut metrics take the first face whose range holds U+0020 and are
-      dropped when web fonts change. `font-display`: invisible text in the
-      block period (`block`/`auto` 3 s, `fallback`/`optional` 100 ms,
-      `swap` none), swap period (`fallback` 3 s, `optional` none), a face
-      arriving after it loaded but unused (`TextFragment::invisible`,
-      tab timers). Script (`fonts.rs`): `FontFace` (from a URL or bytes;
+      dropped when web fonts change. `font-display`, as the WPT
+      `css-fonts/font-display` reference has it: invisible text in the
+      block period (`block`/`auto` 3 s, `fallback` 100 ms, `swap` and
+      `optional` none), swap period (`fallback` 3 s, `optional` 100 ms,
+      the others unbounded), a face arriving after it loaded but unused
+      (`TextFragment::invisible`, tab timers); the invisible text keeps its
+      decoration lines (the block period's face is one whose glyphs have
+      no ink, as Chrome's documentation describes it). Script (`fonts.rs`): `FontFace` (from a URL or bytes;
       descriptors; `status`, `loaded`, `load()`), `document.fonts`
       (set-like; `status`, `ready`, `check`, `load`; `loading`,
       `loadingdone`, `loadingerror`), `FontFaceSetLoadEvent`. Tests: style
@@ -2487,7 +2491,18 @@ what breaks the most pages.
   the `font-feature-settings` and `font-variation-settings` descriptors of
   `@font-face`, one face out of a font collection file (`format(
   collection)`, `.ttc`), `font-style: oblique <angle>` with an explicit
-  angle, and the `font-synthesis` property (and its longhands).
+  angle, and the `font-synthesis` property (and its longhands). Also
+  (owner's 2026-10-18 placement, rarely used): live iteration of
+  `document.fonts` (its iterators follow faces added and deleted during
+  iteration, as a set's do; today they iterate a copy), and a descriptor
+  set on a CSS-connected `FontFace` writing back to its `@font-face`
+  rule (today it changes the `FontFace` only); verified against the
+  browsers and corrected where they differ: `opsz` under
+  `font-optical-sizing: auto` for a face with `size-adjust` (today the
+  element's font size, before the adjustment), what `FontFace`'s
+  attributes read back (today `weight: 'bold'` reads `700` and `family`
+  is unquoted), and `document.fonts.check()` for a matching face that
+  failed to load (today false).
 - Images: SVG via `usvg` to vello, `<picture>` and `srcset`, lazy loading.
 - Web APIs: `WebSocket`, Canvas 2D on vello, `postMessage`, `iframe`
   (each frame is its own document on the same tab thread), `Web Workers`
