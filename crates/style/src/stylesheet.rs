@@ -283,9 +283,30 @@ impl<'i> AtRuleParser<'i> for TopLevel {
                 };
                 let _ = input.try_parse(|i| skip_function(i, "layer"));
                 let _ = input.try_parse(|i| i.expect_ident_matching("layer"));
-                let _ = input.try_parse(|i| skip_function(i, "supports"));
+                // `supports(<supports-condition> | <declaration>)`: an
+                // import whose condition does not hold is not made.
+                let supported = input
+                    .try_parse(|i| {
+                        i.expect_function_matching("supports")?;
+                        i.parse_nested_block(|i| {
+                            Ok::<_, ParseError<'i, ()>>(
+                                i.try_parse(supports_condition).unwrap_or_else(|_| supports_declaration(i)),
+                            )
+                        })
+                    })
+                    .unwrap_or(true);
                 let media = if input.is_exhausted() { MediaQueryList::all() } else { MediaQueryList::parse(input) };
+                if !supported {
+                    return Ok(AtPrelude::Ignore);
+                }
                 AtPrelude::Import(url, media)
+            },
+            // CSS Conditional 3 §2: the block applies when the condition
+            // holds; a prelude that does not parse is false.
+            "supports" => {
+                let holds = input.parse_entirely(supports_condition).unwrap_or(false);
+                while input.next().is_ok() {}
+                if holds { AtPrelude::Flatten } else { AtPrelude::Ignore }
             },
             "layer" => {
                 while input.next().is_ok() {}
@@ -296,7 +317,7 @@ impl<'i> AtRuleParser<'i> for TopLevel {
                 input.expect_exhausted()?;
                 AtPrelude::FontFace
             },
-            "supports" | "container" | "keyframes" | "-webkit-keyframes" | "page"
+            "container" | "keyframes" | "-webkit-keyframes" | "page"
             | "charset" | "namespace" | "font-feature-values" | "counter-style" | "property"
             | "scope" | "starting-style" | "view-transition" => {
                 while input.next().is_ok() {}
@@ -342,6 +363,92 @@ impl<'i> AtRuleParser<'i> for TopLevel {
             }
         }
     }
+}
+
+/// `<supports-condition>` (CSS Conditional 3 §2.1, 4 §2): `not` one
+/// part, or parts joined by `and` alone or `or` alone (mixing them without
+/// parentheses does not parse).
+fn supports_condition<'i>(input: &mut Parser<'i, '_>) -> Result<bool, ParseError<'i, ()>> {
+    if input.try_parse(|i| i.expect_ident_matching("not")).is_ok() {
+        return Ok(!supports_in_parens(input)?);
+    }
+    let first = supports_in_parens(input)?;
+    let mut result = first;
+    let mut joiner: Option<bool> = None;
+    loop {
+        let and = if input.try_parse(|i| i.expect_ident_matching("and")).is_ok() {
+            true
+        } else if input.try_parse(|i| i.expect_ident_matching("or")).is_ok() {
+            false
+        } else {
+            break;
+        };
+        if joiner.is_some_and(|j| j != and) {
+            return Err(input.new_custom_error(()));
+        }
+        joiner = Some(and);
+        let next = supports_in_parens(input)?;
+        result = if and { result && next } else { result || next };
+    }
+    Ok(result)
+}
+
+/// `<supports-in-parens>`: a parenthesized condition or declaration, a
+/// `selector()`, `font-format()` or `font-tech()` test, or anything else
+/// in parentheses or a function (`<general-enclosed>`, false).
+fn supports_in_parens<'i>(input: &mut Parser<'i, '_>) -> Result<bool, ParseError<'i, ()>> {
+    let location = input.current_source_location();
+    let token = input.next()?.clone();
+    match token {
+        cssparser::Token::ParenthesisBlock => input.parse_nested_block(|i| {
+            if let Ok(b) = i.try_parse(|i| i.parse_entirely(supports_condition)) {
+                return Ok(b);
+            }
+            Ok(supports_declaration(i))
+        }),
+        cssparser::Token::Function(name) => {
+            let name = name.to_ascii_lowercase();
+            input.parse_nested_block(|i| {
+                let start = i.position();
+                while i.next().is_ok() {}
+                let text = i.slice_from(start).trim().to_owned();
+                Ok(match name.as_str() {
+                    // A complex selector the engine parses.
+                    "selector" => parse_selectors_text(&text),
+                    "font-format" => matches!(
+                        text.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase().as_str(),
+                        "woff2" | "woff" | "truetype" | "opentype" | "collection"
+                    ),
+                    "font-tech" => text.eq_ignore_ascii_case("variations"),
+                    _ => false,
+                })
+            })
+        }
+        t => Err(location.new_unexpected_token_error(t)),
+    }
+}
+
+fn parse_selectors_text(text: &str) -> bool {
+    let mut input = ParserInput::new(text);
+    let mut p = Parser::new(&mut input);
+    parse_selectors(&mut p).is_some() && !text.contains(',')
+}
+
+/// `<declaration>` inside parentheses: supported when the property is one
+/// the engine knows (or a custom property) and the value parses for it.
+fn supports_declaration(input: &mut Parser<'_, '_>) -> bool {
+    let start = input.position();
+    while input.next().is_ok() {}
+    let text = input.slice_from(start).trim();
+    let Some((name, value)) = text.split_once(':') else { return false };
+    let (name, value) = (name.trim(), value.trim());
+    if name.is_empty() || value.is_empty() || name.contains(char::is_whitespace) {
+        return false;
+    }
+    if name.starts_with("--") {
+        return true;
+    }
+    !parse_declaration_block(&format!("{name}:{value}")).is_empty()
 }
 
 /// Rules inside a block (`@media { ... }`).
@@ -565,6 +672,31 @@ mod tests {
         let Rule::Style(a) = &sheet.rules[5] else { panic!() };
         // nested rule skipped, padding after it kept
         assert_eq!(a.declarations.len(), 5);
+    }
+
+    /// "Working sites first" line 6d: `@supports` applies its block when
+    /// the condition holds, by the engine's own parsers.
+    #[test]
+    fn supports_blocks_apply_when_their_condition_holds() {
+        let holds = |cond: &str| Stylesheet::parse(&format!("@supports {cond} {{ p {{ color: red }} }}"), Origin::Author).rule_count() == 1;
+        assert!(holds("(-webkit-mask-image:none) or (mask-image:none)"), "Wikipedia's icons");
+        assert!(!holds("not ((-webkit-mask-image:none) or (mask-image:none))"), "and its fallback");
+        assert!(holds("(display: grid) and (not (display: nonsense))"));
+        assert!(!holds("(display: nonsense)"));
+        assert!(!holds("(no-such-property: 1px)"));
+        assert!(holds("(--anything: whatever value)"));
+        assert!(holds("(color: var(--x))"), "var() is valid at parse time");
+        assert!(holds("((color: red))"));
+        assert!(holds("selector(a > b:hover)"));
+        assert!(!holds("selector(a >>> b)"));
+        assert!(holds("font-format(woff2)") && !holds("font-tech(color-COLRv1)"));
+        assert!(!holds("(a: b) and (c: d) or (e: f)"), "and with or needs parentheses");
+        assert!(!holds("unknown-function(x)"), "general-enclosed is false");
+        assert!(!holds("garbage"));
+        // Nested in @media, and @import's supports().
+        assert_eq!(Stylesheet::parse("@media all { @supports (display: flex) { p { color: red } } }", Origin::Author).rule_count(), 1);
+        let s = Stylesheet::parse("@import url(a.css) supports(display: grid); @import url(b.css) supports(display: nonsense);", Origin::Author);
+        assert_eq!(s.imports.iter().map(|(u, _)| u.as_str()).collect::<Vec<_>>(), ["a.css"]);
     }
 
     #[test]

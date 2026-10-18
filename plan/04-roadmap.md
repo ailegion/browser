@@ -284,16 +284,18 @@ remaining lists as they stand.
       lines, the `grid-template` area form). Timing: tables 49.3–50.0 ms
       (48.0 before), blocks 14.4–15.1 ms (13.5), Hacker News relayout
       38.9–41.2 ms (38.5–39.7): slower, not attributed.
-- [x] 6b. SVG images (moved up from Phase 5, Images, by the owner,
+- [ ] 6b. SVG images (moved up from Phase 5, Images, by the owner,
       2026-10-18, for Wikipedia's logo and icons): SVG in `<img>`, CSS
       images (`background-image`, `list-style-image`, `content`) and
       `data:` URLs, via `usvg` to vello.
-      Done 2026-10-18. Paint (`decode_svg`, `ImageStore::insert_svg`,
-      `draw_svg`): an image response that is not a raster image is parsed
-      as SVG (or SVGZ) by `usvg` and turned into a vello scene by
-      `vello_svg` once; its size is the root's width/height (its viewBox
-      without them); wherever images are drawn (`<img>` and the image
-      fragments of list markers and `content`, background layers, mask
+      Built 2026-10-18, not done: `content` images wait for 6e (the engine
+      has no `::before`/`::after`; the first record said `content` images
+      were covered, which was false). Paint (`decode_svg`,
+      `ImageStore::insert_svg`, `draw_svg`): an image response that is not
+      a raster image is parsed as SVG (or SVGZ) by `usvg` and turned into
+      a vello scene by `vello_svg` once; its size is the root's
+      width/height (its viewBox without them); wherever images are drawn
+      (`<img>` and list markers' image fragments, background layers, mask
       layers) the scene is appended scaled to the destination and clipped
       to it, vector at any scale. As an image it loads nothing else
       (external `href`s not followed); text through `fontdb`, the installed
@@ -325,6 +327,34 @@ remaining lists as they stand.
       luminance, a missing image). Timing: tables 50.4–51.9 ms (49.3–50.0
       before), blocks 14.7–15.4 ms (14.4–15.1), Hacker News relayout
       39.4–40.2 ms and restyle 2.5–2.6 ms (2.1): slower.
+- [x] 6d. `@supports` (owner, 2026-10-18; Wikipedia's icons set their
+      mask size, position and repeat inside it, and the parser drops every
+      `@supports` block): the condition parsed (`(property: value)` tested
+      with the engine's own property parser, custom properties, `not`,
+      `and`, `or`, nested parentheses, `selector()`), the block applied
+      when it holds; `@import … supports()` likewise.
+      Done 2026-10-18 (`stylesheet.rs`: `supports_condition`,
+      `supports_in_parens`, `supports_declaration`): a declaration holds
+      when the property is known (or custom) and the value parses
+      (`var()` valid at parse time); `and` and `or` mixed without
+      parentheses do not parse (false); `selector()` by the engine's
+      selector parser; `font-format()` and `font-tech()` by the web-font
+      formats and technologies supported; other functions and parenthesized
+      text false (`<general-enclosed>`); a holding block's rules apply as
+      if unwrapped, nested in `@media` too; an `@import` whose
+      `supports()` fails is not made. Tests: style (Wikipedia's conditions
+      and their fallback, `not`/`and`/`or`, nesting, custom properties,
+      `var()`, unknown properties and values, `selector()`, the font
+      tests, mixed operators, general-enclosed, `@import`). Timing: tables
+      51.4–51.8 ms (50.5–51.6 before), blocks 14.6–14.8 ms (14.5), Hacker
+      News relayout 40.6–42.1 ms (41.1–42.1).
+- [ ] 6e. Generated content (owner, 2026-10-18; not in the plan before,
+      and used by most sites): `::before` and `::after` matched in the
+      cascade and given boxes; `content` with strings, `url()` images (6b's
+      `content` part), `attr()`, counters (`counter()`, `counters()`,
+      `counter-reset`, `-increment`, `-set`) and quotes (`quotes`,
+      `open-quote`, `close-quote`, `no-open-quote`, `no-close-quote`);
+      `getComputedStyle` for the pseudo-elements.
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,
