@@ -162,6 +162,26 @@ pub struct StateRule {
     pub scope: Scope,
 }
 
+/// A part of an element a DOM change can alter that selectors test: one
+/// class, the id, or one attribute (lowercase name; `class` and `id` are
+/// attributes too, for `[class~=x]` and `[id]`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Feature {
+    Class(String),
+    Id(String),
+    Attr(String),
+}
+
+/// One way a change of a feature on an element can alter the style of
+/// other elements: when `trigger` matches the changed element (a key that
+/// is itself a changed feature counts as matching: the element may have
+/// just lost it), the elements in `scope` may match differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationRule {
+    pub trigger: SubjectKey,
+    pub scope: Scope,
+}
+
 /// The reach of each state under the current stylesheets (a summary for
 /// logging and tests), and the rules that say exactly what a change can
 /// affect. A changed element is always recomputed itself.
@@ -172,6 +192,10 @@ pub struct InteractionDeps {
     pub focus: Reach,
     pub target: Reach,
     pub rules: Vec<StateRule>,
+    /// For each class, id and attribute a selector tests outside its
+    /// subject compound (or inside a `:has()`), what changing it on an
+    /// element can affect beyond that element (DOM-change invalidation).
+    pub mutation: std::collections::HashMap<Feature, Vec<MutationRule>>,
 }
 
 impl InteractionDeps {

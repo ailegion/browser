@@ -18,7 +18,9 @@ use crate::computed::{ComputedStyle, DeclaredValues, Viewport, compute};
 use crate::custom::{expand_pending, resolve_customs};
 use crate::properties::{CustomValue, Declaration, DeclaredValue};
 use crate::selector_impl::{BrowserSelectors, ElementRef, PseudoClass};
-use crate::state::{ElementStates, InteractionDeps, NO_STATES, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
+use crate::state::{
+    ElementStates, Feature, InteractionDeps, MutationRule, NO_STATES, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys,
+};
 use crate::stylesheet::{Origin, Rule, StyleRule, Stylesheet, parse_declaration_block};
 
 /// Computed style per element. Text nodes have no entry; use the parent's.
@@ -231,22 +233,83 @@ pub fn restyle(
     if changed.is_empty() || deps.reach(state) == Reach::None {
         return Restyled::default();
     }
+    let scopes = changed.iter().map(|&e| {
+        let found: Vec<&Scope> = match doc.element(e) {
+            Some(element) => deps.rules_for(state).filter(|r| r.trigger.matches(element)).map(|r| &r.scope).collect(),
+            None => Vec::new(),
+        };
+        (e, found)
+    });
+    let jobs = plan_jobs(doc, scopes.collect(), changed);
+    run_jobs(doc, stylist, viewport, states, styles, changed, &jobs)
+}
 
+/// One element's DOM change: the classes, id and attributes that changed
+/// on it (added, removed or given another value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeatureChange {
+    pub element: NodeId,
+    pub features: Vec<Feature>,
+}
+
+/// Recompute, in place, the styles DOM changes to classes, ids and
+/// attributes can affect (Blink's and Gecko's invalidation sets, in their
+/// simplest form): each changed element; for each rule of a changed
+/// feature whose trigger matches the element, the elements its scope
+/// names; and the descendants of any element whose computed style did
+/// change. A `style` attribute change is a change of the element itself.
+pub fn restyle_mutations(
+    doc: &Document,
+    stylist: &Stylist,
+    viewport: &Viewport,
+    states: &ElementStates,
+    styles: &mut StyleMap,
+    deps: &InteractionDeps,
+    changes: &[FeatureChange],
+) -> Restyled {
+    let changed: Vec<NodeId> = changes.iter().map(|c| c.element).filter(|&e| doc.element(e).is_some()).collect();
+    if changed.is_empty() {
+        return Restyled::default();
+    }
+    let scopes = changes.iter().filter_map(|c| {
+        let element = doc.element(c.element)?;
+        // A key naming a changed feature counts as matching: the element
+        // may have just lost that class or id.
+        let changed_key = |key: &SubjectKey| match key {
+            SubjectKey::Class(n) => c.features.iter().any(|f| matches!(f, Feature::Class(x) if x == n)),
+            SubjectKey::Id(n) => c.features.iter().any(|f| matches!(f, Feature::Id(x) if x == n)),
+            _ => false,
+        };
+        let found: Vec<&Scope> = c
+            .features
+            .iter()
+            .filter_map(|f| deps.mutation.get(f))
+            .flatten()
+            .filter(|r| r.trigger.matches(element) || changed_key(&r.trigger))
+            .map(|r| &r.scope)
+            .collect();
+        Some((c.element, found))
+    });
+    let jobs = plan_jobs(doc, scopes.collect(), &changed);
+    run_jobs(doc, stylist, viewport, states, styles, &changed, &jobs)
+}
+
+/// The restyle jobs for changed elements and, per element, the scopes of
+/// the rules it triggers: subtree walks keyed by root (with the keys of
+/// the elements to recompute below it) and elements recomputed on their
+/// own, parents before children.
+fn plan_jobs(doc: &Document, scopes: Vec<(NodeId, Vec<&Scope>)>, changed: &[NodeId]) -> Vec<(NodeId, Option<SubjectKeys>)> {
     // Subtree walks, keyed by root, with the keys of the elements to
     // recompute below it; and elements to recompute on their own.
     let mut walks: HashMap<NodeId, SubjectKeys> = HashMap::new();
     let mut singles: Vec<NodeId> = Vec::new();
     let parent_of = |n: NodeId| doc.parent(n).filter(|&p| doc.get(p).is_element()).unwrap_or(n);
-    for &e in changed {
-        let Some(element) = doc.element(e) else { continue };
+    for (e, found) in scopes {
         // Where the element of a `:has()` with `e` inside can be: an
         // ancestor of `e`, or an earlier sibling of `e` or of an ancestor.
         let mut above: Option<Vec<NodeId>> = None;
-        for rule in deps.rules_for(state) {
-            if !rule.trigger.matches(element) {
-                continue;
-            }
-            match &rule.scope {
+        for scope in found {
+            match scope {
                 Scope::Subtree(key) => walks.entry(e).or_default().insert(key.clone()),
                 Scope::Siblings(key) => walks.entry(parent_of(e)).or_default().insert(key.clone()),
                 Scope::Above(has) | Scope::AboveSubtree { has, .. } => {
@@ -255,7 +318,7 @@ pub fn restyle(
                         if !doc.element(c).is_some_and(|el| has.matches(el)) {
                             continue;
                         }
-                        match &rule.scope {
+                        match scope {
                             Scope::Above(_) => singles.push(c),
                             Scope::AboveSubtree { subject, .. } => {
                                 walks.entry(c).or_default().insert(subject.clone());
@@ -282,13 +345,25 @@ pub fn restyle(
     singles.dedup();
     jobs.extend(singles.into_iter().map(|n| (n, None)));
     jobs.sort_by_key(|(n, _)| depth(doc, *n));
+    jobs
+}
 
+/// Run restyle jobs; the `changed` elements are always recomputed.
+fn run_jobs(
+    doc: &Document,
+    stylist: &Stylist,
+    viewport: &Viewport,
+    states: &ElementStates,
+    styles: &mut StyleMap,
+    changed: &[NodeId],
+    jobs: &[(NodeId, Option<SubjectKeys>)],
+) -> Restyled {
     let mut must = changed.to_vec();
     must.sort();
     must.dedup();
     let mut restyler = Restyler::new(doc, stylist, viewport, states, &must);
     let mut result = Restyled::default();
-    for (root, keys) in &jobs {
+    for (root, keys) in jobs {
         let (changed, moved) = restyler.restyle_subtree(*root, styles, keys.as_ref());
         result.repaint |= changed;
         result.moved |= moved;
@@ -681,26 +756,75 @@ fn scan_selector<'a>(
                         PseudoClass::Target => Some(StateKind::Target),
                         _ => None,
                     };
+                    // Pseudo-classes that follow attributes: a change of
+                    // the attribute is a change of what they match. For
+                    // `disabled` (a fieldset's reaches its controls),
+                    // `lang` and `dir` (inherited) the attribute may be on
+                    // an ancestor of the matching element, so its subtree
+                    // is in scope whatever the trigger.
+                    let (attrs, from_ancestor): (&[&str], bool) = match pc {
+                        PseudoClass::Link | PseudoClass::AnyLink | PseudoClass::Visited => (&["href"], false),
+                        PseudoClass::Checked => (&["checked", "selected"], false),
+                        PseudoClass::Disabled | PseudoClass::Enabled => (&["disabled"], true),
+                        PseudoClass::Lang(_) => (&["lang"], true),
+                        PseudoClass::Dir(_) => (&["dir"], true),
+                        _ => (&[], false),
+                    };
+                    for attr in attrs {
+                        let rules = deps.mutation.entry(Feature::Attr((*attr).to_owned())).or_default();
+                        let mut add = |rule: MutationRule| {
+                            if !rules.contains(&rule) {
+                                rules.push(rule);
+                            }
+                        };
+                        if from_ancestor {
+                            add(MutationRule {
+                                trigger: SubjectKey::Universal,
+                                scope: Scope::Subtree(ctx.subject.clone()),
+                            });
+                        }
+                        if let Some(scope) = other_scope(ctx, reach) {
+                            add(MutationRule {
+                                trigger: if from_ancestor { SubjectKey::Universal } else { trigger.clone() },
+                                scope,
+                            });
+                        }
+                    }
                     let Some(state) = state else { continue };
                     let r = deps.reach_mut(state);
                     *r = (*r).max(reach);
-                    let scope = match (&ctx.has, reach) {
-                        (Some((has, true)), _) => Scope::Above(has.clone()),
-                        (Some((has, false)), _) => Scope::AboveSubtree {
-                            has: has.clone(),
-                            subject: ctx.subject.clone(),
-                        },
-                        (None, Reach::None | Reach::Element) => continue,
-                        (None, Reach::Subtree) => Scope::Subtree(ctx.subject.clone()),
-                        (None, Reach::Parent | Reach::Ancestors | Reach::Document) => {
-                            Scope::Siblings(ctx.subject.clone())
-                        }
-                    };
+                    let Some(scope) = other_scope(ctx, reach) else { continue };
                     deps.rules.push(StateRule {
                         state,
                         trigger: trigger.clone(),
                         scope,
                     });
+                }
+                // Classes, ids and attributes a DOM change can alter.
+                Component::Class(_)
+                | Component::ID(_)
+                | Component::AttributeInNoNamespaceExists { .. }
+                | Component::AttributeInNoNamespace { .. }
+                | Component::AttributeOther(_) => {
+                    let feature = match c {
+                        Component::Class(n) => Feature::Class(n.0.to_string()),
+                        Component::ID(n) => Feature::Id(n.0.to_string()),
+                        Component::AttributeInNoNamespaceExists { local_name_lower, .. } => {
+                            Feature::Attr(local_name_lower.0.to_string())
+                        }
+                        Component::AttributeInNoNamespace { local_name, .. } => Feature::Attr(local_name.0.to_string()),
+                        Component::AttributeOther(a) => Feature::Attr(a.local_name_lower.0.to_string()),
+                        _ => continue,
+                    };
+                    let Some(scope) = other_scope(ctx, reach) else { continue };
+                    let rules = deps.mutation.entry(feature).or_default();
+                    let rule = MutationRule {
+                        trigger: trigger.clone(),
+                        scope,
+                    };
+                    if !rules.contains(&rule) {
+                        rules.push(rule);
+                    }
                 }
                 Component::Is(list) | Component::Where(list) | Component::Negation(list) => {
                     for s in list.slice() {
@@ -742,6 +866,24 @@ fn scan_selector<'a>(
             });
         }
     }
+}
+
+/// Which other elements a change tested by a compound at `reach` can
+/// affect: none when the compound is the subject's own (the changed
+/// element is recomputed anyway), its descendants, its later siblings, or
+/// for one inside a `:has()` the element carrying it (and that element's
+/// subtree when the `:has()` is left of a combinator).
+fn other_scope(ctx: &ScanCtx, reach: Reach) -> Option<Scope> {
+    Some(match (&ctx.has, reach) {
+        (Some((has, true)), _) => Scope::Above(has.clone()),
+        (Some((has, false)), _) => Scope::AboveSubtree {
+            has: has.clone(),
+            subject: ctx.subject.clone(),
+        },
+        (None, Reach::None | Reach::Element) => return None,
+        (None, Reach::Subtree) => Scope::Subtree(ctx.subject.clone()),
+        (None, Reach::Parent | Reach::Ancestors | Reach::Document) => Scope::Siblings(ctx.subject.clone()),
+    })
 }
 
 /// The key of one compound: id, else first class, else tag, else universal.
@@ -1311,6 +1453,89 @@ mod tests {
             }
             other => panic!("image-set: {other:?}"),
         }
+    }
+
+    /// DOM changes to classes, ids and attributes restyle only what their
+    /// selectors can reach, and the result equals a full restyle.
+    #[test]
+    fn mutation_restyle_matches_full_restyle() {
+        let mut doc = parse_html(
+            b"<div id=d><a id=link>l</a><section><ul><li>i</li></ul></section>\
+              <p class=a>1</p><p class=b>2</p><ol><li><span>s</span></li></ol><p>x</p><em>e</em></div>",
+        );
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            ".on { color: red } ul { display: none } .open > ul { display: block } .a + .b { color: blue } \
+             li[data-x] span { font-weight: bold } #sel p { color: green } div:has(> .flag) { background-color: purple }",
+            Origin::Author,
+        )));
+        let vp = Viewport::default();
+        let states = ElementStates::default();
+        let deps = stylist.interaction_deps();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let nth = |doc: &Document, tag: &str, n: usize| {
+            doc.descendants(doc.root()).filter(|&i| doc.element(i).is_some_and(|e| &*e.name.local == tag)).nth(n).expect("element")
+        };
+        // One change: set or remove an attribute, restyle, compare.
+        let mut step = |doc: &mut Document, el: NodeId, attr: &str, value: Option<&str>, features: Vec<Feature>| {
+            let e = doc.get_mut(el).as_element_mut().expect("element");
+            match value {
+                Some(v) => e.set_attr(attr, v),
+                None => e.remove_attr(attr),
+            }
+            let r = restyle_mutations(&doc, &stylist, &vp, &states, &mut styles, &deps, &[FeatureChange { element: el, features }]);
+            let full = compute_styles(doc, &stylist, &vp);
+            for (id, s) in full.iter() {
+                assert_eq!(**s, *styles[id], "{attr}={value:?}: element {id:?}");
+            }
+            r
+        };
+        let link = nth(&doc, "a", 0);
+        let r = step(&mut doc, link, "class", Some("on"), vec![Feature::Class("on".into())]);
+        assert!(r.repaint && !r.moved && r.styled <= 3, "a colour: repaint only, {r:?}");
+        let section = nth(&doc, "section", 0);
+        let r = step(&mut doc, section, "class", Some("open"), vec![Feature::Class("open".into())]);
+        assert!(r.moved, "display: layout");
+        let first = nth(&doc, "p", 0);
+        step(&mut doc, first, "class", None, vec![Feature::Class("a".into())]);
+        let li = nth(&doc, "li", 1);
+        step(&mut doc, li, "data-x", Some(""), vec![Feature::Attr("data-x".into())]);
+        let div = nth(&doc, "div", 0);
+        step(&mut doc, div, "id", Some("sel"), vec![Feature::Id("d".into()), Feature::Id("sel".into()), Feature::Attr("id".into())]);
+        let em = nth(&doc, "em", 0);
+        let r = step(&mut doc, em, "class", Some("flag"), vec![Feature::Class("flag".into())]);
+        assert!(r.repaint, ":has() reaches the parent");
+
+        // Attribute-following pseudo-classes: `disabled` and `href` reach a
+        // sibling, `lang` the descendants.
+        let mut doc = parse_html(
+            b"<fieldset><input><label>l</label></fieldset><div><p><b>t</b></p></div><a>x</a><i>y</i>",
+        );
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            "input:disabled + label { color: gray } b:lang(fr) { color: blue } a:link + i { color: red }",
+            Origin::Author,
+        )));
+        let deps = stylist.interaction_deps();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let mut step = |doc: &mut Document, el: NodeId, attr: &str, value: &str| {
+            doc.get_mut(el).as_element_mut().expect("element").set_attr(attr, value);
+            let changes = [FeatureChange { element: el, features: vec![Feature::Attr(attr.to_owned())] }];
+            let r = restyle_mutations(&doc, &stylist, &vp, &states, &mut styles, &deps, &changes);
+            let full = compute_styles(doc, &stylist, &vp);
+            for (id, s) in full.iter() {
+                assert_eq!(**s, *styles[id], "{attr}: element {id:?}");
+            }
+            assert!(r.repaint, "{attr} restyled something");
+        };
+        let input = nth(&doc, "input", 0);
+        step(&mut doc, input, "disabled", "");
+        let div = nth(&doc, "div", 0);
+        step(&mut doc, div, "lang", "fr");
+        let a = nth(&doc, "a", 0);
+        step(&mut doc, a, "href", "#");
     }
 
     #[test]

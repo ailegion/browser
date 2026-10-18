@@ -438,6 +438,29 @@ remaining lists as they stand.
       separator (CSS Text 3 §7.1: spaces, no-break spaces and the other
       word-separator characters), in shaping, line breaking, justification
       and intrinsic sizes.
+- [ ] 6i. DOM-change style invalidation (owner, 2026-10-18; iana.org/
+      protocols, 79,526 nodes: its scroll handler toggles one class and the
+      tab restyled and laid out the whole document each time, ~0.9 s): a
+      script's class, id and attribute changes restyle only what their
+      selectors reach, inserted and removed nodes likewise, and a
+      paint-only result repaints without layout. Three blocks: (1) style
+      crate invalidation rules, (2) DOM change records wired through the
+      tab, (3) inserted/removed nodes and structural selectors.
+      Block 1 done 2026-10-18 (`state.rs` `Feature`, `MutationRule`,
+      `InteractionDeps::mutation`; `cascade.rs` `restyle_mutations`,
+      `FeatureChange`, `plan_jobs`/`run_jobs` shared with `restyle`): each
+      class, id and attribute a selector tests outside its subject compound
+      or inside `:has()` gets the scope a state there gets (subtree, later
+      siblings, the `:has()` element and its subtree); a key naming a
+      changed class or id counts as matching (the element may have just
+      lost it); the attribute-following pseudo-classes record their
+      attributes (`:link`/`:any-link`/`:visited` href, `:checked` checked
+      and selected, `:disabled`/`:enabled` disabled, `:lang()` lang,
+      `:dir()` dir; the last three reach the changed element's subtree
+      whatever the trigger). Test: six DOM changes and three attribute
+      pseudo-classes, each equal to a full restyle; a colour class restyles
+      at most 3 elements, repaint only. Restyle cost unchanged (Wikipedia
+      ~36 ms, iana ~330 ms).
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,

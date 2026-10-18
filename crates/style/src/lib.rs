@@ -26,8 +26,10 @@ pub mod transform;
 pub mod ua;
 pub mod values;
 
-pub use cascade::{Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle};
-pub use state::{ElementStates, InteractionDeps, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
+pub use cascade::{
+    FeatureChange, Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle, restyle_mutations,
+};
+pub use state::{ElementStates, Feature, InteractionDeps, MutationRule, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 pub use computed::{
     AppliedDecoration, ComputedBackgroundSize, ComputedPosition, ComputedStyle, ComputedVerticalAlign, DecorationFont,
     DecorationThickness, LetterSpacing, LineHeight, PositionOffset, UnderlineOffset, Viewport, ViewportOverflow,
