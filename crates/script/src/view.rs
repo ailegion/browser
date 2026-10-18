@@ -31,7 +31,7 @@ use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
     ElementStates, FeatureChange, InteractionDeps, Origin, Position, Rule, Sides, StyleMap, Stylesheet, Stylist, TreeChange,
-    Viewport, compute_styles_with, restyle_mutations,
+    Viewport, compute_styles_with, restyle_mutations, sync_pseudo_elements,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -226,7 +226,7 @@ impl View {
     /// Make `styles` and `layout` current for the lent document, if
     /// they are not: the cascade with the document's sheets as they are
     /// now, then layout.
-    pub fn ensure_layout(&mut self, doc: &Document, states: &ElementStates, generation: u64, changes: &[DomChange]) {
+    pub fn ensure_layout(&mut self, doc: &mut Document, states: &ElementStates, generation: u64, changes: &[DomChange]) {
         if self.clean_generation == Some(generation) && self.layout.is_some() {
             return;
         }
@@ -249,7 +249,9 @@ impl View {
         };
         if let Some(delta) = delta {
             let r = restyle_mutations(doc, &stylist, &vp, states, &mut self.styles, &self.deps, &delta.changes, &delta.trees);
-            if !r.moved && !delta.layout {
+            // `::before`/`::after` boxes that came or went: their nodes.
+            let pseudos = sync_pseudo_elements(doc, &self.styles);
+            if !r.moved && !delta.layout && !pseudos {
                 if r.repaint
                     && let (Some(engine), Some(layout)) = (&mut self.engine, &mut self.layout)
                 {
@@ -262,6 +264,7 @@ impl View {
         } else {
             self.styles = compute_styles_with(doc, &stylist, &vp, states);
             self.deps = stylist.interaction_deps();
+            sync_pseudo_elements(doc, &self.styles);
         }
         let Some(engine) = &mut self.engine else { return };
         let tree = engine.layout_with_scrolls(
@@ -278,6 +281,26 @@ impl View {
         self.clean_generation = Some(generation);
         self.recomputed = true;
         self.clamp_scroll();
+    }
+
+    /// The style `getComputedStyle` gives a pseudo-element of `id` that
+    /// has no box (or is not a list item's marker): from its rules, with
+    /// the element's current style as its parent.
+    pub(crate) fn pseudo_element_style(
+        &mut self,
+        doc: &Document,
+        states: &ElementStates,
+        id: NodeId,
+        which: browser_style::GeneratedPseudo,
+    ) -> Option<browser_style::ComputedStyle> {
+        let stylist = self.stylist_for(doc);
+        let vp = Viewport {
+            width: self.viewport.0,
+            height: self.viewport.1,
+            scale_factor: self.scale,
+            prefers_dark: false,
+        };
+        browser_style::pseudo_element_style(doc, &stylist, &vp, states, &self.styles, id, which)
     }
 
     /// The document's sheets in cascade order, as the tab's loader
@@ -497,7 +520,7 @@ impl View {
             return Vec::new();
         }
         let mut found: Vec<FragmentBox> = Vec::new();
-        for d in doc.descendants(id) {
+        for d in descendants_and_pseudos(doc, id) {
             if let Some(boxes) = index.get(&d) {
                 found.extend(boxes.iter().copied());
             }
@@ -613,7 +636,7 @@ impl View {
         let index = self.index();
         let (mut w, mut h) = (padding_box.width, padding_box.height);
         let inv = affine_invert(&own.transform).unwrap_or(IDENTITY);
-        for d in doc.descendants(id) {
+        for d in descendants_and_pseudos(doc, id) {
             if let Some(boxes) = index.get(&d) {
                 for b in boxes {
                     let relative = affine_mul(&inv, &b.space.transform);
@@ -625,6 +648,21 @@ impl View {
         }
         (w, h)
     }
+}
+
+/// `id`'s descendants, with the `::before`/`::after` nodes of `id` and of
+/// every descendant (their boxes are in what `id` contains).
+fn descendants_and_pseudos(doc: &Document, id: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for n in std::iter::once(id).chain(doc.descendants(id)) {
+        if n != id {
+            out.push(n);
+        }
+        for kind in [browser_dom::PseudoKind::Before, browser_dom::PseudoKind::After] {
+            out.extend(doc.pseudo_element(n, kind));
+        }
+    }
+    out
 }
 
 fn union(rects: &[Rect]) -> Rect {
@@ -671,6 +709,29 @@ pub(crate) fn with_layout<T>(
     };
     view.ensure_layout(doc, states, *generation, changes);
     Ok(Some(f(view, doc, quirks)))
+}
+
+/// `with_layout` for what also needs the interaction state (`:hover` and
+/// the like), as computing a pseudo-element's style on demand does.
+pub(crate) fn with_layout_states<T>(
+    context: &mut Context,
+    f: impl FnOnce(&mut View, &Document, &ElementStates) -> T,
+) -> JsResult<Option<T>> {
+    let shared = dom(context)?;
+    let mut guard = shared.borrow_mut();
+    let Dom {
+        doc,
+        states,
+        view,
+        generation,
+        changes,
+        ..
+    } = &mut *guard;
+    let Some(view) = view.as_mut() else {
+        return Ok(None);
+    };
+    view.ensure_layout(doc, states, *generation, changes);
+    Ok(Some(f(view, doc, states)))
 }
 
 /// `ScrollBehavior` of CSSOM View's `ScrollOptions`.

@@ -288,6 +288,18 @@ pub struct ComputedStyle {
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
     pub list_style_image: Option<Arc<str>>,
+    /// Generated content ("Working sites first" 6e): `content` (its
+    /// `attr()`s resolved against the element by the cascade), `quotes`
+    /// (inherited) and the counter properties.
+    pub content: crate::content::ComputedContent,
+    pub quotes: crate::content::Quotes,
+    pub counter_reset: crate::content::CounterList,
+    pub counter_increment: crate::content::CounterList,
+    pub counter_set: crate::content::CounterList,
+    /// The element's `::marker`, `::before` and `::after` styles: the
+    /// marker's for a list item, the others when their `content` makes a
+    /// box (`PseudoStyles`).
+    pub pseudo: Option<Arc<PseudoStyles>>,
     pub vertical_align: ComputedVerticalAlign,
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
@@ -369,6 +381,46 @@ pub struct ComputedStyle {
     /// Custom properties in effect, inherited; shared with the parent when
     /// this element declares none.
     pub custom: Arc<CustomMap>,
+}
+
+/// An element's pseudo-element styles: `::marker` for a list item (with
+/// only the properties that apply to a marker taken from its rules,
+/// CSS Pseudo 4 §3.6.1), `::before` and `::after` when their `content`
+/// makes a box (CSS Content 3: anything but `none`, which `normal`
+/// computes to on them).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PseudoStyles {
+    pub marker: Option<Arc<ComputedStyle>>,
+    pub before: Option<Arc<ComputedStyle>>,
+    pub after: Option<Arc<ComputedStyle>>,
+}
+
+impl PseudoStyles {
+    /// Whether going from `a` to `b` changes what layout builds.
+    pub fn layout_differs(a: Option<&PseudoStyles>, b: Option<&PseudoStyles>) -> bool {
+        let one = |x: Option<&Arc<ComputedStyle>>, y: Option<&Arc<ComputedStyle>>| match (x, y) {
+            (None, None) => false,
+            (Some(x), Some(y)) => x.layout_differs(y),
+            _ => true,
+        };
+        let empty = PseudoStyles::default();
+        let (a, b) = (a.unwrap_or(&empty), b.unwrap_or(&empty));
+        one(a.marker.as_ref(), b.marker.as_ref()) || one(a.before.as_ref(), b.before.as_ref()) || one(a.after.as_ref(), b.after.as_ref())
+    }
+}
+
+impl ComputedStyle {
+    /// The style of the element's `::before` (`after` false) or
+    /// `::after`, when it has a box.
+    pub fn pseudo_style(&self, after: bool) -> Option<&Arc<ComputedStyle>> {
+        let p = self.pseudo.as_deref()?;
+        if after { p.after.as_ref() } else { p.before.as_ref() }
+    }
+
+    /// The style of the element's `::marker`, when it is a list item.
+    pub fn marker_style(&self) -> Option<&Arc<ComputedStyle>> {
+        self.pseudo.as_deref()?.marker.as_ref()
+    }
 }
 
 /// The `overflow` the viewport scrolls and clips by (CSS Overflow 3 §3.3):
@@ -532,6 +584,12 @@ impl ComputedStyle {
             list_style_type: ListStyleType::Disc,
             list_style_position: ListStylePosition::Outside,
             list_style_image: None,
+            content: crate::content::ComputedContent::Normal,
+            quotes: crate::content::Quotes::Auto,
+            counter_reset: crate::content::CounterList::default(),
+            counter_increment: crate::content::CounterList::default(),
+            counter_set: crate::content::CounterList::default(),
+            pseudo: None,
             vertical_align: ComputedVerticalAlign::default(),
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
@@ -634,6 +692,7 @@ impl ComputedStyle {
         self.list_style_type = p.list_style_type;
         self.list_style_position = p.list_style_position;
         self.list_style_image = p.list_style_image.clone();
+        self.quotes = p.quotes.clone();
         self.text_underline_position = p.text_underline_position;
         self.text_underline_offset = p.text_underline_offset;
         self.text_decoration_skip_ink = p.text_decoration_skip_ink;
@@ -774,6 +833,12 @@ impl ComputedStyle {
             || self.list_style_type != other.list_style_type
             || self.list_style_position != other.list_style_position
             || self.list_style_image != other.list_style_image
+            || self.content != other.content
+            || self.quotes != other.quotes
+            || self.counter_reset != other.counter_reset
+            || self.counter_increment != other.counter_increment
+            || self.counter_set != other.counter_set
+            || PseudoStyles::layout_differs(self.pseudo.as_deref(), other.pseudo.as_deref())
             || self.vertical_align != other.vertical_align
             || self.flex_direction != other.flex_direction
             || self.flex_wrap != other.flex_wrap
@@ -1258,6 +1323,11 @@ pub fn compute(
     pick!(list_style_type, ListStyleType, ListStyleType, |v| v.computed());
     pick!(list_style_position, ListStylePosition, ListStylePosition, |v| *v);
     pick!(list_style_image, ListStyleImage, ListStyleImage, |v| v.url());
+    pick!(content, Content, Content, |v| v.compute(&ctx, current));
+    pick!(quotes, Quotes, Quotes, |v| v.clone());
+    pick!(counter_reset, CounterReset, CounterReset, |v| v.clone());
+    pick!(counter_increment, CounterIncrement, CounterIncrement, |v| v.clone());
+    pick!(counter_set, CounterSet, CounterSet, |v| v.clone());
     pick!(vertical_align, VerticalAlign, VerticalAlign, |v| match v {
         VerticalAlignValue::Keyword(k) => ComputedVerticalAlign::Keyword(*k),
         VerticalAlignValue::Length(l) => ComputedVerticalAlign::Length(lp(l)),

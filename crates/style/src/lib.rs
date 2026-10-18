@@ -11,6 +11,7 @@
 
 pub mod cascade;
 pub mod computed;
+pub mod content;
 pub mod custom;
 pub mod fontface;
 pub mod grid;
@@ -27,13 +28,16 @@ pub mod ua;
 pub mod values;
 
 pub use cascade::{
-    FeatureChange, Restyled, StateChange, StyleMap, Stylist, TreeChange, compute_styles, compute_styles_with, restyle,
-    restyle_mutations,
+    FeatureChange, GeneratedPseudo, Restyled, StateChange, StyleMap, Stylist, TreeChange, compute_styles, compute_styles_with,
+    generates_pseudo_elements, pseudo_element_style, restyle, restyle_mutations, sync_pseudo_elements,
+};
+pub use content::{
+    ComputedContent, CounterEntry, CounterList, CounterStyle, GeneratedItem, Quotes, auto_quotes,
 };
 pub use state::{ElementStates, Feature, InteractionDeps, MutationRule, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 pub use computed::{
     AppliedDecoration, ComputedBackgroundSize, ComputedPosition, ComputedStyle, ComputedVerticalAlign, DecorationFont,
-    DecorationThickness, LetterSpacing, LineHeight, PositionOffset, UnderlineOffset, Viewport, ViewportOverflow,
+    DecorationThickness, LetterSpacing, LineHeight, PositionOffset, PseudoStyles, UnderlineOffset, Viewport, ViewportOverflow,
     viewport_overflow,
 };
 pub use image::{

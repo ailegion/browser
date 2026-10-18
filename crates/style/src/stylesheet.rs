@@ -118,7 +118,8 @@ impl Stylesheet {
 /// Make every `url()` in `decls` absolute against `base` (a stylesheet's
 /// URL, or the document's for a `style` attribute): background and mask
 /// images (`image-set()` candidates too, and the URLs inside image
-/// functions kept as written), `list-style-image`, `cursor` images, and
+/// functions kept as written), `list-style-image`, `content` images,
+/// `cursor` images, and
 /// the text of custom properties and `var()` values, which is parsed
 /// later per element.
 pub fn resolve_declaration_urls(decls: &mut [Declaration], base: &url::Url) {
@@ -152,6 +153,15 @@ pub fn resolve_declaration_urls(decls: &mut [Declaration], base: &url::Url) {
                 }
             }
             DeclaredValue::Value(P::ListStyleImage(img)) => image(img, &join, base),
+            DeclaredValue::Value(P::Content(crate::content::ContentValue::List(items, _))) => {
+                if items.iter().any(|i| matches!(i, crate::content::ContentItem::Image(_))) {
+                    for item in Arc::make_mut(items) {
+                        if let crate::content::ContentItem::Image(img) = item {
+                            image(img, &join, base);
+                        }
+                    }
+                }
+            }
             DeclaredValue::Value(P::Cursor(c)) => {
                 for i in &mut c.images {
                     join(&mut i.url);

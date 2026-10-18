@@ -14,10 +14,11 @@ use selectors::matching::matches_selector;
 use selectors::parser::{Combinator, Component};
 use slotmap::SecondaryMap;
 
-use crate::computed::{ComputedStyle, DeclaredValues, Viewport, compute};
+use crate::computed::{ComputedStyle, DeclaredValues, PseudoStyles, Viewport, compute};
+use crate::content::ComputedContent;
 use crate::custom::{expand_pending, resolve_customs};
 use crate::properties::{CustomValue, Declaration, DeclaredValue};
-use crate::selector_impl::{BrowserSelectors, ElementRef, PseudoClass};
+use crate::selector_impl::{BrowserSelectors, ElementRef, PseudoClass, PseudoElement};
 use crate::state::{
     ElementStates, Feature, InteractionDeps, MutationRule, NO_STATES, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys,
 };
@@ -103,7 +104,9 @@ struct RuleIndex<'a> {
 }
 
 impl<'a> RuleIndex<'a> {
-    fn build(rules: Vec<(Origin, &'a StyleRule)>) -> Self {
+    /// The index of the selectors whose pseudo-element is `pseudo` (none:
+    /// the element itself), bucketed by the element's compound.
+    fn build(rules: Vec<(Origin, &'a StyleRule)>, pseudo: Option<PseudoElement>) -> Self {
         use selectors::parser::Component;
         let mut index = RuleIndex {
             rules: Vec::new(),
@@ -114,17 +117,29 @@ impl<'a> RuleIndex<'a> {
         };
         for (ri, (_, rule)) in rules.iter().enumerate() {
             for (si, selector) in rule.selectors.slice().iter().enumerate() {
+                if selector.pseudo_element() != pseudo.as_ref() {
+                    continue;
+                }
                 let key = (ri as u32, si as u32);
                 let mut id = None;
                 let mut class = None;
                 let mut tag = None;
-                for component in selector.iter() {
-                    match component {
-                        Component::ID(i) => id = Some(i.0.clone()),
-                        Component::Class(c) if class.is_none() => class = Some(c.0.clone()),
-                        Component::LocalName(ln) => tag = Some(ln.lower_name.0.clone()),
-                        _ => {}
+                let mut iter = selector.iter();
+                let mut scan = |iter: &mut selectors::parser::SelectorIter<'_, BrowserSelectors>| {
+                    for component in iter {
+                        match component {
+                            Component::ID(i) => id = Some(i.0.clone()),
+                            Component::Class(c) if class.is_none() => class = Some(c.0.clone()),
+                            Component::LocalName(ln) => tag = Some(ln.lower_name.0.clone()),
+                            _ => {}
+                        }
                     }
+                };
+                scan(&mut iter);
+                // A pseudo-element's compound comes first; the element's
+                // is the one after the pseudo-element combinator.
+                if pseudo.is_some() && iter.next_sequence() == Some(Combinator::PseudoElement) {
+                    scan(&mut iter);
                 }
                 if let Some(id) = id {
                     index.by_id.entry(id).or_default().push(key);
@@ -466,6 +481,8 @@ fn ancestors_and_earlier_siblings(doc: &Document, e: NodeId) -> Vec<NodeId> {
 struct Restyler<'a> {
     doc: &'a Document,
     index: RuleIndex<'a>,
+    /// The `::marker`, `::before` and `::after` selectors.
+    pseudo_index: [RuleIndex<'a>; 3],
     caches: SelectorCaches,
     candidates: Vec<(u32, u32)>,
     quirks: QuirksMode,
@@ -485,9 +502,15 @@ impl<'a> Restyler<'a> {
         states: &'a ElementStates,
         must: &'a [NodeId],
     ) -> Self {
+        let rules = stylist.active_rules(viewport);
         Self {
             doc,
-            index: RuleIndex::build(stylist.active_rules(viewport)),
+            pseudo_index: [
+                RuleIndex::build(rules.clone(), Some(PseudoElement::Marker)),
+                RuleIndex::build(rules.clone(), Some(PseudoElement::Before)),
+                RuleIndex::build(rules.clone(), Some(PseudoElement::After)),
+            ],
+            index: RuleIndex::build(rules, None),
             caches: SelectorCaches::default(),
             candidates: Vec::new(),
             quirks: match doc.quirks_mode {
@@ -577,7 +600,36 @@ impl<'a> Restyler<'a> {
         (changed, moved)
     }
 
-    /// Match, cascade and compute one element.
+    /// The declarations of the rules matching the element (`pseudo`
+    /// `None`) or one of its pseudo-elements (an index into
+    /// `pseudo_index`), with their (level, specificity, order) sort keys.
+    fn match_rules(&mut self, id: NodeId, element: &browser_dom::Element, pseudo: Option<usize>) -> Vec<(u8, u32, u32, &'a Declaration)> {
+        let mut matched = Vec::new();
+        let el = ElementRef::with_states(self.doc, id, self.states);
+        let index = match pseudo {
+            Some(i) => &self.pseudo_index[i],
+            None => &self.index,
+        };
+        index.candidates(element, &mut self.candidates);
+        if self.candidates.is_empty() {
+            return matched;
+        }
+        let mode = if pseudo.is_some() { MatchingMode::ForStatelessPseudoElement } else { MatchingMode::Normal };
+        let mut ctx = MatchingContext::new(mode, None, &mut self.caches, self.quirks, NeedsSelectorFlags::No, MatchingForInvalidation::No);
+        for &(ri, si) in &self.candidates {
+            let (origin, rule) = index.rules[ri as usize];
+            let selector = &rule.selectors.slice()[si as usize];
+            if matches_selector(selector, 0, None, &el, &mut ctx) {
+                let specificity = selector.specificity();
+                for d in &rule.declarations {
+                    matched.push((level(origin, d.important), specificity, ri + 1, d));
+                }
+            }
+        }
+        matched
+    }
+
+    /// Match, cascade and compute one element, with its pseudo-elements.
     fn style_element(
         &mut self,
         id: NodeId,
@@ -587,31 +639,8 @@ impl<'a> Restyler<'a> {
         is_root: bool,
     ) -> ComputedStyle {
         let doc = self.doc;
-        let viewport = self.viewport;
         // (level, specificity, order) sort key, then the declaration.
-        let mut matched: Vec<(u8, u32, u32, &Declaration)> = Vec::new();
-        let el = ElementRef::with_states(doc, id, self.states);
-        {
-            let mut ctx = MatchingContext::new(
-                MatchingMode::Normal,
-                None,
-                &mut self.caches,
-                self.quirks,
-                NeedsSelectorFlags::No,
-                MatchingForInvalidation::No,
-            );
-            self.index.candidates(element, &mut self.candidates);
-            for &(ri, si) in &self.candidates {
-                let (origin, rule) = self.index.rules[ri as usize];
-                let selector = &rule.selectors.slice()[si as usize];
-                if matches_selector(selector, 0, None, &el, &mut ctx) {
-                    let specificity = selector.specificity();
-                    for d in &rule.declarations {
-                        matched.push((level(origin, d.important), specificity, ri + 1, d));
-                    }
-                }
-            }
-        }
+        let mut matched: Vec<(u8, u32, u32, &Declaration)> = self.match_rules(id, element, None);
 
         // Style attribute: author origin, beats any selector specificity.
         // Its `url()`s are relative to the document's base URL.
@@ -636,12 +665,77 @@ impl<'a> Restyler<'a> {
         }
 
         matched.sort_by_key(|(l, s, o, _)| (*l, *s, *o));
+        let mut style = self.cascade(&matched, parent_style, root_font_size, is_root);
+        style.content.resolve_attrs(&|n| element.attr(n).map(str::to_owned));
+        style.pseudo = self.style_pseudos(id, element, &style, root_font_size);
+        style
+    }
 
+    /// The element's `::marker` (a list item's), `::before` and `::after`
+    /// styles, each cascaded from its own rules with the element's style
+    /// as the parent. A `::before`/`::after` no rule gives `content` is not
+    /// computed at all (its `content` is `none`, it makes no box).
+    fn style_pseudos(
+        &mut self,
+        id: NodeId,
+        element: &browser_dom::Element,
+        style: &ComputedStyle,
+        root_font_size: Option<f32>,
+    ) -> Option<Arc<PseudoStyles>> {
+        if style.display.is_none() {
+            return None;
+        }
+        let mut out = PseudoStyles::default();
+        if style.display == crate::properties::Display::ListItem {
+            let mut matched = self.match_rules(id, element, Some(0));
+            matched.sort_by_key(|(l, s, o, _)| (*l, *s, *o));
+            let computed = self.cascade(&matched, style, root_font_size, false);
+            let mut marker = marker_style(style, &computed);
+            marker.content.resolve_attrs(&|n| element.attr(n).map(str::to_owned));
+            out.marker = Some(Arc::new(marker));
+        }
+        if generates_pseudo_elements(element) {
+            for (slot, which) in [(1, false), (2, true)] {
+                let mut matched = self.match_rules(id, element, Some(slot));
+                let sets_content = matched.iter().any(|(_, _, _, d)| match &d.value {
+                    DeclaredValue::Pending { name, .. } => name.eq_ignore_ascii_case("content"),
+                    v => v.id() == Some(crate::properties::PropertyId::Content),
+                });
+                if !sets_content {
+                    continue;
+                }
+                matched.sort_by_key(|(l, s, o, _)| (*l, *s, *o));
+                let mut computed = self.cascade(&matched, style, root_font_size, false);
+                // `normal` computes to `none` on `::before`/`::after`.
+                if matches!(computed.content, ComputedContent::Normal | ComputedContent::None) || computed.display.is_none() {
+                    continue;
+                }
+                computed.content.resolve_attrs(&|n| element.attr(n).map(str::to_owned));
+                let computed = Some(Arc::new(computed));
+                if which {
+                    out.after = computed;
+                } else {
+                    out.before = computed;
+                }
+            }
+        }
+        (out != PseudoStyles::default()).then(|| Arc::new(out))
+    }
+
+    /// Cascade sorted declarations and compute the style.
+    fn cascade(
+        &self,
+        matched: &[(u8, u32, u32, &Declaration)],
+        parent_style: &ComputedStyle,
+        root_font_size: Option<f32>,
+        is_root: bool,
+    ) -> ComputedStyle {
+        let viewport = self.viewport;
         // Custom properties first, since `var()` values depend on them;
         // then declarations that reference them are substituted and parsed.
         let mut custom_decls: Vec<(&Arc<str>, &CustomValue)> = Vec::new();
         let mut has_pending = false;
-        for (_, _, _, d) in &matched {
+        for (_, _, _, d) in matched {
             match &d.value {
                 DeclaredValue::Custom { name, value } => custom_decls.push((name, value)),
                 DeclaredValue::Pending { .. } => has_pending = true,
@@ -677,7 +771,7 @@ impl<'a> Restyler<'a> {
         // user-agent sheet has nothing below it: `unset`.
         let mut ua = DeclaredValues::new();
         let mut expanded_iter = expanded.iter();
-        for (level, _, _, d) in &matched {
+        for (level, _, _, d) in matched {
             let values = values_of(d, &mut expanded_iter);
             if !is_ua(*level) {
                 continue;
@@ -693,7 +787,7 @@ impl<'a> Restyler<'a> {
         let mut decls = DeclaredValues::new();
         decls.custom = custom;
         let mut expanded_iter = expanded.iter();
-        for (level, _, _, d) in &matched {
+        for (level, _, _, d) in matched {
             for v in values_of(d, &mut expanded_iter) {
                 match v {
                     DeclaredValue::Revert(id) | DeclaredValue::RevertLayer(id) => {
@@ -710,6 +804,120 @@ impl<'a> Restyler<'a> {
 
         compute(&decls, parent_style, root_font_size, viewport, is_root)
     }
+}
+
+/// A list item's `::marker` style: inherited from the item, with the
+/// properties that apply to a marker (CSS Pseudo 4 §3.6.1: the font
+/// properties, `white-space`, `color`, `unicode-bidi`, `direction`,
+/// `content`; and `text-transform`, which the CSS Lists 3 sheet sets on
+/// it) taken from its cascaded style.
+fn marker_style(item: &ComputedStyle, cascaded: &ComputedStyle) -> ComputedStyle {
+    let mut m = ComputedStyle::anonymous_from(item);
+    m.font_family = cascaded.font_family.clone();
+    m.font_size = cascaded.font_size;
+    m.font_weight = cascaded.font_weight;
+    m.font_style = cascaded.font_style;
+    m.font_variant = cascaded.font_variant;
+    m.font_stretch = cascaded.font_stretch;
+    m.font_optical_sizing = cascaded.font_optical_sizing;
+    m.font_variation_settings = cascaded.font_variation_settings.clone();
+    m.white_space = cascaded.white_space;
+    m.color = cascaded.color;
+    m.unicode_bidi = cascaded.unicode_bidi;
+    m.direction = cascaded.direction;
+    m.text_transform = cascaded.text_transform;
+    m.content = cascaded.content.clone();
+    m
+}
+
+/// Whether an element can have `::before` and `::after` boxes: not the
+/// replaced elements and form widgets, whose content the engine draws
+/// (`img`, `input` other than checkboxes and radios, `select`,
+/// `textarea`, media, frames, `br`), nor SVG or MathML elements.
+pub fn generates_pseudo_elements(e: &browser_dom::Element) -> bool {
+    if e.name.ns != html5ever::ns!(html) {
+        return false;
+    }
+    match &*e.name.local {
+        "img" | "br" | "wbr" | "select" | "textarea" | "iframe" | "frame" | "video" | "audio" | "canvas" | "embed"
+        | "object" | "meter" | "progress" => false,
+        "input" => e
+            .attr("type")
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("checkbox") || t.trim().eq_ignore_ascii_case("radio")),
+        _ => true,
+    }
+}
+
+/// Create and remove the document's `::before`/`::after` nodes to match
+/// the styles: one per element whose style has that pseudo-element with
+/// a box. Returns whether any was created or removed.
+pub fn sync_pseudo_elements(doc: &mut Document, styles: &StyleMap) -> bool {
+    use browser_dom::PseudoKind;
+    let mut changes: Vec<(NodeId, PseudoKind, bool)> = Vec::new();
+    for (id, style) in styles.iter() {
+        if !doc.contains(id) {
+            continue;
+        }
+        let Some(element) = doc.element(id) else { continue };
+        let shown = !style.display.is_none() && generates_pseudo_elements(element);
+        for (kind, after) in [(PseudoKind::Before, false), (PseudoKind::After, true)] {
+            let want = shown && style.pseudo_style(after).is_some();
+            if want != doc.pseudo_element(id, kind).is_some() {
+                changes.push((id, kind, want));
+            }
+        }
+    }
+    for &(id, kind, want) in &changes {
+        doc.set_pseudo_element(id, kind, want);
+    }
+    !changes.is_empty()
+}
+
+/// Which pseudo-element `pseudo_element_style` computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedPseudo {
+    Marker,
+    Before,
+    After,
+}
+
+/// The computed style of element `id`'s pseudo-element as
+/// `getComputedStyle` gives it: cascaded from its rules with the
+/// element's style (from `styles`) as the parent, whether or not it has
+/// a box (`content: none` then). `None` when the element has no style.
+pub fn pseudo_element_style(
+    doc: &Document,
+    stylist: &Stylist,
+    viewport: &Viewport,
+    states: &ElementStates,
+    styles: &StyleMap,
+    id: NodeId,
+    which: GeneratedPseudo,
+) -> Option<ComputedStyle> {
+    let element = doc.element(id)?;
+    let style = styles.get(id)?.clone();
+    let root_font_size = doc.document_element().filter(|&r| r != id).and_then(|r| styles.get(r)).map(|s| s.font_size);
+    let mut restyler = Restyler::new(doc, stylist, viewport, states, &[]);
+    let slot = match which {
+        GeneratedPseudo::Marker => 0,
+        GeneratedPseudo::Before => 1,
+        GeneratedPseudo::After => 2,
+    };
+    let mut matched = restyler.match_rules(id, element, Some(slot));
+    matched.sort_by_key(|(l, s, o, _)| (*l, *s, *o));
+    let computed = restyler.cascade(&matched, &style, root_font_size, false);
+    let mut out = match which {
+        GeneratedPseudo::Marker => marker_style(&style, &computed),
+        _ => {
+            let mut c = computed;
+            if c.content == ComputedContent::Normal {
+                c.content = ComputedContent::None;
+            }
+            c
+        }
+    };
+    out.content.resolve_attrs(&|n| element.attr(n).map(str::to_owned));
+    Some(out)
 }
 
 impl Stylist {
@@ -1068,6 +1276,34 @@ fn presentational_hints(doc: &Document, id: NodeId, e: &browser_dom::Element) ->
     }
     if e.attr("hidden").is_some() {
         push(&mut out, P::Display(DisplayValue::None));
+    }
+    // Lists (HTML rendering §15.3.7): an `ol`'s `start` and `reversed`
+    // reset `list-item` (a reversed counter, its value one past `start`;
+    // the hint is the one way to make a reversed counter, as in Chrome),
+    // an `li`'s `value` sets it.
+    if e.name.ns == html5ever::ns!(html) {
+        use crate::content::{CounterEntry, CounterList};
+        let list_item = |value: i64, written: bool, reversed: bool| {
+            CounterList(Arc::from(vec![CounterEntry {
+                name: Arc::from("list-item"),
+                value: value.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                written,
+                reversed,
+            }]))
+        };
+        if tag == "ol" {
+            let start = e.attr("start").and_then(browser_dom::parse_html_integer);
+            if e.attr("reversed").is_some() {
+                push(&mut out, P::CounterReset(list_item(start.map_or(0, |s| s + 1), start.is_some(), true)));
+            } else if let Some(s) = start {
+                push(&mut out, P::CounterReset(list_item(s - 1, true, false)));
+            }
+        }
+        if tag == "li"
+            && let Some(v) = e.attr("value").and_then(browser_dom::parse_html_integer)
+        {
+            push(&mut out, P::CounterSet(list_item(v, true, false)));
+        }
     }
     // Tables (HTML rendering §15.3.9): `cellspacing` is the table's
     // border-spacing, `border` its 1px outset border, `align` floats or

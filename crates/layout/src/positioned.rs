@@ -182,7 +182,7 @@ impl LayoutEngine {
         let edges_h = p.left.resolve(cw) + p.right.resolve(cw) + b.left + b.right;
         let edges_v = p.top.resolve(cw) + p.bottom.resolve(cw) + b.top + b.bottom;
 
-        if let BoxKind::Image { url, intrinsic } = &node.kind {
+        if let BoxKind::Image { source, intrinsic } = &node.kind {
             // §10.3.8, §10.6.5: a replaced box keeps its own size; the
             // insets and margins are solved around it.
             let (w, h) = image_size_for(&s, *intrinsic, Some(cw), Some(ch));
@@ -199,8 +199,8 @@ impl LayoutEngine {
                 rect,
                 node: node.node,
                 style: s.clone(),
-                content: match url {
-                    Some(u) => FragmentContent::Image(u.clone()),
+                content: match source {
+                    Some(s) => FragmentContent::Image(s.clone()),
                     None => FragmentContent::Box,
                 },
                 children: Vec::new(),

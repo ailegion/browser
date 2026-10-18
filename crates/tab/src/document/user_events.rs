@@ -158,7 +158,9 @@ impl TabState {
     fn box_offset(&self, target: EventTargetRef, page_x: f32, page_y: f32) -> (f32, f32) {
         match (target, &self.layout, &self.doc) {
             (EventTargetRef::Node(t), Some(tree), Some(doc)) => {
-                tree.offset_in_first(|n| n == t || doc.parent(n) == Some(t), page_x, page_y)
+                // The element's own boxes or its text's, not its
+                // `::before`/`::after` boxes.
+                tree.offset_in_first(|n| n == t || (doc.parent(n) == Some(t) && doc.get(n).pseudo_kind().is_none()), page_x, page_y)
             }
             _ => None,
         }
@@ -309,7 +311,7 @@ impl TabState {
         // it), in viewport coordinates.
         let origin = match (target, &self.layout, &self.doc) {
             (EventTargetRef::Node(t), Some(tree), Some(doc)) => {
-                tree.first_shown_rect(|n| n == t || doc.parent(n) == Some(t)).map(|r| (r.x, r.y))
+                tree.first_shown_rect(|n| n == t || (doc.parent(n) == Some(t) && doc.get(n).pseudo_kind().is_none())).map(|r| (r.x, r.y))
             }
             _ => None,
         }
@@ -706,6 +708,12 @@ impl TabState {
                 }
             }
             ScrollTarget::Element(n) => {
+                // A scrolled `::before`/`::after` box: its element, as
+                // pseudo-elements are no event targets.
+                let n = match &self.doc {
+                    Some(d) if d.contains(n) && d.get(n).pseudo_kind().is_some() => d.parent(n).unwrap_or(n),
+                    _ => n,
+                };
                 if self.live(n) && self.wants_event(EventTargetRef::Node(n), kind) {
                     self.fire_user_event(EventTargetRef::Node(n), kind, UiEventInit::default());
                     fired = true;

@@ -134,6 +134,8 @@ fn serialize_node<S: Serializer>(
                 s.write_processing_instruction(target, data)?;
             }
         }
+        // Never in a child list; nothing to write.
+        NodeKind::PseudoElement(_) => {}
     }
     Ok(())
 }

@@ -425,7 +425,15 @@ impl LayoutEngine {
             let mut element_style: Option<Arc<ComputedStyle>> = None;
             let new_style = match f.node {
                 Some(n) if doc.contains(n) => {
-                    if doc.get(n).is_element() {
+                    if let Some(kind) = doc.get(n).pseudo_kind() {
+                        // A `::before`/`::after` box: its own style.
+                        element_style = doc
+                            .parent(n)
+                            .and_then(|p| styles.get(p))
+                            .and_then(|s| s.pseudo_style(kind == browser_dom::PseudoKind::After))
+                            .cloned();
+                        element_style.clone()
+                    } else if doc.get(n).is_element() {
                         element_style = styles.get(n).cloned();
                         // The element the viewport's `overflow` came from
                         // behaves as `visible` itself, as it was laid out.
@@ -441,6 +449,10 @@ impl LayoutEngine {
                 // Generated text is styled as an anonymous box of the
                 // nearest element above it (as it was built).
                 None => match &f.content {
+                    // An inside marker's text: the item's `::marker` style.
+                    FragmentContent::Text(t) if t.marker && inherited.is_some_and(|s| s.marker_style().is_some()) => {
+                        inherited.and_then(|s| s.marker_style()).cloned()
+                    }
                     FragmentContent::Text(_) => inherited.map(|s| Arc::new(ComputedStyle::anonymous_from(s))),
                     _ => None,
                 },
@@ -454,7 +466,12 @@ impl LayoutEngine {
                     t.decorations = decor.decorations(fonts, &f.style, t);
                 }
             }
-            let next = element_style.as_ref().or(inherited);
+            // A list marker's text takes the item's `::marker` style.
+            let marker = match (&f.content, f.node) {
+                (FragmentContent::Marker, None) => inherited.and_then(|s| s.marker_style()).cloned(),
+                _ => None,
+            };
+            let next = element_style.as_ref().or(marker.as_ref()).or(inherited);
             for c in &mut f.children {
                 refresh(c, doc, styles, next, decor, fonts, viewport_source);
             }
@@ -758,7 +775,7 @@ impl LayoutEngine {
             Sizing::MinContent | Sizing::MaxContent => None,
             Sizing::FitInto(w) | Sizing::Exactly(w) | Sizing::Fill(w) => Some(w),
         };
-        if let BoxKind::Image { url, intrinsic } = &atomic.node.kind {
+        if let BoxKind::Image { source, intrinsic } = &atomic.node.kind {
             let node = &atomic.node;
             // A percentage width or max-width zeroes the min-content
             // contribution: laid out against a zero containing block.
@@ -787,8 +804,8 @@ impl LayoutEngine {
                 rect,
                 node: node.node,
                 style: node.style.clone(),
-                content: match url {
-                    Some(u) => FragmentContent::Image(u.clone()),
+                content: match source {
+                    Some(s) => FragmentContent::Image(s.clone()),
                     None => FragmentContent::Box,
                 },
                 children: Vec::new(),
@@ -1365,12 +1382,12 @@ impl LayoutEngine {
                     grid: None,
                 }
             }
-            BoxKind::Image { url, .. } => Fragment {
+            BoxKind::Image { source, .. } => Fragment {
                 rect,
                 node: node.node,
                 style: node.style.clone(),
-                content: match url {
-                    Some(u) => FragmentContent::Image(u.clone()),
+                content: match source {
+                    Some(s) => FragmentContent::Image(s.clone()),
                     None => FragmentContent::Box,
                 },
                 children: Vec::new(),
@@ -2761,6 +2778,7 @@ fn emit_marker(
             decorations: Vec::new(),
             baseline,
             selectable: style.user_select_used != browser_style::UserSelect::None,
+            marker: false,
         };
         let mut fragment = Fragment {
             rect: Rect::new(ox + x0, oy, run.advance(), line_height),
@@ -2920,6 +2938,7 @@ fn emit_text_fragments(
                         let color = styles[style_idx].brush.0;
                         let range = clusters.iter().map(|c| c.start).min().unwrap_or(0)
                             ..clusters.iter().map(|c| c.end).max().unwrap_or(0);
+                        let marker = node.is_none() && range.end <= content.marker_len;
                         let text = TextFragment {
                             font: r.font().clone(),
                             font_size: r.font_size(),
@@ -2940,6 +2959,7 @@ fn emit_text_fragments(
                             decorations: Vec::new(),
                             baseline,
                             selectable: span_style.user_select_used != browser_style::UserSelect::None,
+                            marker,
                         };
                         let fragment = Fragment {
                             rect: Rect::new(0.0, oy + line_top, x1 - x0, line_height),
@@ -5651,7 +5671,7 @@ mod tests {
         let mut image = None;
         let mut text = None;
         tree.root.walk(&mut |f| match (&f.content, f.node) {
-            (FragmentContent::Image(u), None) => image = Some((f.rect, u.to_string())),
+            (FragmentContent::Image(u), None) => image = Some((f.rect, u.url().map(url::Url::to_string).unwrap_or_default())),
             (FragmentContent::Text(_), Some(_)) if text.is_none() => text = Some(f.rect),
             _ => {}
         });
@@ -6622,5 +6642,276 @@ mod tests {
         let texts = text_rects(&tree);
         assert!(texts.iter().all(|r| r.x >= 0.0 && r.right() <= 800.5));
         assert!(p.height > 16.0);
+    }
+}
+
+/// Generated content ("Working sites first" 6e).
+#[cfg(test)]
+mod generated_content {
+    use super::*;
+    use crate::ImageSource;
+    use browser_dom::PseudoKind;
+    use browser_style::{Origin, Stylesheet, Stylist, Viewport, compute_styles, sync_pseudo_elements, ua::ua_stylesheet};
+
+    /// Twelve-pixel squares for every URL.
+    struct Squares;
+    impl ImageSizes for Squares {
+        fn intrinsic_size(&self, _url: &url::Url) -> Option<(f32, f32)> {
+            Some((12.0, 12.0))
+        }
+    }
+
+    /// Style (with the pseudo-element nodes made) and lay out.
+    fn layout(html: &str, css: &str, images: &dyn ImageSizes) -> (Document, LayoutTree) {
+        let mut doc = browser_dom::parse_html(html.as_bytes());
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(css, Origin::Author)));
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        sync_pseudo_elements(&mut doc, &styles);
+        let mut engine = LayoutEngine::new();
+        let tree = engine.layout(&doc, &styles, 800.0, 600.0, images);
+        (doc, tree)
+    }
+
+    fn by_id(doc: &Document, id: &str) -> NodeId {
+        doc.descendants(doc.root())
+            .find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))
+            .unwrap_or_else(|| panic!("element #{id}"))
+    }
+
+    /// The text shown inside `node`'s fragments, in tree order.
+    fn text_in(tree: &LayoutTree, node: NodeId) -> String {
+        let mut out = String::new();
+        let mut done = false;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(node) && !done {
+                done = true;
+                f.walk(&mut |g| {
+                    if let FragmentContent::Text(t) = &g.content {
+                        out.push_str(&t.text[t.range.clone()]);
+                    }
+                });
+            }
+        });
+        out
+    }
+
+    /// The first fragment of `node`.
+    fn rect_of(tree: &LayoutTree, node: NodeId) -> Rect {
+        let mut found = None;
+        tree.root.walk(&mut |f| {
+            if f.node == Some(node) && found.is_none() {
+                found = Some(f.rect);
+            }
+        });
+        found.expect("fragment")
+    }
+
+    #[test]
+    fn before_and_after_text_sits_around_the_content() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'><p id=p>b<span id=s>x</span></p></body>",
+            "#p::before { content: \"a\" } #p::after { content: \"c\" \"d\" } #s::before { content: \"[\" } #s::after { content: \"]\" }",
+            &(),
+        );
+        let p = by_id(&doc, "p");
+        assert_eq!(text_in(&tree, p), "ab[x]cd");
+        // The generated text belongs to no node: nothing selects it.
+        let mut nodeless = Vec::new();
+        tree.root.walk(&mut |f| {
+            if let (FragmentContent::Text(t), None) = (&f.content, f.node) {
+                nodeless.push(t.text[t.range.clone()].to_owned());
+            }
+        });
+        assert_eq!(nodeless.concat(), "a[]cd");
+        // The inline pseudo-elements have boxes of their own.
+        let s = by_id(&doc, "s");
+        let before = doc.pseudo_element(s, PseudoKind::Before).expect("node");
+        assert!(rect_of(&tree, before).width > 0.0);
+    }
+
+    #[test]
+    fn a_clearfix_after_contains_floats_and_positioned_befores_take_the_element_as_containing_block() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'><div id=c><i style='float:left;width:10px;height:40px'></i></div>\
+             <div id=e><i style='float:left;width:10px;height:40px'></i><b style='display:block;clear:both'></b></div>\
+             <div id=r style='position:relative;margin-left:100px;width:50px;height:50px'></div></body>",
+            "#c::after { content: \"\"; display: block; clear: both }
+             #r::before { content: \"\"; position: absolute; left: 5px; top: 6px; width: 7px; height: 8px }",
+            &(),
+        );
+        assert_eq!(rect_of(&tree, by_id(&doc, "e")).height, 40.0, "a real element clears the float");
+        assert_eq!(rect_of(&tree, by_id(&doc, "c")).height, 40.0, "the ::after clears the float inside");
+        let r = by_id(&doc, "r");
+        let before = doc.pseudo_element(r, PseudoKind::Before).expect("node");
+        assert_eq!(rect_of(&tree, before), Rect::new(105.0, 86.0, 7.0, 8.0));
+    }
+
+    #[test]
+    fn counters_nest_and_list_items_count() {
+        let (doc, tree) = layout(
+            "<body><div id=a class=s><h id=h1 class=h>x</h><div class=s><h id=h2 class=h>y</h><h id=h3 class=h>z</h></div><h id=h4 class=h>w</h></div>\
+             <ol id=o><li id=l1>a</li><li id=l2>b</li></ol><p id=sib1 class=r></p><p id=sib2 class=n></p></body>",
+            ".s { counter-reset: sec } .h { counter-increment: sec; display: block }
+             .h::before { content: counters(sec, \".\") \" \" counter(sec, upper-roman) \"|\" }
+             li::before { content: counter(list-item) \"/\" }
+             .r { counter-reset: pc 5 } .n::before { content: counter(pc) }",
+            &(),
+        );
+        assert_eq!(text_in(&tree, by_id(&doc, "h1")), "1 I|x");
+        assert_eq!(text_in(&tree, by_id(&doc, "h2")), "1.1 I|y");
+        assert_eq!(text_in(&tree, by_id(&doc, "h3")), "1.2 II|z");
+        // The inner reset reaches its following siblings too (CSS 2.1
+        // §12.4.1, Chrome; Firefox ends it with the inner element).
+        assert_eq!(text_in(&tree, by_id(&doc, "h4")), "1.3 III|w");
+        // The marker, then the ::before's `list-item` count.
+        assert_eq!(text_in(&tree, by_id(&doc, "l2")), "2. 2/b");
+        // A reset reaches the element's following siblings (as in Chrome).
+        assert_eq!(text_in(&tree, by_id(&doc, "sib2")), "5");
+    }
+
+    #[test]
+    fn quotes_nest_and_follow_the_language() {
+        let (doc, tree) = layout(
+            "<body><p id=en><q>a<q>b</q></q></p><p id=de lang=de><q>c</q></p>\
+             <p id=x><q style='quotes: \"<\" \">\"'>d<q>e</q></q></p><p id=c><span class=c></span>f</p></body>",
+            ".c::before { content: close-quote \"!\" no-open-quote no-close-quote no-close-quote }",
+            &(),
+        );
+        assert_eq!(text_in(&tree, by_id(&doc, "en")), "\u{201C}a\u{2018}b\u{2019}\u{201D}");
+        assert_eq!(text_in(&tree, by_id(&doc, "de")), "\u{201E}c\u{201C}");
+        // The last pair repeats deeper down.
+        assert_eq!(text_in(&tree, by_id(&doc, "x")), "<d<e>>");
+        // A close-quote at depth 0 inserts nothing.
+        assert_eq!(text_in(&tree, by_id(&doc, "c")), "!f");
+    }
+
+    #[test]
+    fn markers_number_by_html_and_take_marker_content() {
+        let (doc, tree) = layout(
+            "<body><ol id=r reversed><li id=r1>a</li><li id=r2>b</li><li id=r3>c</li></ol>\
+             <ol start=0 style='list-style-type: lower-alpha'><li id=z>d</li></ol>\
+             <ol style='counter-reset: list-item 10'><li id=c>e</li></ol>\
+             <ul><li id=m class=m>f</li><li id=n class=n>g</li></ul>\
+             <ol><div><li id=d1>h</li></div><li id=d2>i</li></ol></body>",
+            ".m::marker { content: \"-> \" } .n::marker { content: none }",
+            &(),
+        );
+        let marker_of = |id: &str| {
+            let li = by_id(&doc, id);
+            let mut out = String::new();
+            tree.root.walk(&mut |f| {
+                if f.node == Some(li) {
+                    f.walk(&mut |g| {
+                        if let (FragmentContent::Text(t), None) = (&g.content, g.node) {
+                            out.push_str(&t.text[t.range.clone()]);
+                        }
+                    });
+                }
+            });
+            out
+        };
+        assert_eq!((marker_of("r1"), marker_of("r2"), marker_of("r3")), ("3. ".into(), "2. ".into(), "1. ".into()));
+        assert_eq!(marker_of("z"), "0. ", "outside lower-alpha's range: decimal");
+        assert_eq!(marker_of("c"), "1. ", "default markers ignore a list-item reset (as in Chrome)");
+        assert_eq!(marker_of("m"), "-> ");
+        assert_eq!(marker_of("n"), "");
+        // Items in a div inside the list belong to the list.
+        assert_eq!((marker_of("d1"), marker_of("d2")), ("1. ".into(), "2. ".into()));
+    }
+
+    #[test]
+    fn content_images_and_gradients_are_replaced_boxes() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'><p id=p>x</p><p id=g>y</p><p id=n>z</p></body>",
+            "#p::before { content: url(http://x/i.png) \"!\" } #g::before { content: linear-gradient(red, blue) }
+             #n::before { content: url(http://x/i.png) }",
+            &Squares,
+        );
+        let images = |id: &str| {
+            let node = by_id(&doc, id);
+            let mut out = Vec::new();
+            tree.root.walk(&mut |f| {
+                if f.node == Some(node) {
+                    f.walk(&mut |g| {
+                        if let FragmentContent::Image(src) = &g.content {
+                            out.push((src.clone(), g.rect.width, g.rect.height));
+                        }
+                    });
+                }
+            });
+            out
+        };
+        let p = images("p");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].0.url().map(url::Url::as_str), Some("http://x/i.png"));
+        assert_eq!((p[0].1, p[0].2), (12.0, 12.0));
+        assert_eq!(text_in(&tree, by_id(&doc, "p")), "!x");
+        let g = images("g");
+        assert!(matches!(g[0].0, ImageSource::Gradient(_)) && (g[0].1, g[0].2) == (300.0, 150.0), "the default object size");
+        // An image not fetched yet makes no box.
+        let (doc, tree) = layout("<p id=n>z</p>", "#n::before { content: url(http://x/i.png) }", &());
+        let n = by_id(&doc, "n");
+        let mut found = false;
+        tree.root.walk(&mut |f| found |= f.node == Some(n) && matches!(f.content, FragmentContent::Image(_)));
+        assert!(!found);
+    }
+
+    #[test]
+    fn markers_and_pseudo_elements_paint_in_their_own_style_after_a_restyle() {
+        let html = "<body><ul><li id=l>a</li><li style='list-style-position: inside'>c</li></ul><p id=p>b</p></body>";
+        let mut doc = browser_dom::parse_html(html.as_bytes());
+        let sheet = |css: &str| {
+            let mut stylist = Stylist::new();
+            stylist.add_sheet(ua_stylesheet());
+            stylist.add_sheet(Arc::new(Stylesheet::parse(css, Origin::Author)));
+            stylist
+        };
+        let styles = compute_styles(&doc, &sheet("li::marker { color: red } #p::before { content: \"x\"; color: red }"), &Viewport::default());
+        sync_pseudo_elements(&mut doc, &styles);
+        let mut engine = LayoutEngine::new();
+        let mut tree = engine.layout(&doc, &styles, 800.0, 600.0, &());
+        let colors = |tree: &LayoutTree| {
+            let mut out = Vec::new();
+            tree.root.walk(&mut |f| {
+                if let (FragmentContent::Text(t), None) = (&f.content, f.node) {
+                    out.push((t.text[t.range.clone()].to_owned(), t.color.to_rgba8()));
+                }
+            });
+            out
+        };
+        let red = [255, 0, 0, 255];
+        assert_eq!(colors(&tree), vec![("\u{2022} ".to_owned(), red), ("\u{2022} ".to_owned(), red), ("x".to_owned(), red)]);
+        // A paint-only restyle gives them their new colours.
+        let styles = compute_styles(&doc, &sheet("li::marker { color: blue } #p::before { content: \"x\"; color: blue }"), &Viewport::default());
+        engine.refresh_styles(&mut tree, &doc, &styles);
+        let blue = [0, 0, 255, 255];
+        assert_eq!(colors(&tree), vec![("\u{2022} ".to_owned(), blue), ("\u{2022} ".to_owned(), blue), ("x".to_owned(), blue)]);
+    }
+
+    #[test]
+    fn wikipedia_hlist_separators() {
+        // Wikipedia's `.hlist`: inline items with " · " after each but the last.
+        let (doc, tree) = layout(
+            "<body><div class=hlist><ul id=u><li>One</li><li>Two</li><li>Three</li></ul></div></body>",
+            ".hlist ul { margin: 0; padding: 0 } .hlist li { display: inline }
+             .hlist li::after { content: \" · \"; font-weight: bold } .hlist li:last-child::after { content: none }",
+            &(),
+        );
+        assert_eq!(text_in(&tree, by_id(&doc, "u")), "One · Two · Three");
+    }
+
+    #[test]
+    fn checkboxes_get_pseudo_elements_images_do_not() {
+        let (doc, tree) = layout(
+            "<body><input id=k type=checkbox><img id=i src=http://x/a.png></body>",
+            "input::before, img::before { content: \"X\" }",
+            &Squares,
+        );
+        let k = by_id(&doc, "k");
+        assert!(doc.pseudo_element(k, PseudoKind::Before).is_some());
+        assert_eq!(text_in(&tree, k), "X");
+        assert!(doc.pseudo_element(by_id(&doc, "i"), PseudoKind::Before).is_none());
     }
 }

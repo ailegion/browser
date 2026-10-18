@@ -15,6 +15,7 @@ mod convert;
 mod decor;
 mod engine;
 mod formatting;
+mod generated;
 mod lines;
 mod positioned;
 pub mod selection;
@@ -543,6 +544,26 @@ pub struct TextFragment {
     /// `user-select` is not `none`): unselectable text is skipped by
     /// pointer selection, select-all, find and copy.
     pub selectable: bool,
+    /// Part of a list marker's text (its `::marker` style is its own).
+    pub marker: bool,
+}
+
+/// What a replaced image draws: a fetched image, or a gradient (a
+/// `content` image of a `::before`/`::after`, at the default object size).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageSource {
+    Url(Url),
+    Gradient(Arc<browser_style::ComputedGradient>),
+}
+
+impl ImageSource {
+    /// The fetched image's URL, if it is one.
+    pub fn url(&self) -> Option<&Url> {
+        match self {
+            ImageSource::Url(u) => Some(u),
+            ImageSource::Gradient(_) => None,
+        }
+    }
 }
 
 /// A form control the painter draws something particular for, beyond
@@ -564,7 +585,7 @@ pub enum FragmentContent {
     Anonymous,
     Text(TextFragment),
     /// A replaced image; `rect` is where it is drawn.
-    Image(Url),
+    Image(ImageSource),
     /// A list marker or other generated text.
     Marker,
     /// One line fragment of a non-replaced `display: inline` element: its

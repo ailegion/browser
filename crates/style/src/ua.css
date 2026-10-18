@@ -48,6 +48,13 @@ ul ul, ol ul { list-style-type: circle; }
 ul ul ul, ol ul ul, ol ol ul { list-style-type: square; }
 dd { margin-left: 40px; }
 li { text-align: start; }
+/* Counters and markers (HTML rendering §15.3.7, CSS Lists 3's sheet). */
+ol, ul, menu { counter-reset: list-item; }
+::marker { unicode-bidi: isolate; white-space: pre; text-transform: none; }
+
+/* Quotes (HTML rendering §15.3.4). */
+q::before { content: open-quote; }
+q::after { content: close-quote; }
 
 /* Bidirectional text (HTML rendering, "the bidi algorithm"). */
 [dir]:dir(ltr), bdi:dir(ltr), input[type=tel i]:dir(ltr) { direction: ltr; }

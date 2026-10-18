@@ -5,16 +5,16 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 
-use browser_dom::{Directionality, Document, NodeId, NodeKind, strong_direction};
+use browser_dom::{Directionality, Document, NodeId, NodeKind, PseudoKind, strong_direction};
 use browser_style::{
-    BoxDecorationBreak, ComputedLp, ComputedLpAuto, ComputedStyle, Direction, Display, Float, FontVariant,
-    LetterSpacing, ListStylePosition, ListStyleType, Overflow, Position, Rgba, Sides, StyleMap, TextTransform,
-    UnicodeBidi, WhiteSpace,
+    BoxDecorationBreak, ComputedImage, ComputedLp, ComputedLpAuto, ComputedStyle, Direction, Display, Float, FontVariant,
+    LetterSpacing, ListStylePosition, Overflow, Position, Rgba, Sides, StyleMap, TextTransform, UnicodeBidi, WhiteSpace,
 };
 use html5ever::{local_name, ns};
 use url::Url;
 
-use crate::{Control, Fragment, ImageSizes};
+use crate::generated::{GenPiece, Generated, MarkerText};
+use crate::{Control, Fragment, ImageSizes, ImageSource};
 
 pub(crate) type TaffyId = taffy::NodeId;
 
@@ -27,7 +27,7 @@ pub(crate) enum BoxKind {
     Inline(InlineContent),
     /// Replaced image with an optional intrinsic size.
     Image {
-        url: Option<Url>,
+        source: Option<ImageSource>,
         intrinsic: Option<(f32, f32)>,
     },
     /// A table (CSS 2.1 §17; "Working sites first" line 3): laid out by
@@ -1025,6 +1025,19 @@ pub(crate) struct BoxBuilder<'a> {
     /// containing block's element; the engine lays each out against it
     /// (`positioned.rs`).
     pub oofs: RefCell<Vec<OutOfFlowBox>>,
+    /// What the `::before`/`::after` boxes and the list markers show
+    /// (`generated.rs`), worked out before the boxes are built.
+    generated: Generated,
+}
+
+/// One child of a box being built: a node (an element, a text node, a
+/// `::before`/`::after`), or a piece of a pseudo-element's generated
+/// content.
+#[derive(Clone)]
+enum Kid {
+    Node(NodeId),
+    Text(Arc<str>),
+    Image(ComputedImage),
 }
 
 /// An absolutely positioned or fixed box out of its flow.
@@ -1045,7 +1058,90 @@ impl<'a> BoxBuilder<'a> {
             images,
             viewport_source,
             oofs: RefCell::new(Vec::new()),
+            generated: crate::generated::generate(doc, styles),
         }
+    }
+
+    /// The children of `id` as boxes see them: an element's `::before`,
+    /// its child nodes and its `::after`; a pseudo-element's generated
+    /// content.
+    fn kids(&self, id: NodeId) -> Vec<Kid> {
+        if self.doc.get(id).pseudo_kind().is_some() {
+            return self
+                .generated
+                .pseudo
+                .get(&id)
+                .map(|pieces| {
+                    pieces
+                        .iter()
+                        .map(|p| match p {
+                            GenPiece::Text(t) => Kid::Text(Arc::from(t.as_str())),
+                            GenPiece::Image(i) => Kid::Image(i.clone()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        let pseudo = |kind: PseudoKind| self.doc.pseudo_element(id, kind).filter(|&p| self.style_of(p).is_some());
+        let mut out = Vec::new();
+        out.extend(pseudo(PseudoKind::Before).map(Kid::Node));
+        out.extend(self.doc.children(id).map(Kid::Node));
+        out.extend(pseudo(PseudoKind::After).map(Kid::Node));
+        out
+    }
+
+    /// A pseudo-element's `content` image into its inline root, as an
+    /// atomic inside the inline element `inline_box` (kept out of the
+    /// recursive builders so their frames stay small).
+    #[inline(never)]
+    fn push_content_image(
+        &self,
+        image: &ComputedImage,
+        style: &Arc<ComputedStyle>,
+        content: &mut InlineContent,
+        ws: &mut WsState,
+        inline_box: Option<usize>,
+    ) {
+        if let Some(node) = self.content_image(image, style) {
+            let seq = content.seq();
+            content.atomics.push(Atomic::new(content.text.len(), node, inline_box, seq));
+            ws.last_was_space = false;
+            ws.at_line_start = false;
+        }
+    }
+
+    /// A `content` image as a replaced box in `style` (inheriting from
+    /// the pseudo-element): a fetched image at its size (an `image-set()`
+    /// candidate at its size over its resolution), a gradient at the
+    /// default object size (300×150, CSS Images 3 §4.3). An image not
+    /// fetched yet makes no box.
+    fn content_image(&self, image: &ComputedImage, style: &Arc<ComputedStyle>) -> Option<BoxNode> {
+        let (source, intrinsic) = match image {
+            ComputedImage::Url(u) => {
+                let url = Url::parse(u).ok()?;
+                let size = self.images.intrinsic_size(&url)?;
+                (ImageSource::Url(url), size)
+            }
+            ComputedImage::ImageSet(candidates) => candidates.iter().find_map(|c| match &c.image {
+                ComputedImage::Url(u) => {
+                    let url = Url::parse(u).ok()?;
+                    let (w, h) = self.images.intrinsic_size(&url)?;
+                    let r = if c.resolution > 0.0 { c.resolution } else { 1.0 };
+                    Some((ImageSource::Url(url), (w / r, h / r)))
+                }
+                _ => None,
+            })?,
+            ComputedImage::Gradient(g) => (ImageSource::Gradient(g.clone()), (300.0, 150.0)),
+            ComputedImage::None | ComputedImage::Function(_) => return None,
+        };
+        Some(BoxNode::new(
+            BoxKind::Image {
+                source: Some(source),
+                intrinsic: Some(intrinsic),
+            },
+            None,
+            Arc::new(ComputedStyle::anonymous_from(style)),
+        ))
     }
 
     /// Take an out-of-flow element's box out of its flow: its index.
@@ -1128,8 +1224,16 @@ impl BoxBuilder<'_> {
         Some(self.build_element(root, style, 0))
     }
 
+    /// The style of an element, or of a `::before`/`::after` node (its
+    /// element's pseudo style).
     fn style_of(&self, id: NodeId) -> Option<Arc<ComputedStyle>> {
-        self.styles.get(id).cloned()
+        match self.doc.get(id).pseudo_kind() {
+            Some(kind) => {
+                let owner = self.doc.parent(id)?;
+                self.styles.get(owner)?.pseudo_style(kind == PseudoKind::After).cloned()
+            }
+            None => self.styles.get(id).cloned(),
+        }
     }
 
     fn is_image(&self, id: NodeId) -> bool {
@@ -1169,12 +1273,17 @@ impl BoxBuilder<'_> {
         match kind {
             ControlKind::Check { radio } => {
                 let checked = attr("checked").is_some();
-                let mut b = BoxNode::new(BoxKind::Block, Some(id), style);
+                let mut b = BoxNode::new(BoxKind::Block, Some(id), style.clone());
                 b.control = Some(if radio {
                     Control::Radio { checked }
                 } else {
                     Control::Checkbox { checked }
                 });
+                // Its `::before`/`::after` boxes, inside it.
+                let kids = self.kids(id);
+                if !kids.is_empty() {
+                    b.children = self.build_children_from(&kids, &style, 1);
+                }
                 b
             }
             ControlKind::Text { password } => {
@@ -1287,11 +1396,11 @@ impl BoxBuilder<'_> {
                 .and_then(|e| e.attr("src"))
                 .and_then(|src| self.doc.resolve_url(src));
             let intrinsic = url.as_ref().and_then(|u| self.images.intrinsic_size(u));
-            return BoxNode::new(BoxKind::Image { url, intrinsic }, Some(id), style);
+            return BoxNode::new(BoxKind::Image { source: url.map(ImageSource::Url), intrinsic }, Some(id), style);
         }
 
         if style.display.is_table() {
-            let children: Vec<NodeId> = self.doc.children(id).collect();
+            let children = self.kids(id);
             return self.build_table(Some(id), style, children, depth);
         }
         let kind = match style.display {
@@ -1333,7 +1442,7 @@ impl BoxBuilder<'_> {
     /// Children of a block or flex container: block-level children become
     /// boxes; runs of inline-level content become anonymous inline roots.
     fn build_children(&self, id: NodeId, container: &Arc<ComputedStyle>, depth: usize) -> Vec<BoxNode> {
-        let children: Vec<NodeId> = self.doc.children(id).collect();
+        let children = self.kids(id);
         self.build_children_from(&children, container, depth)
     }
 
@@ -1342,7 +1451,7 @@ impl BoxBuilder<'_> {
     /// (rows, row groups, cells, captions) outside a table gets an
     /// anonymous table around it (CSS 2.1 §17.2.1), whitespace between
     /// them dropped.
-    fn build_children_from(&self, children: &[NodeId], container: &Arc<ComputedStyle>, depth: usize) -> Vec<BoxNode> {
+    fn build_children_from(&self, children: &[Kid], container: &Arc<ComputedStyle>, depth: usize) -> Vec<BoxNode> {
         let mut out = Vec::new();
         let mut pending: Option<InlineContent> = None;
         let mut ws = WsState {
@@ -1386,14 +1495,29 @@ impl BoxBuilder<'_> {
 
         let mut i = 0;
         while i < children.len() {
-            let child = children[i];
+            let kid = &children[i];
             i += 1;
+            let child = match kid {
+                // A pseudo-element's generated text: nodeless, so nothing
+                // selects, finds or copies it.
+                Kid::Text(text) => {
+                    let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
+                    append_text(content, text, container.clone(), None, &mut ws, None);
+                    continue;
+                }
+                Kid::Image(image) => {
+                    let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
+                    self.push_content_image(image, container, content, &mut ws, None);
+                    continue;
+                }
+                Kid::Node(n) => *n,
+            };
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
                     let content = pending.get_or_insert_with(|| InlineContent::new(container.clone()));
                     append_text(content, text, container.clone(), Some(child), &mut ws, None);
                 }
-                NodeKind::Element(_) => {
+                NodeKind::Element(_) | NodeKind::PseudoElement(_) => {
                     let Some(style) = self.style_of(child) else { continue };
                     if style.display.is_none() {
                         continue;
@@ -1416,10 +1540,10 @@ impl BoxBuilder<'_> {
                     if is_table_part(style.display) {
                         // The run of table parts from here, whitespace
                         // between them left out.
-                        let mut run = vec![child];
+                        let mut run = vec![kid.clone()];
                         while i < children.len() {
-                            match self.table_part_or_space(children[i]) {
-                                Some(true) => run.push(children[i]),
+                            match self.table_part_or_space(&children[i]) {
+                                Some(true) => run.push(children[i].clone()),
                                 Some(false) => {}
                                 None => break,
                             }
@@ -1449,10 +1573,15 @@ impl BoxBuilder<'_> {
     /// Whether a node continues a run of table parts: `Some(true)` for a
     /// displayed table part, `Some(false)` for whitespace-only text or a
     /// node without a box (skipped), `None` for anything else.
-    fn table_part_or_space(&self, id: NodeId) -> Option<bool> {
+    fn table_part_or_space(&self, kid: &Kid) -> Option<bool> {
+        let id = match kid {
+            Kid::Text(t) => return t.chars().all(char::is_whitespace).then_some(false),
+            Kid::Image(_) => return None,
+            Kid::Node(n) => *n,
+        };
         match &self.doc.get(id).kind {
             NodeKind::Text(t) => t.chars().all(char::is_whitespace).then_some(false),
-            NodeKind::Element(_) => match self.style_of(id) {
+            NodeKind::Element(_) | NodeKind::PseudoElement(_) => match self.style_of(id) {
                 Some(s) if s.display.is_none() => Some(false),
                 Some(s) if is_table_part(s.display) => Some(true),
                 _ => None,
@@ -1467,7 +1596,7 @@ impl BoxBuilder<'_> {
     /// (`node`), or an anonymous one around `children`. Children that are
     /// not table parts get the anonymous rows and cells of §17.2.1; the
     /// header groups come first and the footer groups last.
-    fn build_table(&self, node: Option<NodeId>, style: Arc<ComputedStyle>, children: Vec<NodeId>, depth: usize) -> BoxNode {
+    fn build_table(&self, node: Option<NodeId>, style: Arc<ComputedStyle>, children: Vec<Kid>, depth: usize) -> BoxNode {
         let mut table = TableBox {
             style: style.clone(),
             captions: Vec::new(),
@@ -1485,14 +1614,23 @@ impl BoxBuilder<'_> {
         let mut bodies = Vec::new();
         let mut footers = Vec::new();
         let mut anon = AnonTable::default();
-        for child in children {
+        for kid in children {
+            let child = match kid {
+                Kid::Node(n) => n,
+                // Generated content goes into an anonymous cell.
+                Kid::Text(ref t) if t.chars().all(char::is_whitespace) => continue,
+                other => {
+                    anon.misc.push(other);
+                    continue;
+                }
+            };
             match &self.doc.get(child).kind {
                 NodeKind::Text(t) => {
                     if !t.chars().all(char::is_whitespace) {
-                        anon.misc.push(child);
+                        anon.misc.push(Kid::Node(child));
                     }
                 }
-                NodeKind::Element(_) => {
+                NodeKind::Element(_) | NodeKind::PseudoElement(_) => {
                     let Some(cs) = self.style_of(child) else { continue };
                     match cs.display {
                         Display::None => {}
@@ -1526,7 +1664,7 @@ impl BoxBuilder<'_> {
                             anon.flush_misc(self, &style, depth);
                             anon.cells.push(self.build_cell(child, cs, depth));
                         }
-                        _ => anon.misc.push(child),
+                        _ => anon.misc.push(Kid::Node(child)),
                     }
                 }
                 _ => {}
@@ -1545,29 +1683,19 @@ impl BoxBuilder<'_> {
     /// get anonymous rows (and cells).
     fn build_row_group(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> RowGroupBox {
         let mut anon = AnonTable::default();
-        for child in self.doc.children(id) {
-            match &self.doc.get(child).kind {
-                NodeKind::Text(t) => {
-                    if !t.chars().all(char::is_whitespace) {
-                        anon.misc.push(child);
-                    }
+        for kid in self.kids(id) {
+            let Some((child, cs)) = self.table_child(kid, &mut anon) else { continue };
+            match cs.display {
+                Display::None => {}
+                Display::TableRow => {
+                    anon.flush_row(self, &style, depth);
+                    anon.rows.push(self.build_row(child, cs, depth));
                 }
-                NodeKind::Element(_) => {
-                    let Some(cs) = self.style_of(child) else { continue };
-                    match cs.display {
-                        Display::None => {}
-                        Display::TableRow => {
-                            anon.flush_row(self, &style, depth);
-                            anon.rows.push(self.build_row(child, cs, depth));
-                        }
-                        Display::TableCell => {
-                            anon.flush_misc(self, &style, depth);
-                            anon.cells.push(self.build_cell(child, cs, depth));
-                        }
-                        _ => anon.misc.push(child),
-                    }
+                Display::TableCell => {
+                    anon.flush_misc(self, &style, depth);
+                    anon.cells.push(self.build_cell(child, cs, depth));
                 }
-                _ => {}
+                _ => anon.misc.push(Kid::Node(child)),
             }
         }
         anon.flush_row(self, &style, depth);
@@ -1582,25 +1710,15 @@ impl BoxBuilder<'_> {
     /// per run.
     fn build_row(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> RowBox {
         let mut anon = AnonTable::default();
-        for child in self.doc.children(id) {
-            match &self.doc.get(child).kind {
-                NodeKind::Text(t) => {
-                    if !t.chars().all(char::is_whitespace) {
-                        anon.misc.push(child);
-                    }
+        for kid in self.kids(id) {
+            let Some((child, cs)) = self.table_child(kid, &mut anon) else { continue };
+            match cs.display {
+                Display::None => {}
+                Display::TableCell => {
+                    anon.flush_misc(self, &style, depth);
+                    anon.cells.push(self.build_cell(child, cs, depth));
                 }
-                NodeKind::Element(_) => {
-                    let Some(cs) = self.style_of(child) else { continue };
-                    match cs.display {
-                        Display::None => {}
-                        Display::TableCell => {
-                            anon.flush_misc(self, &style, depth);
-                            anon.cells.push(self.build_cell(child, cs, depth));
-                        }
-                        _ => anon.misc.push(child),
-                    }
-                }
-                _ => {}
+                _ => anon.misc.push(Kid::Node(child)),
             }
         }
         anon.flush_misc(self, &style, depth);
@@ -1614,8 +1732,32 @@ impl BoxBuilder<'_> {
     /// A cell: a block container with the element's children, its spans
     /// from the HTML attributes (`colspan` 1..=1000, `rowspan` 0..=65534
     /// with 0 reaching the end of the row group, HTML §4.9.11).
+    /// A child of a row group or row: an element or pseudo-element with
+    /// its style; text (not white space) and generated content go to the
+    /// anonymous cell being gathered.
+    fn table_child(&self, kid: Kid, anon: &mut AnonTable) -> Option<(NodeId, Arc<ComputedStyle>)> {
+        let child = match kid {
+            Kid::Node(n) => n,
+            Kid::Text(ref t) if t.chars().all(char::is_whitespace) => return None,
+            other => {
+                anon.misc.push(other);
+                return None;
+            }
+        };
+        match &self.doc.get(child).kind {
+            NodeKind::Text(t) => {
+                if !t.chars().all(char::is_whitespace) {
+                    anon.misc.push(Kid::Node(child));
+                }
+                None
+            }
+            NodeKind::Element(_) | NodeKind::PseudoElement(_) => Some((child, self.style_of(child)?)),
+            _ => None,
+        }
+    }
+
     fn build_cell(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> CellBox {
-        let children: Vec<NodeId> = self.doc.children(id).collect();
+        let children = self.kids(id);
         let span = |name: &str, default: usize, max: usize| {
             self.doc
                 .element(id)
@@ -1631,7 +1773,7 @@ impl BoxBuilder<'_> {
         cell
     }
 
-    fn cell_box(&self, node: Option<NodeId>, style: Arc<ComputedStyle>, children: &[NodeId], depth: usize) -> CellBox {
+    fn cell_box(&self, node: Option<NodeId>, style: Arc<ComputedStyle>, children: &[Kid], depth: usize) -> CellBox {
         let mut b = BoxNode::new(BoxKind::Block, node, style.clone());
         b.children = if depth < MAX_DEPTH { self.build_children_from(children, &style, depth + 1) } else { Vec::new() };
         b.anonymous = node.is_none();
@@ -1672,7 +1814,7 @@ fn anon_style(parent: &ComputedStyle, display: Display) -> Arc<ComputedStyle> {
 /// rows of an anonymous row group.
 #[derive(Default)]
 struct AnonTable {
-    misc: Vec<NodeId>,
+    misc: Vec<Kid>,
     cells: Vec<CellBox>,
     rows: Vec<RowBox>,
 }
@@ -1834,16 +1976,28 @@ impl BoxBuilder<'_> {
                 style: control_style(&style),
             });
         }
-        let children: Vec<NodeId> = self.doc.children(id).collect();
+        let children = self.kids(id);
         let mut i = 0;
         while i < children.len() {
-            let child = children[i];
+            let kid = &children[i];
             i += 1;
+            let child = match kid {
+                // Generated text and images of a pseudo-element.
+                Kid::Text(text) => {
+                    append_text(content, text, style.clone(), None, ws, me);
+                    continue;
+                }
+                Kid::Image(image) => {
+                    self.push_content_image(image, &style, content, ws, me);
+                    continue;
+                }
+                Kid::Node(n) => *n,
+            };
             match &self.doc.get(child).kind {
                 NodeKind::Text(text) => {
                     append_text(content, text, style.clone(), Some(child), ws, me);
                 }
-                NodeKind::Element(_) => {
+                NodeKind::Element(_) | NodeKind::PseudoElement(_) => {
                     let Some(cs) = self.style_of(child) else { continue };
                     if cs.display.is_none() {
                         continue;
@@ -1855,10 +2009,10 @@ impl BoxBuilder<'_> {
                     if is_table_part(cs.display) {
                         // Table parts inside an inline: an anonymous
                         // inline-table around the run, placed as an atomic.
-                        let mut run = vec![child];
+                        let mut run = vec![kid.clone()];
                         while i < children.len() {
-                            match self.table_part_or_space(children[i]) {
-                                Some(true) => run.push(children[i]),
+                            match self.table_part_or_space(&children[i]) {
+                                Some(true) => run.push(children[i].clone()),
                                 Some(false) => {}
                                 None => break,
                             }
@@ -1887,8 +2041,11 @@ impl BoxBuilder<'_> {
         content.boxes[me_index].seq_end = content.seq();
     }
 
-    /// The list item's marker: the `list-style-image` when the image is
-    /// known (followed by a space), else the `list-style-type`'s text.
+    /// The list item's marker, in its `::marker` style: the marker's
+    /// `content` when it has one (`none`: no marker); else the
+    /// `list-style-image` when the image is known (followed by a space),
+    /// else the `list-style-type`'s representation of the item's ordinal
+    /// with its suffix (`generated.rs` numbers the items).
     /// `inside` puts it at the start of the item's first line;
     /// `outside` (the default) makes it a box of its own that the engine
     /// places left of the content edge, on the first line's baseline,
@@ -1896,45 +2053,61 @@ impl BoxBuilder<'_> {
     /// nothing else to make a line, as the item's one line moved left by
     /// its width (`BoxNode::hangs`).
     fn add_marker(&self, id: NodeId, style: &Arc<ComputedStyle>, b: &mut BoxNode) {
-        let image = style
-            .list_style_image
-            .as_deref()
-            .and_then(|u| Url::parse(u).ok())
-            .and_then(|url| self.images.intrinsic_size(&url).map(|size| (url, size)));
-        let text = if image.is_some() {
-            " ".to_owned()
-        } else {
-            match style.list_style_type {
-                ListStyleType::None => return,
-                ListStyleType::Disc => "\u{2022} ".to_owned(),
-                ListStyleType::Circle => "\u{25E6} ".to_owned(),
-                ListStyleType::Square => "\u{25AA} ".to_owned(),
-                numbered => {
-                    let n = self.list_index(id);
-                    match numbered {
-                        ListStyleType::LowerAlpha => format!("{}. ", alpha(n, false)),
-                        ListStyleType::UpperAlpha => format!("{}. ", alpha(n, true)),
-                        ListStyleType::LowerRoman => format!("{}. ", roman(n).to_ascii_lowercase()),
-                        ListStyleType::UpperRoman => format!("{}. ", roman(n)),
-                        _ => format!("{n}. "),
+        let marker_style = style
+            .marker_style()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(ComputedStyle::anonymous_from(style)));
+        // The marker's text, and its images at their text offsets.
+        let mut text = String::new();
+        let mut images: Vec<(usize, BoxNode)> = Vec::new();
+        match self.generated.markers.get(&id) {
+            Some(MarkerText::None) => return,
+            Some(MarkerText::Custom(pieces)) => {
+                for p in pieces {
+                    match p {
+                        GenPiece::Text(t) => text.push_str(t),
+                        GenPiece::Image(i) => {
+                            if let Some(node) = self.content_image(i, &marker_style) {
+                                images.push((text.len(), node));
+                            }
+                        }
                     }
                 }
+                if text.is_empty() && images.is_empty() {
+                    return;
+                }
             }
-        };
-        let marker_style = Arc::new(ComputedStyle::anonymous_from(style));
-        let image_box = |marker_style: Arc<ComputedStyle>| {
-            image.map(|(url, intrinsic)| {
-                let node = BoxNode::new(
-                    BoxKind::Image {
-                        url: Some(url),
-                        intrinsic: Some(intrinsic),
-                    },
-                    None,
-                    marker_style,
-                );
-                Atomic::new(0, node, None, 0)
-            })
-        };
+            ordinal => {
+                let n = match ordinal {
+                    Some(MarkerText::Default(n)) => *n,
+                    _ => 1,
+                };
+                let image = style
+                    .list_style_image
+                    .as_deref()
+                    .and_then(|u| Url::parse(u).ok())
+                    .and_then(|url| self.images.intrinsic_size(&url).map(|size| (url, size)));
+                if let Some((url, intrinsic)) = image {
+                    let node = BoxNode::new(
+                        BoxKind::Image {
+                            source: Some(ImageSource::Url(url)),
+                            intrinsic: Some(intrinsic),
+                        },
+                        None,
+                        marker_style.clone(),
+                    );
+                    images.push((0, node));
+                    text.push(' ');
+                } else {
+                    let t = style.list_style_type;
+                    if t == browser_style::ListStyleType::None {
+                        return;
+                    }
+                    text = format!("{}{}", t.represent(n), t.suffix());
+                }
+            }
+        }
+        let atomics = || images.into_iter().map(|(index, node)| Atomic::new(index, node, None, 0));
         if style.list_style_position == ListStylePosition::Inside {
             if !b.children.first().is_some_and(BoxNode::is_inline_root) {
                 let mut m = BoxNode::new(BoxKind::Inline(InlineContent::new(style.clone())), None, marker_style.clone());
@@ -1944,24 +2117,24 @@ impl BoxBuilder<'_> {
             let Some(first) = b.children.first_mut() else { return };
             let BoxKind::Inline(root) = &mut first.kind else { return };
             root.prepend(&text, marker_style.clone());
-            if let Some(atomic) = image_box(marker_style) {
-                root.atomics.insert(0, atomic);
+            for (i, atomic) in atomics().enumerate() {
+                root.atomics.insert(i, atomic);
             }
             root.marker_len = text.len();
             return;
         }
         let mut content = InlineContent::new(style.clone());
         content.text = text.clone();
-        content.spans.push(TextSpan {
-            start: 0,
-            end: text.len(),
-            style: marker_style.clone(),
-            node: None,
-            inline_box: None,
-        });
-        if let Some(atomic) = image_box(marker_style.clone()) {
-            content.atomics.push(atomic);
+        if !text.is_empty() {
+            content.spans.push(TextSpan {
+                start: 0,
+                end: text.len(),
+                style: marker_style.clone(),
+                node: None,
+                inline_box: None,
+            });
         }
+        content.atomics.extend(atomics());
         content.marker_len = text.len();
         // An outside marker's own line is not the item's first line.
         content.first_formatted_line = false;
@@ -1976,34 +2149,6 @@ impl BoxBuilder<'_> {
         }
     }
 
-    /// 1-based position among list-item siblings, honoring `<ol start>` and
-    /// `<li value>`.
-    fn list_index(&self, id: NodeId) -> i64 {
-        let mut n: i64 = 0;
-        let mut explicit: Option<i64> = None;
-        if let Some(parent) = self.doc.parent(id) {
-            if let Some(start) = self.doc.element(parent).and_then(|e| e.attr("start")).and_then(|s| s.trim().parse::<i64>().ok()) {
-                n = start - 1;
-            }
-            for sib in self.doc.children(parent) {
-                let is_item = self.styles.get(sib).is_some_and(|s| s.display == Display::ListItem);
-                if !is_item {
-                    continue;
-                }
-                if let Some(v) = self.doc.element(sib).and_then(|e| e.attr("value")).and_then(|s| s.trim().parse::<i64>().ok()) {
-                    explicit = Some(v);
-                    n = v;
-                } else {
-                    n += 1;
-                }
-                if sib == id {
-                    return explicit.unwrap_or(n);
-                }
-                explicit = None;
-            }
-        }
-        n.max(1)
-    }
 }
 
 fn is_inline_level(style: &ComputedStyle) -> bool {
@@ -2140,36 +2285,6 @@ fn append_text(
     }
 }
 
-fn alpha(n: i64, upper: bool) -> String {
-    let mut n = n.max(1) as u64;
-    let mut s = Vec::new();
-    while n > 0 {
-        let r = ((n - 1) % 26) as u8;
-        s.push(if upper { b'A' + r } else { b'a' + r });
-        n = (n - 1) / 26;
-    }
-    s.reverse();
-    String::from_utf8(s).unwrap_or_default()
-}
-
-fn roman(n: i64) -> String {
-    if !(1..4000).contains(&n) {
-        return n.to_string();
-    }
-    let mut n = n;
-    let mut out = String::new();
-    for (v, s) in [
-        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
-        (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
-    ] {
-        while n >= v {
-            out.push_str(s);
-            n -= v;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2224,7 +2339,7 @@ mod tests {
 let img_index = 9;
         c.atomics.push(Atomic::new(
             img_index,
-            BoxNode::new(BoxKind::Image { url: None, intrinsic: None }, None, c.container.clone()),
+            BoxNode::new(BoxKind::Image { source: None, intrinsic: None }, None, c.container.clone()),
             None,
             0,
         ));
@@ -2435,8 +2550,9 @@ let img_index = 9;
 
     #[test]
     fn roman_and_alpha() {
-        assert_eq!(roman(1994), "MCMXCIV");
-        assert_eq!(alpha(1, false), "a");
-        assert_eq!(alpha(27, true), "AA");
+        use browser_style::ListStyleType;
+        assert_eq!(ListStyleType::UpperRoman.represent(1994), "MCMXCIV");
+        assert_eq!(ListStyleType::LowerAlpha.represent(1), "a");
+        assert_eq!(ListStyleType::UpperAlpha.represent(27), "AA");
     }
 }

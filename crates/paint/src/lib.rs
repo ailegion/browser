@@ -187,7 +187,7 @@ pub fn decode_image(bytes: &[u8]) -> Option<ImageData> {
 /// Style, lay out, paint and rasterize an HTML document with no network,
 /// for tests and tools. Returns RGBA8 pixels, or `None` without a GPU.
 pub fn render_html(html: &[u8], width: u32, height: u32, scale: f32) -> Option<Vec<u8>> {
-    let doc = browser_dom::parse_html(html);
+    let mut doc = browser_dom::parse_html(html);
     let mut stylist = browser_style::Stylist::new();
     stylist.add_sheet(browser_style::ua::ua_stylesheet());
     // Inline <style> elements only; no external resources.
@@ -206,6 +206,7 @@ pub fn render_html(html: &[u8], width: u32, height: u32, scale: f32) -> Option<V
         prefers_dark: false,
     };
     let styles = browser_style::compute_styles(&doc, &stylist, &vp);
+    browser_style::sync_pseudo_elements(&mut doc, &styles);
     let mut engine = browser_layout::LayoutEngine::new();
     let images = ImageStore::new();
     let tree = engine.layout(&doc, &styles, logical_w, logical_h, &images);
@@ -1610,7 +1611,25 @@ impl<'a> Painter<'a> {
         self.scene.pop_layer();
     }
 
-    fn image(&mut self, rect: &Rect, style: &ComputedStyle, url: &Url) {
+    fn image(&mut self, rect: &Rect, style: &ComputedStyle, source: &browser_layout::ImageSource) {
+        let url = match source {
+            browser_layout::ImageSource::Url(u) => u,
+            // A gradient `content` image fills its content box.
+            browser_layout::ImageSource::Gradient(g) => {
+                let content = content_box(rect, style);
+                let (w, h) = (content.width as f64, content.height as f64);
+                if w <= 0.0 || h <= 0.0 {
+                    return;
+                }
+                if let Some((brush, brush_transform)) = gradient_paint(g, w, h) {
+                    let (x, y) = (content.x as f64, content.y as f64);
+                    let area = KRect::new(x, y, x + w, y + h);
+                    let bt = Affine::translate((x, y)) * brush_transform;
+                    self.scene.fill(Fill::NonZero, self.transform, &brush, Some(bt), &area);
+                }
+                return;
+            }
+        };
         if let Some(svg) = self.images.get_svg(url).cloned() {
             let content = content_box(rect, style);
             self.draw_svg(&svg, content.x as f64, content.y as f64, content.width as f64, content.height as f64);
@@ -2938,6 +2957,23 @@ mod tests {
         assert_eq!([pixels[800], pixels[801], pixels[802]], [0xff, 0x96, 0x32]);
 
         let _ = &mut options;
+    }
+
+    /// A gradient in a `::before`'s `content` paints at the default object
+    /// size, 300×150 ("Working sites first" 6e).
+    #[test]
+    fn content_gradients_paint_at_the_default_object_size() {
+        let html = b"<style>body { margin: 0 } p { margin: 0 } p::before { content: linear-gradient(rgb(255, 0, 0), rgb(255, 0, 0)) }</style><p></p>";
+        let Some(pixels) = render_html(html, 400, 200, 1.0) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let px = |x: usize, y: usize| {
+            let i = (y * 400 + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        assert_eq!(px(150, 75), [255, 0, 0], "inside the 300×150 image");
+        assert_eq!(px(350, 75), [255, 255, 255], "right of it");
     }
 
     /// A checked box is filled blue, an unchecked one white, and the

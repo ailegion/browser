@@ -33,13 +33,13 @@ use boa_gc::{Finalize, Trace};
 use browser_dom::{Document, NodeId};
 use browser_style::serialize::shorthand_value;
 use browser_style::{
-    ComputedStyle, Declaration, DeclaredValue, Position, PropertyId, SHORTHANDS, Sides, UsedValues, is_shorthand,
-    longhands_of, parse_cssom_block, parse_declaration_value, resolved_value, serialize_block, serialize_declared,
-    serialize_shorthand, shorthand_longhands,
+    ComputedStyle, Declaration, DeclaredValue, GeneratedPseudo, Position, PropertyId, SHORTHANDS, Sides, UsedValues,
+    is_shorthand, longhands_of, parse_cssom_block, parse_declaration_value, resolved_value, serialize_block,
+    serialize_declared, serialize_shorthand, shorthand_longhands,
 };
 
 use crate::dom::{Dom, DomNode, dom, dom_exception, illegal_invocation};
-use crate::view::{View, with_layout};
+use crate::view::{View, with_layout_states};
 use crate::{getter, js_str, setter};
 
 // ----- the property names -----
@@ -95,8 +95,9 @@ fn is_supported(name: &str) -> bool {
 
 // ----- the declaration objects -----
 
-/// The pseudo-elements `getComputedStyle` accepts. None has rules or a
-/// box in this engine: their style inherits from the element.
+/// The pseudo-elements `getComputedStyle` accepts: `::before`, `::after`
+/// and `::marker` have rules and boxes; the others are styled as an
+/// anonymous child of the element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pseudo {
     Before,
@@ -424,14 +425,33 @@ fn set_in(decls: &mut Vec<Declaration>, values: Vec<DeclaredValue>, important: b
 /// used values. `None` when the element is not connected or no view is
 /// lent.
 fn computed_of(id: NodeId, pseudo: Option<Pseudo>, context: &mut Context) -> JsResult<Option<(Arc<ComputedStyle>, Option<UsedValues>)>> {
-    Ok(with_layout(context, |view, doc, _| {
+    Ok(with_layout_states(context, |view, doc, states| {
         if !doc.contains(id) || !doc.is_connected(id) {
             return None;
         }
         let style = view.styles.get(id)?.clone();
         match pseudo {
-            // No pseudo-element has rules or a box here: it is styled as
-            // an anonymous child of the element.
+            // `::before`/`::after`: the style of its box with the box's
+            // used values, or, with no box, its style from its rules
+            // (`content: none`).
+            Some(p @ (Pseudo::Before | Pseudo::After)) => {
+                let after = p == Pseudo::After;
+                let kind = if after { browser_dom::PseudoKind::After } else { browser_dom::PseudoKind::Before };
+                if let Some(ps) = style.pseudo_style(after).cloned() {
+                    let used = doc.pseudo_element(id, kind).and_then(|node| used_values(view, doc, node, &ps));
+                    return Some((ps, used));
+                }
+                let which = if after { GeneratedPseudo::After } else { GeneratedPseudo::Before };
+                view.pseudo_element_style(doc, states, id, which).map(|s| (Arc::new(s), None))
+            }
+            // `::marker`: a list item's marker style; another element's
+            // from its rules.
+            Some(Pseudo::Marker) => match style.marker_style() {
+                Some(m) => Some((m.clone(), None)),
+                None => view.pseudo_element_style(doc, states, id, GeneratedPseudo::Marker).map(|s| (Arc::new(s), None)),
+            },
+            // The others have no rules or box here: styled as an
+            // anonymous child of the element.
             Some(_) => Some((Arc::new(ComputedStyle::anonymous_from(&style)), None)),
             None => {
                 let used = used_values(view, doc, id, &style);

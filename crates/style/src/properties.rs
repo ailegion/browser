@@ -1801,8 +1801,11 @@ pub enum ListStyleType {
     Circle,
     Square,
     Decimal,
+    DecimalLeadingZero,
     LowerAlpha,
+    LowerLatin,
     UpperAlpha,
+    UpperLatin,
     LowerRoman,
     UpperRoman,
 }
@@ -1815,8 +1818,11 @@ impl ListStyleType {
             ListStyleType::Circle => "circle",
             ListStyleType::Square => "square",
             ListStyleType::Decimal => "decimal",
+            ListStyleType::DecimalLeadingZero => "decimal-leading-zero",
             ListStyleType::LowerAlpha => "lower-alpha",
+            ListStyleType::LowerLatin => "lower-latin",
             ListStyleType::UpperAlpha => "upper-alpha",
+            ListStyleType::UpperLatin => "upper-latin",
             ListStyleType::LowerRoman => "lower-roman",
             ListStyleType::UpperRoman => "upper-roman",
         }
@@ -1850,9 +1856,12 @@ impl ListStyleTypeValue {
             Disc => ListStyleType::Disc,
             Circle => ListStyleType::Circle,
             Square => ListStyleType::Square,
-            Decimal | DecimalLeadingZero => ListStyleType::Decimal,
-            LowerAlpha | LowerLatin => ListStyleType::LowerAlpha,
-            UpperAlpha | UpperLatin => ListStyleType::UpperAlpha,
+            Decimal => ListStyleType::Decimal,
+            DecimalLeadingZero => ListStyleType::DecimalLeadingZero,
+            LowerAlpha => ListStyleType::LowerAlpha,
+            LowerLatin => ListStyleType::LowerLatin,
+            UpperAlpha => ListStyleType::UpperAlpha,
+            UpperLatin => ListStyleType::UpperLatin,
             LowerRoman => ListStyleType::LowerRoman,
             UpperRoman => ListStyleType::UpperRoman,
         }
@@ -1861,9 +1870,6 @@ impl ListStyleTypeValue {
     pub fn to_css(&self) -> String {
         use ListStyleTypeValue::*;
         match self {
-            DecimalLeadingZero => "decimal-leading-zero".to_owned(),
-            LowerLatin => "lower-latin".to_owned(),
-            UpperLatin => "upper-latin".to_owned(),
             String(s) => css_string(s),
             other => other.computed().keyword().to_owned(),
         }
@@ -2558,6 +2564,11 @@ longhands! {
     ListStyleType: "list-style-type" => ListStyleTypeValue, true;
     ListStylePosition: "list-style-position" => ListStylePosition, true;
     ListStyleImage: "list-style-image" => ImageValue, true;
+    Content: "content" => crate::content::ContentValue, false;
+    Quotes: "quotes" => crate::content::Quotes, true;
+    CounterReset: "counter-reset" => crate::content::CounterList, false;
+    CounterIncrement: "counter-increment" => crate::content::CounterList, false;
+    CounterSet: "counter-set" => crate::content::CounterList, false;
     VerticalAlign: "vertical-align" => VerticalAlignValue, false;
     FlexDirection: "flex-direction" => FlexDirection, false;
     FlexWrap: "flex-wrap" => FlexWrap, false;
@@ -2963,6 +2974,11 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
         PropertyId::ListStyleType => P::ListStyleType(parse_list_style_type(input)?),
         PropertyId::ListStylePosition => P::ListStylePosition(parse_list_style_position(input)?),
         PropertyId::ListStyleImage => P::ListStyleImage(parse_image(input)?),
+        PropertyId::Content => P::Content(crate::content::parse_content(input)?),
+        PropertyId::Quotes => P::Quotes(crate::content::parse_quotes(input)?),
+        PropertyId::CounterReset => P::CounterReset(crate::content::parse_counter_list(input, 0)?),
+        PropertyId::CounterIncrement => P::CounterIncrement(crate::content::parse_counter_list(input, 1)?),
+        PropertyId::CounterSet => P::CounterSet(crate::content::parse_counter_list(input, 0)?),
         PropertyId::VerticalAlign => P::VerticalAlign(parse_vertical_align(input)?),
         PropertyId::FlexDirection => P::FlexDirection(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "row" => FlexDirection::Row, "row-reverse" => FlexDirection::RowReverse,

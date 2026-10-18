@@ -1133,7 +1133,7 @@ impl TabState {
             let mut best: Option<(usize, Rect, f32)> = None;
             tree.root.walk(&mut |frag| {
                 let browser_layout::FragmentContent::Text(t) = &frag.content else { return };
-                let mine = frag.node.is_some_and(|n| n == f || doc.parent(n) == Some(f));
+                let mine = frag.node.is_some_and(|n| n == f || (doc.parent(n) == Some(f) && doc.get(n).pseudo_kind().is_none()));
                 if !mine || t.range.start > display || best.is_some_and(|(s, _, _)| s > t.range.start) {
                     return;
                 }
@@ -1860,7 +1860,7 @@ impl TabState {
             // of the viewport, its `scroll-margin` counted.
             Some(t) => self.reveal(
                 t,
-                &|tree, doc| tree.first_shown_rect(|n| n == t || doc.parent(n) == Some(t)),
+                &|tree, doc| tree.first_shown_rect(|n| n == t || (doc.parent(n) == Some(t) && doc.get(n).pseudo_kind().is_none())),
                 Reveal::Start,
                 true,
                 true,
@@ -2053,17 +2053,28 @@ impl TabState {
         let over_link = hit.and_then(|h| self.ancestor_or_self(h, is_link)).is_some();
         // Text nodes, and the made-up text of a text control (whose
         // fragments carry the control itself).
+        // A `::before`/`::after` box is not text (its generated text has
+        // no node; what is hit is the pseudo-element's box).
         let over_text = raw.is_some_and(|n| {
-            self.doc
-                .as_ref()
-                .is_some_and(|d| d.contains(n) && (!d.get(n).is_element() || d.element(n).is_some_and(is_text_control)))
+            self.doc.as_ref().is_some_and(|d| {
+                d.contains(n)
+                    && d.get(n).pseudo_kind().is_none()
+                    && (!d.get(n).is_element() || d.element(n).is_some_and(is_text_control))
+            })
         });
         let over_bar = self.mouse.is_some_and(|(x, y)| self.over_scrollbar_area(x, y));
         // The hovered element's `cursor` (inherited): an image of its list
         // that is decoded and no larger than 128×128 (Chrome's limit),
         // else its keyword; `auto` is the pointer over links, the I-beam
         // over text, the arrow elsewhere.
-        let css = hit.and_then(|h| self.styles.get(h)).map(|s| s.cursor.clone());
+        // Over a `::before`/`::after` box, its own `cursor`.
+        let pseudo_cursor = raw.and_then(|n| {
+            let d = self.doc.as_ref()?;
+            let kind = d.contains(n).then(|| d.get(n).pseudo_kind()).flatten()?;
+            let owner = d.parent(n)?;
+            self.styles.get(owner)?.pseudo_style(kind == browser_dom::PseudoKind::After).map(|s| s.cursor.clone())
+        });
+        let css = pseudo_cursor.or_else(|| hit.and_then(|h| self.styles.get(h)).map(|s| s.cursor.clone()));
         let image = css.as_ref().and_then(|c| {
             c.images.iter().find_map(|i| {
                 let url = Url::parse(&i.url).ok()?;
@@ -2197,18 +2208,31 @@ impl TabState {
             ms = started.elapsed().as_millis(),
             "restyle for interaction"
         );
-        if result.moved {
+        // A `:hover::before` may come or go.
+        let pseudos = self.sync_pseudos();
+        if result.moved || pseudos {
             // A state may ask for another face (bold on hover): the layout
             // that follows asks for it.
             self.needs_layout = true;
         } else if result.repaint {
             // Paint-only (colours, backgrounds, decorations): the boxes
             // stay where they are and take the new styles.
-            if let (Some(layout), Some(engine)) = (&mut self.layout, &mut self.engine) {
+            if let (Some(layout), Some(engine), Some(doc)) = (&mut self.layout, &mut self.engine, &self.doc) {
                 engine.refresh_styles(layout, doc, &self.styles);
             }
             self.needs_paint = true;
         }
+        if result.repaint {
+            // A new style may name an image not fetched yet.
+            self.fetch_background_images();
+        }
+    }
+
+    /// Create and remove the `::before`/`::after` nodes to match the
+    /// styles; whether any came or went (layout must run again then).
+    fn sync_pseudos(&mut self) -> bool {
+        let Some(doc) = &mut self.doc else { return false };
+        browser_style::sync_pseudo_elements(doc, &self.styles)
     }
 
     /// Restyle only what a script's attribute changes reach, when the
@@ -2246,10 +2270,11 @@ impl TabState {
             ms = started.elapsed().as_millis(),
             "restyle for DOM changes"
         );
-        if r.moved || delta.layout {
+        let pseudos = self.sync_pseudos();
+        if r.moved || delta.layout || pseudos {
             self.needs_layout = true;
         } else if r.repaint {
-            if let (Some(layout), Some(engine)) = (&mut self.layout, &mut self.engine) {
+            if let (Some(layout), Some(engine), Some(doc)) = (&mut self.layout, &mut self.engine, &self.doc) {
                 engine.refresh_styles(layout, doc, &self.styles);
             }
             self.needs_paint = true;
@@ -3464,12 +3489,29 @@ impl TabState {
         let mut sized = false;
         let href = url.as_str();
         tree.root.walk(&mut |f| {
-            if let browser_layout::FragmentContent::Image(u) = &f.content {
+            if let browser_layout::FragmentContent::Image(browser_layout::ImageSource::Url(u)) = &f.content {
                 sized |= u.as_str() == href;
             }
         });
-        // A marker image gets its box only once it is decoded.
-        sized = sized || self.styles.iter().any(|(_, s)| s.list_style_image.iter().any(|u| &**u == href));
+        // A marker image, and a `content` image of a `::before`/`::after`
+        // or marker, get their boxes only once decoded.
+        let scale = self.viewport.scale_factor;
+        let in_content = |s: &browser_style::ComputedStyle| {
+            s.content.items().is_some_and(|items| {
+                items.iter().any(|i| match i {
+                    browser_style::GeneratedItem::Image(img) => {
+                        img.url_to_fetch(scale).is_some_and(|u| &**u == href)
+                            || matches!(img, browser_style::ComputedImage::ImageSet(c) if c.iter().any(|c| c.image.url_to_fetch(scale).is_some_and(|u| &**u == href)))
+                    }
+                    _ => false,
+                })
+            })
+        };
+        sized = sized
+            || self.styles.iter().any(|(_, s)| {
+                s.list_style_image.iter().any(|u| &**u == href)
+                    || s.pseudo.as_deref().is_some_and(|p| [&p.marker, &p.before, &p.after].into_iter().flatten().any(|ps| in_content(ps)))
+            });
         if sized {
             self.needs_layout = true;
         } else {
@@ -3477,12 +3519,12 @@ impl TabState {
         }
     }
 
-    /// Background and list marker images only become known after the
-    /// cascade.
+    /// Background, list marker and `content` images only become known
+    /// after the cascade.
     fn fetch_background_images(&mut self) {
         let scale = self.viewport.scale_factor;
         let mut urls = Vec::new();
-        for (_, style) in self.styles.iter() {
+        let mut collect = |style: &browser_style::ComputedStyle| {
             // Every layer's image; an `image-set()` the candidate this
             // device's scale chooses.
             let mut names: Vec<String> =
@@ -3492,9 +3534,25 @@ impl TabState {
             names.extend(style.mask_images.iter().filter_map(|i| i.url_to_fetch(scale)).map(|u| u.to_string()));
             // `cursor: url()` images too.
             names.extend(style.cursor.images.iter().map(|i| i.url.to_string()));
+            // A pseudo-element's or marker's `content` images.
+            if let Some(items) = style.content.items() {
+                names.extend(items.iter().filter_map(|i| match i {
+                    browser_style::GeneratedItem::Image(img) => img.url_to_fetch(scale).map(|u| u.to_string()),
+                    _ => None,
+                }));
+            }
             for u in names {
                 if let Ok(url) = Url::parse(&u) {
                     urls.push(url);
+                }
+            }
+        };
+        for (_, style) in self.styles.iter() {
+            collect(style);
+            // The `::marker`, `::before` and `::after` styles too.
+            if let Some(p) = style.pseudo.as_deref() {
+                for ps in [&p.marker, &p.before, &p.after].into_iter().flatten() {
+                    collect(ps);
                 }
             }
         }
@@ -3998,6 +4056,7 @@ impl TabState {
             deps = ?self.deps,
             "restyle"
         );
+        self.sync_pseudos();
         // Background images only become known after the cascade (the web
         // fonts after the layout, which knows the characters each font
         // sets); their arrival triggers layout again.
@@ -5619,6 +5678,80 @@ mod tests {
         let text = text.expect("text");
         assert_eq!((image.width, image.height), (1.0, 1.0));
         assert!(image.right() < 40.0 && (text.x - 40.0).abs() < 0.5, "{image:?} {text:?}");
+    }
+
+    /// The generated text inside the current layout (nodeless text).
+    fn generated_texts(h: &Harness) -> Vec<String> {
+        let mut out = Vec::new();
+        h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+            if let (browser_layout::FragmentContent::Text(t), None) = (&f.content, f.node) {
+                out.push(t.text[t.range.clone()].to_owned());
+            }
+        });
+        out
+    }
+
+    /// `::before`/`::after` ("Working sites first" 6e) through the tab:
+    /// `getComputedStyle`, an `attr()` following its attribute, an inline
+    /// element's rectangles with its pseudo-elements, a click on a
+    /// pseudo-element's box going to its element, `:hover::after`.
+    #[test]
+    fn pseudo_elements_through_the_tab() {
+        let html = "<!DOCTYPE html><style>body { margin: 0 } \
+             #p::before { content: attr(data-x); color: rgb(0, 128, 0); display: inline-block; width: 50px } \
+             #q::after { content: '!!!' } #h:hover::after { content: 'H' }</style>\
+             <p id=p data-x=one>text</p><span id=q>q</span> <span id=r>q</span><div id=h style='height:20px'>h</div>\
+             <script>var clicks = []; document.addEventListener('click', e => clicks.push(e.target.id)); \
+             var p = document.getElementById('p'), q = document.getElementById('q'), r = document.getElementById('r');</script>";
+        let mut h = Harness::load(html);
+        assert_eq!(
+            run_js(&mut h, "var s = getComputedStyle(p, '::before'); [s.content, s.color, s.width].join('|')"),
+            "\"\\\"one\\\"|rgb(0, 128, 0)|50px\""
+        );
+        assert_eq!(run_js(&mut h, "[getComputedStyle(q, '::before').content, getComputedStyle(q).content, getComputedStyle(q, ':after').content].join('|')"), "\"none|normal|\\\"!!!\\\"\"");
+        assert!(generated_texts(&h).contains(&"one".to_owned()));
+        // The attribute changes: so does the generated text.
+        run_js(&mut h, "p.setAttribute('data-x', 'two')");
+        assert!(generated_texts(&h).contains(&"two".to_owned()), "{:?}", generated_texts(&h));
+        // The inline element's box takes in its ::after.
+        assert_eq!(run_js(&mut h, "q.getBoundingClientRect().width > r.getBoundingClientRect().width + 5"), "true");
+        // A click on the ::before box goes to the paragraph.
+        let p = h.find("p");
+        let before = h.state.doc.as_ref().expect("doc").pseudo_element(p, browser_dom::PseudoKind::Before).expect("::before node");
+        let mut rect = None;
+        h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+            if f.node == Some(before) && rect.is_none() {
+                rect = Some(f.rect);
+            }
+        });
+        let rect = rect.expect("::before box");
+        let (x, y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+        h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+        assert_eq!(js(&mut h, "clicks.join()"), "\"p\"");
+        // Hovering makes the ::after.
+        assert!(!generated_texts(&h).contains(&"H".to_owned()));
+        let (x, y) = h.center("div");
+        h.send(ShellToTab::MouseMove { x, y });
+        h.pump();
+        assert!(generated_texts(&h).contains(&"H".to_owned()), "{:?}", generated_texts(&h));
+    }
+
+    #[test]
+    fn content_images_are_fetched_and_laid_out() {
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let html = format!("<!DOCTYPE html><style>p::before {{ content: url({png}) }}</style><p>x</p>");
+        let mut h = Harness::load(&html);
+        h.pump_until(|h| !h.state.images.is_empty());
+        h.pump();
+        let mut image = None;
+        h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+            if let browser_layout::FragmentContent::Image(_) = &f.content {
+                image = Some(f.rect);
+            }
+        });
+        let image = image.expect("the content image is laid out once it arrives");
+        assert_eq!((image.width, image.height), (1.0, 1.0));
     }
 
     #[test]

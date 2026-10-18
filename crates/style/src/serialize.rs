@@ -104,6 +104,9 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::BoxDecorationBreak(b) => b.keyword().to_owned(),
         P::ListStyleType(t) => t.to_css(),
         P::ListStylePosition(p) => p.keyword().to_owned(),
+        P::Content(c) => c.to_css(),
+        P::Quotes(q) => q.to_css(),
+        P::CounterReset(c) | P::CounterIncrement(c) | P::CounterSet(c) => c.to_css(),
         P::VerticalAlign(v) => match v {
             VerticalAlignValue::Keyword(k) => k.keyword().to_owned(),
             VerticalAlignValue::Length(l) => l.to_css(),
@@ -1184,6 +1187,11 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::ListStyleType => style.list_style_type.keyword().to_owned(),
         Id::ListStylePosition => style.list_style_position.keyword().to_owned(),
         Id::ListStyleImage => style.list_style_image.as_deref().map_or("none".to_owned(), css_url),
+        Id::Content => style.content.to_css(),
+        Id::Quotes => style.quotes.to_css(),
+        Id::CounterReset => style.counter_reset.computed_css(),
+        Id::CounterIncrement => style.counter_increment.computed_css(),
+        Id::CounterSet => style.counter_set.computed_css(),
         Id::VerticalAlign => match style.vertical_align {
             ComputedVerticalAlign::Keyword(k) => k.keyword().to_owned(),
             ComputedVerticalAlign::Length(l) => lp_css(l),

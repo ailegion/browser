@@ -62,6 +62,37 @@ pub enum NodeKind {
         target: String,
         data: String,
     },
+    /// An element's `::before` or `::after` ("Working sites first" 6e):
+    /// its parent is the element, but it is in no child list, so no tree
+    /// walk, serialization or script ever meets it. The style engine
+    /// creates and removes it (`Document::set_pseudo_element`); layout
+    /// builds its generated content.
+    PseudoElement(PseudoKind),
+}
+
+/// Which pseudo-element a `NodeKind::PseudoElement` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoKind {
+    Before,
+    After,
+}
+
+/// HTML's rules for parsing integers (HTML §2.3.4.1): leading ASCII
+/// white space, an optional sign, then digits; anything after them is
+/// ignored. `None` without digits or out of range.
+pub fn parse_html_integer(s: &str) -> Option<i64> {
+    let s = s.trim_start_matches(['\t', '\n', '\x0C', '\r', ' ']);
+    let (negative, rest) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let n: i64 = rest[..digits].parse().ok()?;
+    Some(if negative { -n } else { n })
 }
 
 /// Element-specific data.
@@ -177,6 +208,8 @@ pub struct Node {
     pub last_child: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
+    /// An element's `::before` and `::after` nodes, when it has them.
+    pseudos: [Option<NodeId>; 2],
 }
 
 impl Node {
@@ -188,6 +221,15 @@ impl Node {
             last_child: None,
             prev_sibling: None,
             next_sibling: None,
+            pseudos: [None, None],
+        }
+    }
+
+    /// Which pseudo-element the node is, if it is one.
+    pub fn pseudo_kind(&self) -> Option<PseudoKind> {
+        match self.kind {
+            NodeKind::PseudoElement(k) => Some(k),
+            _ => None,
         }
     }
 
@@ -660,6 +702,10 @@ impl Document {
 
     /// Detach `id` from its parent. The node stays in the arena.
     pub fn detach(&mut self, id: NodeId) {
+        // A pseudo-element is in no child list; it leaves with its element.
+        if self.nodes[id].pseudo_kind().is_some() {
+            return;
+        }
         let (parent, prev, next) = {
             let n = &self.nodes[id];
             (n.parent, n.prev_sibling, n.next_sibling)
@@ -693,6 +739,9 @@ impl Document {
     }
 
     pub fn remove_subtree(&mut self, id: NodeId) {
+        if self.nodes[id].pseudo_kind().is_some() {
+            return;
+        }
         self.detach(id);
         let mut stack = vec![id];
         while let Some(n) = stack.pop() {
@@ -701,7 +750,35 @@ impl Document {
                 child = self.nodes[c].next_sibling;
                 stack.push(c);
             }
+            // An element's pseudo-element nodes go with it.
+            for p in self.nodes[n].pseudos.into_iter().flatten() {
+                self.nodes.remove(p);
+            }
             self.nodes.remove(n);
+        }
+    }
+
+    /// The element's `::before` or `::after` node, if it has one.
+    pub fn pseudo_element(&self, owner: NodeId, kind: PseudoKind) -> Option<NodeId> {
+        self.nodes[owner].pseudos[kind as usize]
+    }
+
+    /// Give the element a `::before`/`::after` node (`present`) or take
+    /// it away. The node's parent is the element; it is in no child list.
+    pub fn set_pseudo_element(&mut self, owner: NodeId, kind: PseudoKind, present: bool) {
+        let slot = kind as usize;
+        match (self.nodes[owner].pseudos[slot], present) {
+            (None, true) => {
+                let mut node = Node::new(NodeKind::PseudoElement(kind));
+                node.parent = Some(owner);
+                let id = self.nodes.insert(node);
+                self.nodes[owner].pseudos[slot] = Some(id);
+            }
+            (Some(id), false) => {
+                self.nodes.remove(id);
+                self.nodes[owner].pseudos[slot] = None;
+            }
+            _ => {}
         }
     }
 
@@ -776,6 +853,8 @@ impl Document {
             NodeKind::ProcessingInstruction { target, data } => {
                 let _ = writeln!(out, "{indent}<?{target} {data}?>");
             }
+            // Never in a child list.
+            NodeKind::PseudoElement(_) => {}
         }
         for c in self.children(id) {
             self.dump_node(c, depth + 1, out);
@@ -837,6 +916,40 @@ impl Iterator for Descendants<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `::before`/`::after` node hangs off its element but is in no
+    /// child list: tree walks, text and serialization never meet it,
+    /// detaching it is a no-op, and it is freed with its element.
+    #[test]
+    fn pseudo_element_nodes_stay_out_of_the_tree() {
+        let mut doc = parse_html(b"<div><p>a</p></div>");
+        let p = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "p")).expect("p");
+        let div = doc.parent(p).expect("div");
+        doc.set_pseudo_element(p, PseudoKind::Before, true);
+        doc.set_pseudo_element(p, PseudoKind::After, true);
+        let before = doc.pseudo_element(p, PseudoKind::Before).expect("before");
+        let after = doc.pseudo_element(p, PseudoKind::After).expect("after");
+        assert_eq!(doc.parent(before), Some(p));
+        assert_eq!(doc.get(after).pseudo_kind(), Some(PseudoKind::After));
+        assert!(doc.is_connected(before));
+        assert_eq!(doc.children(p).count(), 1);
+        assert!(!doc.descendants(doc.root()).any(|n| n == before || n == after));
+        assert_eq!(doc.text_content(div), "a");
+        assert_eq!(doc.serialize_html(div, false), "<p>a</p>");
+        doc.detach(before);
+        assert_eq!(doc.parent(before), Some(p), "detaching a pseudo-element does nothing");
+        assert_eq!(doc.children(p).count(), 1, "nor does it touch the element's children");
+        // Taken away: freed. Given again: a new node.
+        doc.set_pseudo_element(p, PseudoKind::Before, false);
+        assert!(!doc.contains(before) && doc.pseudo_element(p, PseudoKind::Before).is_none());
+        // Removing an ancestor frees them with it.
+        doc.remove_subtree(div);
+        assert!(!doc.contains(after));
+        assert_eq!(parse_html_integer("  -12px"), Some(-12));
+        assert_eq!(parse_html_integer("+3"), Some(3));
+        assert_eq!(parse_html_integer("x1"), None);
+        assert_eq!(parse_html_integer("-"), None);
+    }
 
     /// HTML's disabled rules: own attribute, a disabled fieldset around
     /// (not inside its first legend), nested fieldsets, optgroup/option,

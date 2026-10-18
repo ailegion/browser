@@ -289,12 +289,15 @@ remaining lists as they stand.
       lines, the `grid-template` area form). Timing: tables 49.3–50.0 ms
       (48.0 before), blocks 14.4–15.1 ms (13.5), Hacker News relayout
       38.9–41.2 ms (38.5–39.7): slower, not attributed.
-- [ ] 6b. SVG images (moved up from Phase 5, Images, by the owner,
+- [x] 6b. SVG images (moved up from Phase 5, Images, by the owner,
       2026-10-18, for Wikipedia's logo and icons): SVG in `<img>`, CSS
       images (`background-image`, `list-style-image`, `content`) and
       `data:` URLs, via `usvg` to vello.
-      Built 2026-10-18, not done: `content` images wait for 6e (the engine
-      has no `::before`/`::after`; the first record said `content` images
+      Done 2026-10-18 with 6e: `content` images (SVG ones too) are
+      replaced boxes of the `::before`/`::after` and `::marker` boxes,
+      drawn through the same image path (`ImageSource::Url`).
+      Built 2026-10-18: `content` images waited for 6e (the engine
+      had no `::before`/`::after`; the first record said `content` images
       were covered, which was false). Paint (`decode_svg`,
       `ImageStore::insert_svg`, `draw_svg`): an image response that is not
       a raster image is parsed as SVG (or SVGZ) by `usvg` and turned into
@@ -431,7 +434,97 @@ remaining lists as they stand.
       `content` part), `attr()`, counters (`counter()`, `counters()`,
       `counter-reset`, `-increment`, `-set`) and quotes (`quotes`,
       `open-quote`, `close-quote`, `no-open-quote`, `no-close-quote`);
-      `getComputedStyle` for the pseudo-elements.
+      `getComputedStyle` for the pseudo-elements. Owner's 2026-10-18
+      decisions: `::marker` rules and `content` belong here; counters as
+      Chrome has them where browsers differ (a reset reaches following
+      siblings, `reversed()` refused in author CSS, default markers
+      numbered by HTML's ordinal, not by an author's `list-item` reset);
+      `attr()` reported as the attribute's string, `::before`/`::after` on
+      checkboxes and radios, a gradient at 300×150, `quotes: auto` from
+      CLDR (best guesses for Chrome, not verified against it); the rarely
+      used parts in Phase 5, Style; pseudo-elements as nodes of their own
+      (a core change, owner's go).
+      Built 2026-10-18, not ticked (the owner rules on the table clearance
+      found below). DOM (`NodeKind::PseudoElement`, `PseudoKind`): a
+      `::before`/`::after` node whose parent is its element, in no child
+      list (tree walks, `textContent`, serialization, `cloneNode`,
+      `querySelector` and mutation records never meet it), recorded on the
+      element (`pseudo_element`, `set_pseudo_element`) and freed with it
+      (`remove_subtree`); `detach` leaves it alone; `parse_html_integer`
+      (HTML §2.3.4.1). Style (`content.rs`): `content` (`normal`, `none`,
+      strings, images, `attr(name [string]? [, fallback]?)`, `counter()`,
+      `counters()`, the four quotes, `/ alt` text), `quotes`
+      (inherited), `counter-reset`/`-increment`/`-set`, parsed and
+      serialized as WPT's `content-computed.html` has it (`decimal` left
+      out, a counter list computed with every value); counter styles
+      (`represent`, `suffix`; out-of-range values fall back to decimal,
+      `list-style-type` keeps `decimal-leading-zero`/`lower-latin`/
+      `upper-latin`); `auto_quotes` from the Unicode CLDR delimiters of
+      766 locales (130 differing from their parent kept). Cascade:
+      `::marker`, `::before` and `::after` selectors in their own
+      buckets, matched in `ForStatelessPseudoElement` mode and cascaded
+      with the element as parent (`ComputedStyle::pseudo`,
+      `PseudoStyles`; a `::before`/`::after` no rule gives `content` is not
+      computed; `normal` makes no box on them); a marker takes only the
+      font properties, `white-space`, `color`, `unicode-bidi`,
+      `direction`, `text-transform` and `content` of its rules (CSS
+      Pseudo 4 §3.6.1); `attr()` resolved against the element; HTML's
+      hints (`ol start`/`reversed` → `counter-reset: list-item`, a
+      reversed one for `reversed`; `li value` → `counter-set`); UA sheet
+      (`ol, ul, menu { counter-reset: list-item }`, `::marker`, `q::before`,
+      `q::after`); `generates_pseudo_elements` (none on `img`, `br`,
+      widgets, media, frames, SVG/MathML, inputs other than checkbox and
+      radio); `sync_pseudo_elements` makes and drops the nodes after every
+      restyle (tab: full, script changes, hover/focus/active; script's
+      forced layout, which now gets the document mutably; `render_html`),
+      and a node coming or going lays out again; `pseudo_element_style`
+      for `getComputedStyle` of one without a box. Layout
+      (`generated.rs`): one tree-order walk per box build works out the
+      counters (scopes per CSS 2.1 §12.4.1, implicit `list-item`
+      increments, reversed starts) and quote depths (`no-open-quote`
+      counts, a close at depth 0 inserts nothing, the last pair repeats,
+      `auto` by the element's `lang`), and numbers markers by HTML's
+      ordinal (list owner, `start`, `value`, `reversed`); the box builder's
+      child lists are an element's `::before`, children and `::after`
+      (`Kid`), a pseudo-element's generated text (nodeless: not selected,
+      found or copied) and images, through every path (block, inline,
+      flex/grid items, tables and their anonymous parts, floats,
+      out-of-flow boxes, checkboxes); `content` images as replaced boxes
+      (`ImageSource::Url`/`Gradient`, a gradient at 300×150, an image not
+      fetched yet makes no box); markers from the walk in their
+      `::marker` style (its `content`, `none`); `refresh_styles` restyles
+      pseudo boxes and marker text (`TextFragment::marker`). Paint: a
+      gradient image fills its content box. Tab and script: a hit on a
+      pseudo box is its element's (events, hover, focus); over one, its
+      own `cursor`, no I-beam; `offsetX/Y`, the keyboard context menu and
+      the caret ignore pseudo boxes; a scrolled pseudo box's `scroll`
+      event goes to its element; an inline element's client rects and
+      `scrollWidth/Height` include its pseudo boxes;
+      `getComputedStyle(el, '::before'|'::after'|'::marker')` gives their
+      styles and used values; `content` images (and pseudo boxes'
+      backgrounds and masks) are fetched and lay out on arrival; a
+      hover restyle now also fetches images its new styles name (it did
+      not before, for backgrounds either). Tests: style (WPT's computed
+      values, refusals, quotes and counters, the cascade, nodes made and
+      dropped, markers and hints, a style without a box), DOM (the node
+      out of the tree), layout (text order, positioned and clearing
+      pseudo boxes, nested counters, quotes by language, markers,
+      images and gradients, Wikipedia's `.hlist` " · ", checkboxes,
+      restyled colours), paint (a gradient), tab (`getComputedStyle`,
+      `attr()` following its attribute, rects, a click on a pseudo box,
+      `:hover::after`, a fetched `content` image). Found, not part of 6e:
+      a `display: table` box (and any box starting its own formatting
+      context) gets no clearance, as the vendored taffy computes it only
+      for boxes in the same formatting context, so the common clearfix
+      `::after { content: ""; display: table; clear: both }` does not
+      clear floats (nor does a real table with `clear`); a string
+      `list-style-type` shows no marker (as before). Timing: tables
+      49.7 ms (50.8 before), blocks 14.0 ms (14.5); Wikipedia load
+      0.84 s (0.74–0.80), restyle 38 ms (35), relayout 121–123 ms
+      (115–117), 105 pseudo nodes; iana load 7.86 s (5.19–6.08, live),
+      restyle 616–623 ms (589–591), relayout 1.23 s (0.95–0.98): its
+      2,844 `a::before { content: ""; display: inline-block }` icons are
+      laid out now (the walk itself takes ~5 ms).
 - [ ] 6h. `word-spacing` (owner, 2026-10-18; found missing while doing
       `text-indent`, used by many sites): `normal` or a length (`calc()`
       too), inherited, serialized; the extra space added to each word
@@ -2836,7 +2929,18 @@ what breaks the most pages.
   element's font size, before the adjustment), what `FontFace`'s
   attributes read back (today `weight: 'bold'` reads `700` and `family`
   is unquoted), and `document.fonts.check()` for a matching face that
-  failed to load (today false).
+  failed to load (today false). Generated content parts rarely used by
+  sites (owner's 2026-10-18 placement, out of "Working sites first" 6e):
+  the predefined counter styles beyond `none`, `disc`, `circle`,
+  `square`, `decimal`, `decimal-leading-zero`, `lower`/`upper-alpha`,
+  `lower`/`upper-latin`, `lower`/`upper-roman` (`lower-greek`,
+  `armenian`, `georgian`, the CJK and the other CSS Counter Styles 3 §6
+  styles; until then they draw as `decimal`), `symbols()` and
+  `@counter-style`; `content: <image>` replacing an ordinary element's
+  content (CSS Content 3 `<content-replacement>`; today parsed and
+  reported, not drawn); `::before::marker` and the other nested
+  pseudo-elements; the general `attr()` substitution in any property
+  (CSS Values 5; `content`'s `attr(name)` with a fallback is done).
 - Images: `<picture>` and `srcset`, lazy loading (SVG: "Working sites
   first" line 6b).
 - Web APIs: `WebSocket`, Canvas 2D on vello, `postMessage`, `iframe`

@@ -975,6 +975,9 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
                 NodeKind::Document => 9,
                 NodeKind::Doctype { .. } => 10,
                 NodeKind::DocumentFragment => 11,
+                // Never handed to script (the tab answers with the
+                // element); an element-like answer if one ever were.
+                NodeKind::PseudoElement(_) => 1,
             }
             .into(),
         ),
@@ -986,6 +989,8 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
             NodeKind::Document => "#document".to_owned(),
             NodeKind::DocumentFragment => "#document-fragment".to_owned(),
             NodeKind::Doctype { name, .. } => name.clone(),
+            NodeKind::PseudoElement(browser_dom::PseudoKind::Before) => "::before".to_owned(),
+            NodeKind::PseudoElement(browser_dom::PseudoKind::After) => "::after".to_owned(),
         })),
         NodeValue | Data => match &node.kind {
             NodeKind::Text(t) | NodeKind::Comment(t) | NodeKind::ProcessingInstruction { data: t, .. } => {
@@ -1001,7 +1006,9 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
         }),
         TextContent => match &node.kind {
             NodeKind::Document | NodeKind::Doctype { .. } => Out::Value(JsValue::null()),
-            NodeKind::Element(_) | NodeKind::DocumentFragment => Out::Value(js_str(&doc.text_content(id))),
+            NodeKind::Element(_) | NodeKind::DocumentFragment | NodeKind::PseudoElement(_) => {
+                Out::Value(js_str(&doc.text_content(id)))
+            }
             NodeKind::Text(t) | NodeKind::Comment(t) | NodeKind::ProcessingInstruction { data: t, .. } => {
                 Out::Value(js_str(t))
             }
