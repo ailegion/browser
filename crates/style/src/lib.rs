@@ -27,7 +27,8 @@ pub mod ua;
 pub mod values;
 
 pub use cascade::{
-    FeatureChange, Restyled, StateChange, StyleMap, Stylist, compute_styles, compute_styles_with, restyle, restyle_mutations,
+    FeatureChange, Restyled, StateChange, StyleMap, Stylist, TreeChange, compute_styles, compute_styles_with, restyle,
+    restyle_mutations,
 };
 pub use state::{ElementStates, Feature, InteractionDeps, MutationRule, Reach, Scope, StateKind, StateRule, SubjectKey, SubjectKeys};
 pub use computed::{

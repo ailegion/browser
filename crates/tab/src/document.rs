@@ -1911,9 +1911,6 @@ impl TabState {
         // fallback) or its swap period (the fallback stays for good): the
         // fonts are walked again after the next layout.
         if self.web_fonts.tick(now) {
-            if std::env::var_os("TEMP_STAGES").is_some() {
-                eprintln!("TEMP needs_layout: web font timer");
-            }
             self.needs_layout = true;
         }
         // `document.fonts`: its promises and events run as a task here,
@@ -2190,16 +2187,6 @@ impl TabState {
                 deps: &self.deps,
             },
         );
-        if std::env::var_os("TEMP_STAGES").is_some() {
-            eprintln!(
-                "TEMP restyle_for {state:?}: changed {} reach {reach:?} styled {} moved {} repaint {} in {:.1} ms",
-                changed.len(),
-                result.styled,
-                result.moved,
-                result.repaint,
-                started.elapsed().as_secs_f32() * 1000.0
-            );
-        }
         tracing::debug!(
             tab = self.id.0,
             changed = changed.len(),
@@ -2239,18 +2226,26 @@ impl TabState {
         let stylist = self.stylist();
         let vp = self.style_viewport();
         let Some(doc) = &self.doc else { return false };
-        let r = browser_style::restyle_mutations(doc, &stylist, &vp, &self.states, &mut self.styles, &self.deps, &delta.changes);
-        if std::env::var_os("TEMP_STAGES").is_some() {
-            eprintln!(
-                "TEMP restyle_changes: {} elements, styled {} moved {} repaint {} layout-attr {} in {:.1} ms",
-                delta.changes.len(),
-                r.styled,
-                r.moved,
-                r.repaint,
-                delta.layout,
-                started.elapsed().as_secs_f32() * 1000.0
-            );
-        }
+        let r = browser_style::restyle_mutations(
+            doc,
+            &stylist,
+            &vp,
+            &self.states,
+            &mut self.styles,
+            &self.deps,
+            &delta.changes,
+            &delta.trees,
+        );
+        tracing::debug!(
+            tab = self.id.0,
+            elements = delta.changes.len(),
+            trees = delta.trees.len(),
+            styled = r.styled,
+            moved = r.moved,
+            repaint = r.repaint,
+            ms = started.elapsed().as_millis(),
+            "restyle for DOM changes"
+        );
         if r.moved || delta.layout {
             self.needs_layout = true;
         } else if r.repaint {
@@ -2616,9 +2611,6 @@ impl TabState {
                     self.web_fonts.dirty = true;
                 }
                 if registered {
-                    if std::env::var_os("TEMP_STAGES").is_some() {
-                        eprintln!("TEMP needs_layout: font fetched");
-                    }
                     self.needs_layout = true;
                 } else {
                     tracing::debug!(tab = self.id.0, url = url.as_str(), "web font failed");
@@ -3215,9 +3207,6 @@ impl TabState {
         // A `<style>` or `<link>` the script added, changed or removed.
         self.sync_stylesheets();
         if !fresh && !self.restyle_changes(changes) {
-            if std::env::var_os("TEMP_STAGES").is_some() {
-                eprintln!("TEMP needs_layout: dom_changed");
-            }
             self.needs_style = true;
             self.needs_layout = true;
         }
@@ -3225,6 +3214,7 @@ impl TabState {
         // (URLs already fetched are skipped).
         let images_touched = changes.iter().any(|c| match c {
             browser_script::DomChange::Tree { .. } => true,
+            browser_script::DomChange::Children { inserted, .. } => !inserted.is_empty(),
             browser_script::DomChange::Attr { element, name, .. } => {
                 name == "src"
                     && self
@@ -3678,9 +3668,6 @@ impl TabState {
             let Some(data) = self.web_fonts.script_data.get(&id).cloned() else { continue };
             if self.engine.as_mut().is_some_and(|e| e.register_web_font(&data, face, order as u32)) {
                 self.web_fonts.loaded.insert(key);
-                if std::env::var_os("TEMP_STAGES").is_some() {
-                    eprintln!("TEMP needs_layout: script font");
-                }
                 self.needs_layout = true;
             }
         }
@@ -3856,9 +3843,6 @@ impl TabState {
             let face = &faces[order as usize];
             if self.engine.as_mut().is_some_and(|e| e.register_local_font(&name, face, order)) {
                 self.web_fonts.loaded.insert(face_key(face));
-                if std::env::var_os("TEMP_STAGES").is_some() {
-                    eprintln!("TEMP needs_layout: local font {name}");
-                }
                 self.needs_layout = true;
             } else {
                 self.web_fonts.failed.insert(Source::Local(name.to_lowercase()));
@@ -4004,13 +3988,9 @@ impl TabState {
         let Some(doc) = &self.doc else { return };
         let started = std::time::Instant::now();
         let stylist = self.stylist();
-        let stylist_ms = started.elapsed().as_secs_f32() * 1000.0;
         let vp = self.style_viewport();
         self.styles = compute_styles_with(doc, &stylist, &vp, &self.states);
         self.deps = stylist.interaction_deps();
-        if std::env::var_os("TEMP_STAGES").is_some() {
-            eprintln!("TEMP restyle_all: stylist {stylist_ms:.1} ms, total {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
-        }
         tracing::debug!(
             tab = self.id.0,
             nodes = doc.node_count(),
@@ -4038,9 +4018,6 @@ impl TabState {
             (self.scroll_x, self.scroll_y),
         );
         self.layouts += 1;
-        if std::env::var_os("TEMP_STAGES").is_some() {
-            eprintln!("TEMP relayout #{}: {:.1} ms", self.layouts, started.elapsed().as_secs_f32() * 1000.0);
-        }
         tracing::debug!(
             tab = self.id.0,
             layout_ms = started.elapsed().as_millis(),
@@ -7843,6 +7820,36 @@ mod tests {
         h.pump();
         assert!(h.state.layouts > layouts, "an insertion lays out again");
         assert_eq!(width(&h), Some(200.0));
+    }
+
+    /// A script's tree changes restyle what they reach: an appended item
+    /// and its siblings, a replaced subtree inheriting from its parent,
+    /// and a removed stylesheet (a full restyle).
+    #[test]
+    fn script_tree_changes_restyle_what_they_reach() {
+        let page = "<!DOCTYPE html><style>li:first-child { color: red } li + li { color: green } #box { color: blue }</style>\
+            <style id=extra>#box b { color: orange }</style>\
+            <body><button>b</button><ul id=u><li id=a>a</li></ul><div id=box>x</div>\
+            <script>let n = 0; document.querySelector('button').onclick = () => { n++; \
+              if (n == 1) { const li = document.createElement('li'); li.id = 'b'; document.getElementById('u').append(li); } \
+              if (n == 2) document.getElementById('box').innerHTML = '<i id=i>i</i><b id=bb>b</b>'; \
+              if (n == 3) document.getElementById('extra').remove(); }</script>";
+        let mut h = Harness::load(page);
+        h.pump_until(|h| h.state.layout.is_some() && h.state.lifecycle == Lifecycle::Complete);
+        let color = |h: &Harness, id: &str| {
+            let doc = h.state.doc.as_ref().expect("doc");
+            let n = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id))).expect(id);
+            h.state.styles[n].color.to_rgba8()
+        };
+        h.click("button");
+        h.pump();
+        assert_eq!((color(&h, "a"), color(&h, "b")), ([255, 0, 0, 255], [0, 128, 0, 255]));
+        h.click("button");
+        h.pump();
+        assert_eq!((color(&h, "i"), color(&h, "bb")), ([0, 0, 255, 255], [255, 165, 0, 255]), "inherited, and a rule");
+        h.click("button");
+        h.pump();
+        assert_eq!(color(&h, "bb"), [0, 0, 255, 255], "the removed sheet's rule is gone");
     }
 
     /// A control disabled by its fieldset gets no `click`; one in the

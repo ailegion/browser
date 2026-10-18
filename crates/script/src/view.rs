@@ -30,8 +30,8 @@ use browser_layout::{
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
-    ElementStates, FeatureChange, InteractionDeps, Origin, Position, Rule, Sides, StyleMap, Stylesheet, Stylist, Viewport,
-    compute_styles_with, restyle_mutations,
+    ElementStates, FeatureChange, InteractionDeps, Origin, Position, Rule, Sides, StyleMap, Stylesheet, Stylist, TreeChange,
+    Viewport, compute_styles_with, restyle_mutations,
 };
 use html5ever::{local_name, ns};
 use url::Url;
@@ -51,6 +51,8 @@ const MAX_IMPORT_DEPTH: u8 = 6;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeatureDelta {
     pub changes: Vec<FeatureChange>,
+    /// Children inserted, removed or retexted (always a layout).
+    pub trees: Vec<TreeChange>,
     pub layout: bool,
 }
 
@@ -63,11 +65,35 @@ pub struct FeatureDelta {
 pub fn feature_changes(doc: &Document, changes: &[DomChange], since: Option<u64>) -> Option<FeatureDelta> {
     use browser_style::Feature;
     let mut delta = FeatureDelta::default();
+    // Sheets and the base URL come from these.
+    let sheet_element = |n: NodeId| {
+        doc.element(n).is_some_and(|e| {
+            e.name.ns == ns!(html)
+                && (e.name.local == local_name!("style") || e.name.local == local_name!("link") || e.name.local == local_name!("base"))
+        })
+    };
     for change in changes {
         let (element, name, old) = match change {
             DomChange::Tree { generation } if since.is_none_or(|s| *generation > s) => return None,
             DomChange::Tree { .. } => continue,
-            DomChange::Attr { generation, .. } if since.is_some_and(|s| *generation <= s) => continue,
+            DomChange::Children { generation, .. } | DomChange::Attr { generation, .. }
+                if since.is_some_and(|s| *generation <= s) =>
+            {
+                continue;
+            }
+            DomChange::Children { parent, inserted, .. } => {
+                if sheet_element(*parent)
+                    || inserted.iter().any(|&r| std::iter::once(r).chain(doc.descendants(r)).any(sheet_element))
+                {
+                    return None;
+                }
+                delta.layout = true;
+                match delta.trees.iter_mut().find(|t| t.parent == *parent) {
+                    Some(t) => t.inserted.extend(inserted.iter().copied()),
+                    None => delta.trees.push(TreeChange { parent: *parent, inserted: inserted.clone() }),
+                }
+                continue;
+            }
             DomChange::Attr { element, name, old, .. } => (*element, name.as_str(), old.as_deref()),
         };
         let Some(e) = doc.element(element) else { continue };
@@ -222,7 +248,7 @@ impl View {
             _ => None,
         };
         if let Some(delta) = delta {
-            let r = restyle_mutations(doc, &stylist, &vp, states, &mut self.styles, &self.deps, &delta.changes);
+            let r = restyle_mutations(doc, &stylist, &vp, states, &mut self.styles, &self.deps, &delta.changes, &delta.trees);
             if !r.moved && !delta.layout {
                 if r.repaint
                     && let (Some(engine), Some(layout)) = (&mut self.engine, &mut self.layout)

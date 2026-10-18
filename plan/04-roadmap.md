@@ -438,7 +438,7 @@ remaining lists as they stand.
       separator (CSS Text 3 §7.1: spaces, no-break spaces and the other
       word-separator characters), in shaping, line breaking, justification
       and intrinsic sizes.
-- [ ] 6i. DOM-change style invalidation (owner, 2026-10-18; iana.org/
+- [x] 6i. DOM-change style invalidation (owner, 2026-10-18; iana.org/
       protocols, 79,526 nodes: its scroll handler toggles one class and the
       tab restyled and laid out the whole document each time, ~0.9 s): a
       script's class, id and attribute changes restyle only what their
@@ -481,6 +481,23 @@ remaining lists as they stand.
       4.35 s (5.9). Timing: tables 51.8–52.5 ms, blocks 14.9–15.0 ms
       (unchanged), Wikipedia probe 0.73–0.83 s (live resources; one
       relayout more or less).
+      Block 3 done 2026-10-18: tree changes are logged as `Children`
+      (the parent, the roots placed under it with fragments unpacked, the
+      old parents of moved nodes; a text change logs its parent; a removal
+      taking a `<style>`, `<link>` or `<base>` with it, and `normalize`,
+      stay whole-document changes). The selector scan also records the
+      subjects of sibling combinators and position pseudo-classes
+      (`:nth-*`, `:first-child`, `:*-of-type`, `:nth-child(… of S)` with
+      the features of `S`), of `:empty`, and every `:has()` scope;
+      `restyle_mutations` takes `TreeChange`s: the inserted subtrees whole,
+      the parent's subtree for the position subjects, the grandparent's for
+      `:empty`, the `:has()` elements above; layout follows. Tests: style
+      (`tree_change_restyle_matches_full_restyle`: append, prepend, remove,
+      `:empty` both ways, `:has()`, an inherited subtree, a move, each equal
+      to a full restyle), tab (`script_tree_changes_restyle_what_they_reach`:
+      `append`, `innerHTML`, a removed `<style>`). Timing: tables
+      50.0–50.5 ms, blocks 14.5–14.8 ms, Wikipedia probe 0.83 s, iana 4.26 s
+      (unchanged; their remaining full restyles happen while parsing).
 - [x] 6j. Script-set `<img src>` loads (owner, 2026-10-18, before 6i
       block 3; found during 6i): images are only collected when the
       document is set, so an `<img>` a script inserts or whose `src` it
@@ -2753,6 +2770,25 @@ Exit criteria:
 Goal: fewer broken sites. This phase does not end; items are prioritized by
 what breaks the most pages.
 
+- Incremental layout (owner's 2026-10-18 placement; found with "Working
+  sites first" 6i: every layout-affecting change lays out the whole page,
+  ~550 ms on iana.org/protocols' 79,526 nodes, ~120 ms on Wikipedia's Main
+  Page, and a web font arriving after load does the same). A core change
+  to the engine's flow (`LayoutEngine`, the taffy pass loop, `fragments`,
+  the box builder's entry points), so it starts with its own design for
+  the owner's go. What it covers: the box tree, the taffy tree and the
+  inline roots' parley layouts kept between layouts; dirty marks from
+  the style changes (`Restyled::moved` per element), tree changes, image
+  and font arrivals and viewport changes, propagated to the ancestors
+  whose size can depend on them (intrinsic sizes, shrink-to-fit, flex
+  and grid containers, tables, floats and the lines that avoid them);
+  taffy's per-node caches cleared only on the dirty path, clean
+  subtrees' results and text layouts reused; fragments rebuilt only for
+  the dirty subtrees and moved for the rest; the multi-pass parts
+  (floats, scroll gutters, sticky placement, positioned boxes) re-run
+  where their inputs changed. Verified against a full layout (equal
+  fragment trees) across the paint fixtures, the corpus dump and the
+  layout tests, and timed on iana and Wikipedia.
 - DOM bindings (owner's 2026-10-18 placement, out of "Working sites
   first"; found during its line 6j): (A) the HTML element interfaces
   (`HTMLImageElement`, `HTMLScriptElement`, `HTMLInputElement`, …,
@@ -2783,7 +2819,8 @@ what breaks the most pages.
 - Style: transitions and animations wired to rAF, `@font-face` web fonts,
   `filter`, `backdrop-filter`, `clip-path` (`mask`: "Working sites
   first" line 6c), gradients, shadows,
-  selector-based invalidation for performance. Web-font parts rarely used
+  selector-based invalidation for performance (states, attributes and
+  tree changes: done in "Working sites first" 6i). Web-font parts rarely used
   by sites (owner's 2026-10-18 split from "Working sites first" line 6):
   the `font-feature-settings` and `font-variation-settings` descriptors of
   `@font-face`, one face out of a font collection file (`format(

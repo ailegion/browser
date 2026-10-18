@@ -196,6 +196,17 @@ pub struct InteractionDeps {
     /// subject compound (or inside a `:has()`), what changing it on an
     /// element can affect beyond that element (DOM-change invalidation).
     pub mutation: std::collections::HashMap<Feature, Vec<MutationRule>>,
+    /// The subjects of selectors that look at an element's siblings or
+    /// its place among them (`+`, `~`, `:first-child`, `:nth-*`,
+    /// `:*-of-type`, …): what inserting or removing a child can restyle
+    /// in the parent's subtree.
+    pub structural: SubjectKeys,
+    /// The subjects of selectors with `:empty`: what a parent gaining its
+    /// first child or losing its last can restyle around it.
+    pub empty: SubjectKeys,
+    /// Every `:has()`'s scope: a tree change below the element carrying
+    /// one can change what it matches.
+    pub has: Vec<Scope>,
 }
 
 impl InteractionDeps {
@@ -283,6 +294,21 @@ impl SubjectKeys {
 
     pub fn is_empty(&self) -> bool {
         !self.universal && self.ids.is_empty() && self.classes.is_empty() && self.tags.is_empty()
+    }
+
+    /// Every element: what a newly inserted subtree needs.
+    pub fn all() -> SubjectKeys {
+        SubjectKeys {
+            universal: true,
+            ..SubjectKeys::default()
+        }
+    }
+
+    pub fn extend(&mut self, other: &SubjectKeys) {
+        self.universal |= other.universal;
+        self.ids.extend(other.ids.iter().cloned());
+        self.classes.extend(other.classes.iter().cloned());
+        self.tags.extend(other.tags.iter().cloned());
     }
 }
 

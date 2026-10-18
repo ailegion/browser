@@ -252,12 +252,24 @@ pub struct FeatureChange {
     pub features: Vec<Feature>,
 }
 
+/// A change to `parent`'s children: some removed, the `inserted` roots
+/// placed (new or moved), or a child's text changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeChange {
+    pub parent: NodeId,
+    pub inserted: Vec<NodeId>,
+}
+
 /// Recompute, in place, the styles DOM changes to classes, ids and
 /// attributes can affect (Blink's and Gecko's invalidation sets, in their
 /// simplest form): each changed element; for each rule of a changed
 /// feature whose trigger matches the element, the elements its scope
 /// names; and the descendants of any element whose computed style did
 /// change. A `style` attribute change is a change of the element itself.
+/// Tree changes restyle the inserted subtrees whole; in the parent's
+/// subtree the subjects of sibling and position selectors; around the
+/// parent the subjects of `:empty`; and the `:has()` elements above.
+#[allow(clippy::too_many_arguments)]
 pub fn restyle_mutations(
     doc: &Document,
     stylist: &Stylist,
@@ -266,9 +278,32 @@ pub fn restyle_mutations(
     styles: &mut StyleMap,
     deps: &InteractionDeps,
     changes: &[FeatureChange],
+    trees: &[TreeChange],
 ) -> Restyled {
-    let changed: Vec<NodeId> = changes.iter().map(|c| c.element).filter(|&e| doc.element(e).is_some()).collect();
-    if changed.is_empty() {
+    let mut changed: Vec<NodeId> = changes.iter().map(|c| c.element).filter(|&e| doc.element(e).is_some()).collect();
+    let connected = |n: NodeId| doc.contains(n) && doc.is_connected(n);
+    // Walks the tree changes call for, by root.
+    let mut walks: HashMap<NodeId, SubjectKeys> = HashMap::new();
+    let mut has_scopes: Vec<(NodeId, Vec<&Scope>)> = Vec::new();
+    for t in trees.iter().filter(|t| connected(t.parent)) {
+        for &n in &t.inserted {
+            if doc.element(n).is_some() && connected(n) {
+                walks.entry(n).or_default().extend(&SubjectKeys::all());
+                changed.push(n);
+            }
+        }
+        if !deps.structural.is_empty() {
+            walks.entry(t.parent).or_default().extend(&deps.structural);
+        }
+        if !deps.empty.is_empty() {
+            let around = doc.parent(t.parent).filter(|&g| doc.get(g).is_element()).unwrap_or(t.parent);
+            walks.entry(around).or_default().extend(&deps.empty);
+        }
+        if !deps.has.is_empty() && doc.get(t.parent).is_element() {
+            has_scopes.push((t.parent, deps.has.iter().collect()));
+        }
+    }
+    if changed.is_empty() && walks.is_empty() && has_scopes.is_empty() {
         return Restyled::default();
     }
     let scopes = changes.iter().filter_map(|c| {
@@ -290,7 +325,22 @@ pub fn restyle_mutations(
             .collect();
         Some((c.element, found))
     });
-    let jobs = plan_jobs(doc, scopes.collect(), &changed);
+    let mut scopes: Vec<(NodeId, Vec<&Scope>)> = scopes.collect();
+    scopes.extend(has_scopes);
+    changed.sort();
+    changed.dedup();
+    let planned = plan_jobs(doc, scopes, &changed);
+    // The tree changes' walks join the planned ones, one walk per root.
+    let mut singles = Vec::new();
+    for (root, keys) in planned {
+        match keys {
+            Some(k) => walks.entry(root).or_default().extend(&k),
+            None => singles.push(root),
+        }
+    }
+    let mut jobs: Vec<(NodeId, Option<SubjectKeys>)> = walks.into_iter().map(|(n, k)| (n, Some(k))).collect();
+    jobs.extend(singles.into_iter().map(|n| (n, None)));
+    jobs.sort_by_key(|(n, _)| depth(doc, *n));
     run_jobs(doc, stylist, viewport, states, styles, &changed, &jobs)
 }
 
@@ -831,6 +881,18 @@ fn scan_selector<'a>(
                         scan_selector(s.iter_raw_match_order(), reach, deps, ctx, Some(&trigger));
                     }
                 }
+                // An element's place among its siblings: inserting or
+                // removing a sibling changes it.
+                Component::Nth(_) => deps.structural.insert(ctx.subject.clone()),
+                // `:nth-child(… of S)` also counts siblings matching `S`: a
+                // feature `S` tests changing on a sibling counts too.
+                Component::NthOf(data) => {
+                    deps.structural.insert(ctx.subject.clone());
+                    for s in data.selectors() {
+                        scan_selector(s.iter_raw_match_order(), reach.max(Reach::Parent), deps, ctx, Some(&trigger));
+                    }
+                }
+                Component::Empty => deps.empty.insert(ctx.subject.clone()),
                 // `:has()` looks down and sideways from its element, so a
                 // state inside it is on an element below or after that
                 // one. The outermost `:has()` is the one whose element
@@ -839,10 +901,25 @@ fn scan_selector<'a>(
                     let in_subject = reach <= Reach::Element;
                     let inner_ctx = match &ctx.has {
                         Some(_) => None,
-                        None => Some(ScanCtx {
-                            subject: ctx.subject.clone(),
-                            has: Some((trigger.clone(), in_subject)),
-                        }),
+                        None => {
+                            // A tree change below the `:has()` element can
+                            // change what it matches.
+                            let scope = if in_subject {
+                                Scope::Above(trigger.clone())
+                            } else {
+                                Scope::AboveSubtree {
+                                    has: trigger.clone(),
+                                    subject: ctx.subject.clone(),
+                                }
+                            };
+                            if !deps.has.contains(&scope) {
+                                deps.has.push(scope);
+                            }
+                            Some(ScanCtx {
+                                subject: ctx.subject.clone(),
+                                has: Some((trigger.clone(), in_subject)),
+                            })
+                        }
                     };
                     let inside = if in_subject { Reach::Ancestors } else { Reach::Document };
                     for rs in list.iter() {
@@ -859,6 +936,11 @@ fn scan_selector<'a>(
             }
         }
         if let Some(Component::Combinator(comb)) = combinator {
+            // A sibling combinator: inserting or removing a sibling changes
+            // which elements are adjacent.
+            if matches!(comb, Combinator::NextSibling | Combinator::LaterSibling) {
+                deps.structural.insert(ctx.subject.clone());
+            }
             reach = reach.max(match comb {
                 Combinator::Child | Combinator::Descendant => Reach::Subtree,
                 Combinator::NextSibling | Combinator::LaterSibling => Reach::Parent,
@@ -1484,7 +1566,7 @@ mod tests {
                 Some(v) => e.set_attr(attr, v),
                 None => e.remove_attr(attr),
             }
-            let r = restyle_mutations(&doc, &stylist, &vp, &states, &mut styles, &deps, &[FeatureChange { element: el, features }]);
+            let r = restyle_mutations(&doc, &stylist, &vp, &states, &mut styles, &deps, &[FeatureChange { element: el, features }], &[]);
             let full = compute_styles(doc, &stylist, &vp);
             for (id, s) in full.iter() {
                 assert_eq!(**s, *styles[id], "{attr}={value:?}: element {id:?}");
@@ -1523,7 +1605,7 @@ mod tests {
         let mut step = |doc: &mut Document, el: NodeId, attr: &str, value: &str| {
             doc.get_mut(el).as_element_mut().expect("element").set_attr(attr, value);
             let changes = [FeatureChange { element: el, features: vec![Feature::Attr(attr.to_owned())] }];
-            let r = restyle_mutations(&doc, &stylist, &vp, &states, &mut styles, &deps, &changes);
+            let r = restyle_mutations(&doc, &stylist, &vp, &states, &mut styles, &deps, &changes, &[]);
             let full = compute_styles(doc, &stylist, &vp);
             for (id, s) in full.iter() {
                 assert_eq!(**s, *styles[id], "{attr}: element {id:?}");
@@ -1539,6 +1621,108 @@ mod tests {
         step(&mut doc, div, "lang", "fr");
         let a = nth(&doc, "a", 0);
         step(&mut doc, a, "href", "#");
+    }
+
+    /// Tree changes restyle the inserted subtrees, the sibling and
+    /// position selectors' subjects, `:empty` and `:has()`, and the result
+    /// equals a full restyle.
+    #[test]
+    fn tree_change_restyle_matches_full_restyle() {
+        let mut doc = parse_html(
+            b"<ul id=u><li>1</li><li>2</li></ul><div id=e></div><section id=h><p>p</p></section>\
+              <div id=red><span id=mover>m</span></div><div id=blue></div><ol id=o><li>a</li></ol>",
+        );
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(
+            "li:first-child { color: red } li + li { font-weight: bold } li:nth-child(odd) { background-color: yellow } \
+             div:empty { height: 5px } div:empty + section { color: green } section:has(> .x) { color: blue } \
+             #red { color: red } #blue { color: blue } ol li:last-child b { color: purple }",
+            Origin::Author,
+        )));
+        let vp = Viewport::default();
+        let states = ElementStates::default();
+        let deps = stylist.interaction_deps();
+        let mut styles = compute_styles(&doc, &stylist, &vp);
+        let by_id = |doc: &Document, id: &str| doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id))).expect(id);
+        // One change: apply `f`, report the parent and the inserted roots.
+        let mut step = |doc: &mut Document, what: &str, f: &dyn Fn(&mut Document) -> (NodeId, Vec<NodeId>)| {
+            let (parent, inserted) = f(doc);
+            let r = restyle_mutations(doc, &stylist, &vp, &states, &mut styles, &deps, &[], &[TreeChange { parent, inserted }]);
+            let full = compute_styles(doc, &stylist, &vp);
+            for (id, s) in full.iter() {
+                assert_eq!(**s, *styles[id], "{what}: element {id:?}");
+            }
+            r
+        };
+        step(&mut doc, "append", &|d| {
+            let u = by_id(d, "u");
+            let li = d.create_html_element("li");
+            d.append_child(u, li);
+            (u, vec![li])
+        });
+        step(&mut doc, "prepend", &|d| {
+            let u = by_id(d, "u");
+            let li = d.create_html_element("li");
+            let first = d.first_child(u);
+            match first {
+                Some(f) => d.insert_before(f, li),
+                None => d.append_child(u, li),
+            }
+            (u, vec![li])
+        });
+        step(&mut doc, "remove", &|d| {
+            let u = by_id(d, "u");
+            let first = d.children(u).find(|&c| d.get(c).is_element()).expect("li");
+            d.detach(first);
+            (u, vec![])
+        });
+        step(&mut doc, "empty gains a child", &|d| {
+            let e = by_id(d, "e");
+            let t = d.create_text("t");
+            d.append_child(e, t);
+            (e, vec![t])
+        });
+        step(&mut doc, "empty loses it", &|d| {
+            let e = by_id(d, "e");
+            let t = d.first_child(e).expect("text");
+            d.detach(t);
+            (e, vec![])
+        });
+        step(&mut doc, ":has() child", &|d| {
+            let h = by_id(d, "h");
+            let x = d.create_html_element("i");
+            d.get_mut(x).as_element_mut().expect("i").set_attr("class", "x");
+            d.append_child(h, x);
+            (h, vec![x])
+        });
+        step(&mut doc, "a subtree, inheriting", &|d| {
+            let o = by_id(d, "o");
+            let li = d.create_html_element("li");
+            let b = d.create_html_element("b");
+            d.append_child(li, b);
+            d.append_child(o, li);
+            (o, vec![li])
+        });
+        // A move is a removal from one parent and an insertion under another.
+        let (red, blue, mover) = (by_id(&doc, "red"), by_id(&doc, "blue"), by_id(&doc, "mover"));
+        doc.detach(mover);
+        doc.append_child(blue, mover);
+        let r = restyle_mutations(
+            &doc,
+            &stylist,
+            &vp,
+            &states,
+            &mut styles,
+            &deps,
+            &[],
+            &[TreeChange { parent: red, inserted: vec![] }, TreeChange { parent: blue, inserted: vec![mover] }],
+        );
+        let full = compute_styles(&doc, &stylist, &vp);
+        for (id, s) in full.iter() {
+            assert_eq!(**s, *styles[id], "move: element {id:?}");
+        }
+        assert!(r.repaint);
     }
 
     #[test]

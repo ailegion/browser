@@ -116,7 +116,11 @@ const CHANGE_LOG_LIMIT: usize = 4096;
 pub enum DomChange {
     /// An attribute was set, changed or removed; `old` is its value before.
     Attr { element: NodeId, name: String, old: Option<String>, generation: u64 },
-    /// Anything else: nodes inserted, removed or moved, text changed.
+    /// `parent`'s children changed: nodes removed, the `inserted` ones
+    /// placed (new or moved here, fragments already unpacked), or the text
+    /// of a child text node changed.
+    Children { parent: NodeId, inserted: Vec<NodeId>, generation: u64 },
+    /// Any other change to the tree.
     Tree { generation: u64 },
 }
 
@@ -170,9 +174,24 @@ impl Dom {
         });
     }
 
-    /// A script changed the connected tree otherwise: nodes inserted,
-    /// removed or moved, text changed. Past the log's limit the whole log
-    /// becomes one such change (a full restyle is cheaper then).
+    /// A script changed the children of `parent` (which is connected):
+    /// removed some, placed `inserted`, or changed a child's text.
+    pub(crate) fn note_children(&mut self, parent: NodeId, inserted: Vec<NodeId>) {
+        self.mutated = true;
+        if self.changes.len() >= CHANGE_LOG_LIMIT {
+            self.note_tree();
+            return;
+        }
+        self.changes.push(DomChange::Children {
+            parent,
+            inserted,
+            generation: self.generation,
+        });
+    }
+
+    /// A script changed the connected tree in a way not described more
+    /// closely. Past the log's limit the whole log becomes one such change
+    /// (a full restyle is cheaper then).
     pub(crate) fn note_tree(&mut self) {
         self.mutated = true;
         if self.changes.len() >= CHANGE_LOG_LIMIT {
@@ -1258,11 +1277,25 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
     let connected = dom.doc.is_connected(id);
     let is_element = dom.doc.get(id).is_element();
     let mut attr_change = None;
+    let mut children_change: Option<(NodeId, Vec<NodeId>)> = None;
     match prop {
-        SetProp::TextContent if is_element => replace_children_with_text(&mut dom, id, &text),
-        SetProp::InnerHtml if is_element => replace_children_with_html(&mut dom, id, &text),
+        SetProp::TextContent if is_element => {
+            let held = holds_sheet(&dom.doc, &dom.doc.children(id).collect::<Vec<_>>());
+            replace_children_with_text(&mut dom, id, &text);
+            children_change = (!held).then(|| (id, dom.doc.children(id).collect()));
+        }
+        SetProp::InnerHtml if is_element => {
+            let held = holds_sheet(&dom.doc, &dom.doc.children(id).collect::<Vec<_>>());
+            replace_children_with_html(&mut dom, id, &text);
+            // A template's contents are not in the tree.
+            let template = dom.doc.get(id).as_element().is_some_and(|e| e.template_contents.is_some());
+            children_change = (!held).then(|| (id, if template { Vec::new() } else { dom.doc.children(id).collect() }));
+        }
         SetProp::InnerHtml => return Ok(JsValue::undefined()),
-        SetProp::TextContent | SetProp::NodeValue | SetProp::Data => set_data(&mut dom.doc, id, text),
+        SetProp::TextContent | SetProp::NodeValue | SetProp::Data => {
+            set_data(&mut dom.doc, id, text);
+            children_change = dom.doc.parent(id).map(|p| (p, Vec::new()));
+        }
         SetProp::Id | SetProp::ClassName => {
             let name = if matches!(prop, SetProp::Id) { "id" } else { "class" };
             if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
@@ -1272,9 +1305,10 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
         }
     }
     if connected {
-        match attr_change {
-            Some((name, old)) => dom.note_attr(id, name, old),
-            None => dom.note_tree(),
+        match (attr_change, children_change) {
+            (Some((name, old)), _) => dom.note_attr(id, name, old),
+            (None, Some((parent, inserted))) => dom.note_children(parent, inserted),
+            (None, None) => dom.note_tree(),
         }
     }
     Ok(JsValue::undefined())
@@ -1448,6 +1482,40 @@ fn insert_all(doc: &mut Document, parent: NodeId, nodes: &[NodeId], reference: O
     Ok(connected)
 }
 
+/// Whether removing these subtrees takes a stylesheet or the base URL
+/// with it (`style`, `link`, `base`): then the change log records a plain
+/// tree change, and the whole document is restyled.
+fn holds_sheet(doc: &Document, nodes: &[NodeId]) -> bool {
+    nodes.iter().any(|&n| {
+        std::iter::once(n).chain(doc.descendants(n)).any(|d| {
+            doc.element(d).is_some_and(|e| e.is_html() && matches!(&*e.name.local, "style" | "link" | "base"))
+        })
+    })
+}
+
+/// What inserting `nodes` will place, read before the insertion: the
+/// roots (a fragment's children instead of the fragment) and the parents
+/// they leave (moved nodes), for the change log.
+fn placing(doc: &Document, nodes: &[NodeId]) -> (Vec<NodeId>, Vec<NodeId>) {
+    let mut roots = Vec::new();
+    for &n in nodes {
+        if matches!(doc.get(n).kind, NodeKind::DocumentFragment) {
+            roots.extend(doc.children(n));
+        } else {
+            roots.push(n);
+        }
+    }
+    let mut olds: Vec<NodeId> = Vec::new();
+    for &r in &roots {
+        if let Some(p) = doc.parent(r)
+            && !olds.contains(&p)
+        {
+            olds.push(p);
+        }
+    }
+    (roots, olds)
+}
+
 /// The first sibling after `id` (or before, when `backwards`) that is
 /// not among `nodes`: where `after`/`before` insert so a node listed
 /// among its own arguments does not anchor the insertion.
@@ -1560,6 +1628,14 @@ fn mutate(
     let mut connected = dom.doc.is_connected(id);
     // An attribute method's attribute and its value before, for the log.
     let mut attr_change: Option<(String, Option<String>)> = None;
+    // The parents whose children changed and what was placed under each;
+    // a removed stylesheet makes it a plain tree change.
+    let mut tree_changes: Vec<(NodeId, Vec<NodeId>)> = Vec::new();
+    let mut sheet_removed = false;
+    let placed = |tree_changes: &mut Vec<(NodeId, Vec<NodeId>)>, parent: NodeId, (roots, olds): (Vec<NodeId>, Vec<NodeId>)| {
+        tree_changes.extend(olds.into_iter().map(|p| (p, Vec::new())));
+        tree_changes.push((parent, roots));
+    };
     let out = match method {
         AppendChild | InsertBefore => {
             let child = node_arg(args, 0, &dom.doc)?;
@@ -1567,7 +1643,9 @@ fn mutate(
                 InsertBefore if !args.get_or_undefined(1).is_null_or_undefined() => Some(node_arg(args, 1, &dom.doc)?),
                 _ => None,
             };
+            let placing = placing(&dom.doc, &[child]);
             connected |= insert_node(&mut dom.doc, id, child, reference)?;
+            placed(&mut tree_changes, id, placing);
             Out::Node(Some(child))
         }
         ReplaceChild => {
@@ -1580,8 +1658,11 @@ fn mutate(
             // `new` goes where `old` was: before the node after `old`
             // (which may be `new` itself, moving up).
             let reference = viable_sibling(&dom.doc, old, &[new], false);
+            let placing = placing(&dom.doc, &[new]);
+            sheet_removed |= holds_sheet(&dom.doc, &[old]);
             dom.doc.detach(old);
             connected |= insert_node(&mut dom.doc, id, new, reference)?;
+            placed(&mut tree_changes, id, placing);
             Out::Node(Some(old))
         }
         RemoveChild => {
@@ -1590,11 +1671,16 @@ fn mutate(
                 return Err(Fail::Dom("NotFoundError", "the node to be removed is not a child of this node".to_owned()));
             }
             // Returned to the caller, so it is held and stays in the arena.
+            sheet_removed |= holds_sheet(&dom.doc, &[child]);
             dom.doc.detach(child);
+            tree_changes.push((id, Vec::new()));
             Out::Node(Some(child))
         }
         Remove => {
+            let parent = dom.doc.parent(id);
+            sheet_removed |= holds_sheet(&dom.doc, &[id]);
             dom.doc.detach(id);
+            tree_changes.extend(parent.map(|p| (p, Vec::new())));
             Out::Value(JsValue::undefined())
         }
         CloneNode => {
@@ -1609,7 +1695,9 @@ fn mutate(
         Append | Prepend => {
             let nodes = materialize(&mut dom.doc, items)?;
             let reference = if matches!(method, Prepend) { dom.doc.first_child(id) } else { None };
+            let placing = placing(&dom.doc, &nodes);
             connected |= insert_all(&mut dom.doc, id, &nodes, reference)?;
+            placed(&mut tree_changes, id, placing);
             Out::Value(JsValue::undefined())
         }
         ReplaceChildren => {
@@ -1618,6 +1706,8 @@ fn mutate(
                 check_insert(&dom.doc, id, *n, None)?;
             }
             let children: Vec<NodeId> = dom.doc.children(id).collect();
+            let leaving: Vec<NodeId> = children.iter().copied().filter(|c| !nodes.contains(c)).collect();
+            sheet_removed |= holds_sheet(&dom.doc, &leaving);
             for c in children {
                 if !nodes.contains(&c) {
                     dom.discard(c);
@@ -1625,7 +1715,9 @@ fn mutate(
                     dom.doc.detach(c);
                 }
             }
+            let placing = placing(&dom.doc, &nodes);
             connected |= insert_all(&mut dom.doc, id, &nodes, None)?;
+            placed(&mut tree_changes, id, placing);
             Out::Value(JsValue::undefined())
         }
         Before | After | ReplaceWith => {
@@ -1638,10 +1730,13 @@ fn mutate(
                     .map_or(dom.doc.first_child(parent), |s| dom.doc.next_sibling(s)),
                 _ => viable_sibling(&dom.doc, id, &nodes, false),
             };
+            let placing = placing(&dom.doc, &nodes);
             if matches!(method, ReplaceWith) {
+                sheet_removed |= !nodes.contains(&id) && holds_sheet(&dom.doc, &[id]);
                 dom.doc.detach(id);
             }
             connected |= insert_all(&mut dom.doc, parent, &nodes, reference)?;
+            placed(&mut tree_changes, parent, placing);
             Out::Value(JsValue::undefined())
         }
         InsertAdjacentElement | InsertAdjacentText | InsertAdjacentHtml => {
@@ -1668,7 +1763,9 @@ fn mutate(
                 InsertAdjacentText => vec![dom.doc.create_text(strings[1].clone())],
                 _ => dom.doc.parse_fragment(parent, &strings[1]),
             };
+            let placing = placing(&dom.doc, &nodes);
             connected |= insert_all(&mut dom.doc, parent, &nodes, reference)?;
+            placed(&mut tree_changes, parent, placing);
             match method {
                 InsertAdjacentElement => Out::Node(nodes.first().copied()),
                 _ => Out::Value(JsValue::undefined()),
@@ -1745,6 +1842,13 @@ fn mutate(
     if connected {
         match attr_change {
             Some((name, old)) => dom.note_attr(id, &name, old),
+            None if !tree_changes.is_empty() && !sheet_removed => {
+                for (parent, inserted) in tree_changes {
+                    if dom.doc.is_connected(parent) {
+                        dom.note_children(parent, inserted);
+                    }
+                }
+            }
             None => dom.note_tree(),
         }
     }
