@@ -1510,7 +1510,7 @@ mod tests {
         // Attribute-following pseudo-classes: `disabled` and `href` reach a
         // sibling, `lang` the descendants.
         let mut doc = parse_html(
-            b"<fieldset><input><label>l</label></fieldset><div><p><b>t</b></p></div><a>x</a><i>y</i>",
+            b"<fieldset><input><label>l</label></fieldset><p><input><label>m</label></p><div><p><b>t</b></p></div><a>x</a><i>y</i>",
         );
         let mut stylist = Stylist::new();
         stylist.add_sheet(ua_stylesheet());
@@ -1530,7 +1530,10 @@ mod tests {
             }
             assert!(r.repaint, "{attr} restyled something");
         };
-        let input = nth(&doc, "input", 0);
+        // A fieldset's `disabled` reaches the controls inside it.
+        let fieldset = nth(&doc, "fieldset", 0);
+        step(&mut doc, fieldset, "disabled", "");
+        let input = nth(&doc, "input", 1);
         step(&mut doc, input, "disabled", "");
         let div = nth(&doc, "div", 0);
         step(&mut doc, div, "lang", "fr");

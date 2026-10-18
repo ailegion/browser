@@ -618,7 +618,7 @@ impl TabState {
         if !((ux && ox) || (uy && oy)) {
             return false;
         }
-        !doc.descendants(n).any(|d| doc.element(d).is_some_and(is_focusable))
+        !doc.descendants(n).any(|d| is_focusable(doc, d))
     }
 
     // ----- scrollbars -----

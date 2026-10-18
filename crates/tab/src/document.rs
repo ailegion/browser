@@ -905,7 +905,15 @@ impl TabState {
                 // and `contextmenu` have no default action here.
                 let pressed_on = self.press_target.take();
                 let click_target = self.common_ancestor(pressed_on, self.hover);
+                // A disabled form control gets no `click` (HTML §4.10.18.2),
+                // and nothing follows from one.
+                let on_disabled = matches!(
+                    (click_target, &self.doc),
+                    (Some(t), Some(d)) if d.disabled_state(t) == Some(true)
+                        && d.element(t).is_some_and(|e| matches!(&*e.name.local, "button" | "input" | "select" | "textarea"))
+                );
                 let proceed = match button {
+                    MouseButton::Left if on_disabled => false,
                     MouseButton::Left => self.fire_click("click", click_target, x, y, button, clicks),
                     _ => self.fire_click("auxclick", click_target, x, y, button, clicks),
                 };
@@ -1213,10 +1221,10 @@ impl TabState {
     /// (same `name`, same form or document).
     fn toggle_control(&mut self, id: NodeId) {
         let Some(doc) = &mut self.doc else { return };
-        let Some(e) = doc.element(id) else { return };
-        if e.attr("disabled").is_some() {
+        if doc.disabled_state(id) == Some(true) {
             return;
         }
+        let Some(e) = doc.element(id) else { return };
         let radio = input_type(e).as_deref() == Some("radio");
         let name = e.attr("name").map(str::to_owned);
         if radio {
@@ -1332,7 +1340,7 @@ impl TabState {
             let Some(e) = doc.element(n) else { continue };
             // Scrollers with nothing focusable inside take keyboard focus
             // too (Chrome's keyboard-focusable scrollers).
-            if !rendered.contains(&n) || !(is_focusable(e) || self.keyboard_focusable_scroller(n)) {
+            if !rendered.contains(&n) || !(is_focusable(doc, n) || self.keyboard_focusable_scroller(n)) {
                 continue;
             }
             match tabindex(e) {
@@ -2010,7 +2018,15 @@ impl TabState {
     }
 
     fn focusable_ancestor(&self, id: NodeId) -> Option<NodeId> {
-        self.ancestor_or_self(id, is_focusable)
+        let doc = self.doc.as_ref()?;
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            if is_focusable(doc, n) {
+                return Some(n);
+            }
+            cur = doc.parent(n);
+        }
+        None
     }
 
     /// Re-evaluate what is under the pointer; restyle if it changed.
@@ -4178,15 +4194,17 @@ fn is_link(e: &browser_dom::Element) -> bool {
 }
 
 /// Whether an element can take focus at all: links, enabled form
-/// controls (not hidden inputs), and anything with a `tabindex`.
-fn is_focusable(e: &browser_dom::Element) -> bool {
+/// controls (not hidden inputs; a control in a disabled fieldset is
+/// disabled), and anything with a `tabindex`.
+fn is_focusable(doc: &Document, id: NodeId) -> bool {
+    let Some(e) = doc.element(id) else { return false };
     if e.name.ns != ns!(html) {
         return false;
     }
     let control = matches!(
         e.name.local,
         local_name!("input") | local_name!("button") | local_name!("select") | local_name!("textarea")
-    ) && e.attr("disabled").is_none()
+    ) && doc.disabled_state(id) != Some(true)
         && !(e.name.local == local_name!("input")
             && e.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("hidden")));
     is_link(e) || control || e.attr("tabindex").is_some()
@@ -5156,14 +5174,16 @@ mod tests {
         <span id=s tabindex='0'>three</span> <a id=a3 href='#z' tabindex='2'>four</a> \
         <b id=b tabindex='1'>five</b> <a id=hidden href='#h' style='display:none'>hidden</a> \
         <input id=hid type=hidden> <input id=dis disabled></p>\
+        <fieldset disabled style='margin:0;padding:0;border:0'><legend><input id=leg style='width:5px'></legend><input id=fd style='width:5px'></fieldset>\
         <div></div><p><a id=last href='#last'>last</a></p>";
 
     #[test]
     fn tab_walks_the_focus_order_shows_a_ring_and_leaves_the_page_at_the_ends() {
         let mut h = Harness::load(FOCUS_PAGE);
         // Positive tabindex first, ascending, then tree order; hidden,
-        // disabled and negative-tabindex elements are skipped.
-        let expected = ["b", "a3", "a1", "s", "last"];
+        // disabled (by a fieldset too, but not in its first legend) and
+        // negative-tabindex elements are skipped.
+        let expected = ["b", "a3", "a1", "s", "leg", "last"];
         for id in expected {
             h.key(Key::Tab, false);
             assert_eq!(h.focus_id().as_deref(), Some(id));
@@ -5180,6 +5200,8 @@ mod tests {
         // Shift+Tab from nothing starts at the last; keeps going back.
         h.key(Key::Tab, true);
         assert_eq!(h.focus_id().as_deref(), Some("last"));
+        h.key(Key::Tab, true);
+        assert_eq!(h.focus_id().as_deref(), Some("leg"));
         h.key(Key::Tab, true);
         assert_eq!(h.focus_id().as_deref(), Some("s"));
         assert!(h.state.scroll_y < 100.0, "scrolled back up to it");
@@ -7821,6 +7843,40 @@ mod tests {
         h.pump();
         assert!(h.state.layouts > layouts, "an insertion lays out again");
         assert_eq!(width(&h), Some(200.0));
+    }
+
+    /// A control disabled by its fieldset gets no `click`; one in the
+    /// fieldset's first legend does.
+    #[test]
+    fn disabled_controls_get_no_click() {
+        let page = "<!DOCTYPE html><body style='margin:0'><fieldset disabled style='margin:0;padding:0;border:0'>\
+            <legend><button id=ok style='width:50px;height:20px'>a</button></legend>\
+            <button id=no style='width:50px;height:20px'>b</button></fieldset>\
+            <script>var log = []; for (const b of document.querySelectorAll('button')) b.onclick = () => log.push(b.id);</script>";
+        let mut h = Harness::load(page);
+        h.pump_until(|h| h.state.layout.is_some() && h.state.lifecycle == Lifecycle::Complete);
+        let center = |h: &Harness, id: &str| {
+            let doc = h.state.doc.as_ref().expect("doc");
+            let node = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id))).expect(id);
+            let mut c = None;
+            h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+                if f.node == Some(node) && c.is_none() {
+                    c = Some((f.rect.x + f.rect.width / 2.0, f.rect.y + f.rect.height / 2.0));
+                }
+            });
+            c.expect("box")
+        };
+        for id in ["no", "ok"] {
+            let (x, y) = center(&h, id);
+            h.send(ShellToTab::MouseMove { x, y });
+            h.send(ShellToTab::MouseDown { x, y, button: MouseButton::Left });
+            h.send(ShellToTab::MouseUp { x, y, button: MouseButton::Left });
+            h.pump();
+        }
+        assert_eq!(
+            h.state.script.as_mut().and_then(|s| s.eval_to_string("log.join(' ')").ok()).as_deref(),
+            Some("\"ok\"")
+        );
     }
 
     /// An `<img>` a script inserts, or whose `src` it changes, is fetched

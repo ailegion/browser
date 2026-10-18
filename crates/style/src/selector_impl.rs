@@ -463,13 +463,8 @@ impl selectors::Element for ElementRef<'_> {
             PseudoClass::Checked => {
                 e.attr("checked").is_some() || e.attr("selected").is_some()
             }
-            PseudoClass::Disabled => e.attr("disabled").is_some(),
-            PseudoClass::Enabled => {
-                matches!(
-                    &*e.name.local,
-                    "input" | "button" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
-                ) && e.attr("disabled").is_none()
-            }
+            PseudoClass::Disabled => self.doc.disabled_state(self.id) == Some(true),
+            PseudoClass::Enabled => self.doc.disabled_state(self.id) == Some(false),
             PseudoClass::Dir(dir) => dir.is_some_and(|d| self.doc.directionality(self.id) == d),
             PseudoClass::Lang(lang) => {
                 let mut cur = Some(self.id);

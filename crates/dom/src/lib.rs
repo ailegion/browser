@@ -348,6 +348,53 @@ impl Document {
         self.find_child_element(self.document_element()?, &local_name!("body"))
     }
 
+    /// Whether a node is one `:disabled` matches (HTML §4.16.3, §4.10.18.2),
+    /// `None` for one neither `:disabled` nor `:enabled` applies to:
+    /// `button`, `input`, `select` and `textarea` are disabled by their own
+    /// `disabled` attribute or by a fieldset with one around them, unless
+    /// they are inside that fieldset's first `legend` child; a `fieldset`
+    /// likewise; an `optgroup` by its attribute; an `option` by its own or
+    /// its parent `optgroup`'s.
+    pub fn disabled_state(&self, id: NodeId) -> Option<bool> {
+        let e = self.element(id).filter(|e| e.name.ns == ns!(html))?;
+        let own = e.attr("disabled").is_some();
+        match &*e.name.local {
+            "button" | "input" | "select" | "textarea" | "fieldset" => Some(own || self.in_disabled_fieldset(id)),
+            "optgroup" => Some(own),
+            "option" => Some(
+                own || self.parent(id).and_then(|p| self.element(p)).is_some_and(|p| {
+                    p.name.ns == ns!(html) && p.name.local == local_name!("optgroup") && p.attr("disabled").is_some()
+                }),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether a fieldset with a `disabled` attribute is an ancestor of
+    /// `id` with `id` outside its first `legend` child.
+    fn in_disabled_fieldset(&self, id: NodeId) -> bool {
+        let mut child = id;
+        let mut cur = self.parent(id);
+        // The ancestor just below each one, to tell the first legend apart.
+        while let Some(a) = cur {
+            if let Some(e) = self.element(a)
+                && e.name.ns == ns!(html)
+                && e.name.local == local_name!("fieldset")
+                && e.attr("disabled").is_some()
+            {
+                let first_legend = self.children(a).find(|&c| {
+                    self.element(c).is_some_and(|l| l.name.ns == ns!(html) && l.name.local == local_name!("legend"))
+                });
+                if first_legend != Some(child) {
+                    return true;
+                }
+            }
+            child = a;
+            cur = self.parent(a);
+        }
+        false
+    }
+
     /// The directionality of a node (HTML "the directionality"): `dir=ltr`
     /// or `dir=rtl` as given; `dir=auto` (and `bdi` without `dir`) from
     /// the first strong character of the element's text, skipping `bdi`,
@@ -790,6 +837,31 @@ impl Iterator for Descendants<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HTML's disabled rules: own attribute, a disabled fieldset around
+    /// (not inside its first legend), nested fieldsets, optgroup/option,
+    /// and elements the rule does not apply to.
+    #[test]
+    fn disabled_state_follows_html() {
+        let doc = parse_html(
+            b"<body><fieldset id=f disabled><legend><input id=l1></legend><legend><input id=l2></legend>\
+              <input id=in><fieldset id=g><button id=b>b</button></fieldset></fieldset>\
+              <fieldset><legend><fieldset disabled><legend>x</legend><select id=s></select></fieldset></legend></fieldset>\
+              <select><optgroup id=og disabled><option id=o1>1</option></optgroup><option id=o2 disabled>2</option><option id=o3>3</option></select>\
+              <textarea id=t disabled></textarea><input id=e><div id=d disabled></div><a id=a disabled href=x>a</a></body>",
+        );
+        let by_id = |id: &str| doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id))).expect(id);
+        let state = |id: &str| doc.disabled_state(by_id(id));
+        assert_eq!(state("f"), Some(true));
+        assert_eq!(state("l1"), Some(false), "inside the first legend");
+        assert_eq!(state("l2"), Some(true), "a later legend is no exception");
+        assert_eq!(state("in"), Some(true));
+        assert_eq!((state("g"), state("b")), (Some(true), Some(true)), "a nested fieldset and its control");
+        assert_eq!(state("s"), Some(true), "a disabled fieldset inside an enabled one's legend");
+        assert_eq!((state("og"), state("o1"), state("o2"), state("o3")), (Some(true), Some(true), Some(true), Some(false)));
+        assert_eq!((state("t"), state("e")), (Some(true), Some(false)));
+        assert_eq!((state("d"), state("a")), (None, None), "neither :disabled nor :enabled");
+    }
 
     #[test]
     fn directionality_follows_html() {

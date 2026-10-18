@@ -508,9 +508,23 @@ remaining lists as they stand.
       verified: whether Chrome also names SVG elements by `id` (HTML says
       HTML elements; done so). Timing: Wikipedia probe 0.84 s, iana 4.32 s
       (unchanged).
-- [ ] 6l. `:disabled` inside a disabled `<fieldset>` (owner, 2026-10-18;
+- [x] 6l. `:disabled` inside a disabled `<fieldset>` (owner, 2026-10-18;
       HTML §4.10.18.2): a form control in a disabled fieldset, outside its
       first `<legend>`, is disabled (`:disabled`, no focus, no activation).
+      Done 2026-10-18 (`Document::disabled_state`): `button`, `input`,
+      `select`, `textarea` and `fieldset` disabled by their attribute or a
+      disabled fieldset around them outside its first `legend` child,
+      `optgroup` by its attribute, `option` by its own or its
+      `optgroup`'s; other elements are neither `:disabled` nor `:enabled`
+      (a `<div disabled>` matched before). Used by `:disabled`/`:enabled`,
+      focusability, checkbox/radio toggling, and the `click` a disabled
+      control does not get (nor its default action). Tests: dom
+      (`disabled_state_follows_html`), style (a fieldset's `disabled`
+      restyling its controls incrementally), tab (Tab order skips a control
+      in a disabled fieldset but not one in its first legend;
+      `disabled_controls_get_no_click`). Not verified: whether Chrome and
+      Firefox also withhold `click` when the press lands on a child of a
+      disabled control (done per the spec's wording: the target only).
 - [ ] 6m. Responsive images (owner, 2026-10-18; found during 6j; most
       sites, Wikipedia included, send their images this way): `srcset`
       with density (`2x`) and width (`640w`) descriptors and `sizes`
