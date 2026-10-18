@@ -2886,7 +2886,9 @@ what breaks the most pages.
 
 - Incremental layout: brought forward by the owner on 2026-10-19, design
   in `07-incremental-layout.md` (go given), blocks B1–B4; B1 done
-  2026-10-19 (record there). Original placement: (owner's 2026-10-18 placement; found with "Working
+  2026-10-19 (record there); B2 partly built 2026-10-19, not done:
+  persistent taffy tree, row-level rebuilds and full restyles laying out
+  fully are SKIPPED (record there). Original placement: (owner's 2026-10-18 placement; found with "Working
   sites first" 6i: every layout-affecting change lays out the whole page,
   ~550 ms on iana.org/protocols' 79,526 nodes, ~120 ms on Wikipedia's Main
   Page, and a web font arriving after load does the same). A core change

@@ -149,6 +149,52 @@ full build (it walks the kept tree to index it); layouts otherwise as
 before (B2 is where the time goes); heap after iana's load 182 → 229 MiB
 (the kept boxes), its peak 630 → 691 MiB.
 
+**B2 partly built 2026-10-19, not done.** Built: the leaf caches live
+on between layouts. `reset_layout_state` runs before a layout of the
+kept tree and clears only what belongs to one layout: taffy ids,
+scrollbar gutters, the `text-overflow` marker, a table's containing
+block width, and the float bands along with the line layouts made
+around them. It keeps line layouts keyed by width, atomics' results,
+tables' grids, constraints and layouts, and cells' and captions'
+measures. `trim_after_layout` drops shaped paragraphs and cells'
+per-width results when the tree is stored. A rebuild takes the
+rebuilt box apart first (`harvest`): the element boxes and cells
+inside it that no change reaches go to the builder (`BoxBuilder::
+reuse`/`reuse_cells`), and the new build takes them back with their
+caches. A change reaches the changed elements, the starts and all
+their ancestors. Above a replaced box, `replace_in` clears what the
+boxes on the way up measured from it: an inline root's line layouts
+and shaping, an atomic's results, a table's caches, a cell's or
+caption's measures. It logs "table caches cleared by a change inside".
+
+SKIPPED, so the block is not done:
+- the persistent taffy tree (`set_style`/`mark_dirty`, taffy's caches
+  answering for clean subtrees): taffy is still built again on every
+  layout;
+- a change inside a table row rebuilds the whole table: rows have no
+  element box of their own to rebuild, while browsers rebuild only the
+  row;
+- a full restyle (iana's hover moves) still notes an unknown change, so
+  it lays out everything.
+
+Verification: `BROWSER_VERIFY_LAYOUT=1` on iana gave 9 incremental
+layouts and 0 differences. All workspace tests pass.
+
+Timing (release):
+- iana scroll-script layouts went from ~440 ms to ~70 ms each in the
+  probe (42 ms of layout, 0 tables or cells measured again). The shell
+  cannot scroll by itself, so these come from the probe, which runs
+  the same tab code.
+- iana table-row script changes take 230–275 ms.
+- iana hover moves take 470–490 ms each (full restyle and full layout).
+- iana load in the real shell at 1280×720 takes 7.6 s, with 5 full
+  layouts of 0.9–1.38 s; fonts and images still lay out fully (B3).
+  The previous shell run was 8.1 s at 1024×768.
+- Wikipedia: load 709 ms (835 before); hover relayout 60–63 ms (121
+  before).
+- Heap after iana's load: 229 (B1) → 350.6 MiB; its peak 691 →
+  630.7 MiB.
+
 ## Risks
 
 - A missed dependency gives a stale layout. The verify switch and the

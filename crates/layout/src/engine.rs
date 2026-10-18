@@ -559,15 +559,17 @@ impl LayoutEngine {
         let html_box = if incremental {
             let mut root = kept.take().map(|k| k.root);
             if let Some(r) = &mut root {
-                crate::incremental::reset(r);
+                crate::incremental::reset_layout_state(r);
             }
             for o in &mut self.oofs {
                 if let Some(n) = &mut o.node {
-                    crate::incremental::reset(n);
+                    crate::incremental::reset_layout_state(n);
                 }
             }
             root
         } else {
+            // The old tree goes before the new one is built.
+            drop(kept.take());
             counters(|c| c.full = true);
             // What a failed rebuild left in the list goes.
             builder.oofs.borrow_mut().clear();
@@ -772,13 +774,12 @@ impl LayoutEngine {
             oofs = self.oofs.len(),
             "layout phases"
         );
-        // The boxes stay for the next layout, without what this layout
-        // left on them (its line layouts, shaping, results), which the
-        // next one does not use.
-        crate::incremental::reset(&mut html);
+        // The boxes stay for the next layout with the caches it reuses
+        // (block B2), less what only helped within this one.
+        crate::incremental::trim_after_layout(&mut html);
         for o in &mut self.oofs {
             if let Some(n) = &mut o.node {
-                crate::incremental::reset(n);
+                crate::incremental::trim_after_layout(n);
             }
         }
         self.kept = Some(crate::incremental::KeptBoxes {

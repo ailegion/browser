@@ -112,6 +112,27 @@ pub(crate) struct CellBox {
     pub done: Vec<((f32, f32), crate::engine::SubtreeResult)>,
 }
 
+impl CellBox {
+    /// An empty cell standing in while a cell is taken out (incremental
+    /// layout).
+    pub(crate) fn placeholder() -> Self {
+        CellBox {
+            node: BoxNode::placeholder(),
+            colspan: 1,
+            rowspan: 1,
+            col: 0,
+            rows: 1,
+            row: 0,
+            empty: true,
+            min_content: 0.0,
+            max_content: 0.0,
+            measured: false,
+            last: None,
+            done: Vec::new(),
+        }
+    }
+}
+
 /// How a scroll container's box is laid out (roadmap 4a (4s)): which
 /// scrollbar gutters taffy reserves and how thick. `gutter_y` is the
 /// vertical scrollbar's gutter (at the inline-end edge), `gutter_x` the
@@ -230,6 +251,12 @@ pub(crate) struct BoxNode {
 }
 
 impl BoxNode {
+    /// An empty box standing in while a box is taken out (incremental
+    /// layout).
+    pub(crate) fn placeholder() -> Self {
+        Self::new(BoxKind::Block, None, Arc::new(ComputedStyle::initial()))
+    }
+
     fn new(kind: BoxKind, node: Option<NodeId>, style: Arc<ComputedStyle>) -> Self {
         Self {
             kind,
@@ -1040,6 +1067,11 @@ pub(crate) struct BoxBuilder<'a> {
     /// What the `::before`/`::after` boxes and the list markers show
     /// (`generated.rs`), worked out before the boxes are built.
     generated: Generated,
+    /// Incremental layout: element boxes (and cells) of the kept tree no
+    /// change reaches, by element; a build at the same depth takes them
+    /// as they are, with their caches (`incremental.rs`).
+    pub reuse: RefCell<std::collections::HashMap<NodeId, BoxNode>>,
+    pub reuse_cells: RefCell<std::collections::HashMap<NodeId, CellBox>>,
 }
 
 /// One child of a box being built: a node (an element, a text node, a
@@ -1071,6 +1103,8 @@ impl<'a> BoxBuilder<'a> {
             viewport_source,
             oofs: RefCell::new(Vec::new()),
             generated: crate::generated::generate(doc, styles),
+            reuse: RefCell::new(std::collections::HashMap::new()),
+            reuse_cells: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1385,6 +1419,15 @@ impl BoxBuilder<'_> {
     /// `will-change` promising one (CSS Transforms 1 §3).
     /// Build a block-level or atomic box for an element.
     fn build_element(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> BoxNode {
+        // A box of the kept tree no change reaches, built at this depth
+        // before: taken as it is.
+        let kept = self.reuse.borrow_mut().remove(&id);
+        if let Some(b) = kept {
+            if b.depth == depth {
+                return b;
+            }
+            self.reuse.borrow_mut().insert(id, b);
+        }
         let mut b = self.build_element_box(id, style, depth);
         b.depth = depth;
         b
@@ -1812,6 +1855,13 @@ impl BoxBuilder<'_> {
     }
 
     fn build_cell(&self, id: NodeId, style: Arc<ComputedStyle>, depth: usize) -> CellBox {
+        let kept = self.reuse_cells.borrow_mut().remove(&id);
+        if let Some(c) = kept {
+            if c.node.depth == depth {
+                return c;
+            }
+            self.reuse_cells.borrow_mut().insert(id, c);
+        }
         let children = self.kids(id);
         let span = |name: &str, default: usize, max: usize| {
             self.doc

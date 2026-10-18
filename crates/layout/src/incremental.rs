@@ -1,7 +1,10 @@
-//! Incremental layout, block B1 (`plan/07-incremental-layout.md`): the box
-//! tree lives on between layouts, and a layout rebuilds only the boxes a
-//! change can affect, then resets every box's per-layout state so the
-//! layout that follows sees the tree a full build would have given.
+//! Incremental layout, blocks B1 and B2 (`plan/07-incremental-layout.md`):
+//! the box tree lives on between layouts, and a layout rebuilds only the
+//! boxes a change can affect. Untouched boxes inside a rebuilt one are
+//! reused with their caches; the caches above a replaced box are cleared;
+//! before a layout only what belongs to one layout is reset
+//! (`reset_layout_state`), and after it what only helps within one layout
+//! is dropped (`trim_after_layout`).
 //!
 //! What changed reaches the engine from the tab and the script view
 //! (`LayoutEngine::note_box_changes`, `note_unknown_box_change`): the
@@ -16,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use browser_dom::{Document, NodeId};
 
-use crate::boxes::{BoxBuilder, BoxKind, BoxNode, CellBox, InlineContent, OutOfFlowBox, ScrollPlan, TableBox};
+use crate::boxes::{BoxBuilder, BoxKind, BoxNode, OutOfFlowBox, ScrollPlan};
 use crate::generated::Generated;
 
 /// What changed since the last layout.
@@ -93,6 +96,14 @@ pub(crate) fn rebuild(
     index(&kept.root, oofs, &mut places);
     // The box to rebuild for each start: the nearest element box at or
     // above it; never the root's or the body's.
+    // What a change reaches: the changed elements, the starts and every
+    // element above them. A box of any other element is reused as it is
+    // when the box around it is rebuilt (with its caches, block B2).
+    let mut dirty: HashSet<NodeId> = elements.iter().copied().collect();
+    for &s in &starts {
+        dirty.insert(s);
+        dirty.extend(doc.ancestors(s));
+    }
     let mut roots: HashSet<NodeId> = HashSet::new();
     for s in starts {
         let mut cur = Some(s);
@@ -124,21 +135,139 @@ pub(crate) fn rebuild(
         .filter(|&r| !doc.ancestors(r).any(|a| roots.contains(&a)))
         .collect();
     crate::engine::count(|c| *c.boxes_rebuilt += tops.len() as u32);
+    // The timing log: which boxes are rebuilt, and for which changes.
+    let name = |n: NodeId| match doc.element(n) {
+        Some(e) => {
+            let mut s = e.name.local.to_string();
+            if let Some(id) = e.id() {
+                s.push('#');
+                s.push_str(id);
+            }
+            if let Some(c) = e.attr("class") {
+                s.push('.');
+                s.push_str(&c.split_ascii_whitespace().collect::<Vec<_>>().join("."));
+            }
+            s
+        }
+        None => format!("{:?}", doc.get(n).pseudo_kind()),
+    };
+    tracing::info!(
+        target: "perf",
+        rebuilt = tops.iter().map(|&n| name(n)).collect::<Vec<_>>().join(", "),
+        changed = elements.iter().take(6).map(|&n| if doc.contains(n) { name(n) } else { "gone".into() }).collect::<Vec<_>>().join(", "),
+        "incremental boxes"
+    );
     let mut ok = true;
+    let cx = Rebuild {
+        tops: &tops,
+        dirty: &dirty,
+        builder,
+    };
     // The out-of-flow boxes continue the kept list.
     *builder.oofs.borrow_mut() = std::mem::take(oofs);
-    replace_in(&mut kept.root, &tops, builder, &mut ok);
+    let _ = replace_node(&mut kept.root, &cx, &mut ok);
     // Boxes inside the out-of-flow boxes (whose placeholders stay put).
     let len = builder.oofs.borrow().len();
     for i in 0..len {
         let taken = builder.oofs.borrow_mut()[i].node.take();
         if let Some(mut node) = taken {
-            replace_node(&mut node, &tops, builder, &mut ok);
+            let _ = replace_node(&mut node, &cx, &mut ok);
             builder.oofs.borrow_mut()[i].node = Some(node);
         }
     }
+    // Reusable boxes the new builds did not take: gone, with the
+    // out-of-flow boxes inside them.
+    let left: Vec<BoxNode> = builder.reuse.borrow_mut().drain().map(|(_, b)| b).collect();
+    for b in left {
+        harvest(b, &cx, true);
+    }
+    let left: Vec<crate::boxes::CellBox> = builder.reuse_cells.borrow_mut().drain().map(|(_, c)| c).collect();
+    for c in left {
+        harvest(c.node, &cx, true);
+    }
     *oofs = builder.oofs.take();
     ok
+}
+
+/// What a rebuild needs on its way down.
+struct Rebuild<'a, 'b> {
+    /// The element boxes to build again.
+    tops: &'a HashSet<NodeId>,
+    /// The elements a change reaches (their boxes are not reused).
+    dirty: &'a HashSet<NodeId>,
+    builder: &'a BoxBuilder<'b>,
+}
+
+/// Take apart a box being rebuilt (or one no longer wanted, `drop_all`):
+/// the element boxes and cells inside it that no change reaches go to the
+/// builder for reuse; out-of-flow boxes whose placeholders are inside it
+/// go too (their list entries emptied); the rest is dropped.
+fn harvest(b: BoxNode, cx: &Rebuild<'_, '_>, drop_all: bool) {
+    let BoxNode { kind, children, marker, .. } = b;
+    for c in children {
+        offer(c, cx, drop_all);
+    }
+    if let Some(m) = marker {
+        offer(*m, cx, drop_all);
+    }
+    match kind {
+        BoxKind::Inline(content) => {
+            for a in content.atomics {
+                offer(a.node, cx, drop_all);
+            }
+            for anchor in content.oofs {
+                offer_out_of_flow(anchor.oof, Some(anchor.node), cx, drop_all);
+            }
+        }
+        BoxKind::Table(t) => {
+            let t = *t;
+            for c in t.captions {
+                offer(c.node, cx, drop_all);
+            }
+            for g in t.groups {
+                for r in g.rows {
+                    for c in r.cells {
+                        match c.node.node {
+                            Some(n) if !drop_all && !cx.dirty.contains(&n) => {
+                                cx.builder.reuse_cells.borrow_mut().insert(n, c);
+                            }
+                            _ => harvest(c.node, cx, drop_all),
+                        }
+                    }
+                }
+            }
+        }
+        BoxKind::OutOfFlow(i) => offer_out_of_flow(i, None, cx, drop_all),
+        _ => {}
+    }
+}
+
+/// A box inside one being taken apart: kept for reuse when it is an
+/// element's box no change reaches, else taken apart in turn.
+fn offer(c: BoxNode, cx: &Rebuild<'_, '_>, drop_all: bool) {
+    if let BoxKind::OutOfFlow(i) = c.kind {
+        offer_out_of_flow(i, c.node, cx, drop_all);
+        return;
+    }
+    match c.node {
+        Some(n) if !drop_all && !c.anonymous && !cx.dirty.contains(&n) => {
+            cx.builder.reuse.borrow_mut().insert(n, c);
+        }
+        _ => harvest(c, cx, drop_all),
+    }
+}
+
+/// An out-of-flow box whose placeholder was in a box taken apart: its
+/// entry emptied, its box kept for reuse or taken apart.
+fn offer_out_of_flow(i: usize, node: Option<NodeId>, cx: &Rebuild<'_, '_>, drop_all: bool) {
+    let taken = cx.builder.oofs.borrow_mut().get_mut(i).and_then(|o| o.node.take());
+    let Some(b) = taken else { return };
+    match node.or(b.node) {
+        Some(n) if !drop_all && !cx.dirty.contains(&n) => {
+            cx.builder.reuse.borrow_mut().insert(n, b);
+        }
+        _ => harvest(b, cx, drop_all),
+    }
 }
 
 /// The owners whose generated content differs between two builds: a
@@ -216,33 +345,57 @@ fn index(b: &BoxNode, oofs: &[OutOfFlowBox], out: &mut HashMap<NodeId, Place>) {
     }
 }
 
-/// Replace, below `b`, every element box in `tops` with a new build.
-fn replace_in(b: &mut BoxNode, tops: &HashSet<NodeId>, builder: &BoxBuilder<'_>, ok: &mut bool) {
+/// Replace, below `b`, every element box in `tops` with a new build, and
+/// clear what the boxes on the way down cached from the replaced ones
+/// (block B2): an inline root's line layouts, an atomic's results, a
+/// table's grid, constraints and layouts, a cell's or caption's measures.
+/// Returns whether anything below `b` was replaced.
+fn replace_in(b: &mut BoxNode, cx: &Rebuild<'_, '_>, ok: &mut bool) -> bool {
+    let (tops, builder) = (cx.tops, cx.builder);
+    let mut changed = false;
     for c in &mut b.children {
-        replace_node(c, tops, builder, ok);
+        changed |= replace_node(c, cx, ok);
     }
     if let Some(m) = &mut b.marker {
-        replace_node(m, tops, builder, ok);
+        changed |= replace_node(m, cx, ok);
     }
     match &mut b.kind {
         BoxKind::Inline(content) => {
+            let mut inside = false;
             for a in &mut content.atomics {
-                replace_node(&mut a.node, tops, builder, ok);
+                if replace_node(&mut a.node, cx, ok) {
+                    a.results.clear();
+                    a.selected = None;
+                    inside = true;
+                }
+            }
+            if inside {
+                content.cache.clear();
+                content.shaped = None;
+                changed = true;
             }
         }
         BoxKind::Table(t) => {
+            let mut inside = false;
             for c in &mut t.captions {
                 if c.node.node.is_some_and(|n| tops.contains(&n)) {
                     let id = c.node.node.expect("checked");
-                    match builder.rebuild_caption(id, c.node.depth) {
-                        Some(node) => {
-                            drop_out_of_flow(&c.node, builder);
-                            c.node = node;
-                        }
+                    let old = std::mem::replace(&mut c.node, BoxNode::placeholder());
+                    let depth = old.depth;
+                    harvest(old, cx, false);
+                    match builder.rebuild_caption(id, depth) {
+                        Some(node) => c.node = node,
                         None => *ok = false,
                     }
-                } else {
-                    replace_in(&mut c.node, tops, builder, ok);
+                    c.min_content = None;
+                    c.max_content = None;
+                    c.last = None;
+                    inside = true;
+                } else if replace_in(&mut c.node, cx, ok) {
+                    c.min_content = None;
+                    c.max_content = None;
+                    c.last = None;
+                    inside = true;
                 }
             }
             for g in &mut t.groups {
@@ -250,92 +403,68 @@ fn replace_in(b: &mut BoxNode, tops: &HashSet<NodeId>, builder: &BoxBuilder<'_>,
                     for c in &mut r.cells {
                         if c.node.node.is_some_and(|n| tops.contains(&n)) {
                             let id = c.node.node.expect("checked");
-                            match builder.rebuild_cell(id, c.node.depth) {
-                                Some(cell) => {
-                                    drop_out_of_flow(&c.node, builder);
-                                    *c = cell;
-                                }
+                            let old = std::mem::replace(c, crate::boxes::CellBox::placeholder());
+                            let depth = old.node.depth;
+                            harvest(old.node, cx, false);
+                            match builder.rebuild_cell(id, depth) {
+                                Some(cell) => *c = cell,
                                 None => *ok = false,
                             }
-                        } else {
-                            replace_in(&mut c.node, tops, builder, ok);
+                            inside = true;
+                        } else if replace_in(&mut c.node, cx, ok) {
+                            c.measured = false;
+                            c.min_content = 0.0;
+                            c.max_content = 0.0;
+                            c.last = None;
+                            c.done.clear();
+                            inside = true;
                         }
                     }
                 }
+            }
+            if inside {
+                t.placed = false;
+                t.constraints = None;
+                t.layouts.clear();
+                t.current = 0;
+                t.intrinsic = None;
+                changed = true;
+                tracing::info!(target: "perf", table = ?b.node, "table caches cleared by a change inside");
             }
         }
         _ => {}
     }
+    changed
 }
 
 /// `b` itself rebuilt when it is one of `tops`, else what is below it.
-fn replace_node(b: &mut BoxNode, tops: &HashSet<NodeId>, builder: &BoxBuilder<'_>, ok: &mut bool) {
-    let mine = b.node.filter(|n| tops.contains(n) && !b.anonymous && !matches!(b.kind, BoxKind::OutOfFlow(_)));
+/// Returns whether anything was replaced.
+fn replace_node(b: &mut BoxNode, cx: &Rebuild<'_, '_>, ok: &mut bool) -> bool {
+    let mine = b.node.filter(|n| cx.tops.contains(n) && !b.anonymous && !matches!(b.kind, BoxKind::OutOfFlow(_)));
     match mine {
-        Some(id) => match builder.rebuild_element(id, b.depth) {
-            Some(new) => {
-                drop_out_of_flow(b, builder);
-                *b = new;
+        Some(id) => {
+            // Its untouched inner boxes go to the builder first, so the
+            // new build takes them back.
+            let old = std::mem::replace(b, BoxNode::placeholder());
+            let depth = old.depth;
+            harvest(old, cx, false);
+            match cx.builder.rebuild_element(id, depth) {
+                Some(new) => *b = new,
+                None => *ok = false,
             }
-            None => *ok = false,
-        },
-        None => replace_in(b, tops, builder, ok),
+            true
+        }
+        None => replace_in(b, cx, ok),
     }
 }
 
-/// The out-of-flow boxes whose placeholders were in a replaced subtree
-/// are dropped from the list (their indices are never asked again).
-fn drop_out_of_flow(b: &BoxNode, builder: &BoxBuilder<'_>) {
-    let mut found = Vec::new();
-    fn collect(b: &BoxNode, found: &mut Vec<usize>) {
-        if let BoxKind::OutOfFlow(i) = b.kind {
-            found.push(i);
-        }
-        for c in &b.children {
-            collect(c, found);
-        }
-        if let Some(m) = &b.marker {
-            collect(m, found);
-        }
-        match &b.kind {
-            BoxKind::Inline(content) => {
-                found.extend(content.oofs.iter().map(|a| a.oof));
-                for a in &content.atomics {
-                    collect(&a.node, found);
-                }
-            }
-            BoxKind::Table(t) => {
-                for c in &t.captions {
-                    collect(&c.node, found);
-                }
-                for g in &t.groups {
-                    for r in &g.rows {
-                        for c in &r.cells {
-                            collect(&c.node, found);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    collect(b, &mut found);
-    let mut i = 0;
-    while i < found.len() {
-        let idx = found[i];
-        let taken = builder.oofs.borrow_mut().get_mut(idx).and_then(|o| o.node.take());
-        if let Some(n) = taken {
-            collect(&n, &mut found);
-        }
-        i += 1;
-    }
-}
-
-/// Reset everything a layout leaves on the boxes (taffy ids, scrollbar
-/// gutters, line layouts and shaping, atomics' results, tables' grids and
-/// layouts, cells' and captions' measures), so the next layout starts as
-/// on a fresh build.
-pub(crate) fn reset(b: &mut BoxNode) {
+/// Before a layout of the kept tree (block B2): clear what belongs to one
+/// layout only (taffy ids, scrollbar gutters, the `text-overflow` marker,
+/// a table's containing block width, the floats' bands with the line
+/// layouts made around them), keeping the caches the boxes' own content
+/// decides: line layouts keyed by width, atomics' results by question,
+/// tables' layouts by width, cells' and captions' measures.
+pub(crate) fn reset_layout_state(b: &mut BoxNode) {
     b.taffy = None;
     if let Some(plan) = &mut b.scroll {
         let (inner_editor, caret_room) = (plan.inner_editor, plan.caret_room);
@@ -346,62 +475,73 @@ pub(crate) fn reset(b: &mut BoxNode) {
         }
     }
     match &mut b.kind {
-        BoxKind::Inline(content) => reset_inline(content),
-        BoxKind::Table(t) => reset_table(t),
+        BoxKind::Inline(content) => {
+            // Line layouts made around floats are only good for those
+            // bands, which this layout works out again.
+            if !content.floats.is_empty() {
+                content.floats.clear();
+                content.cache.clear();
+            }
+            content.ellipsis = None;
+            for a in &mut content.atomics {
+                reset_layout_state(&mut a.node);
+            }
+        }
+        BoxKind::Table(t) => {
+            t.available_width = 0.0;
+            for c in &mut t.captions {
+                reset_layout_state(&mut c.node);
+            }
+            for g in &mut t.groups {
+                for r in &mut g.rows {
+                    for c in &mut r.cells {
+                        reset_layout_state(&mut c.node);
+                    }
+                }
+            }
+        }
         _ => {}
     }
     if let Some(m) = &mut b.marker {
-        reset(m);
+        reset_layout_state(m);
     }
     for c in &mut b.children {
-        reset(c);
+        reset_layout_state(c);
     }
 }
 
-fn reset_inline(content: &mut InlineContent) {
-    content.cache.clear();
-    content.floats.clear();
-    content.ellipsis = None;
-    content.shaped = None;
-    for a in &mut content.atomics {
-        a.results.clear();
-        a.selected = None;
-        reset(&mut a.node);
-    }
-}
-
-fn reset_table(t: &mut TableBox) {
-    t.placed = false;
-    t.columns = 0;
-    t.row_count = 0;
-    t.constraints = None;
-    t.layouts.clear();
-    t.current = 0;
-    t.intrinsic = None;
-    t.available_width = 0.0;
-    for c in &mut t.captions {
-        c.min_content = None;
-        c.max_content = None;
-        c.last = None;
-        reset(&mut c.node);
-    }
-    for g in &mut t.groups {
-        for r in &mut g.rows {
-            for c in &mut r.cells {
-                reset_cell(c);
+/// After a layout (block B2): drop what only helps within one layout
+/// (inline roots' shaped paragraphs, cells' results per width), keeping
+/// the caches the next layout reuses.
+pub(crate) fn trim_after_layout(b: &mut BoxNode) {
+    match &mut b.kind {
+        BoxKind::Inline(content) => {
+            content.shaped = None;
+            for a in &mut content.atomics {
+                trim_after_layout(&mut a.node);
             }
         }
+        BoxKind::Table(t) => {
+            for c in &mut t.captions {
+                trim_after_layout(&mut c.node);
+            }
+            for g in &mut t.groups {
+                for r in &mut g.rows {
+                    for c in &mut r.cells {
+                        c.done.clear();
+                        c.last = None;
+                        trim_after_layout(&mut c.node);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(m) = &mut b.marker {
+        trim_after_layout(m);
+    }
+    for c in &mut b.children {
+        trim_after_layout(c);
     }
 }
 
-fn reset_cell(c: &mut CellBox) {
-    c.col = 0;
-    c.rows = 1;
-    c.row = 0;
-    c.min_content = 0.0;
-    c.max_content = 0.0;
-    c.measured = false;
-    c.last = None;
-    c.done.clear();
-    reset(&mut c.node);
-}
