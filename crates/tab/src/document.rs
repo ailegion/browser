@@ -1903,6 +1903,9 @@ impl TabState {
         // fallback) or its swap period (the fallback stays for good): the
         // fonts are walked again after the next layout.
         if self.web_fonts.tick(now) {
+            if std::env::var_os("TEMP_STAGES").is_some() {
+                eprintln!("TEMP needs_layout: web font timer");
+            }
             self.needs_layout = true;
         }
         // `document.fonts`: its promises and events run as a task here,
@@ -2171,6 +2174,16 @@ impl TabState {
                 deps: &self.deps,
             },
         );
+        if std::env::var_os("TEMP_STAGES").is_some() {
+            eprintln!(
+                "TEMP restyle_for {state:?}: changed {} reach {reach:?} styled {} moved {} repaint {} in {:.1} ms",
+                changed.len(),
+                result.styled,
+                result.moved,
+                result.repaint,
+                started.elapsed().as_secs_f32() * 1000.0
+            );
+        }
         tracing::debug!(
             tab = self.id.0,
             changed = changed.len(),
@@ -2482,13 +2495,13 @@ impl TabState {
             }
             PendingKind::Image { url } => {
                 if let Some(img) = decode_image(&p.body) {
+                    self.image_arrived(&url);
                     self.images.insert(url, img);
-                    self.needs_layout = true;
                     self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
                 } else if let Some(svg) = browser_paint::decode_svg(&p.body) {
                     // An SVG image: kept as vector drawing (line 6b).
+                    self.image_arrived(&url);
                     self.images.insert_svg(url, svg);
-                    self.needs_layout = true;
                     self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
                 }
             }
@@ -2545,6 +2558,9 @@ impl TabState {
                     self.web_fonts.dirty = true;
                 }
                 if registered {
+                    if std::env::var_os("TEMP_STAGES").is_some() {
+                        eprintln!("TEMP needs_layout: font fetched");
+                    }
                     self.needs_layout = true;
                 } else {
                     tracing::debug!(tab = self.id.0, url = url.as_str(), "web font failed");
@@ -3135,6 +3151,9 @@ impl TabState {
     fn dom_changed(&mut self) {
         // A layout the script forced after its last change is current.
         if !std::mem::take(&mut self.host_layout_fresh) {
+            if std::env::var_os("TEMP_STAGES").is_some() {
+                eprintln!("TEMP needs_layout: dom_changed");
+            }
             self.needs_style = true;
             self.needs_layout = true;
         }
@@ -3366,6 +3385,29 @@ impl TabState {
         self.fetch(request, PendingKind::Image { url });
     }
 
+    /// An image finished loading: layout only when a box takes its size
+    /// from it (an `<img>`, a list marker's image: an image fragment of
+    /// that URL), else a repaint (backgrounds, masks, border images do not
+    /// size boxes). Before the first layout there is nothing to redo.
+    fn image_arrived(&mut self, url: &Url) {
+        let Some(tree) = &self.layout else {
+            self.needs_layout = true;
+            return;
+        };
+        let mut sized = false;
+        let href = url.as_str();
+        tree.root.walk(&mut |f| {
+            if let browser_layout::FragmentContent::Image(u) = &f.content {
+                sized |= u.as_str() == href;
+            }
+        });
+        if sized {
+            self.needs_layout = true;
+        } else {
+            self.needs_paint = true;
+        }
+    }
+
     /// Background and list marker images only become known after the
     /// cascade.
     fn fetch_background_images(&mut self) {
@@ -3557,6 +3599,9 @@ impl TabState {
             let Some(data) = self.web_fonts.script_data.get(&id).cloned() else { continue };
             if self.engine.as_mut().is_some_and(|e| e.register_web_font(&data, face, order as u32)) {
                 self.web_fonts.loaded.insert(key);
+                if std::env::var_os("TEMP_STAGES").is_some() {
+                    eprintln!("TEMP needs_layout: script font");
+                }
                 self.needs_layout = true;
             }
         }
@@ -3732,6 +3777,9 @@ impl TabState {
             let face = &faces[order as usize];
             if self.engine.as_mut().is_some_and(|e| e.register_local_font(&name, face, order)) {
                 self.web_fonts.loaded.insert(face_key(face));
+                if std::env::var_os("TEMP_STAGES").is_some() {
+                    eprintln!("TEMP needs_layout: local font {name}");
+                }
                 self.needs_layout = true;
             } else {
                 self.web_fonts.failed.insert(Source::Local(name.to_lowercase()));
@@ -3877,9 +3925,13 @@ impl TabState {
         let Some(doc) = &self.doc else { return };
         let started = std::time::Instant::now();
         let stylist = self.stylist();
+        let stylist_ms = started.elapsed().as_secs_f32() * 1000.0;
         let vp = self.style_viewport();
         self.styles = compute_styles_with(doc, &stylist, &vp, &self.states);
         self.deps = stylist.interaction_deps();
+        if std::env::var_os("TEMP_STAGES").is_some() {
+            eprintln!("TEMP restyle_all: stylist {stylist_ms:.1} ms, total {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
+        }
         tracing::debug!(
             tab = self.id.0,
             nodes = doc.node_count(),
@@ -3907,6 +3959,9 @@ impl TabState {
             (self.scroll_x, self.scroll_y),
         );
         self.layouts += 1;
+        if std::env::var_os("TEMP_STAGES").is_some() {
+            eprintln!("TEMP relayout #{}: {:.1} ms", self.layouts, started.elapsed().as_secs_f32() * 1000.0);
+        }
         tracing::debug!(
             tab = self.id.0,
             layout_ms = started.elapsed().as_millis(),
@@ -7653,6 +7708,35 @@ mod tests {
         let (_, color, underline, _) = link_text(&h);
         assert_eq!((color, underline), ([0, 0, 238, 255], false), "the link is plain again");
         assert_eq!(h.style("b").padding.left, browser_style::ComputedLp::Px(10.0));
+    }
+
+    /// An image arriving lays the page out again only when a box takes its
+    /// size from it: a background repaints, an `<img>` relayouts.
+    #[test]
+    fn only_images_that_size_boxes_relayout() {
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'><rect width='20' height='20'/></svg>";
+        let page = "<!DOCTYPE html><style>div{width:10px;height:10px;background:url(/bg.svg)}</style><body><div></div><img src='/i.svg'>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/bg.svg", "image/svg+xml", svg),
+                ("/i.svg", "image/svg+xml", svg),
+            ],
+            &["/bg.svg", "/i.svg"],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.layout.is_some() && h.state.lifecycle == Lifecycle::ContentLoaded);
+        let before = h.state.layouts;
+        let bg = server.url("/bg.svg");
+        server.release("/bg.svg");
+        h.pump_until(|h| h.state.images.get_svg(&bg).is_some());
+        h.pump();
+        assert_eq!(h.state.layouts, before, "a background image only repaints");
+        let img = server.url("/i.svg");
+        server.release("/i.svg");
+        h.pump_until(|h| h.state.images.get_svg(&img).is_some());
+        h.pump();
+        assert!(h.state.layouts > before, "an <img> takes its size from the image");
     }
 
     /// Where the time goes on a real page, served over loopback from a

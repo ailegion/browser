@@ -411,7 +411,11 @@ remaining lists as they stand.
       layout (first line, %, hanging, each-line, block child, RTL, -9999px).
       Timing: tables 51.1–51.7 ms (50.9–52.6), blocks 14.3–14.6 ms
       (14.6–15.3), Wikipedia probe load 0.80–0.82 s, restyle ~37 ms,
-      relayout 124–126 ms (unchanged).
+      relayout 124–126 ms (unchanged). (4) An arriving image lays the page
+      out again only when an image fragment of that URL exists (an `<img>`,
+      a marker image); backgrounds, masks and the rest repaint
+      (`image_arrived`; test `only_images_that_size_boxes_relayout`).
+      Wikipedia probe load 0.72 s (0.80), one full relayout fewer.
 - [ ] 6e. Generated content (owner, 2026-10-18; not in the plan before,
       and used by most sites): `::before` and `::after` matched in the
       cascade and given boxes; `content` with strings, `url()` images (6b's
@@ -419,6 +423,12 @@ remaining lists as they stand.
       `counter-reset`, `-increment`, `-set`) and quotes (`quotes`,
       `open-quote`, `close-quote`, `no-open-quote`, `no-close-quote`);
       `getComputedStyle` for the pseudo-elements.
+- [ ] 6h. `word-spacing` (owner, 2026-10-18; found missing while doing
+      `text-indent`, used by many sites): `normal` or a length (`calc()`
+      too), inherited, serialized; the extra space added to each word
+      separator (CSS Text 3 §7.1: spaces, no-break spaces and the other
+      word-separator characters), in shaping, line breaking, justification
+      and intrinsic sizes.
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,
