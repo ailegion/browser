@@ -937,6 +937,29 @@ impl LetterSpacingValue {
     }
 }
 
+/// `text-indent` as written (CSS Text 3 §8.1): `<length-percentage> &&
+/// hanging? && each-line?`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextIndentValue {
+    pub length: LengthPercentage,
+    pub hanging: bool,
+    pub each_line: bool,
+}
+
+impl TextIndentValue {
+    /// The length, then the keywords in the grammar's order.
+    pub fn to_css(&self) -> String {
+        let mut s = self.length.to_css();
+        if self.hanging {
+            s.push_str(" hanging");
+        }
+        if self.each_line {
+            s.push_str(" each-line");
+        }
+        s
+    }
+}
+
 /// `word-break`. `break-word` is the legacy keyword that lays out as
 /// `normal` with `overflow-wrap: anywhere` (CSS Text 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2528,6 +2551,7 @@ longhands! {
     TextTransform: "text-transform" => TextTransform, true;
     WhiteSpace: "white-space" => WhiteSpace, true;
     LetterSpacing: "letter-spacing" => LetterSpacingValue, true;
+    TextIndent: "text-indent" => TextIndentValue, true;
     WordBreak: "word-break" => WordBreak, true;
     OverflowWrap: "overflow-wrap" => OverflowWrap, true;
     TextOverflow: "text-overflow" => TextOverflow, false;
@@ -2929,6 +2953,7 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "pre-wrap" => WhiteSpace::PreWrap, "pre-line" => WhiteSpace::PreLine,
             "break-spaces" => WhiteSpace::BreakSpaces, _ => return None }))?),
         PropertyId::LetterSpacing => P::LetterSpacing(parse_letter_spacing(input)?),
+        PropertyId::TextIndent => P::TextIndent(parse_text_indent(input)?),
         PropertyId::WordBreak => P::WordBreak(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "normal" => WordBreak::Normal, "break-all" => WordBreak::BreakAll, "keep-all" => WordBreak::KeepAll,
             "break-word" => WordBreak::BreakWord, _ => return None }))?),
@@ -3917,6 +3942,33 @@ fn parse_text_underline_offset<'i>(input: &mut Parser<'i, '_>) -> Result<TextUnd
         return Ok(TextUnderlineOffsetValue::Auto);
     }
     Ok(TextUnderlineOffsetValue::Length(parse_length_percentage(input)?))
+}
+
+/// `<length-percentage> && hanging? && each-line?`, in any order, each
+/// part once.
+fn parse_text_indent<'i>(input: &mut Parser<'i, '_>) -> Result<TextIndentValue, ParseErr<'i>> {
+    let (mut length, mut hanging, mut each_line) = (None, false, false);
+    loop {
+        if length.is_none() {
+            if let Ok(l) = input.try_parse(parse_length_percentage) {
+                length = Some(l);
+                continue;
+            }
+        }
+        if !hanging && input.try_parse(|i| i.expect_ident_matching("hanging")).is_ok() {
+            hanging = true;
+            continue;
+        }
+        if !each_line && input.try_parse(|i| i.expect_ident_matching("each-line")).is_ok() {
+            each_line = true;
+            continue;
+        }
+        break;
+    }
+    match length {
+        Some(length) => Ok(TextIndentValue { length, hanging, each_line }),
+        None => Err(input.new_custom_error(())),
+    }
 }
 
 fn parse_letter_spacing<'i>(input: &mut Parser<'i, '_>) -> Result<LetterSpacingValue, ParseErr<'i>> {
@@ -5165,6 +5217,20 @@ mod tests {
         assert_eq!(one("letter-spacing", "2px"), Some(D::Value(P::LetterSpacing(LetterSpacingValue::Length(Length::Px(2.0))))));
         assert_eq!(one("letter-spacing", "-0.05em"), Some(D::Value(P::LetterSpacing(LetterSpacingValue::Length(Length::Em(-0.05))))));
         assert!(matches!(one("letter-spacing", "calc(1px + 1em)"), Some(D::Value(P::LetterSpacing(LetterSpacingValue::Calc(_))))));
+        // `text-indent`: a length or percentage with `hanging` and
+        // `each-line` in any order, each once; serialized length first.
+        let indent = |v: &str| match one("text-indent", v) {
+            Some(D::Value(P::TextIndent(t))) => Some(t.to_css()),
+            _ => None,
+        };
+        assert_eq!(indent("-9999px").as_deref(), Some("-9999px"));
+        assert_eq!(indent("10%").as_deref(), Some("10%"));
+        assert_eq!(indent("each-line 2em hanging").as_deref(), Some("2em hanging each-line"));
+        assert_eq!(indent("hanging 0").as_deref(), Some("0px hanging"));
+        assert_eq!(indent("hanging"), None);
+        assert_eq!(indent("1px hanging hanging"), None);
+        assert_eq!(indent("1px 2px"), None);
+        assert_eq!(indent("auto"), None);
         assert_eq!(one("letter-spacing", "5%"), None, "percentages are refused");
         assert_eq!(one("letter-spacing", "2"), None);
         assert_eq!(one("word-break", "keep-all"), Some(D::Value(P::WordBreak(WordBreak::KeepAll))));

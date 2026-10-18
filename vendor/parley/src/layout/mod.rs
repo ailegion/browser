@@ -100,4 +100,8 @@ pub struct IndentOptions {
     /// If `true`, inverts which lines are indented: continuation lines are indented
     /// instead of the first line(s). Corresponds to the CSS `hanging` keyword. Defaults to `false`.
     pub hanging: bool,
+    /// If `true`, the layout's first line continues a paragraph begun before it (browser
+    /// patch: an embedder laying out a block's text in several layouts), so it is not a
+    /// line the indent is scoped to. Defaults to `false`.
+    pub continuation: bool,
 }

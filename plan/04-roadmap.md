@@ -392,6 +392,26 @@ remaining lists as they stand.
       (2.5–2.6 at 6c) and relayout 27.3–29.2 ms (40.6–42.1): restyle
       slower; HN's stylesheet and scripts are fetched live, so the two
       runs are not of the same page bytes.
+- [x] 6g. Owner-reported Wikipedia fixes (2026-10-18). (1) Masks inside a
+      rounded `overflow` clip: the mask landed in the clip layer its space
+      re-opened, empty, and masked nothing (Wikipedia's icons drew as dark
+      squares); the clips are closed before the mask (`paint` `Op::Mask`;
+      test `codex_icon_masks_its_background`). (2) Insets moved static and
+      sticky boxes: taffy offsets every non-absolute box, so only relative
+      boxes pass theirs (`convert::to_taffy_box`; wikipedia.org's language
+      label sat 32px off; test `insets_move_only_relative_boxes`). (3)
+      `text-indent` (was unknown; wikipedia.org's search button shows its
+      hidden "Search"): `<length-percentage> && hanging? && each-line?`,
+      inherited, serialized; layout indents the container's first formatted
+      line (not a run after an in-flow block child, not an outside
+      marker's), with `each-line` each line after a forced break, `hanging`
+      the others, from the start side, a percentage of the container's
+      width (zero while measuring intrinsic sizes), through parley's indent
+      (parley patch, `03-crates.md`); tests: style (grammar, serialization),
+      layout (first line, %, hanging, each-line, block child, RTL, -9999px).
+      Timing: tables 51.1–51.7 ms (50.9–52.6), blocks 14.3–14.6 ms
+      (14.6–15.3), Wikipedia probe load 0.80–0.82 s, restyle ~37 ms,
+      relayout 124–126 ms (unchanged).
 - [ ] 6e. Generated content (owner, 2026-10-18; not in the plan before,
       and used by most sites): `::before` and `::after` matched in the
       cascade and given boxes; `content` with strings, `url()` images (6b's
@@ -407,7 +427,13 @@ remaining lists as they stand.
       `requestAnimationFrame` exists (Phase 3 item 1). Later: streams,
       AbortController, ResizeObserver, custom elements and shadow DOM.
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
-      the encodings, control values, form events, navigation on submit.
+      the encodings, control values, form events, navigation on submit;
+      `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,
+      2026-10-18, found on wikipedia.org's portal, frequently used):
+      `none` drops a control's native look (`<select>` arrow, checkbox and
+      radio marks, button and field chrome) so the page's own styling
+      draws it, `auto` and the compat keywords keep it; parsed, inherited
+      no, serialized, honoured in paint and in control sizing.
       Later: validation UI, file inputs, the owner's 2026-10-09 additions.
 
 ## Phase 0: Skeleton, policy, one resolved crate set

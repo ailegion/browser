@@ -294,11 +294,22 @@ fn to_taffy_box(style: &ComputedStyle, display: taffy::Display, is_replaced: boo
             Clear::Right => taffy::Clear::Right,
             Clear::Both => taffy::Clear::Both,
         },
-        inset: taffy::Rect {
-            left: lpa(style.inset.left),
-            right: lpa(style.inset.right),
-            top: lpa(style.inset.top),
-            bottom: lpa(style.inset.bottom),
+        // Taffy offsets every non-absolute box by its insets; only a
+        // relatively positioned one may move (a static box ignores them,
+        // a sticky one is shifted later from where layout put it).
+        inset: match style.position {
+            Position::Static | Position::Sticky => taffy::Rect {
+                left: LengthPercentageAuto::auto(),
+                right: LengthPercentageAuto::auto(),
+                top: LengthPercentageAuto::auto(),
+                bottom: LengthPercentageAuto::auto(),
+            },
+            _ => taffy::Rect {
+                left: lpa(style.inset.left),
+                right: lpa(style.inset.right),
+                top: lpa(style.inset.top),
+                bottom: lpa(style.inset.bottom),
+            },
         },
         size: Size {
             width: dimension(style.width),

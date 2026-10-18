@@ -97,6 +97,7 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::TextTransform(t) => t.keyword().to_owned(),
         P::WhiteSpace(w) => w.keyword().to_owned(),
         P::LetterSpacing(l) => l.to_css(),
+        P::TextIndent(t) => t.to_css(),
         P::WordBreak(w) => w.keyword().to_owned(),
         P::OverflowWrap(w) => w.keyword().to_owned(),
         P::TextOverflow(t) => t.to_css(),
@@ -1165,6 +1166,17 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
             LetterSpacing::Normal => "normal".to_owned(),
             LetterSpacing::Px(p) => px(p),
         },
+        Id::TextIndent => {
+            let t = style.text_indent;
+            let mut s = lp_css(t.length);
+            if t.hanging {
+                s.push_str(" hanging");
+            }
+            if t.each_line {
+                s.push_str(" each-line");
+            }
+            s
+        }
         Id::WordBreak => style.word_break.keyword().to_owned(),
         Id::OverflowWrap => style.overflow_wrap.keyword().to_owned(),
         Id::TextOverflow => style.text_overflow.to_css(),
@@ -1668,6 +1680,9 @@ mod tests {
         assert_eq!(resolved_value(&style, PropertyId::LetterSpacing, None), "normal");
         style.letter_spacing = LetterSpacing::Px(1.5);
         assert_eq!(resolved_value(&style, PropertyId::LetterSpacing, None), "1.5px");
+        assert_eq!(resolved_value(&style, PropertyId::TextIndent, None), "0px");
+        style.text_indent = crate::computed::TextIndent { length: ComputedLp::Percent(10.0), hanging: true, each_line: true };
+        assert_eq!(resolved_value(&style, PropertyId::TextIndent, None), "10% hanging each-line");
         assert_eq!(resolved_value(&style, PropertyId::WordBreak, None), "normal");
         assert_eq!(resolved_value(&style, PropertyId::OverflowWrap, None), "normal");
         assert_eq!(resolved_value(&style, PropertyId::TextOverflow, None), "\"~\"");

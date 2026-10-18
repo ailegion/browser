@@ -46,6 +46,21 @@ impl LetterSpacing {
     }
 }
 
+/// Computed `text-indent`: the length in pixels or a percentage of the
+/// block container's inline size, and the keywords.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextIndent {
+    pub length: ComputedLp,
+    pub hanging: bool,
+    pub each_line: bool,
+}
+
+impl Default for TextIndent {
+    fn default() -> Self {
+        TextIndent { length: ComputedLp::ZERO, hanging: false, each_line: false }
+    }
+}
+
 /// Computed `text-decoration-thickness`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum DecorationThickness {
@@ -265,6 +280,7 @@ pub struct ComputedStyle {
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
     pub letter_spacing: LetterSpacing,
+    pub text_indent: TextIndent,
     pub word_break: WordBreak,
     pub overflow_wrap: OverflowWrap,
     pub text_overflow: TextOverflow,
@@ -508,6 +524,7 @@ impl ComputedStyle {
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             letter_spacing: LetterSpacing::Normal,
+            text_indent: TextIndent::default(),
             word_break: WordBreak::Normal,
             overflow_wrap: OverflowWrap::Normal,
             text_overflow: TextOverflow::Clip,
@@ -749,6 +766,7 @@ impl ComputedStyle {
             || self.text_transform != other.text_transform
             || self.white_space != other.white_space
             || self.letter_spacing != other.letter_spacing
+            || self.text_indent != other.text_indent
             || self.word_break != other.word_break
             || self.overflow_wrap != other.overflow_wrap
             || self.text_overflow != other.text_overflow
@@ -1227,6 +1245,11 @@ pub fn compute(
             ComputedLp::Percent(_) => LetterSpacing::Normal,
             ComputedLp::Calc(_) => LetterSpacing::Normal,
         },
+    });
+    pick!(text_indent, TextIndent, TextIndent, |v| TextIndent {
+        length: lp(&v.length),
+        hanging: v.hanging,
+        each_line: v.each_line,
     });
     pick!(word_break, WordBreak, WordBreak, |v| *v);
     pick!(overflow_wrap, OverflowWrap, OverflowWrap, |v| *v);

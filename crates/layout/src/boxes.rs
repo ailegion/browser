@@ -593,6 +593,10 @@ pub(crate) struct InlineContent {
     /// `inside` marker this root is the item's first line; for an
     /// `outside` one the root is the marker's own (`BoxNode::marker`).
     pub marker_len: usize,
+    /// Whether this root's first line is its block container's first
+    /// formatted line, the one `text-indent` indents (CSS Text 3 §8.1): not
+    /// for a run after an in-flow block child, nor an outside marker's.
+    pub first_formatted_line: bool,
     /// The next document-order number for an atomic or inline box edge.
     next_seq: u32,
 }
@@ -617,6 +621,7 @@ impl InlineContent {
             floats: Vec::new(),
             ellipsis: None,
             marker_len: 0,
+            first_formatted_line: true,
             next_seq: 0,
         };
         // A block container's override applies to all of its inline
@@ -1360,6 +1365,11 @@ impl BoxBuilder<'_> {
                         content.trim_trailing_space();
                     }
                     content.finish();
+                    // A run after an in-flow block-level child does not
+                    // hold the container's first formatted line.
+                    content.first_formatted_line = !out.iter().any(|b: &BoxNode| {
+                        !matches!(b.kind, BoxKind::OutOfFlow(_)) && b.style.float == browser_style::Float::None
+                    });
                     let style = Arc::new(ComputedStyle::anonymous_from(&content.container));
                     let mut b = BoxNode::new(BoxKind::Inline(content), None, style);
                     b.anonymous = true;
@@ -1953,6 +1963,8 @@ impl BoxBuilder<'_> {
             content.atomics.push(atomic);
         }
         content.marker_len = text.len();
+        // An outside marker's own line is not the item's first line.
+        content.first_formatted_line = false;
         content.finish();
         let mut m = BoxNode::new(BoxKind::Inline(content), None, marker_style);
         m.anonymous = true;
@@ -2206,9 +2218,10 @@ mod tests {
             floats: Vec::new(),
             ellipsis: None,
             marker_len: 0,
+            first_formatted_line: true,
             next_seq: 0,
         };
-        let img_index = 9;
+let img_index = 9;
         c.atomics.push(Atomic::new(
             img_index,
             BoxNode::new(BoxKind::Image { url: None, intrinsic: None }, None, c.container.clone()),

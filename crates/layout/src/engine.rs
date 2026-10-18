@@ -1834,6 +1834,20 @@ fn build_paragraphs(
             });
         }
         let mut layout = builder.build(slice);
+        // `text-indent` (CSS Text 3 §8.1): a percentage of the container's
+        // inline size (none while measuring intrinsic sizes). The lines it
+        // is scoped to: the container's first formatted line, and with
+        // `each-line` each line after a forced break, which starts a
+        // paragraph here; `hanging` indents the others instead.
+        let indent = container.text_indent;
+        let amount = indent.length.resolve(max_width.unwrap_or(0.0));
+        if amount != 0.0 {
+            let scoped = (pi == 0 && content.first_formatted_line) || (pi > 0 && indent.each_line);
+            layout.set_text_indent(
+                amount,
+                parley::IndentOptions { each_line: indent.each_line, hanging: indent.hanging, continuation: !scoped },
+            );
+        }
         // Spans that may not wrap carry `TextWrapMode::NoWrap`
         // (`push_style`), so the width goes to parley in every case.
         let wrap = container.white_space.allows_wrap();
@@ -5279,6 +5293,82 @@ mod tests {
         let underline = underline.expect("underline turned on");
         assert!(underline.y > 0.0 && underline.thickness > 0.0, "{underline:?}");
         assert_eq!(underline.color.to_rgba8(), [0, 255, 0, 255]);
+    }
+
+    /// `text-indent` (CSS Text 3 §8.1): the first formatted line, `%` of
+    /// the container's width, `hanging`, `each-line` after a forced break,
+    /// not a run after a block child, from the right in RTL, and the
+    /// hide-the-text trick (wikipedia.org's search button).
+    #[test]
+    fn text_indent_shifts_the_lines_it_is_scoped_to() {
+        let (doc, tree) = layout(
+            "<body style='margin:0;font-size:10px;width:200px'>\
+             <p id=a style='margin:0;text-indent:40px'>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll</p>\
+             <p id=b style='margin:0;text-indent:10%'>aaaa</p>\
+             <p id=c style='margin:0;text-indent:40px hanging'>aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll</p>\
+             <p id=d style='margin:0;text-indent:40px each-line'>aaaa<br>bbbb</p>\
+             <p id=e style='margin:0;text-indent:40px'>aaaa<br>bbbb</p>\
+             <div id=f style='text-indent:40px'><div style='text-indent:0'>x</div>yyyy</div>\
+             <p id=g style='margin:0;text-indent:40px;direction:rtl'>aaaa</p>\
+             <span style='display:inline-block;width:22px;overflow:hidden'><i id=h style='display:inline-block;width:22px;text-indent:-9999px'>Search</i></span>\
+             </body>",
+            "",
+        );
+        // Each line's leftmost and rightmost text edge under element `id`.
+        let lines = |id: &str| {
+            let el = by_id(&doc, id);
+            let mut rows: Vec<(f32, f32, f32)> = Vec::new();
+            tree.root.walk(&mut |f| {
+                if let (FragmentContent::Text(_), Some(n)) = (&f.content, f.node) {
+                    if doc.ancestors(n).any(|a| a == el) {
+                        match rows.iter_mut().find(|r| (r.0 - f.rect.y).abs() < 0.5) {
+                            Some(r) => {
+                                r.1 = r.1.min(f.rect.x);
+                                r.2 = r.2.max(f.rect.right());
+                            }
+                            None => rows.push((f.rect.y, f.rect.x, f.rect.right())),
+                        }
+                    }
+                }
+            });
+            rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+            rows
+        };
+        let a = lines("a");
+        assert!(a.len() >= 2, "wraps: {a:?}");
+        assert_eq!((a[0].1, a[1].1), (40.0, 0.0), "the first line only");
+        assert_eq!(lines("b")[0].1, 20.0, "10% of 200px");
+        let c = lines("c");
+        assert_eq!((c[0].1, c[1].1), (0.0, 40.0), "hanging: all but the first");
+        let d = lines("d");
+        assert_eq!((d[0].1, d[1].1), (40.0, 40.0), "each-line: after a forced break too");
+        let e = lines("e");
+        assert_eq!((e[0].1, e[1].1), (40.0, 0.0), "not after a forced break without each-line");
+        let f = lines("f");
+        assert_eq!((f[0].1, f[1].1), (0.0, 0.0), "a run after a block child is not the first line");
+        assert_eq!(lines("g")[0].2, 160.0, "RTL: from the right");
+        assert!(lines("h")[0].2 < -9000.0, "pushed out of its box: {:?}", lines("h"));
+    }
+
+    /// Insets move only a relatively positioned box (CSS 2.1 §9.3.2): a
+    /// static box ignores them (wikipedia.org's `.hide-arrow`), a sticky
+    /// box short of its threshold stays where the flow put it.
+    #[test]
+    fn insets_move_only_relative_boxes() {
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div id=a style='position:absolute;right:12px;top:0'><div id=s style='right:32px;top:10px;width:48px;height:10px'></div></div>\
+             <div id=r style='position:relative;left:10px;top:5px;width:10px;height:10px;margin-top:20px'></div>\
+             <div style='height:100px'></div>\
+             <div id=k style='position:sticky;top:20px;height:10px'></div>\
+             <div style='height:2000px'></div>\
+             </body>",
+            "",
+        );
+        let b = |id: &str| box_of(&tree, by_id(&doc, id));
+        assert_eq!((b("s").x, b("s").y, b("a").width), (b("a").x, 0.0, 48.0), "static: no offset");
+        assert_eq!((b("r").x, b("r").y), (10.0, 25.0), "relative: offset");
+        assert_eq!(b("k").y, 130.0, "sticky below its threshold: in flow");
     }
 
     /// "Working sites first" line 6f: math functions resolve to pixels at
