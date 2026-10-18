@@ -2583,6 +2583,7 @@ longhands! {
     EmptyCells: "empty-cells" => EmptyCells, true;
     GridTemplateColumns: "grid-template-columns" => crate::grid::TrackList<LengthPercentage>, false;
     GridTemplateRows: "grid-template-rows" => crate::grid::TrackList<LengthPercentage>, false;
+    GridTemplateAreas: "grid-template-areas" => crate::grid::TemplateAreas, false;
     GridAutoColumns: "grid-auto-columns" => Vec<crate::grid::TrackSize<LengthPercentage>>, false;
     GridAutoRows: "grid-auto-rows" => Vec<crate::grid::TrackSize<LengthPercentage>>, false;
     GridAutoFlow: "grid-auto-flow" => crate::grid::GridAutoFlow, false;
@@ -3006,6 +3007,7 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "show" => EmptyCells::Show, "hide" => EmptyCells::Hide, _ => return None }))?),
         PropertyId::GridTemplateColumns => P::GridTemplateColumns(crate::grid::parse_track_list(input)?),
         PropertyId::GridTemplateRows => P::GridTemplateRows(crate::grid::parse_track_list(input)?),
+        PropertyId::GridTemplateAreas => P::GridTemplateAreas(crate::grid::parse_template_areas(input)?),
         PropertyId::GridAutoColumns => P::GridAutoColumns(crate::grid::parse_auto_tracks(input)?),
         PropertyId::GridAutoRows => P::GridAutoRows(crate::grid::parse_auto_tracks(input)?),
         PropertyId::GridAutoFlow => P::GridAutoFlow(crate::grid::parse_auto_flow(input)?),
@@ -4049,8 +4051,8 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "grid-row" => &[GridRowStart, GridRowEnd],
         "grid-column" => &[GridColumnStart, GridColumnEnd],
         "grid-area" => &[GridRowStart, GridColumnStart, GridRowEnd, GridColumnEnd],
-        "grid-template" => &[GridTemplateRows, GridTemplateColumns],
-        "grid" => &[GridTemplateRows, GridTemplateColumns, GridAutoRows, GridAutoColumns, GridAutoFlow],
+        "grid-template" => &[GridTemplateRows, GridTemplateColumns, GridTemplateAreas],
+        "grid" => &[GridTemplateRows, GridTemplateColumns, GridTemplateAreas, GridAutoRows, GridAutoColumns, GridAutoFlow],
         _ => return None,
     })
 }
@@ -4073,13 +4075,16 @@ fn parse_grid_lines<'i>(input: &mut Parser<'i, '_>, max: usize) -> Result<Vec<cr
     Ok(lines)
 }
 
-/// `grid-template`: `none`, or `<'grid-template-rows'> /
-/// <'grid-template-columns'>` (the form with area strings is a later
-/// part of grid).
+/// `grid-template`: `none`, `<'grid-template-rows'> /
+/// <'grid-template-columns'>` (areas `none`), or the form with area
+/// strings.
 fn parse_grid_template<'i>(
     input: &mut Parser<'i, '_>,
-) -> Result<(crate::grid::TrackList<LengthPercentage>, crate::grid::TrackList<LengthPercentage>), ParseErr<'i>> {
-    use crate::grid::TrackList;
+) -> Result<
+    (crate::grid::TrackList<LengthPercentage>, crate::grid::TrackList<LengthPercentage>, crate::grid::TemplateAreas),
+    ParseErr<'i>,
+> {
+    use crate::grid::{TemplateAreas, TrackList};
     if input
         .try_parse(|i| {
             i.expect_ident_matching("none")?;
@@ -4087,12 +4092,19 @@ fn parse_grid_template<'i>(
         })
         .is_ok()
     {
-        return Ok((TrackList::None, TrackList::None));
+        return Ok((TrackList::None, TrackList::None, TemplateAreas::None));
+    }
+    if let Ok(t) = input.try_parse(|i| {
+        let t = crate::grid::parse_area_template(i)?;
+        i.expect_exhausted()?;
+        Ok::<_, ParseErr<'i>>(t)
+    }) {
+        return Ok(t);
     }
     let rows = crate::grid::parse_track_list(input)?;
     input.expect_delim('/')?;
     let columns = crate::grid::parse_track_list(input)?;
-    Ok((rows, columns))
+    Ok((rows, columns, TemplateAreas::None))
 }
 
 /// `[ auto-flow && dense? ]`, for the `grid` shorthand.
@@ -4176,15 +4188,15 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
             vec![P::GridRowStart(row_start), P::GridColumnStart(column_start), P::GridRowEnd(row_end), P::GridColumnEnd(column_end)]
         },
         "grid-template" => {
-            let (rows, columns) = parse_grid_template(input)?;
-            vec![P::GridTemplateRows(rows), P::GridTemplateColumns(columns)]
+            let (rows, columns, areas) = parse_grid_template(input)?;
+            vec![P::GridTemplateRows(rows), P::GridTemplateColumns(columns), P::GridTemplateAreas(areas)]
         },
         "grid" => {
-            use crate::grid::{GridAutoFlow, TrackBreadth, TrackList, TrackSize};
+            use crate::grid::{GridAutoFlow, TemplateAreas, TrackBreadth, TrackList, TrackSize};
             let auto = || vec![TrackSize::Breadth(TrackBreadth::Auto)];
             // `<'grid-template'>`, or one axis auto-flowed: the
             // other longhands back to their initial values.
-            if let Ok((rows, columns)) = input.try_parse(|i| {
+            if let Ok((rows, columns, areas)) = input.try_parse(|i| {
                 let t = parse_grid_template(i)?;
                 i.expect_exhausted()?;
                 Ok::<_, ParseErr<'i>>(t)
@@ -4192,6 +4204,7 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
                 vec![
                     P::GridTemplateRows(rows),
                     P::GridTemplateColumns(columns),
+                    P::GridTemplateAreas(areas),
                     P::GridAutoRows(auto()),
                     P::GridAutoColumns(auto()),
                     P::GridAutoFlow(GridAutoFlow::default()),
@@ -4204,6 +4217,7 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
                 vec![
                     P::GridTemplateRows(TrackList::None),
                     P::GridTemplateColumns(columns),
+                    P::GridTemplateAreas(TemplateAreas::None),
                     P::GridAutoRows(rows),
                     P::GridAutoColumns(auto()),
                     P::GridAutoFlow(GridAutoFlow { column: false, dense }),
@@ -4217,6 +4231,7 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
                 vec![
                     P::GridTemplateRows(rows),
                     P::GridTemplateColumns(TrackList::None),
+                    P::GridTemplateAreas(TemplateAreas::None),
                     P::GridAutoRows(auto()),
                     P::GridAutoColumns(columns),
                     P::GridAutoFlow(GridAutoFlow { column: true, dense }),

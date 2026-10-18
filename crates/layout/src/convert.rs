@@ -185,6 +185,27 @@ fn grid_style(style: &ComputedStyle, out: &mut Style) {
     out.grid_template_column_names = column_names;
     out.grid_template_rows = rows;
     out.grid_template_row_names = row_names;
+    // Named areas: they size the explicit grid with the tracks and name
+    // the `name-start`/`name-end` lines items are placed by.
+    if let browser_style::grid::TemplateAreas::Rows(_) = &style.grid_template_areas {
+        let (row_count, column_count) = style.grid_template_areas.size();
+        out.grid_template_areas = Some(taffy::GridTemplateAreas {
+            areas: style
+                .grid_template_areas
+                .areas()
+                .into_iter()
+                .map(|a| taffy::GridTemplateArea {
+                    name: a.name.to_string(),
+                    row_start: a.row_start,
+                    row_end: a.row_end,
+                    column_start: a.column_start,
+                    column_end: a.column_end,
+                })
+                .collect(),
+            row_count,
+            column_count,
+        });
+    }
     out.grid_auto_columns = style.grid_auto_columns.iter().map(track).collect();
     out.grid_auto_rows = style.grid_auto_rows.iter().map(track).collect();
     out.grid_auto_flow = match (style.grid_auto_flow.column, style.grid_auto_flow.dense) {

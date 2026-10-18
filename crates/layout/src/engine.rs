@@ -4546,6 +4546,35 @@ mod tests {
     /// `inline-grid` in a line, and an absolutely positioned child in the
     /// grid area of its lines.
     #[test]
+    fn grid_areas_place_items_by_name() {
+        // Wikipedia's page grid: named areas, items placed by
+        // `grid-area: name`, by the implicit `name-start`/`name-end` lines,
+        // and an item without a placement auto-placed into a free cell.
+        let (doc, tree) = layout(
+            "<body style='margin:0'>\
+             <div id=g style=\"display:grid;width:300px;grid-template-areas:'notice notice' 'side main' 'foot foot';\
+               grid-template-columns:100px 1fr;grid-template-rows:10px 50px 20px\">\
+             <div id=f style='grid-area:foot'>f</div><div id=m style='grid-area:main'>m</div>\
+             <div id=n style='grid-area:notice'>n</div><div id=s style='grid-column:side-start / side-end;grid-row:side'>s</div></div>\
+             <div id=t style=\"display:grid;grid-template:'a b' 30px 'c d' 40px / 50px 60px\"><div id=d style='grid-area:d'>d</div></div>\
+             </body>",
+            "",
+        );
+        let b = |id: &str| box_of(&tree, by_id(&doc, id));
+        let g = b("g");
+        let at = |id: &str| {
+            let r = b(id);
+            (r.x - g.x, r.y - g.y, r.width, r.height)
+        };
+        assert_eq!(at("n"), (0.0, 0.0, 300.0, 10.0), "notice across both columns");
+        assert_eq!(at("s"), (0.0, 10.0, 100.0, 50.0), "side by its start/end lines");
+        assert_eq!(at("m"), (100.0, 10.0, 200.0, 50.0), "main");
+        assert_eq!(at("f"), (0.0, 60.0, 300.0, 20.0), "foot last, though first in the source");
+        let (t, d) = (b("t"), b("d"));
+        assert_eq!((d.x - t.x, d.y - t.y, d.width, d.height), (50.0, 30.0, 60.0, 40.0), "the grid-template area form");
+    }
+
+    #[test]
     fn grid_containers_place_and_size_their_items() {
         let (doc, tree) = layout(
             "<body style='margin:0'>\

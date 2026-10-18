@@ -178,8 +178,8 @@ remaining lists as they stand.
       Wikipedia 170 ms).
 - [x] 5. From 4a block 7 (grid): grid-template-rows/columns with
       lengths, fr, repeat, minmax, auto; gap; auto placement; line
-      spans. Later: named areas, auto-fill/fit, alignment keywords,
-      subgrid.
+      spans. Later: auto-fill/fit, alignment keywords, subgrid (named
+      areas: line 6a).
       Done 2026-10-18. Style (`crates/style/src/grid.rs`): `display:
       grid`/`inline-grid` are their own computed values (they computed
       to `block`/`inline-block`); `grid-template-columns`/`-rows` (`none`
@@ -263,6 +263,35 @@ remaining lists as they stand.
       49.2 ms (47.6 before), blocks 13.8–14.2 ms (13.8), Hacker News
       relayout 39.0–39.9 ms (38.4–39.1), Wikipedia 178.6–181.9 ms
       (175.8–181.0).
+- [x] 6a. Named grid areas (moved up from line 5's "Later" by the owner,
+      2026-10-18, for Wikipedia's page layout): `grid-template-areas`, the
+      area-string form of `grid-template` and `grid`, items placed by area
+      name (`grid-area: name`) and by the implicit `name-start`/`name-end`
+      lines.
+      Done 2026-10-18. Style (`grid.rs`): `TemplateAreas` (`none` or rows of
+      named and `.` cells; area strings tokenized per CSS Grid 1 §7.3.1;
+      ragged rows, non-rectangular names and stray characters refused),
+      `NamedArea` lines; `grid-template-areas` (not inherited, serialized as
+      Chrome writes it); the area form of `grid-template` and `grid` (line
+      names before and after each row, adjacent sets merged, rows without a
+      size `auto`, `/ <explicit-track-list>`), their `/` forms resetting the
+      areas to `none`, and serialization back to the area form when the rows
+      line up with the strings (else no shorthand value). Layout: the areas
+      go to taffy's grid (`convert::grid_style`), which sizes the explicit
+      grid by them and resolves `name`, `name-start`, `name-end`. Tests:
+      style (parsing, refusals, serialization, shorthands), layout
+      (Wikipedia's page template: placement by area and by the implicit
+      lines, the `grid-template` area form). Timing: tables 49.3–50.0 ms
+      (48.0 before), blocks 14.4–15.1 ms (13.5), Hacker News relayout
+      38.9–41.2 ms (38.5–39.7): slower, not attributed.
+- [ ] 6b. SVG images (moved up from Phase 5, Images, by the owner,
+      2026-10-18, for Wikipedia's logo and icons): SVG in `<img>`, CSS
+      images (`background-image`, `list-style-image`, `content`) and
+      `data:` URLs, via `usvg` to vello.
+- [ ] 6c. CSS `mask` (moved up from Phase 5, Style, by the owner,
+      2026-10-18, for Wikipedia's icons): `mask-image` (and `-webkit-mask-
+      image`) with its `mask-*` longhands and the `mask` shorthand, images
+      including SVG.
 - [ ] 7. From Phase 3 item 3, sub-items 5, 6 and 8: `fetch` and
       `XMLHttpRequest` end to end, `localStorage`/`sessionStorage`,
       `history.pushState`/`popstate`, `MutationObserver`,
@@ -2485,7 +2514,8 @@ what breaks the most pages.
   `scrollTop`/`scrollLeft`/`scrollTo`/`scrollIntoView` of item 3.3.4
   applying to them (today they move only the page).
 - Style: transitions and animations wired to rAF, `@font-face` web fonts,
-  `filter`, `backdrop-filter`, `mask`, `clip-path`, gradients, shadows,
+  `filter`, `backdrop-filter`, `clip-path` (`mask`: "Working sites
+  first" line 6c), gradients, shadows,
   selector-based invalidation for performance. Web-font parts rarely used
   by sites (owner's 2026-10-18 split from "Working sites first" line 6):
   the `font-feature-settings` and `font-variation-settings` descriptors of
@@ -2503,7 +2533,8 @@ what breaks the most pages.
   attributes read back (today `weight: 'bold'` reads `700` and `family`
   is unquoted), and `document.fonts.check()` for a matching face that
   failed to load (today false).
-- Images: SVG via `usvg` to vello, `<picture>` and `srcset`, lazy loading.
+- Images: `<picture>` and `srcset`, lazy loading (SVG: "Working sites
+  first" line 6b).
 - Web APIs: `WebSocket`, Canvas 2D on vello, `postMessage`, `iframe`
   (each frame is its own document on the same tab thread), `Web Workers`
   (a separate Boa context on its own thread, message passing only),

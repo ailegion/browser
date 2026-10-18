@@ -198,6 +198,7 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
             EmptyCells::Hide => "hide".to_owned(),
         },
         P::GridTemplateColumns(t) | P::GridTemplateRows(t) => t.to_css(),
+        P::GridTemplateAreas(a) => a.to_css(),
         P::GridAutoColumns(t) | P::GridAutoRows(t) => crate::grid::auto_tracks_css(t),
         P::GridAutoFlow(f) => f.to_css(),
         P::GridRowStart(l) | P::GridRowEnd(l) | P::GridColumnStart(l) | P::GridColumnEnd(l) => l.to_css(),
@@ -627,21 +628,13 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             }
             parts.join(" / ")
         }
-        "grid-template" => {
-            if v(0) == "none" && v(1) == "none" {
-                "none".to_owned()
-            } else {
-                format!("{} / {}", v(0), v(1))
-            }
-        }
+        "grid-template" => grid_template_css(v(0), v(1), v(2))?,
         "grid" => {
-            let (rows, columns, auto_rows, auto_columns, flow) = (v(0), v(1), v(2), v(3), v(4));
+            let (rows, columns, areas, auto_rows, auto_columns, flow) = (v(0), v(1), v(2), v(3), v(4), v(5));
             if auto_rows == "auto" && auto_columns == "auto" && flow == "row" {
-                if rows == "none" && columns == "none" {
-                    "none".to_owned()
-                } else {
-                    format!("{rows} / {columns}")
-                }
+                grid_template_css(rows, columns, areas)?
+            } else if areas != "none" {
+                return None;
             } else if rows == "none" && auto_columns == "auto" && (flow == "row" || flow == "dense") {
                 let keyword = if flow == "dense" { "auto-flow dense" } else { "auto-flow" };
                 if auto_rows == "auto" {
@@ -678,6 +671,58 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
         }
         _ => return None,
     })
+}
+
+/// `grid-template` from its longhands' text: `none`, `rows / columns`, or
+/// with areas each row's string after its leading line names, then its
+/// size (left out when `auto`) and trailing names, and `/ columns`. `None`
+/// when the rows do not line up with the area strings (or use `repeat()`),
+/// which no shorthand value expresses.
+fn grid_template_css(rows: &str, columns: &str, areas: &str) -> Option<String> {
+    use crate::grid::{TemplateAreas, TrackComponent, TrackList};
+    if areas == "none" {
+        return Some(if rows == "none" && columns == "none" { "none".to_owned() } else { format!("{rows} / {columns}") });
+    }
+    let parse = |text: &str| {
+        let mut input = cssparser::ParserInput::new(text);
+        let mut p = cssparser::Parser::new(&mut input);
+        p.parse_entirely(crate::grid::parse_track_list).ok()
+    };
+    let parse_areas = |text: &str| {
+        let mut input = cssparser::ParserInput::new(text);
+        let mut p = cssparser::Parser::new(&mut input);
+        p.parse_entirely(crate::grid::parse_template_areas).ok()
+    };
+    let TemplateAreas::Rows(strings) = parse_areas(areas)? else { return None };
+    let TrackList::List(components) = parse(rows)? else { return None };
+    let mut out: Vec<String> = Vec::new();
+    let mut row = 0;
+    for c in &components {
+        match c {
+            TrackComponent::Names(n) => out.push(crate::grid::names_css(n)),
+            TrackComponent::Size(s) => {
+                out.push(crate::grid::row_css(strings.get(row)?));
+                let size = s.to_css();
+                if size != "auto" {
+                    out.push(size);
+                }
+                row += 1;
+            }
+            TrackComponent::Repeat(..) => return None,
+        }
+    }
+    if row != strings.len() {
+        return None;
+    }
+    let mut text = out.join(" ");
+    if columns != "none" {
+        if columns.contains("repeat(") {
+            return None;
+        }
+        text.push_str(" / ");
+        text.push_str(columns);
+    }
+    Some(text)
 }
 
 /// The serialized grid line a shorthand gives an omitted part after the
@@ -1175,6 +1220,7 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
             Some(g) => used_tracks_css(&g.columns, &style.grid_template_columns),
             None => style.grid_template_columns.to_css(),
         },
+        Id::GridTemplateAreas => style.grid_template_areas.to_css(),
         Id::GridTemplateRows => match rendered.and_then(|u| u.grid.as_ref()) {
             Some(g) => used_tracks_css(&g.rows, &style.grid_template_rows),
             None => style.grid_template_rows.to_css(),
@@ -1236,6 +1282,39 @@ mod tests {
         assert_eq!(resolved_value(s, PropertyId::FontVariationSettings, None), "\"slnt\" -10");
     }
 
+    /// "Working sites first" line 6a: `grid-template-areas` parses
+    /// (names, `.` runs, white space), refuses ragged rows, non-rectangular
+    /// names and stray characters, and serializes; `grid-template` and
+    /// `grid` take the area form and collapse back to it.
+    #[test]
+    fn grid_template_areas_parse_and_serialize() {
+        let cases = [
+            ("grid-template-areas: 'head head' 'nav  main' '.... foot'", "grid-template-areas: \"head head\" \"nav main\" \". foot\";"),
+            ("grid-template-areas: none", "grid-template-areas: none;"),
+            ("grid-template-areas: 'a b' 'c'", ""),
+            ("grid-template-areas: 'a b a'", ""),
+            ("grid-template-areas: 'a b' 'b a'", ""),
+            ("grid-template-areas: 'a #'", ""),
+            ("grid-template-areas: ''", ""),
+            (
+                "grid-template: [top] 'a a' 40px [mid] [mid2] 'b c' / 100px 1fr",
+                "grid-template: [top] \"a a\" 40px [mid mid2] \"b c\" / 100px 1fr;",
+            ),
+            ("grid-template: 'a' 'b'", "grid-template: \"a\" \"b\";"),
+            ("grid-template: 'a' / repeat(2, 1fr)", ""),
+            ("grid: 'h h' 'n m' / 15rem 1fr", "grid: \"h h\" \"n m\" / 15rem 1fr;"),
+            ("grid-template: 10px / 20px", "grid-template: 10px / 20px;"),
+        ];
+        for (css, want) in cases {
+            assert_eq!(block(css), want, "{css}");
+        }
+        // Areas set apart from the shorthand's rows: no shorthand value.
+        assert_eq!(
+            block("grid-template: 'a' 'b'; grid-template-rows: 10px"),
+            "grid-template-columns: none; grid-template-areas: \"a\" \"b\"; grid-template-rows: 10px;"
+        );
+    }
+
     /// "Working sites first" line 5: the grid properties parse, refuse
     /// what the grammar refuses, serialize as written (shortest forms),
     /// and the shorthands expand and collapse back.
@@ -1283,10 +1362,11 @@ mod tests {
             "grid-row-start: span 0",
             "grid-row-start: span",
             "grid-auto-flow: row column",
-            "grid-template: \"a b\" / 1fr",
         ] {
             assert_eq!(block(css), "", "{css} refused");
         }
+        // The area form (line 6a) parses.
+        assert_eq!(block("grid-template: \"a b\" / 1fr"), "grid-template: \"a b\" / 1fr;");
     }
 
     #[test]

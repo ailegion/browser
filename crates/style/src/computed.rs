@@ -236,6 +236,7 @@ pub struct ComputedStyle {
     /// auto-placement flow, and the lines an item is placed on.
     pub grid_template_columns: crate::grid::TrackList<ComputedLp>,
     pub grid_template_rows: crate::grid::TrackList<ComputedLp>,
+    pub grid_template_areas: crate::grid::TemplateAreas,
     pub grid_auto_columns: Vec<crate::grid::TrackSize<ComputedLp>>,
     pub grid_auto_rows: Vec<crate::grid::TrackSize<ComputedLp>>,
     pub grid_auto_flow: crate::grid::GridAutoFlow,
@@ -466,6 +467,7 @@ impl ComputedStyle {
             column_gap: ComputedLp::ZERO,
             grid_template_columns: crate::grid::TrackList::None,
             grid_template_rows: crate::grid::TrackList::None,
+            grid_template_areas: crate::grid::TemplateAreas::None,
             // Empty for the initial `auto` (no allocation per style).
             grid_auto_columns: Vec::new(),
             grid_auto_rows: Vec::new(),
@@ -699,6 +701,7 @@ impl ComputedStyle {
             || self.column_gap != other.column_gap
             || self.grid_template_columns != other.grid_template_columns
             || self.grid_template_rows != other.grid_template_rows
+            || self.grid_template_areas != other.grid_template_areas
             || self.grid_auto_columns != other.grid_auto_columns
             || self.grid_auto_rows != other.grid_auto_rows
             || self.grid_auto_flow != other.grid_auto_flow
@@ -1291,6 +1294,7 @@ pub fn compute(
     pick!(empty_cells, EmptyCells, EmptyCells, |v| *v);
     pick!(grid_template_columns, GridTemplateColumns, GridTemplateColumns, |v| v.compute(&ctx));
     pick!(grid_template_rows, GridTemplateRows, GridTemplateRows, |v| v.compute(&ctx));
+    pick!(grid_template_areas, GridTemplateAreas, GridTemplateAreas, |v| v.clone());
     pick!(grid_auto_columns, GridAutoColumns, GridAutoColumns, |v| v.iter().map(|t| t.compute(&ctx)).collect());
     pick!(grid_auto_rows, GridAutoRows, GridAutoRows, |v| v.iter().map(|t| t.compute(&ctx)).collect());
     pick!(grid_auto_flow, GridAutoFlow, GridAutoFlow, |v| *v);
