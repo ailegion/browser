@@ -10,6 +10,11 @@
 
 #![forbid(unsafe_code)]
 
+/// The test binary counts its heap, for the timing tests' memory figures.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: browser_platform::CountingAlloc = browser_platform::CountingAlloc;
+
 mod boxes;
 mod convert;
 mod decor;

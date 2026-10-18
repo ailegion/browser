@@ -607,6 +607,7 @@ name = "browser-layout"
 version = "0.0.1"
 dependencies = [
  "browser-dom",
+ "browser-platform",
  "browser-style",
  "fontique",
  "html5ever",
@@ -691,6 +692,7 @@ dependencies = [
  "browser-ipc-types",
  "browser-net",
  "browser-paint",
+ "browser-platform",
  "browser-store",
  "browser-tab",
  "image",
@@ -739,6 +741,7 @@ dependencies = [
  "browser-layout",
  "browser-net",
  "browser-paint",
+ "browser-platform",
  "browser-script",
  "browser-style",
  "fontique",

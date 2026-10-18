@@ -436,6 +436,8 @@ pub(crate) struct TabState {
     /// How many layouts this tab has run: a paint-only restyle must not
     /// add one (checked by tests; useful in logs).
     layouts: u64,
+    /// What the current batch of events costs (the `perf` log line).
+    perf: BatchPerf,
     scene: Scene,
     /// The view lent to scripts: the viewport and what it needs to lay
     /// out; its caches live on between runs.
@@ -593,7 +595,116 @@ pub(crate) struct TabState {
     state_dirty: bool,
 }
 
+/// What one batch of events cost the tab, for the `perf` log line
+/// (`TabState::end_batch`): the events, and the time and count of each
+/// kind of work (a script's time includes the style and layout it
+/// forces).
+#[derive(Debug, Default)]
+struct BatchPerf {
+    started: Option<std::time::Instant>,
+    shell_events: usize,
+    net_events: usize,
+    script: std::time::Duration,
+    scripts: u32,
+    restyle: std::time::Duration,
+    full_restyles: u32,
+    partial_restyles: u32,
+    styled: usize,
+    layout: std::time::Duration,
+    layouts: u32,
+    paint: std::time::Duration,
+    paints: u32,
+    /// Why style or layout was asked for, in order (each reason once).
+    why: Vec<&'static str>,
+    /// Time spent handling each kind of event: (kind, count, time).
+    events: Vec<(&'static str, u32, std::time::Duration)>,
+    tick: std::time::Duration,
+    flush: std::time::Duration,
+}
+
 impl TabState {
+    /// Ask for layout, saying why (the timing log lists the reasons).
+    fn want_layout(&mut self, why: &'static str) {
+        self.needs_layout = true;
+        if !self.perf.why.contains(&why) {
+            self.perf.why.push(why);
+        }
+    }
+
+    /// Ask for a full restyle (and so layout), saying why.
+    fn want_style(&mut self, why: &'static str) {
+        self.needs_style = true;
+        if !self.perf.why.contains(&why) {
+            self.perf.why.push(why);
+        }
+    }
+
+    /// The timing log: an event of `kind` took `time` to handle.
+    pub fn note_event(&mut self, kind: &'static str, time: std::time::Duration) {
+        match self.perf.events.iter_mut().find(|e| e.0 == kind) {
+            Some(e) => {
+                e.1 += 1;
+                e.2 += time;
+            }
+            None => self.perf.events.push((kind, 1, time)),
+        }
+    }
+
+    /// The timing log: the batch's timers and its flush took this long.
+    pub fn note_tick_and_flush(&mut self, tick: std::time::Duration, flush: std::time::Duration) {
+        self.perf.tick += tick;
+        self.perf.flush += flush;
+    }
+    /// A batch of events starts: the timing log counts from here.
+    pub fn begin_batch(&mut self, shell_events: usize, net_events: usize) {
+        self.perf = BatchPerf {
+            started: Some(std::time::Instant::now()),
+            shell_events,
+            net_events,
+            ..BatchPerf::default()
+        };
+    }
+
+    /// The batch is done: one `perf` line (target `perf`, level info) when
+    /// it did any work or took over 2 ms, with the heap live and its peak
+    /// (when the process counts its allocations).
+    pub fn end_batch(&mut self) {
+        let p = std::mem::take(&mut self.perf);
+        let Some(started) = p.started else { return };
+        let total = started.elapsed();
+        let worked = p.scripts + p.full_restyles + p.partial_restyles + p.layouts + p.paints > 0;
+        if !worked && total < std::time::Duration::from_millis(2) {
+            return;
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let events: Vec<String> = p.events.iter().map(|(k, n, t)| format!("{k}x{n}={:.1}", ms(*t))).collect();
+        tracing::info!(
+            target: "perf",
+            tab = self.id.0,
+            batch_ms = format!("{:.1}", ms(total)),
+            shell_events = p.shell_events,
+            net_events = p.net_events,
+            events_ms = events.join(","),
+            tick_ms = format!("{:.1}", ms(p.tick)),
+            flush_ms = format!("{:.1}", ms(p.flush)),
+            why = p.why.join("; "),
+            script_ms = format!("{:.1}", ms(p.script)),
+            scripts = p.scripts,
+            restyle_ms = format!("{:.1}", ms(p.restyle)),
+            full_restyles = p.full_restyles,
+            partial_restyles = p.partial_restyles,
+            styled = p.styled,
+            layout_ms = format!("{:.1}", ms(p.layout)),
+            layouts = p.layouts,
+            paint_ms = format!("{:.1}", ms(p.paint)),
+            paints = p.paints,
+            nodes = self.doc.as_ref().map_or(0, |d| d.node_count()),
+            heap_mib = format!("{:.1}", browser_platform::mib(browser_platform::heap_live())),
+            heap_peak_mib = format!("{:.1}", browser_platform::mib(browser_platform::heap_peak())),
+            "batch"
+        );
+    }
+
     pub fn new(id: TabId, net: Arc<NetService>, net_sink: Sink, viewport: Viewport, output: Arc<OutputSink>) -> Self {
         Self {
             id,
@@ -620,6 +731,7 @@ impl TabState {
             styles: StyleMap::new(),
             layout: None,
             layouts: 0,
+            perf: BatchPerf::default(),
             scene: Scene::new(),
             view: View::default(),
             window_size: (viewport.width, viewport.height),
@@ -753,7 +865,7 @@ impl TabState {
                 if vp != self.viewport {
                     self.viewport = vp;
                     // Media queries may change with the viewport.
-                    self.needs_style = true;
+                    self.want_style("viewport resized");
                 }
             }
             ShellToTab::Screen { window, screen } => {
@@ -1107,7 +1219,7 @@ impl TabState {
             e.set_attr("value", value);
         }
         // The value is not a selector subject yet; layout is enough.
-        self.needs_layout = true;
+        self.want_layout("text control value");
     }
 
     /// Where the caret goes: after the value's character at `caret` in
@@ -1262,7 +1374,7 @@ impl TabState {
             }
         }
         // `:checked` can restyle anything; the cascade runs again.
-        self.needs_style = true;
+        self.want_style("checked toggled");
         self.fire_control_changed(id);
     }
 
@@ -1300,7 +1412,7 @@ impl TabState {
                 }
             }
         }
-        self.needs_style = true;
+        self.want_style("select option changed");
         self.fire_control_changed(id);
     }
 
@@ -1911,7 +2023,7 @@ impl TabState {
         // fallback) or its swap period (the fallback stays for good): the
         // fonts are walked again after the next layout.
         if self.web_fonts.tick(now) {
-            self.needs_layout = true;
+            self.want_layout("web font period ended");
         }
         // `document.fonts`: its promises and events run as a task here,
         // never from inside rendering or a network handler.
@@ -2210,10 +2322,13 @@ impl TabState {
         );
         // A `:hover::before` may come or go.
         let pseudos = self.sync_pseudos();
+        self.perf.restyle += started.elapsed();
+        self.perf.partial_restyles += 1;
+        self.perf.styled += result.styled;
         if result.moved || pseudos {
             // A state may ask for another face (bold on hover): the layout
             // that follows asks for it.
-            self.needs_layout = true;
+            self.want_layout(if result.moved { "hover/focus/active restyle moved a box" } else { "hover/focus/active pseudo-element came or went" });
         } else if result.repaint {
             // Paint-only (colours, backgrounds, decorations): the boxes
             // stay where they are and take the new styles.
@@ -2271,8 +2386,17 @@ impl TabState {
             "restyle for DOM changes"
         );
         let pseudos = self.sync_pseudos();
+        self.perf.restyle += started.elapsed();
+        self.perf.partial_restyles += 1;
+        self.perf.styled += r.styled;
         if r.moved || delta.layout || pseudos {
-            self.needs_layout = true;
+            self.want_layout(if r.moved {
+                "script change restyle moved a box"
+            } else if delta.layout {
+                "script changed an attribute layout reads"
+            } else {
+                "script change made or removed a pseudo-element"
+            });
         } else if r.repaint {
             if let (Some(layout), Some(engine), Some(doc)) = (&mut self.layout, &mut self.engine, &self.doc) {
                 engine.refresh_styles(layout, doc, &self.styles);
@@ -2568,7 +2692,7 @@ impl TabState {
                         let slot = slot + self.queue_imports(slot, &sheet, depth);
                         self.sheets[slot].sheet = Some(sheet.clone());
                     }
-                    self.needs_style = true;
+                    self.want_style("stylesheet arrived");
                 }
             }
             PendingKind::Image { url } => {
@@ -2636,7 +2760,7 @@ impl TabState {
                     self.web_fonts.dirty = true;
                 }
                 if registered {
-                    self.needs_layout = true;
+                    self.want_layout("web font arrived");
                 } else {
                     tracing::debug!(tab = self.id.0, url = url.as_str(), "web font failed");
                     self.web_fonts.failed.insert(Source::Url(url));
@@ -2758,7 +2882,7 @@ impl TabState {
         }
         // Parsed: `interactive`, before any deferred script runs.
         self.update_readiness();
-        self.needs_style = true;
+        self.want_style("parsing finished");
         self.state_dirty = true;
     }
 
@@ -2828,7 +2952,10 @@ impl TabState {
         view.elements_scrolled = false;
         self.host_layout_fresh = false;
         host.lend_view(view);
+        let started = std::time::Instant::now();
         f(host);
+        self.perf.script += started.elapsed();
+        self.perf.scripts += 1;
         let doc = host.reclaim_document();
         match (&mut self.parser, &mut self.doc) {
             (Some(parser), _) => *parser.document_mut() = doc,
@@ -3232,8 +3359,8 @@ impl TabState {
         // A `<style>` or `<link>` the script added, changed or removed.
         self.sync_stylesheets();
         if !fresh && !self.restyle_changes(changes) {
-            self.needs_style = true;
-            self.needs_layout = true;
+            self.want_style("script change needing a full restyle");
+            self.want_layout("script change needing a full restyle");
         }
         // An `<img>` inserted, or given another `src`: fetch what is new
         // (URLs already fetched are skipped).
@@ -3400,7 +3527,7 @@ impl TabState {
             changed = true;
         }
         if changed {
-            self.needs_style = true;
+            self.want_style("document's stylesheets changed");
         }
     }
 
@@ -3483,7 +3610,7 @@ impl TabState {
     /// size boxes). Before the first layout there is nothing to redo.
     fn image_arrived(&mut self, url: &Url) {
         let Some(tree) = &self.layout else {
-            self.needs_layout = true;
+            self.want_layout("image arrived before the first layout");
             return;
         };
         let mut sized = false;
@@ -3513,7 +3640,7 @@ impl TabState {
                     || s.pseudo.as_deref().is_some_and(|p| [&p.marker, &p.before, &p.after].into_iter().flatten().any(|ps| in_content(ps)))
             });
         if sized {
-            self.needs_layout = true;
+            self.want_layout("image arrived that sizes a box");
         } else {
             self.needs_paint = true;
         }
@@ -3726,7 +3853,7 @@ impl TabState {
             let Some(data) = self.web_fonts.script_data.get(&id).cloned() else { continue };
             if self.engine.as_mut().is_some_and(|e| e.register_web_font(&data, face, order as u32)) {
                 self.web_fonts.loaded.insert(key);
-                self.needs_layout = true;
+                self.want_layout("script font face registered");
             }
         }
         if faces.is_empty() && self.web_fonts.forced_script.is_empty() {
@@ -3901,7 +4028,7 @@ impl TabState {
             let face = &faces[order as usize];
             if self.engine.as_mut().is_some_and(|e| e.register_local_font(&name, face, order)) {
                 self.web_fonts.loaded.insert(face_key(face));
-                self.needs_layout = true;
+                self.want_layout("local font face registered");
             } else {
                 self.web_fonts.failed.insert(Source::Local(name.to_lowercase()));
                 local_changed = true;
@@ -4057,6 +4184,9 @@ impl TabState {
             "restyle"
         );
         self.sync_pseudos();
+        self.perf.restyle += started.elapsed();
+        self.perf.full_restyles += 1;
+        self.perf.styled += self.styles.len();
         // Background images only become known after the cascade (the web
         // fonts after the layout, which knows the characters each font
         // sets); their arrival triggers layout again.
@@ -4077,6 +4207,8 @@ impl TabState {
             (self.scroll_x, self.scroll_y),
         );
         self.layouts += 1;
+        self.perf.layout += started.elapsed();
+        self.perf.layouts += 1;
         tracing::debug!(
             tab = self.id.0,
             layout_ms = started.elapsed().as_millis(),
@@ -4170,6 +4302,8 @@ impl TabState {
             draw_corner_colored(&mut self.scene, transform, c, colors);
         }
         let scene = std::mem::take(&mut self.scene);
+        self.perf.paint += started.elapsed();
+        self.perf.paints += 1;
         (self.output)(self.id, TabOutput::Frame(scene));
     }
 }
@@ -4528,6 +4662,7 @@ mod tests {
             // events; keep going until a round delivers none. Timers run
             // first so what they start is delivered in the same call.
             loop {
+                self.state.begin_batch(0, 0);
                 self.state.tick();
                 // Scroll animations reach their end at once unless a test
                 // watches them frame by frame.
@@ -4535,6 +4670,8 @@ mod tests {
                     self.state.finish_scroll_animations();
                 }
                 self.state.flush();
+                // The timing log, as the tab loop writes it.
+                self.state.end_batch();
                 let mut delivered = false;
                 while let Ok(ev) = self.net_events.try_recv() {
                     delivered = true;
@@ -8158,10 +8295,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         eprintln!(
-            "load: {:?} in {rounds} rounds, lifecycle {:?}, nodes {}",
+            "load: {:?} in {rounds} rounds, lifecycle {:?}, nodes {}, layouts {}, heap {:.1} MiB (peak {:.1} MiB)",
             started.elapsed(),
             h.state.lifecycle,
-            h.state.doc.as_ref().map_or(0, |d| d.node_count())
+            h.state.doc.as_ref().map_or(0, |d| d.node_count()),
+            h.state.layouts,
+            browser_platform::mib(browser_platform::heap_live()),
+            browser_platform::mib(browser_platform::heap_peak()),
         );
         for _ in 0..2 {
             let t = std::time::Instant::now();
@@ -8177,8 +8317,9 @@ mod tests {
         // What a user does on the page, each input timed on its own.
         let timed = |h: &mut Harness, what: &str, msg: ShellToTab| {
             let t = std::time::Instant::now();
+            let layouts = h.state.layouts;
             h.send(msg);
-            eprintln!("{what}: {:?}", t.elapsed());
+            eprintln!("{what}: {:?} ({} layouts)", t.elapsed(), h.state.layouts - layouts);
         };
         for i in 0..5 {
             let y = 100.0 + i as f32 * 60.0;
@@ -8204,6 +8345,22 @@ mod tests {
             ctrl: false,
             alt: false,
         };
+        // Down the page as a user reads it: a wheel step, the pointer
+        // moving, the page's timers (its scroll handlers' work) run.
+        let height = h.state.layout.as_ref().map_or(0.0, |t| t.content_height);
+        let mut y = 0.0;
+        let mut step = 0;
+        while y < height && step < 40 {
+            step += 1;
+            timed(&mut h, &format!("read down {step} (at {y:.0} of {height:.0})"), ShellToTab::Scroll { dx: 0.0, dy: 600.0 });
+            timed(&mut h, &format!("  pointer moves {step}"), ShellToTab::MouseMove { x: 300.0 + step as f32, y: 300.0 });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let t = std::time::Instant::now();
+            let layouts = h.state.layouts;
+            h.pump();
+            eprintln!("  timers {step}: {:?} ({} layouts)", t.elapsed(), h.state.layouts - layouts);
+            y = h.state.scroll_y;
+        }
         timed(&mut h, "tab key", tab());
         timed(&mut h, "tab key again", tab());
         timed(&mut h, "scroll far", ShellToTab::Scroll { dx: 0.0, dy: 400_000.0 });
@@ -8214,6 +8371,11 @@ mod tests {
         timed(&mut h, "click (down)", ShellToTab::MouseDown { x: 300.0, y: 300.0, button: MouseButton::Left });
         timed(&mut h, "click (up)", ShellToTab::MouseUp { x: 300.0, y: 300.0, button: MouseButton::Left });
         eprintln!("navigations started by the click: {}", h.state.history.len() - before + usize::from(h.state.nav.is_some()));
+        eprintln!(
+            "heap at the end: {:.1} MiB (peak {:.1} MiB)",
+            browser_platform::mib(browser_platform::heap_live()),
+            browser_platform::mib(browser_platform::heap_peak())
+        );
     }
 }
 

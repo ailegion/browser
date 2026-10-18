@@ -20,6 +20,8 @@ browser-tab.workspace = true
 browser-net.workspace = true
 browser-paint.workspace = true
 browser-store.workspace = true
+# The counting allocator behind the timing log's heap figures.
+browser-platform.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 vello.workspace = true

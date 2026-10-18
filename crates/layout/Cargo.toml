@@ -26,3 +26,7 @@ html5ever.workspace = true
 # Web fonts arrive as WOFF/WOFF2 most of the time.
 wuff.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Heap figures in the timing tests.
+browser-platform.workspace = true

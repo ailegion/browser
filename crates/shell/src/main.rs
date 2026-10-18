@@ -154,6 +154,10 @@ struct App {
     modifiers: Modifiers,
     /// Set when startup fails so the process can exit non-zero from `main`.
     failure: Option<anyhow::Error>,
+    /// The timing log: when the first input since the current tab's last
+    /// frame was sent, and when that tab's last frame arrived.
+    input_sent: std::cell::Cell<Option<Instant>>,
+    frame_arrived: Option<Instant>,
 }
 
 impl App {
@@ -176,6 +180,8 @@ impl App {
             press_on_page: false,
             modifiers: Modifiers::default(),
             failure: None,
+            input_sent: std::cell::Cell::new(None),
+            frame_arrived: None,
         }
     }
 
@@ -519,6 +525,20 @@ impl App {
     }
 
     fn send_to_current(&self, msg: ShellToTab) {
+        // The timing log: the first input since the last frame, to measure
+        // how long the page takes to answer it.
+        if matches!(
+            msg,
+            ShellToTab::Scroll { .. }
+                | ShellToTab::MouseDown { .. }
+                | ShellToTab::MouseUp { .. }
+                | ShellToTab::Key { .. }
+                | ShellToTab::ImeCommit { .. }
+                | ShellToTab::Paste { .. }
+        ) && self.input_sent.get().is_none()
+        {
+            self.input_sent.set(Some(Instant::now()));
+        }
         if let Some(tab) = self.current_handle() {
             tab.send(msg);
         }
@@ -540,6 +560,8 @@ impl App {
     }
 
     fn render(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let waited = self.frame_arrived.take().map(|t| started - t);
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
@@ -611,6 +633,18 @@ impl App {
         handle.queue.submit([encoder.finish()]);
         frame.present();
         active.frames_rendered += 1;
+        // The timing log: the frame's encoding, raster and present (the
+        // GPU work is submitted, not waited on), and how long the page's
+        // frame waited for it.
+        let ms = |d: std::time::Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
+        tracing::info!(
+            target: "perf",
+            render_ms = ms(started.elapsed()),
+            waited_ms = waited.map(ms).unwrap_or_default(),
+            frames = active.frames_rendered,
+            heap_mib = format!("{:.1}", browser_platform::mib(browser_platform::heap_live())),
+            "frame"
+        );
         Ok(())
     }
 
@@ -711,6 +745,17 @@ impl ApplicationHandler<UserEvent> for App {
                     tab.loading
                 };
                 if is_current {
+                    // The timing log: how long the page took to answer the
+                    // first input since its last frame.
+                    let now = Instant::now();
+                    if let Some(sent) = self.input_sent.take() {
+                        tracing::info!(
+                            target: "perf",
+                            input_to_frame_ms = format!("{:.1}", (now - sent).as_secs_f64() * 1000.0),
+                            "page answered input"
+                        );
+                    }
+                    self.frame_arrived = Some(now);
                     if let Some(active) = &self.active {
                         active.window.request_redraw();
                     }
@@ -1229,6 +1274,10 @@ fn key_code_name(key: &PhysicalKey) -> String {
         PhysicalKey::Unidentified(_) => String::new(),
     }
 }
+
+/// Counts the heap for the timing log (`target: perf` lines).
+#[global_allocator]
+static ALLOC: browser_platform::CountingAlloc = browser_platform::CountingAlloc;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()

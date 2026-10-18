@@ -199,6 +199,27 @@ fn crash_page_url(message: &str, url: Option<&Url>) -> Url {
     Url::parse(&format!("data:text/html,{encoded}")).expect("data url")
 }
 
+/// A shell message's kind, for the timing log.
+fn shell_kind(msg: &ShellToTab) -> &'static str {
+    match msg {
+        ShellToTab::Navigate { .. } => "navigate",
+        ShellToTab::Reload => "reload",
+        ShellToTab::Stop => "stop",
+        ShellToTab::GoBack | ShellToTab::GoForward => "history",
+        ShellToTab::Resize(_) => "resize",
+        ShellToTab::Screen { .. } => "screen",
+        ShellToTab::Scroll { .. } => "scroll",
+        ShellToTab::MouseMove { .. } => "mousemove",
+        ShellToTab::MouseDown { .. } => "mousedown",
+        ShellToTab::MouseUp { .. } => "mouseup",
+        ShellToTab::MouseLeave => "mouseleave",
+        ShellToTab::Key { .. } => "key",
+        ShellToTab::KeyUp { .. } => "keyup",
+        ShellToTab::Modifiers { .. } => "modifiers",
+        _ => "other",
+    }
+}
+
 /// The event loop proper. Returns when the tab is closed.
 fn run(state: &mut TabState, inbox: &Receiver<TabEvent>) {
     loop {
@@ -227,17 +248,38 @@ fn run(state: &mut TabState, inbox: &Receiver<TabEvent>) {
                 break;
             }
         }
+        let shell = events.iter().filter(|e| matches!(e, TabEvent::Shell(_))).count();
+        state.begin_batch(shell, events.len() - shell);
         for ev in events {
-            match ev {
+            let started = std::time::Instant::now();
+            let kind = match ev {
                 TabEvent::Shell(ShellToTab::Close) => return,
-                TabEvent::Shell(msg) => state.handle_shell(msg),
-                TabEvent::Net(msg) => state.handle_net(msg),
-            }
+                TabEvent::Shell(msg) => {
+                    let kind = shell_kind(&msg);
+                    state.handle_shell(msg);
+                    kind
+                }
+                TabEvent::Net(msg) => {
+                    state.handle_net(msg);
+                    "net"
+                }
+            };
+            state.note_event(kind, started.elapsed());
         }
+        let started = std::time::Instant::now();
         state.tick();
+        let tick = started.elapsed();
+        let started = std::time::Instant::now();
         state.flush();
+        state.note_tick_and_flush(tick, started.elapsed());
+        state.end_batch();
     }
 }
+
+/// The test binary counts its heap, for the timing probe's memory figures.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: browser_platform::CountingAlloc = browser_platform::CountingAlloc;
 
 #[cfg(test)]
 mod tests {

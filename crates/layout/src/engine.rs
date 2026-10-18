@@ -514,6 +514,9 @@ impl LayoutEngine {
     ) -> LayoutTree {
         self.plans.clear();
         self.viewport = (viewport_width, viewport_height);
+        // The timing log: each phase of this layout (`target: perf`).
+        let t_start = std::time::Instant::now();
+        COUNTERS.with(|c| c.set(Counters::default()));
         let vo = viewport_overflow(doc, styles);
         let builder = BoxBuilder::new(doc, styles, images, vo.source);
         let root_style = Arc::new(ComputedStyle::initial());
@@ -579,6 +582,7 @@ impl LayoutEngine {
 
         // The absolutely positioned and fixed boxes, out of their flows.
         self.oofs = builder.oofs.take();
+        let t_boxes = t_start.elapsed();
         self.prepare_markers(&mut html);
 
         let mut tree: TaffyTree<Leaf> = TaffyTree::new();
@@ -587,6 +591,9 @@ impl LayoutEngine {
         let mut entries: Vec<Entry> = Vec::new();
         let html_id = self.build_taffy(&mut tree, &mut html, &mut leaves, &mut leaf_ids, &mut entries);
         drop(leaves);
+        let t_taffy_tree = t_start.elapsed() - t_boxes;
+        let zero = std::time::Duration::ZERO;
+        let (mut t_run, mut t_fragments, mut t_oof) = (zero, zero, zero);
 
         let viewport_id = tree
             .new_with_children(viewport_style(viewport_width, viewport_height, &viewport_plan), &[html_id])
@@ -601,18 +608,24 @@ impl LayoutEngine {
         let mut html_fragment;
         let mut pass = 0;
         loop {
+            let t = std::time::Instant::now();
             let mut leaves: Vec<LeafRef<'_>> = Vec::new();
             collect_leaves(&mut html, &mut leaves);
             self.run_with_floats(&mut tree, viewport_id, available, &mut leaves, &leaf_ids, &entries);
             drop(leaves);
+            t_run += t.elapsed();
+            let t = std::time::Instant::now();
             html_fragment = self.fragments(&html, &tree, 0.0, 0.0);
+            t_fragments += t.elapsed();
             // The absolutely positioned boxes left: against their
             // containing blocks in here, else the initial containing
             // block; the fixed ones against the viewport (CSS 2.1 §10.1),
             // both the viewport less the page's scrollbar gutters.
+            let t = std::time::Instant::now();
             let (gl, gr, gb) = plan_gutters(&viewport_plan);
             let icb = Rect::new(gl, 0.0, (viewport_width - gl - gr).max(0.0), (viewport_height - gb).max(0.0));
             self.place_out_of_flow(&mut html_fragment, Some(icb), None);
+            t_oof += t.elapsed();
             pass += 1;
             if pass >= MAX_SCROLLBAR_PASSES {
                 break;
@@ -666,10 +679,36 @@ impl LayoutEngine {
             out.move_scroller(node, offset);
         }
         out.viewport.offset = out.viewport.clamp(page_scroll);
+        let t = std::time::Instant::now();
         out.apply_sticky();
         if !out.has_sticky {
             out.rebuild_paint_order();
         }
+        let t_order = t.elapsed();
+        let ms = |d: std::time::Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
+        let c = COUNTERS.with(std::cell::Cell::get);
+        tracing::info!(
+            target: "perf",
+            total_ms = ms(t_start.elapsed()),
+            taffy_runs = c.taffy_runs,
+            inline_measures = c.inline_measures,
+            inline_measure_ms = ms(c.inline_measure),
+            table_measures = c.table_measures,
+            table_measure_ms = ms(c.table_measure),
+            text_built = c.text_built,
+            text_build_ms = ms(c.text_build),
+            text_kib = c.text_bytes / 1024,
+            text_reused = c.text_reused,
+            boxes_ms = ms(t_boxes),
+            taffy_tree_ms = ms(t_taffy_tree),
+            passes = pass,
+            taffy_run_ms = ms(t_run),
+            fragments_ms = ms(t_fragments),
+            out_of_flow_ms = ms(t_oof),
+            sticky_and_paint_order_ms = ms(t_order),
+            oofs = self.oofs.len(),
+            "layout phases"
+        );
         out
     }
 
@@ -1208,21 +1247,40 @@ impl LayoutEngine {
     /// (`formatting::measure`), which lays out whatever it holds for it.
     fn run_taffy(&mut self, tree: &mut TaffyTree<Leaf>, root: TaffyId, available: Size<AvailableSpace>, leaves: &mut [LeafRef<'_>]) {
         let engine = &mut *self;
+        counters(|c| c.taffy_runs += 1);
         let result = tree.compute_layout_with_measure(root, available, |inputs, _id, ctx, style| {
             let cb_width = inputs.parent_size.width;
             let width_only = inputs.run_mode == taffy::RunMode::ComputeSize && inputs.axis == taffy::RequestedAxis::Horizontal;
             let mut image;
+            let mut kind = 0;
             let leaf: &mut dyn SelfLayout = match ctx {
-                Some(Leaf::Measured(idx)) => leaves[*idx].as_dyn(),
+                Some(Leaf::Measured(idx)) => {
+                    kind = if matches!(leaves[*idx], LeafRef::Table(_)) { 2 } else { 1 };
+                    leaves[*idx].as_dyn()
+                }
                 Some(Leaf::Image { intrinsic }) => {
                     image = ImageLeaf(*intrinsic);
                     &mut image
                 }
                 None => return taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |_, _| Size::ZERO),
             };
-            taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
+            let started = std::time::Instant::now();
+            let out = taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
                 crate::formatting::measure(leaf, engine, known, avail, cb_width, width_only)
-            })
+            });
+            let spent = started.elapsed();
+            counters(|c| match kind {
+                1 => {
+                    c.inline_measures += 1;
+                    c.inline_measure += spent;
+                }
+                2 => {
+                    c.table_measures += 1;
+                    c.table_measure += spent;
+                }
+                _ => {}
+            });
+            out
         });
         if let Err(e) = result {
             tracing::warn!("taffy layout failed: {e:?}");
@@ -1663,8 +1721,12 @@ impl LayoutEngine {
             atomic.layout(self, sizing, None, None);
         }
         if let Some(pos) = content.cache.iter().position(|l| l.key == key) {
+            counters(|c| c.text_reused += 1);
             return &content.cache[pos];
         }
+        let started = std::time::Instant::now();
+        let text_len = content.text.len();
+        let _count = CountOnDrop(started, text_len);
         let max_width = key.max_advance();
         // The inline boxes' edges for this width: percentages against the
         // containing block's width, zero while an intrinsic size is
@@ -1692,6 +1754,50 @@ impl LayoutEngine {
             edges,
         });
         content.cache.last().expect("just pushed")
+    }
+}
+
+/// What one layout did, for the timing log's `layout phases` line: taffy
+/// passes, measure questions and their time by leaf (times of nested
+/// layouts count in their outer leaf too), parley line layouts built
+/// (their time and text) and reused.
+#[derive(Debug, Default, Clone, Copy)]
+struct Counters {
+    taffy_runs: u32,
+    inline_measures: u32,
+    inline_measure: std::time::Duration,
+    table_measures: u32,
+    table_measure: std::time::Duration,
+    text_built: u32,
+    text_build: std::time::Duration,
+    text_bytes: usize,
+    text_reused: u32,
+}
+
+thread_local! {
+    static COUNTERS: std::cell::Cell<Counters> = std::cell::Cell::new(Counters::default());
+}
+
+fn counters(f: impl FnOnce(&mut Counters)) {
+    COUNTERS.with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+    });
+}
+
+/// Counts one parley line layout built (from its start, with its text's
+/// length) when it goes out of scope.
+struct CountOnDrop(std::time::Instant, usize);
+
+impl Drop for CountOnDrop {
+    fn drop(&mut self) {
+        let (spent, bytes) = (self.0.elapsed(), self.1);
+        counters(|c| {
+            c.text_built += 1;
+            c.text_build += spent;
+            c.text_bytes += bytes;
+        });
     }
 }
 
@@ -5138,10 +5244,17 @@ mod tests {
             let mut engine = LayoutEngine::new();
             let _ = engine.layout(&doc, &styles, 800.0, 600.0, &());
             let start = std::time::Instant::now();
+            browser_platform::reset_heap_peak();
+            let before = browser_platform::heap_live();
             for _ in 0..5 {
                 let _ = engine.layout(&doc, &styles, 800.0, 600.0, &());
             }
-            eprintln!("{name}: {:.1} ms per layout", start.elapsed().as_secs_f64() * 1000.0 / 5.0);
+            eprintln!(
+                "{name}: {:.1} ms per layout, heap peak {:.1} MiB above the {:.1} MiB before",
+                start.elapsed().as_secs_f64() * 1000.0 / 5.0,
+                browser_platform::mib(browser_platform::heap_peak().saturating_sub(before)),
+                browser_platform::mib(before)
+            );
         }
     }
 
