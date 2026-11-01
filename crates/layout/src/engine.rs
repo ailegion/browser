@@ -939,10 +939,8 @@ impl LayoutEngine {
         // The stacking contexts of the last layout's paint order, to put
         // back those that did not change (block B4).
         out.paint.contexts = self.contexts.clone();
-        out.apply_sticky();
-        if !out.has_sticky {
-            out.rebuild_paint_order();
-        }
+        out.place_sticky_boxes();
+        out.rebuild_paint_order_recording();
         self.contexts = out.paint.contexts.clone();
         let t_order = t.elapsed();
         let ms = |d: std::time::Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);

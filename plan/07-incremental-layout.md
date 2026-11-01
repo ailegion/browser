@@ -401,6 +401,19 @@ Timing (release probe, live):
   after load 43.9 MiB (38.3), at the end 57.3 MiB (39.8): the kept
   contexts' records and the inline roots' kept fragments.
 
+Fixed 2026-11-01 (owner: scrolling on Wikipedia stuttered with B4): every
+paint order rebuild recorded its contexts, the root's (the whole page)
+among them, and a page with sticky boxes rebuilds it on every scroll
+step. Now only a new layout's order records
+(`LayoutTree::rebuild_paint_order_recording`); a scroll, a sticky shift
+or a style refresh only puts back unchanged contexts from the last
+layout's records (`rebuild_paint_order`); the root's context is neither
+recorded nor put back; the check that puts a context back reads the
+fragments without copying (`Builder::reads_as`). Scroll steps (release
+probe, live): Wikipedia Main Page 0.9–3.4 ms; the Rust article's scroll
+box 22–30 ms (35–56 ms with B4 before the fix, 41–59 ms building every
+order from nothing).
+
 Found, not part of B2: the paint crate's unit tests crash at times with
 `STATUS_ACCESS_VIOLATION` when run in parallel (2 of 3 runs once); with
 `--test-threads=1` they pass every time. Safe code cannot fault so; it is

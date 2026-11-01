@@ -1072,11 +1072,22 @@ impl LayoutTree {
         }
     }
 
-    /// Build the paint order again from the fragments as they stand, the
-    /// stacking contexts that did not change put back (block B4).
+    /// Build the paint order again from the fragments as they stand (a
+    /// scroll, a sticky shift, a style refresh), the stacking contexts
+    /// that did not change put back from the records of the last layout's
+    /// order (block B4); none is recorded again, so a scroll frame costs
+    /// no more than building the order did before.
     pub(crate) fn rebuild_paint_order(&mut self) {
         let previous = self.paint.contexts.clone();
-        self.paint = stacking::build_reusing(self, Some(&previous));
+        self.paint = stacking::build_reusing(self, Some(&previous), false);
+        self.paint.contexts = previous;
+    }
+
+    /// The paint order of a new layout: contexts put back as above, and
+    /// every context built recorded for the next ones.
+    pub(crate) fn rebuild_paint_order_recording(&mut self) {
+        let previous = self.paint.contexts.clone();
+        self.paint = stacking::build_reusing(self, Some(&previous), true);
     }
 
     /// Place every `position: sticky` box (CSS Positioned 3 §3.4): each

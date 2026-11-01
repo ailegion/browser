@@ -400,13 +400,15 @@ impl PaintOrder {    /// The order resolved against the tree it was built from: 
 
 /// The paint order of `tree`, built from nothing.
 pub fn build(tree: &LayoutTree) -> PaintOrder {
-    build_reusing(tree, None)
+    build_reusing(tree, None, false)
 }
 
 /// The paint order of `tree`, putting back the stacking contexts of
 /// `previous` (an order built before, its records) whose fragments and
-/// entry are unchanged (block B4).
-pub(crate) fn build_reusing(tree: &LayoutTree, previous: Option<&HashMap<NodeId, Arc<ContextRecord>>>) -> PaintOrder {
+/// entry are unchanged (block B4); with `record`, every context built
+/// (but the root's, the whole page, which only an unchanged page could
+/// put back) is recorded for the next build.
+pub(crate) fn build_reusing(tree: &LayoutTree, previous: Option<&HashMap<NodeId, Arc<ContextRecord>>>, record: bool) -> PaintOrder {
     // Each fragment's subtree size in pre-order, so a child's index is
     // its parent's plus one plus the sizes of the siblings before it.
     let mut sizes: Vec<u32> = Vec::new();
@@ -428,6 +430,7 @@ pub(crate) fn build_reusing(tree: &LayoutTree, previous: Option<&HashMap<NodeId,
         seq: 0,
         cb_clips: HashMap::new(),
         previous,
+        record,
         records: HashMap::new(),
         recordings: Vec::new(),
         space_log: Vec::new(),
@@ -570,6 +573,8 @@ struct Builder<'a> {
     /// build, the contexts being recorded (innermost last), and every
     /// space noted and containing block clip set, in order, for them.
     previous: Option<&'a HashMap<NodeId, Arc<ContextRecord>>>,
+    /// Whether the contexts built are recorded (a new layout's order).
+    record: bool,
     records: HashMap<NodeId, Arc<ContextRecord>>,
     recordings: Vec<Recording>,
     space_log: Vec<(NodeId, Space)>,
@@ -779,14 +784,19 @@ impl<'a> Builder<'a> {
             matrix3d: walk.matrix3d,
             flex_item,
         };
+        // The root's context (pre-order index 1, the root element: the
+        // whole page) is neither put back nor recorded.
         let boxed = match &sub {
-            Sub::Box(fr) => fr.f.node.map(|n| (n, *fr)),
-            Sub::Inline(_) => None,
+            Sub::Box(fr) if fr.id != 1 => fr.f.node.map(|n| (n, *fr)),
+            _ => None,
         };
         if let Some((n, fr)) = boxed {
             if self.put_back(n, fr, entry, walk.space.clip) {
                 return;
             }
+        }
+        let boxed = boxed.filter(|_| self.record);
+        if let Some((n, fr)) = boxed {
             self.recordings.push(Recording {
                 node: n,
                 entry,
@@ -862,12 +872,36 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Whether `f` reads as `k` (`key(f) == k`, without making the key:
+    /// nothing copied, the cheapest field first).
+    fn reads_as(&self, f: &Fragment, k: &FragKey) -> bool {
+        let content = match &f.content {
+            FragmentContent::Box => ContentKey::Box,
+            FragmentContent::Control(_) => ContentKey::Control,
+            FragmentContent::Anonymous => ContentKey::Anonymous,
+            FragmentContent::Text(_) => ContentKey::Text,
+            FragmentContent::Image(_) => ContentKey::Image,
+            FragmentContent::Marker => ContentKey::Marker,
+            FragmentContent::Inline { left, right, .. } => ContentKey::Inline { left: *left, right: *right },
+            FragmentContent::Placeholder(_) => ContentKey::Placeholder,
+        };
+        f.node == k.node
+            && [f.rect.x.to_bits(), f.rect.y.to_bits(), f.rect.width.to_bits(), f.rect.height.to_bits()] == k.rect
+            && Arc::ptr_eq(&f.style, &k.style)
+            && content == k.content
+            && f.children.len() == k.children
+            && f.transform.as_deref() == k.transform.as_ref()
+            && f.fixed == k.fixed
+            && f.containing == k.containing
+            && self.scroller(f) == k.scroller.as_ref()
+    }
+
     /// Whether the subtree at `fr` reads as `keys` (pre-order), stopping
     /// at the first fragment that differs.
     fn keys_match(&self, fr: Fr<'a>, keys: &[FragKey]) -> bool {
         fn walk(b: &Builder<'_>, f: &Fragment, keys: &[FragKey], at: &mut usize) -> bool {
             let Some(k) = keys.get(*at) else { return false };
-            if b.key(f) != *k {
+            if !b.reads_as(f, k) {
                 return false;
             }
             *at += 1;
