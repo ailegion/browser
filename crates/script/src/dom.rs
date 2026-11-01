@@ -122,6 +122,10 @@ pub enum DomChange {
     Children { parent: NodeId, inserted: Vec<NodeId>, generation: u64 },
     /// Any other change to the tree.
     Tree { generation: u64 },
+    /// `parent`'s children changed and a `<style>`, `<link>` or `<base>`
+    /// came or went with them: the sheets change (the whole document is
+    /// restyled), and the boxes there are built again.
+    Sheets { parent: NodeId, generation: u64 },
 }
 
 /// The parsed form of `text` from the cache, parsing it once. `None` if
@@ -185,6 +189,20 @@ impl Dom {
         self.changes.push(DomChange::Children {
             parent,
             inserted,
+            generation: self.generation,
+        });
+    }
+
+    /// A script changed the children of the connected `parent`, taking a
+    /// `<style>`, `<link>` or `<base>` with them (or bringing one).
+    pub(crate) fn note_sheet_children(&mut self, parent: NodeId) {
+        self.mutated = true;
+        if self.changes.len() >= CHANGE_LOG_LIMIT {
+            self.note_tree();
+            return;
+        }
+        self.changes.push(DomChange::Sheets {
+            parent,
             generation: self.generation,
         });
     }
@@ -1315,6 +1333,8 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
         match (attr_change, children_change) {
             (Some((name, old)), _) => dom.note_attr(id, name, old),
             (None, Some((parent, inserted))) => dom.note_children(parent, inserted),
+            // A sheet among the children replaced.
+            (None, None) if is_element && matches!(prop, SetProp::TextContent | SetProp::InnerHtml) => dom.note_sheet_children(id),
             (None, None) => dom.note_tree(),
         }
     }
@@ -1853,6 +1873,14 @@ fn mutate(
                 for (parent, inserted) in tree_changes {
                     if dom.doc.is_connected(parent) {
                         dom.note_children(parent, inserted);
+                    }
+                }
+            }
+            // A removal that took a sheet with it: the parents it changed.
+            None if !tree_changes.is_empty() => {
+                for (parent, _) in tree_changes {
+                    if dom.doc.is_connected(parent) {
+                        dom.note_sheet_children(parent);
                     }
                 }
             }

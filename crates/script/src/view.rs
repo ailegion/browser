@@ -56,6 +56,30 @@ pub struct FeatureDelta {
     pub layout: bool,
 }
 
+/// The boxes the changes after generation `since` (all of them when
+/// `None`) reach, for incremental layout after a full restyle: the
+/// elements whose attributes changed and the parents whose children
+/// changed. `None` when a change to the tree is not described (every box
+/// is built again then).
+pub fn dom_box_changes(changes: &[DomChange], since: Option<u64>) -> Option<(Vec<NodeId>, Vec<NodeId>)> {
+    let mut elements = Vec::new();
+    let mut parents = Vec::new();
+    for change in changes {
+        match change {
+            DomChange::Tree { generation } if since.is_none_or(|s| *generation > s) => return None,
+            DomChange::Tree { .. } => {}
+            DomChange::Attr { element, generation, .. } if since.is_none_or(|s| *generation > s) => elements.push(*element),
+            DomChange::Children { parent, generation, .. } | DomChange::Sheets { parent, generation }
+                if since.is_none_or(|s| *generation > s) =>
+            {
+                parents.push(*parent);
+            }
+            _ => {}
+        }
+    }
+    Some((elements, parents))
+}
+
 /// The changes after generation `since` (all of them when `None`) as a
 /// feature delta; `None` when one cannot be targeted and the whole
 /// document must be restyled: a tree change, or an attribute of a
@@ -74,8 +98,10 @@ pub fn feature_changes(doc: &Document, changes: &[DomChange], since: Option<u64>
     };
     for change in changes {
         let (element, name, old) = match change {
-            DomChange::Tree { generation } if since.is_none_or(|s| *generation > s) => return None,
-            DomChange::Tree { .. } => continue,
+            DomChange::Tree { generation } | DomChange::Sheets { generation, .. } if since.is_none_or(|s| *generation > s) => {
+                return None;
+            }
+            DomChange::Tree { .. } | DomChange::Sheets { .. } => continue,
             DomChange::Children { generation, .. } | DomChange::Attr { generation, .. }
                 if since.is_some_and(|s| *generation <= s) =>
             {
@@ -269,11 +295,25 @@ impl View {
                 return;
             }
         } else {
+            // A full restyle. With the layout current up to `clean` and
+            // every change since described, only the boxes those changes
+            // and the changed styles reach are built again.
+            let described = match (self.clean_generation, &self.layout) {
+                (Some(clean), Some(_)) => dom_box_changes(changes, Some(clean)),
+                _ => None,
+            };
+            let old = std::mem::take(&mut self.styles);
             self.styles = compute_styles_with(doc, &stylist, &vp, states);
             self.deps = stylist.interaction_deps();
             sync_pseudo_elements(doc, &self.styles);
             if let Some(engine) = &mut self.engine {
-                engine.note_unknown_box_change();
+                match described {
+                    Some((mut elements, parents)) if engine.box_changes_known() => {
+                        elements.extend(browser_style::changed_styles(&old, &self.styles));
+                        engine.note_box_changes(&elements, &parents);
+                    }
+                    _ => engine.note_unknown_box_change(),
+                }
             }
         }
         let Some(engine) = &mut self.engine else { return };

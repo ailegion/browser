@@ -380,7 +380,59 @@ pub struct ComputedStyle {
     pub empty_cells: EmptyCells,
     /// Custom properties in effect, inherited; shared with the parent when
     /// this element declares none.
-    pub custom: Arc<CustomMap>,
+    pub custom: CustomProps,
+}
+
+/// An element's custom properties, shared between elements (`Arc`). Two
+/// are equal when they are the same map or hold the same values; while
+/// `changed_styles` compares two style maps, each pair of maps is compared
+/// once (`with_custom_memo`): the maps are shared down the tree, so most
+/// elements' comparisons are a pair seen before.
+#[derive(Debug, Clone)]
+pub struct CustomProps(pub Arc<CustomMap>);
+
+impl std::ops::Deref for CustomProps {
+    type Target = CustomMap;
+    fn deref(&self) -> &CustomMap {
+        &self.0
+    }
+}
+
+impl PartialEq for CustomProps {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        CUSTOM_MEMO.with(|memo| match memo.borrow_mut().as_mut() {
+            Some(memo) => *memo
+                .entry((Arc::as_ptr(&self.0) as usize, Arc::as_ptr(&other.0) as usize))
+                .or_insert_with(|| *self.0 == *other.0),
+            None => *self.0 == *other.0,
+        })
+    }
+}
+
+thread_local! {
+    /// The comparisons of custom property maps made so far, by the maps'
+    /// addresses; only while `with_custom_memo` runs, during which every
+    /// map compared is held by the styles being compared (so no address is
+    /// reused for another map).
+    static CUSTOM_MEMO: std::cell::RefCell<Option<std::collections::HashMap<(usize, usize), bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the custom property comparisons remembered (see
+/// `CustomProps`); every map compared inside must outlive the call.
+pub(crate) fn with_custom_memo<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CUSTOM_MEMO.with(|m| *m.borrow_mut() = None);
+        }
+    }
+    CUSTOM_MEMO.with(|m| *m.borrow_mut() = Some(std::collections::HashMap::new()));
+    let _reset = Reset;
+    f()
 }
 
 /// An element's pseudo-element styles: `::marker` for a list item (with
@@ -658,7 +710,7 @@ impl ComputedStyle {
             border_spacing: (0.0, 0.0),
             border_collapse: BorderCollapse::Separate,
             empty_cells: EmptyCells::Show,
-            custom: Arc::new(CustomMap::new()),
+            custom: CustomProps(Arc::new(CustomMap::new())),
         }
     }
 
@@ -966,7 +1018,7 @@ pub fn compute(
 ) -> ComputedStyle {
     let initial = ComputedStyle::initial();
     let mut out = ComputedStyle::initial();
-    out.custom = decls.custom.clone();
+    out.custom = CustomProps(decls.custom.clone());
 
     // Font size first: em units on everything else depend on it.
     out.font_size = match resolve(decls, PropertyId::FontSize) {

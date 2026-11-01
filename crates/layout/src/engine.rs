@@ -229,6 +229,12 @@ impl LayoutEngine {
         }
     }
 
+    /// Incremental layout: whether the changes since the last layout are
+    /// all described so far (the next layout can be incremental).
+    pub fn box_changes_known(&self) -> bool {
+        matches!(self.changes, crate::incremental::BoxChanges::Known { .. }) && self.kept.is_some()
+    }
+
     /// Incremental layout: something changed that is not described (a
     /// new document, a full restyle, an image's size): the next layout
     /// builds every box.
@@ -2254,6 +2260,12 @@ struct Counters {
     float_restarts: u32,
     /// Positioned boxes' layouts taken from their kept results.
     positioned_reused: u32,
+}
+
+/// Whether the last layout on this thread built every box (tests of the
+/// tab's incremental layout).
+pub fn last_layout_was_full() -> bool {
+    COUNTERS.with(|c| c.get().full)
 }
 
 /// The timing log's counters, for the other layout modules.
@@ -7882,6 +7894,60 @@ mod incremental_layout {
             set_attr(doc, p, "class", "tall");
             (vec![p], vec![])
         });
+    }
+
+    /// Part 2: a change in a table rebuilds the row, row group or cell it
+    /// is in when that part keeps its kind, not the table.
+    #[test]
+    fn table_parts_rebuild_by_themselves() {
+        let page = "<body><div><table id=t><thead id=h><tr><th>head</th><th>er</th></tr></thead>\
+            <tbody id=b><tr id=r1><td id=c1>one</td><td>two</td></tr><tr id=r2><td>three</td><td id=c4>four</td></tr></tbody>\
+            </table><p>after</p></div></body>";
+        let css = ".tall { height: 60px } .wide { padding-left: 40px } .red { color: rgb(255, 0, 0) } .blk { display: block }\
+            .head { display: table-header-group }";
+        let attr_change = |id: &'static str, class: &'static str| {
+            move |doc: &mut Document| {
+                let n = by_id(doc, id);
+                set_attr(doc, n, "class", class);
+                (vec![n], vec![])
+            }
+        };
+        // A row's own style, a cell's: the table box and the other cells
+        // stay; taffy nodes are made only in the rebuilt cells' own trees
+        // (a cell's box and its text, two each: none for a row's height,
+        // the restyled cell, the two cells a row's inherited colour
+        // reaches), and the result is a full layout's.
+        for (id, class, nodes) in [("r1", "tall", 0), ("c4", "wide", 2), ("r2", "red", 4)] {
+            let c = check_counted(page, css, attr_change(id, class));
+            assert!(!c.full, "#{id}");
+            assert_eq!(c.taffy_nodes_built, nodes, "#{id}: only the rebuilt cells' nodes");
+        }
+        // Kinds changed: the part above rebuilds (still incremental).
+        for (id, class) in [("r2", "blk"), ("c1", "blk"), ("b", "head")] {
+            assert!(!check_counted(page, css, attr_change(id, class)).full, "#{id} {class}");
+        }
+        // A cell into a row, a row into a body.
+        let c = check_counted(page, css, |doc| {
+            let r1 = by_id(doc, "r1");
+            let td = doc.create_html_element("td");
+            let t = doc.create_text("new cell");
+            doc.append_child(td, t);
+            doc.append_child(r1, td);
+            (vec![], vec![r1])
+        });
+        assert!(!c.full);
+        let c = check_counted(page, css, |doc| {
+            let b = by_id(doc, "b");
+            let tr = doc.create_html_element("tr");
+            let td = doc.create_html_element("td");
+            let t = doc.create_text("new row");
+            doc.append_child(td, t);
+            doc.append_child(tr, td);
+            let r2 = by_id(doc, "r2");
+            doc.insert_before(r2, tr);
+            (vec![], vec![b])
+        });
+        assert!(!c.full);
     }
 
     #[test]

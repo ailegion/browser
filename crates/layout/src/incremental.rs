@@ -20,6 +20,8 @@ use std::collections::{HashMap, HashSet};
 
 use browser_dom::{Document, NodeId};
 
+use browser_style::Display;
+
 use crate::boxes::{BoxBuilder, BoxKind, BoxNode, OutOfFlowBox, ScrollPlan, TaffyId};
 use crate::generated::Generated;
 
@@ -51,6 +53,23 @@ enum Place {
     Element,
     Cell,
     Caption,
+    /// A table row, and a row group of its kind (header, body, footer).
+    Row,
+    RowGroup(Display),
+}
+
+impl Place {
+    /// The `display` of a table part's box (a changed element still of that
+    /// kind is rebuilt by itself: its siblings' anonymous boxes cannot
+    /// change, as they can when its kind does).
+    fn table_display(self) -> Option<Display> {
+        match self {
+            Place::Cell => Some(Display::TableCell),
+            Place::Row => Some(Display::TableRow),
+            Place::RowGroup(d) => Some(d),
+            Place::Element | Place::Caption => None,
+        }
+    }
 }
 
 /// Rebuild, in `kept`, the boxes `changes` can affect. `false` when that
@@ -70,8 +89,12 @@ pub(crate) fn rebuild(
     }
     let Some(html) = doc.document_element() else { return false };
     let body = doc.body();
-    // Where each change starts: a changed element's parent, a changed
-    // parent, the owner of generated content that changed.
+    // The boxes the tree has, by element.
+    let mut places: HashMap<NodeId, Place> = HashMap::new();
+    index(&kept.root, oofs, &mut places);
+    // Where each change starts: a changed element's parent (a table cell,
+    // row or row group still of its kind: itself), a changed parent, the
+    // owner of generated content that changed.
     let mut starts: Vec<NodeId> = Vec::new();
     for &e in elements {
         // Gone or out of the document: its old parent is in `parents`.
@@ -80,6 +103,12 @@ pub(crate) fn rebuild(
         }
         if e == html || Some(e) == body {
             return false;
+        }
+        if let Some(d) = places.get(&e).and_then(|p| p.table_display())
+            && builder.display_of(e) == Some(d)
+        {
+            starts.push(e);
+            continue;
         }
         match doc.parent(e) {
             Some(p) => starts.push(p),
@@ -92,10 +121,6 @@ pub(crate) fn rebuild(
         }
     }
     starts.extend(generated_changes(&kept.generated, builder.generated(), doc));
-
-    // The boxes the tree has, by element.
-    let mut places: HashMap<NodeId, Place> = HashMap::new();
-    index(&kept.root, oofs, &mut places);
     // The box to rebuild for each start: the nearest element box at or
     // above it; never the root's or the body's.
     // What a change reaches: the changed elements, the starts and every
@@ -107,10 +132,18 @@ pub(crate) fn rebuild(
         dirty.extend(doc.ancestors(s));
     }
     let mut roots: HashSet<NodeId> = HashSet::new();
-    for s in starts {
+    // For the timing log: each start and the box it led to.
+    let mut led: Vec<(NodeId, NodeId)> = Vec::new();
+    'starts: for s in starts {
         let mut cur = Some(s);
         let mut found = None;
         while let Some(n) = cur {
+            // Inside a `display: none` subtree (`head`, a hidden element):
+            // no box comes from there (what a sheet in it does to styles,
+            // and an element there shown later, are style changes).
+            if builder.display_of(n).is_some_and(|d| d.is_none()) {
+                continue 'starts;
+            }
             if Some(n) == Some(html) || Some(n) == body {
                 return false;
             }
@@ -123,6 +156,7 @@ pub(crate) fn rebuild(
         match found {
             Some(n) => {
                 roots.insert(n);
+                led.push((s, n));
             }
             None => return false,
         }
@@ -155,8 +189,10 @@ pub(crate) fn rebuild(
     };
     tracing::info!(
         target: "perf",
-        rebuilt = tops.iter().map(|&n| name(n)).collect::<Vec<_>>().join(", "),
+        rebuilt_count = tops.len(),
+        rebuilt = tops.iter().take(8).map(|&n| name(n)).collect::<Vec<_>>().join(", "),
         changed = elements.iter().take(6).map(|&n| if doc.contains(n) { name(n) } else { "gone".into() }).collect::<Vec<_>>().join(", "),
+        starts = led.iter().take(8).map(|&(s, n)| format!("{} -> {}", name(s), name(n))).collect::<Vec<_>>().join(", "),
         "incremental boxes"
     );
     let mut ok = true;
@@ -271,6 +307,19 @@ fn harvest(b: BoxNode, cx: &Rebuild<'_, '_>, drop_all: bool) {
     }
 }
 
+/// A row being taken apart: its cells no change reaches go to the builder
+/// for reuse, the rest is taken apart.
+fn harvest_row(r: crate::boxes::RowBox, cx: &Rebuild<'_, '_>) {
+    for c in r.cells {
+        match c.node.node {
+            Some(n) if !cx.dirty.contains(&n) => {
+                cx.builder.reuse_cells.borrow_mut().insert(n, c);
+            }
+            _ => harvest(c.node, cx, false),
+        }
+    }
+}
+
 /// A box inside one being taken apart: kept for reuse when it is an
 /// element's box no change reaches, else taken apart in turn.
 fn offer(c: BoxNode, cx: &Rebuild<'_, '_>, drop_all: bool) {
@@ -360,7 +409,13 @@ fn index(b: &BoxNode, oofs: &[OutOfFlowBox], out: &mut HashMap<NodeId, Place>) {
                     walk(&c.node, out, Place::Caption);
                 }
                 for g in &t.groups {
+                    if let Some(n) = g.node {
+                        out.entry(n).or_insert(Place::RowGroup(g.style.display));
+                    }
                     for r in &g.rows {
+                        if let Some(n) = r.node {
+                            out.entry(n).or_insert(Place::Row);
+                        }
                         for c in &r.cells {
                             walk(&c.node, out, Place::Cell);
                         }
@@ -433,7 +488,36 @@ fn replace_in(b: &mut BoxNode, cx: &Rebuild<'_, '_>, ok: &mut bool) -> bool {
                 }
             }
             for g in &mut t.groups {
+                // A row group or row rebuilt by itself (of its kind still,
+                // `rebuild`): its cells no change reaches are reused.
+                if let Some(id) = g.node.filter(|n| tops.contains(n)) {
+                    let display = g.style.display;
+                    let placeholder = crate::boxes::RowGroupBox { node: None, style: g.style.clone(), rows: Vec::new(), depth: g.depth };
+                    let old = std::mem::replace(g, placeholder);
+                    let depth = old.depth;
+                    for r in old.rows {
+                        harvest_row(r, cx);
+                    }
+                    match builder.rebuild_row_group(id, depth, display) {
+                        Some(group) => *g = group,
+                        None => *ok = false,
+                    }
+                    inside = true;
+                    continue;
+                }
                 for r in &mut g.rows {
+                    if let Some(id) = r.node.filter(|n| tops.contains(n)) {
+                        let placeholder = crate::boxes::RowBox { node: None, style: r.style.clone(), cells: Vec::new(), depth: r.depth };
+                        let old = std::mem::replace(r, placeholder);
+                        let depth = old.depth;
+                        harvest_row(old, cx);
+                        match builder.rebuild_row(id, depth) {
+                            Some(row) => *r = row,
+                            None => *ok = false,
+                        }
+                        inside = true;
+                        continue;
+                    }
                     for c in &mut r.cells {
                         if c.node.node.is_some_and(|n| tops.contains(&n)) {
                             let id = c.node.node.expect("checked");

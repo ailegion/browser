@@ -173,9 +173,10 @@ SKIPPED, so the block is not done:
   layout (done 2026-11-01, record below);
 - a change inside a table row rebuilds the whole table: rows have no
   element box of their own to rebuild, while browsers rebuild only the
-  row;
-- a full restyle (iana's hover moves) still notes an unknown change, so
-  it lays out everything.
+  row (done 2026-11-01, part 2 below);
+- a full restyle still notes an unknown change, so it lays out
+  everything (done 2026-11-01, part 3 below; iana's hover moves turned
+  out not to be full restyles but script changes).
 
 Verification: `BROWSER_VERIFY_LAYOUT=1` on iana gave 9 incremental
 layouts and 0 differences. All workspace tests pass.
@@ -261,8 +262,58 @@ records are gone, so these are not the same bytes as B2's numbers):
   377 ms; heap after load 480.1 MiB, peak 703.2 MiB.
 - Wikipedia Main Page: load 733 ms (B2: 709 ms), full layouts 42–51 ms.
 
-Still SKIPPED in B2: row-level rebuilds inside tables (part 2) and full
-restyles laying out fully (part 3), as recorded above.
+**B2 part 2 (table parts) done 2026-11-01.** Rows and row groups are in
+the box index (`Place::Row`, `Place::RowGroup` with their `display`) and
+carry the depth they were built at (`RowBox::depth`, `RowGroupBox::depth`).
+A changed cell, row or row group still of its kind starts its own rebuild
+(its siblings' anonymous boxes cannot change; a changed kind still starts
+at the parent); a tree change in a row or group rebuilds that part. The
+builder rebuilds a row or group by itself (`rebuild_row`,
+`rebuild_row_group`), its cells no change reaches reused (`harvest_row`);
+the table's caches are cleared so its grid is placed again. Test
+`table_parts_rebuild_by_themselves` (a row's height, a cell's padding, a
+row's inherited colour: only the rebuilt cells' own taffy nodes made;
+kinds changed; a cell into a row, a row into a body; each equal to a full
+layout). On iana the table-row changes now rebuild single rows; its script
+changes about a thousand rows' classes at once, so those changes still
+take 155–166 ms (2,584 taffy nodes: the rebuilt rows' changed cells).
+
+**B2 part 3 (full restyles) done 2026-11-01.** A full restyle tells layout
+the elements whose computed style changed (`browser_style::
+changed_styles`, old map against new, pseudo-elements' styles included;
+custom property maps compared once per pair of maps, `CustomProps`,
+`with_custom_memo`: 76–80 ms → 15–16 ms on iana) instead of an unknown
+change; `want_style` no longer forgets what is known. A change the styles
+do not show is noted where it happens: a new document (`set_document`),
+a checkbox's or radio group's `checked` and a select's option (their
+controls), a script's changes when it needs a full restyle
+(`browser_script::dom_box_changes`; a removal or replacement that takes a
+`<style>`, `<link>` or `<base>` is now logged as `DomChange::Sheets` with
+its parent, not as an undescribed tree change); the script view's forced
+layouts do the same. A start inside a `display: none` subtree (`head`) is
+skipped. Tests: style (`changed_styles`), tab
+(`full_restyles_lay_out_only_what_they_change`: a removed stylesheet, a
+checkbox, a resize, each incremental and equal to a full layout).
+
+Verification (both parts, release probe, live): iana.org/protocols 12
+incremental layouts, Wikipedia Main Page 3, the Rust article 3, 0
+differences.
+
+Timing (release probe, live):
+- iana: full restyle 377–380 ms (351–373 before part 3: the comparison
+  adds 15–16 ms), the layout after it 37 ms (489–508 ms); load 4.73 s;
+  scroll-script layouts 29–31 ms; table-row changes 155–166 ms.
+- Wikipedia Main Page: load 769 ms (733 ms in the part 1 run, 709 ms in
+  B2's); full restyle 42 ms (40 ms), the layout after it 5.3–6.2 ms
+  (~45 ms).
+
+Flaky, not changed: two tab tests that wait on real timers
+(`lifecycle_events_fire_in_order_and_load_waits_for_fetches`,
+`font_display_blocks_swaps_and_gives_up`) failed once in a workspace run
+that took 10 s; alone they pass 3 of 3.
+
+B2 is done. Still open in this design: B3 (fonts and images) and B4
+(fragments and paint order).
 
 Found, not part of B2: the paint crate's unit tests crash at times with
 `STATUS_ACCESS_VIOLATION` when run in parallel (2 of 3 runs once); with

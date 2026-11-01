@@ -82,12 +82,16 @@ pub(crate) struct RowGroupBox {
     pub node: Option<NodeId>,
     pub style: Arc<ComputedStyle>,
     pub rows: Vec<RowBox>,
+    /// The depth it was built at (incremental layout builds it again).
+    pub depth: usize,
 }
 
 pub(crate) struct RowBox {
     pub node: Option<NodeId>,
     pub style: Arc<ComputedStyle>,
     pub cells: Vec<CellBox>,
+    /// The depth it was built at (incremental layout builds it again).
+    pub depth: usize,
 }
 
 pub(crate) struct CellBox {
@@ -1491,6 +1495,26 @@ impl BoxBuilder<'_> {
         (style.display == Display::TableCell).then(|| self.build_cell(id, style, depth))
     }
 
+    /// Incremental layout: a table row built again (its cells no change
+    /// reaches are reused, `reuse_cells`).
+    pub(crate) fn rebuild_row(&self, id: NodeId, depth: usize) -> Option<RowBox> {
+        let style = self.style_of(id)?;
+        (style.display == Display::TableRow).then(|| self.build_row(id, style, depth))
+    }
+
+    /// Incremental layout: a row group built again, of the same kind
+    /// (`display`) as before, which decides its place among the groups.
+    pub(crate) fn rebuild_row_group(&self, id: NodeId, depth: usize, display: Display) -> Option<RowGroupBox> {
+        let style = self.style_of(id)?;
+        (style.display == display).then(|| self.build_row_group(id, style, depth))
+    }
+
+    /// The `display` an element computes to now (incremental layout: a
+    /// table part whose kind did not change is rebuilt by itself).
+    pub(crate) fn display_of(&self, id: NodeId) -> Option<Display> {
+        self.style_of(id).map(|s| s.display)
+    }
+
     /// Incremental layout: a table caption's box built again (a caption
     /// that is a table is laid out as a block, as `build_table` does).
     pub(crate) fn rebuild_caption(&self, id: NodeId, depth: usize) -> Option<BoxNode> {
@@ -1843,6 +1867,7 @@ impl BoxBuilder<'_> {
             node: Some(id),
             style,
             rows: anon.rows,
+            depth,
         }
     }
 
@@ -1866,6 +1891,7 @@ impl BoxBuilder<'_> {
             node: Some(id),
             style,
             cells: anon.cells,
+            depth,
         }
     }
 
@@ -1987,6 +2013,7 @@ impl AnonTable {
             node: None,
             style: anon_style(parent, Display::TableRow),
             cells: std::mem::take(&mut self.cells),
+            depth,
         });
     }
 
@@ -1999,6 +2026,7 @@ impl AnonTable {
             node: None,
             style: anon_style(parent, Display::TableRowGroup),
             rows: std::mem::take(&mut self.rows),
+            depth,
         });
     }
 }

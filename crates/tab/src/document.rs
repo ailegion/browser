@@ -642,9 +642,11 @@ impl TabState {
         }
     }
 
-    /// Ask for a full restyle (and so layout), saying why.
+    /// Ask for a full restyle (and so layout), saying why. The restyle
+    /// tells layout which elements' styles changed (`restyle_all`); a
+    /// change it cannot see (the tree changed undescribed, a control's
+    /// state) is noted by the caller.
     fn want_style(&mut self, why: &'static str) {
-        self.note_unknown_box_change();
         self.needs_style = true;
         if !self.perf.why.contains(&why) {
             self.perf.why.push(why);
@@ -1369,6 +1371,8 @@ impl TabState {
         let Some(e) = doc.element(id) else { return };
         let radio = input_type(e).as_deref() == Some("radio");
         let name = e.attr("name").map(str::to_owned);
+        // The controls whose `checked` changes: their boxes draw it.
+        let mut toggled = vec![id];
         if radio {
             let mut scope = doc.root();
             let mut cur = doc.parent(id);
@@ -1389,8 +1393,11 @@ impl TabState {
                 })
                 .collect();
             for n in group {
-                if let Some(o) = doc.get_mut(n).as_element_mut() {
+                if let Some(o) = doc.get_mut(n).as_element_mut()
+                    && o.attr("checked").is_some()
+                {
                     o.remove_attr("checked");
+                    toggled.push(n);
                 }
             }
             if let Some(e) = doc.get_mut(id).as_element_mut() {
@@ -1404,6 +1411,7 @@ impl TabState {
             }
         }
         // `:checked` can restyle anything; the cascade runs again.
+        self.note_box_changes(&toggled, &[]);
         self.want_style("checked toggled");
         self.fire_control_changed(id);
     }
@@ -1442,6 +1450,8 @@ impl TabState {
                 }
             }
         }
+        // The select's box shows the chosen option.
+        self.note_box_changes(&[id], &[]);
         self.want_style("select option changed");
         self.fire_control_changed(id);
     }
@@ -2888,6 +2898,8 @@ impl TabState {
         self.web_fonts = WebFonts::default();
         if let Some(engine) = &mut self.engine {
             engine.clear_web_fonts();
+            // A new document: none of the kept boxes are its.
+            engine.note_unknown_box_change();
         }
         self.doc = Some(doc);
         self.doc_url = self.url.clone();
@@ -3404,13 +3416,20 @@ impl TabState {
         // A `<style>` or `<link>` the script added, changed or removed.
         self.sync_stylesheets();
         if !fresh && !self.restyle_changes(changes) {
+            // A full restyle: the boxes the changes reach (the full
+            // restyle adds those whose style changed), unless the tree
+            // changed in a way the log does not describe.
+            match browser_script::dom_box_changes(changes, None) {
+                Some((elements, parents)) => self.note_box_changes(&elements, &parents),
+                None => self.note_unknown_box_change(),
+            }
             self.want_style("script change needing a full restyle");
-            self.want_layout("script change needing a full restyle");
+            self.want_layout_noted("script change needing a full restyle");
         }
         // An `<img>` inserted, or given another `src`: fetch what is new
         // (URLs already fetched are skipped).
         let images_touched = changes.iter().any(|c| match c {
-            browser_script::DomChange::Tree { .. } => true,
+            browser_script::DomChange::Tree { .. } | browser_script::DomChange::Sheets { .. } => true,
             browser_script::DomChange::Children { inserted, .. } => !inserted.is_empty(),
             browser_script::DomChange::Attr { element, name, .. } => {
                 name == "src"
@@ -4219,11 +4238,19 @@ impl TabState {
         let started = std::time::Instant::now();
         let stylist = self.stylist();
         let vp = self.style_viewport();
+        let old = std::mem::take(&mut self.styles);
         self.styles = compute_styles_with(doc, &stylist, &vp, &self.states);
         self.deps = stylist.interaction_deps();
-        // Every style computed afresh: every box built afresh.
-        if let Some(engine) = &mut self.engine {
-            engine.note_unknown_box_change();
+        // Every style computed afresh: the boxes of the elements whose
+        // style changed are built again (all of them when the changes
+        // since the last layout are not all described anyway).
+        if let Some(engine) = &mut self.engine
+            && engine.box_changes_known()
+        {
+            let t = std::time::Instant::now();
+            let changed = browser_style::changed_styles(&old, &self.styles);
+            tracing::info!(target: "perf", compare_ms = t.elapsed().as_secs_f64() * 1000.0, changed = changed.len(), "full restyle compared");
+            engine.note_box_changes(&changed, &[]);
         }
         tracing::debug!(
             tab = self.id.0,
@@ -8139,6 +8166,46 @@ mod tests {
         h.pump();
         assert!(h.state.layouts > layouts, "an insertion lays out again");
         assert_eq!(width(&h), Some(200.0));
+    }
+
+    /// Part 3 of incremental layout B2: a full restyle (a stylesheet a
+    /// script removes, a checkbox toggled, the viewport resized) lays out
+    /// only the boxes whose styles (or controls) changed, and the result
+    /// is a full layout's.
+    #[test]
+    fn full_restyles_lay_out_only_what_they_change() {
+        let page = "<!DOCTYPE html><style>#box { color: blue } input:checked + span { padding-left: 30px }</style>\
+            <style id=extra>#box { width: 300px }</style>\
+            <style>@media (max-width: 500px) { #narrow { width: 50px } }</style>\
+            <body><div><button>b</button><input type=checkbox id=c><span id=s>label</span>\
+            <div id=box>x</div><p id=narrow>narrow text</p></div>\
+            <script>document.querySelector('button').onclick = () => document.getElementById('extra').remove();</script>";
+        let mut h = Harness::load(page);
+        h.pump_until(|h| h.state.layout.is_some() && h.state.lifecycle == Lifecycle::Complete);
+        let check = |h: &Harness, what: &str| {
+            assert!(!browser_layout::last_layout_was_full(), "{what}: laid out incrementally");
+            let doc = h.state.doc.as_ref().expect("doc");
+            let full = browser_layout::LayoutEngine::new().layout(doc, &h.state.styles, h.state.viewport.width, h.state.viewport.height, &h.state.images);
+            let rects = |t: &browser_layout::LayoutTree| {
+                let mut v = Vec::new();
+                t.root.walk(&mut |f| v.push((f.node, f.rect)));
+                v
+            };
+            assert_eq!(rects(h.state.layout.as_ref().expect("layout")), rects(&full), "{what}: equal to a full layout");
+        };
+        let layouts = h.state.layouts;
+        h.click("button");
+        h.pump();
+        assert!(h.state.layouts > layouts);
+        check(&h, "a stylesheet removed");
+        let layouts = h.state.layouts;
+        h.click("input");
+        h.pump();
+        assert!(h.state.layouts > layouts);
+        check(&h, "a checkbox toggled");
+        h.send(ShellToTab::Resize(Viewport { width: 400.0, height: 600.0, scale_factor: 1.0 }));
+        h.pump();
+        check(&h, "the viewport resized");
     }
 
     /// A script's tree changes restyle what they reach: an appended item

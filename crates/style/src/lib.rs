@@ -28,7 +28,7 @@ pub mod ua;
 pub mod values;
 
 pub use cascade::{
-    FeatureChange, GeneratedPseudo, Restyled, StateChange, StyleMap, Stylist, TreeChange, compute_styles, compute_styles_with,
+    FeatureChange, GeneratedPseudo, Restyled, StateChange, StyleMap, Stylist, TreeChange, changed_styles, compute_styles, compute_styles_with,
     generates_pseudo_elements, pseudo_element_style, restyle, restyle_mutations, sync_pseudo_elements,
 };
 pub use content::{

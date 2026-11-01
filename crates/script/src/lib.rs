@@ -41,7 +41,7 @@ mod view;
 pub use events::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
 pub use fonts::{FaceRef, FontLoadStatus, FontRequest, ScriptFace};
 pub use dom::DomChange;
-pub use view::{FeatureDelta, ImageSizeMap, View, feature_changes};
+pub use view::{FeatureDelta, ImageSizeMap, View, dom_box_changes, feature_changes};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

@@ -36,7 +36,7 @@ use browser_style::transform::Matrix4;
 use browser_style::{ComputedStyle, Overflow, Position, Rgba, ScrollbarWidth, Sides, TextDecorationStyle, ViewportOverflow};
 use url::Url;
 
-pub use engine::{LayoutEngine, layout_document};
+pub use engine::{LayoutEngine, last_layout_was_full, layout_document};
 pub use parley::FontData;
 pub use selection::{SelectionRanges, TextPos};
 pub use stacking::{ClipNode, Op, PaintList, PaintOrder, Placed, Space};

@@ -187,6 +187,23 @@ fn level(origin: Origin, important: bool) -> u8 {
     }
 }
 
+/// The elements whose computed style differs between two style maps of
+/// the same document (a full restyle against the styles before it: their
+/// pseudo-elements' styles count), and those styled in only one of them:
+/// what incremental layout builds again after a full restyle.
+pub fn changed_styles(old: &StyleMap, new: &StyleMap) -> Vec<NodeId> {
+    // Both maps hold every custom property map compared here.
+    crate::computed::with_custom_memo(|| {
+        let mut out: Vec<NodeId> = new
+            .iter()
+            .filter(|(id, s)| old.get(*id).is_none_or(|o| !Arc::ptr_eq(o, s) && **o != ***s))
+            .map(|(id, _)| id)
+            .collect();
+        out.extend(old.iter().filter(|(id, _)| !new.contains_key(*id)).map(|(id, _)| id));
+        out
+    })
+}
+
 /// Compute styles for every element in `doc`, with no element hovered,
 /// active or focused.
 pub fn compute_styles(doc: &Document, stylist: &Stylist, viewport: &Viewport) -> StyleMap {
@@ -750,7 +767,7 @@ impl<'a> Restyler<'a> {
                 _ => {}
             }
         }
-        let custom = resolve_customs(&parent_style.custom, &custom_decls);
+        let custom = resolve_customs(&parent_style.custom.0, &custom_decls);
         let expanded: Vec<Vec<DeclaredValue>> = if has_pending {
             matched
                 .iter()
@@ -1714,7 +1731,19 @@ mod tests {
         // Fallback inside a function; the map itself is inherited.
         assert_eq!(styles[em].background_color.to_rgba8(), [0, 128, 0, 255]);
         assert_eq!(styles[em].custom.get("--c").map(|v| &**v), Some("red"));
-        assert!(Arc::ptr_eq(&styles[em].custom, &styles[p].custom), "unchanged maps are shared");
+        assert!(Arc::ptr_eq(&styles[em].custom.0, &styles[p].custom.0), "unchanged maps are shared");
+        // A full restyle's comparison (`changed_styles`): equal maps from
+        // two cascades compare equal, a changed value does not.
+        let css = ":root { --c: red; --m: 1px 2px } p { color: var(--c); margin: var(--m) } em { background-color: rgb(var(--r, 0), 128, 0) }";
+        let cascade = |css: &str| {
+            let mut stylist = Stylist::new();
+            stylist.add_sheet(ua_stylesheet());
+            stylist.add_sheet(Arc::new(Stylesheet::parse(css, Origin::Author)));
+            compute_styles(&doc, &stylist, &Viewport::default())
+        };
+        assert!(changed_styles(&styles, &cascade(css)).is_empty(), "the same styles again: nothing changed");
+        let changed = changed_styles(&styles, &cascade(&format!("{css} p {{ --x: 1 }}")));
+        assert!(changed.contains(&p) && changed.contains(&em), "a custom property changed: {changed:?}");
     }
 
     #[test]
