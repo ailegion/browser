@@ -83,6 +83,9 @@ pub struct LayoutEngine {
     /// layout builds again the boxes of the elements whose `font-family`
     /// names one of them.
     font_changes: std::collections::HashSet<String>,
+    /// Block B4: the last layout's stacking contexts as its paint order
+    /// built them, for the next layout's paint order to put back.
+    contexts: Arc<HashMap<NodeId, Arc<crate::stacking::ContextRecord>>>,
 }
 
 /// A web font registered for the current document.
@@ -222,6 +225,7 @@ impl LayoutEngine {
             doc: None,
             removed: HashMap::new(),
             font_changes: std::collections::HashSet::new(),
+            contexts: Arc::new(HashMap::new()),
         }
     }
 
@@ -932,10 +936,14 @@ impl LayoutEngine {
         }
         out.viewport.offset = out.viewport.clamp(page_scroll);
         let t = std::time::Instant::now();
+        // The stacking contexts of the last layout's paint order, to put
+        // back those that did not change (block B4).
+        out.paint.contexts = self.contexts.clone();
         out.apply_sticky();
         if !out.has_sticky {
             out.rebuild_paint_order();
         }
+        self.contexts = out.paint.contexts.clone();
         let t_order = t.elapsed();
         let ms = |d: std::time::Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
         let c = COUNTERS.with(std::cell::Cell::get);
@@ -960,6 +968,8 @@ impl LayoutEngine {
             boxes_rebuilt = c.boxes_rebuilt,
             taffy_nodes_built = c.taffy_nodes_built,
             float_restarts = c.float_restarts,
+            inline_fragments_reused = c.inline_fragments_reused,
+            contexts_reused = c.contexts_reused,
             boxes_ms = ms(t_boxes),
             taffy_tree_ms = ms(t_taffy_tree),
             passes = pass,
@@ -1058,6 +1068,13 @@ impl LayoutEngine {
                 tracing::warn!(target: "perf", differ, ?first, ?src, ?changes, "incremental layout differs from a full layout");
             } else {
                 tracing::info!(target: "perf", fragments = a.len(), "incremental layout verified");
+            }
+            // The paint order with its contexts put back, against one built
+            // from nothing.
+            if out.paint.same_as(&crate::stacking::build(&out)) {
+                tracing::info!(target: "perf", "paint order verified");
+            } else {
+                tracing::warn!(target: "perf", "paint order differs from one built from nothing");
             }
         }
         out
@@ -1882,24 +1899,43 @@ impl LayoutEngine {
                     _ => x,
                 };
                 if let Some(il) = content.cache.first() {
-                    let text: Arc<str> = Arc::from(content.text.as_str());
-                    let overflow = content.ellipsis.as_ref().map(|e| (rect.width, e));
-                    for p in &il.paragraphs {
-                        emit_text_fragments(
-                            content,
-                            &text,
-                            p,
-                            &il.edges,
-                            x,
-                            y,
-                            rect.width,
-                            overflow,
-                            &mut children,
-                            &mut self.decor,
-                            &mut self.fonts,
-                        );
+                    // The fragments the last layout made from these same
+                    // lines at this same place and width (block B4), else
+                    // made now and kept.
+                    let key = crate::boxes::EmittedKey {
+                        generation: il.generation,
+                        origin: (x.to_bits(), y.to_bits()),
+                        width: rect.width.to_bits(),
+                        ellipsis: content.ellipsis.as_ref().map(|e| e.text.clone()),
+                    };
+                    let kept = content.emitted.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, f)| f.clone());
+                    match kept {
+                        Some(kept) => {
+                            counters(|c| c.inline_fragments_reused += 1);
+                            children = kept;
+                        }
+                        None => {
+                            let text: Arc<str> = Arc::from(content.text.as_str());
+                            let overflow = content.ellipsis.as_ref().map(|e| (rect.width, e));
+                            for p in &il.paragraphs {
+                                emit_text_fragments(
+                                    content,
+                                    &text,
+                                    p,
+                                    &il.edges,
+                                    x,
+                                    y,
+                                    rect.width,
+                                    overflow,
+                                    &mut children,
+                                    &mut self.decor,
+                                    &mut self.fonts,
+                                );
+                            }
+                            place_inline_offsets(&mut children);
+                            *content.emitted.borrow_mut() = Some((key, children.clone()));
+                        }
                     }
-                    place_inline_offsets(&mut children);
                 }
                 // The scroll containers inside the atomics, as their
                 // layouts for these lines left them.
@@ -2296,6 +2332,7 @@ impl LayoutEngine {
             paragraphs,
             height,
             edges,
+            generation: InlineLayout::next_generation(),
         });
         content.cache.last().expect("just pushed")
     }
@@ -2344,6 +2381,10 @@ struct Counters {
     float_restarts: u32,
     /// Positioned boxes' layouts taken from their kept results.
     positioned_reused: u32,
+    /// Block B4: inline roots whose fragments were handed out again, and
+    /// stacking contexts whose paint order was put back.
+    inline_fragments_reused: u32,
+    contexts_reused: u32,
 }
 
 /// Whether the last layout on this thread built every box (tests of the
@@ -2359,6 +2400,7 @@ pub(crate) fn count(f: impl FnOnce(&mut CountersMut)) {
             table_layouts: &mut c.table_layouts,
             cell_layouts: &mut c.cell_layouts,
             boxes_rebuilt: &mut c.boxes_rebuilt,
+            contexts_reused: &mut c.contexts_reused,
         };
         f(&mut m);
     });
@@ -2369,6 +2411,7 @@ pub(crate) struct CountersMut<'a> {
     pub table_layouts: &'a mut u32,
     pub cell_layouts: &'a mut u32,
     pub boxes_rebuilt: &'a mut u32,
+    pub contexts_reused: &'a mut u32,
 }
 
 thread_local! {
@@ -3555,10 +3598,10 @@ fn emit_marker(
             font: r.font().clone(),
             font_size: r.font_size(),
             coords: r.normalized_coords().to_vec(),
-            glyphs,
+            glyphs: Arc::new(glyphs),
             text: marker.text.clone(),
             range: 0..marker.text.len(),
-            clusters,
+            clusters: Arc::new(clusters),
             color: style.color,
             embolden: synthesis.embolden(),
             skew: synthesis.skew(),
@@ -3731,10 +3774,10 @@ fn emit_text_fragments(
                             font: r.font().clone(),
                             font_size: r.font_size(),
                             coords: r.normalized_coords().to_vec(),
-                            glyphs,
+                            glyphs: Arc::new(glyphs),
                             text: text.clone(),
                             range,
-                            clusters,
+                            clusters: Arc::new(clusters),
                             color: browser_style::Rgba {
                                 r: color[0] as f32 / 255.0,
                                 g: color[1] as f32 / 255.0,
@@ -4218,13 +4261,15 @@ fn place_line_items(
                 break;
             }
             let adv = c.advance;
-            t.clusters[ci].advance = 0.0;
-            for k in &mut t.clusters {
+            // Held only here (just emitted): edited in place.
+            let clusters = Arc::make_mut(&mut t.clusters);
+            clusters[ci].advance = 0.0;
+            for k in clusters.iter_mut() {
                 if k.x > c.x + 0.001 {
                     k.x -= adv;
                 }
             }
-            for g in &mut t.glyphs {
+            for g in Arc::make_mut(&mut t.glyphs).iter_mut() {
                 if g.x > c.x + 0.001 {
                     g.x -= adv;
                 }
@@ -4423,12 +4468,14 @@ fn place_line_items(
                         }
                         let dropped_glyphs: usize = glyphs_per_cluster[..ci].iter().sum();
                         let dx = t.clusters[ci].x;
-                        t.clusters.drain(..ci);
-                        t.glyphs.drain(..dropped_glyphs);
-                        for c in &mut t.clusters {
+                        let clusters = Arc::make_mut(&mut t.clusters);
+                        clusters.drain(..ci);
+                        for c in clusters.iter_mut() {
                             c.x -= dx;
                         }
-                        for g in &mut t.glyphs {
+                        let glyphs = Arc::make_mut(&mut t.glyphs);
+                        glyphs.drain(..dropped_glyphs);
+                        for g in glyphs.iter_mut() {
                             g.x -= dx;
                         }
                         shown_x0 = x + dx;
@@ -4439,8 +4486,8 @@ fn place_line_items(
                         }
                         let kept_glyphs: usize = glyphs_per_cluster[..ci].iter().sum();
                         let end = t.clusters[ci].x;
-                        t.clusters.truncate(ci);
-                        t.glyphs.truncate(kept_glyphs);
+                        Arc::make_mut(&mut t.clusters).truncate(ci);
+                        Arc::make_mut(&mut t.glyphs).truncate(kept_glyphs);
                         shown_x1 = x + end;
                         fragment.rect.width = end;
                     }
@@ -6612,7 +6659,7 @@ mod tests {
             if let (FragmentContent::Text(t), Some(_)) = (&f.content, f.node)
                 && clusters.is_empty()
             {
-                clusters = t.clusters.clone();
+                clusters = t.clusters.to_vec();
             }
         });
         let (h, g) = (clusters[0], clusters[1]);
@@ -7859,6 +7906,9 @@ mod incremental_layout {
         let counted = COUNTERS.with(std::cell::Cell::get);
         let full = LayoutEngine::new().layout(&doc, &new_styles, width, height, &());
         assert_eq!(shown(&incremental), shown(&full), "incremental layout differs from a full one");
+        // Block B4: the paint order with contexts put back is the one built
+        // from nothing.
+        assert!(incremental.paint.same_as(&crate::stacking::build(&incremental)), "the paint order differs from one built from nothing");
         assert_eq!(
             (incremental.content_width, incremental.content_height, incremental.viewport.vertical_bar, incremental.viewport.horizontal_bar),
             (full.content_width, full.content_height, full.viewport.vertical_bar, full.viewport.horizontal_bar),
@@ -7884,6 +7934,9 @@ mod incremental_layout {
         assert!(!c.full);
         assert_eq!(c.taffy_nodes_built, 0, "no taffy node made");
         assert_eq!((c.inline_measures, c.table_measures, c.independent_layouts), (0, 0, 0), "nothing measured again");
+        // Block B4: every inline root in the tree hands out its fragments
+        // again (the atomics' and cells' kept results hold theirs).
+        assert!(c.inline_fragments_reused > 0, "the inline roots' fragments are reused");
     }
 
     #[test]
@@ -7978,6 +8031,44 @@ mod incremental_layout {
             set_attr(doc, p, "class", "tall");
             (vec![p], vec![])
         });
+    }
+
+    /// Block B4: stacking contexts whose fragments and entry did not change
+    /// are put back into the paint order; each order equals one built from
+    /// nothing (`check_at` compares).
+    #[test]
+    fn unchanged_stacking_contexts_are_put_back() {
+        let page = "<body><div><div id=outer style='position:relative;overflow:hidden'><p id=far>far text</p>\
+            <div id=fade style='opacity:.5'><p id=in1>inside the fade</p>\
+            <b id=esc style='position:absolute;left:3px;top:3px'>escapes to outer</b></div>\
+            <div id=card style='transform:translateX(5px)'><span>card</span><div id=z style='position:relative;z-index:2'>z</div></div>\
+            <div id=fx style='position:fixed;top:0;left:0;z-index:1'>fixed</div>\
+            <p><span id=ic style='position:relative;z-index:1;opacity:.8'>inline context</span></p>\
+            <div id=scr style='overflow:auto;height:30px;opacity:.9'><p>1</p><p>2</p><p>3</p></div>\
+            <p id=after>after</p></div></div></body>";
+        let css = ".red { color: rgb(255, 0, 0) } .tall { height: 60px } .wide { padding-left: 20px } .clip { overflow: hidden }";
+        let change = |id: &'static str, class: &'static str| {
+            move |doc: &mut Document| {
+                let n = by_id(doc, id);
+                set_attr(doc, n, "class", class);
+                (vec![n], vec![])
+            }
+        };
+        // After them: every box's context is put back (#fade, #card with
+        // #z inside it, #fx, #scr; the inline element's is built with the
+        // root's, which holds the change).
+        let c = check_counted(page, css, change("after", "red"));
+        assert!(!c.full);
+        assert_eq!(c.contexts_reused, 4, "contexts put back");
+        // Before them, moving them: built again (and equal).
+        check_counted(page, css, change("far", "tall"));
+        // Inside one: that one is built again, the others put back.
+        let c = check_counted(page, css, change("in1", "wide"));
+        assert_eq!(c.contexts_reused, 3, "contexts put back");
+        // A clip before them, nothing moved: put back with every clip index
+        // after it shifted (#esc's containing block's clip among them).
+        let c = check_counted(page, css, change("far", "clip"));
+        assert_eq!(c.contexts_reused, 4, "contexts put back past a new clip");
     }
 
     /// Part 2: a change in a table rebuilds the row, row group or cell it

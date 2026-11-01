@@ -113,7 +113,7 @@ fn offset_at_x(t: &TextRef<'_>, x: f32) -> usize {
     if lx < first.x {
         return left_edge(first);
     }
-    for c in clusters {
+    for c in clusters.iter() {
         if lx < c.x + c.advance {
             return if lx < c.x + c.advance / 2.0 {
                 left_edge(c)

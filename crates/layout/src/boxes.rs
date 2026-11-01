@@ -569,6 +569,28 @@ pub(crate) struct InlineLayout {
     /// per `InlineContent::boxes`), so the fragments carry what the lines
     /// were broken with.
     pub edges: Vec<ResolvedEdges>,
+    /// A number no other line layout has had (block B4: the fragments
+    /// made from these lines are kept under it).
+    pub generation: u64,
+}
+
+impl InlineLayout {
+    /// A fresh `generation`.
+    pub fn next_generation() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// What an inline root's fragments were made from (block B4): the lines'
+/// layout, where the root sat and how wide it was, and the
+/// `text-overflow` marker's text. Equal keys make equal fragments.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EmittedKey {
+    pub generation: u64,
+    pub origin: (u32, u32),
+    pub width: u32,
+    pub ellipsis: Option<Arc<str>>,
 }
 
 impl InlineLayout {
@@ -681,6 +703,10 @@ pub(crate) struct InlineContent {
     /// Its paragraphs as shaped for the last width laid out, kept for the
     /// other widths of this layout (`engine::Shaped`).
     pub shaped: Option<crate::engine::Shaped>,
+    /// The fragments its last layout made (block B4), positioned, under
+    /// what they were made from: the next layout that makes them from the
+    /// same hands them out again (their glyphs and clusters shared).
+    pub emitted: std::cell::RefCell<Option<(EmittedKey, Vec<crate::Fragment>)>>,
 }
 
 /// The laid-out `text-overflow` marker of an inline root.
@@ -706,6 +732,7 @@ impl InlineContent {
             first_formatted_line: true,
             next_seq: 0,
             shaped: None,
+            emitted: std::cell::RefCell::new(None),
         };
         // A block container's override applies to all of its inline
         // content: the paragraph is wrapped in it (`finish` closes it).
@@ -2513,6 +2540,7 @@ mod tests {
             first_formatted_line: true,
             next_seq: 0,
             shaped: None,
+            emitted: std::cell::RefCell::new(None),
         };
 let img_index = 9;
         c.atomics.push(Atomic::new(

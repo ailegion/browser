@@ -354,6 +354,53 @@ runs; alone it passes 5 of 5).
 
 Still open in this design: B4 (fragments and paint order).
 
+**B4 (fragments and paint order) done 2026-11-01** (owner's go on the
+design, and on sharing fragment data). Fragments: a text fragment's
+glyphs and clusters are shared (`Arc<Vec<_>>`, edited in place while held
+once); an inline root keeps the fragments its last layout made under what
+they were made from (`InlineContent::emitted`, `EmittedKey`: its line
+layout's `InlineLayout::generation`, a number no other line layout has
+had, its origin and width bit for bit, its `text-overflow` marker's
+text), and hands them out again when all are the same. Paint order:
+building a stacking context whose root is a box is recorded
+(`ContextRecord`: its entry, the fragments of its subtree as the order
+reads them (`FragKey`: element, rect, style by identity (held), content
+kind, transform, fixed and containing block, scroll container state), its
+items, clips, spaces and containing blocks' clips with that build's
+indices, the outside clips it names (the one it was entered under, the
+clips of containing blocks outside it for its absolutely positioned
+boxes, and containing blocks that had none), the contexts recorded
+inside it); the next build (`stacking::build_reusing`, the records kept
+on `PaintOrder::contexts` and by the engine between layouts) puts a
+context back when its entry and fragments are the same and every
+outside clip has its counterpart, its fragment and clip indices shifted
+to the new build's, its outside references given to the contexts being
+recorded around it. An inline element's own context is built with its
+parent's. `BROWSER_VERIFY_LAYOUT` compares the paint order against one
+built from nothing (`PaintOrder::same_as`), and so does every
+incremental-layout test (`check_at`). Test
+`unchanged_stacking_contexts_are_put_back` (opacity holding a box whose
+containing block is outside it, a transformed card with a z-index box in
+it, a fixed box, an inline context, a scroll container; changed after
+them, before them (moving them), inside one, and a clip added before
+them that shifts every clip index; it fails when the shift is wrong).
+Verification (release probe, live): iana 12, Wikipedia Main Page 7, the
+Rust article 4 incremental layouts, layouts and paint orders 0
+differences.
+
+Timing (release probe, live):
+- iana: scroll-script layouts 23.6–26.5 ms (28–31 ms before B4):
+  fragments 3.8–4.1 ms (5.3–5.7), paint order 6.2–7.3 ms (9.8–11.0);
+  table-row changes 87–150 ms with the paint order SLOWER, 14.4–16.1 ms
+  (10.5–11.2): those build about 1,500 small contexts again or put them
+  back, and recording each (its fragments' keys, its items) costs more
+  than it saves; heap after load 470.1 MiB (480.1), peak 718.8 MiB
+  (703.3).
+- Wikipedia Main Page: load 678 ms; incremental layouts 3.8–4.6 ms
+  (4.5–5.7), the layout after a full restyle 3.3 ms (5.3–6.2); heap
+  after load 43.9 MiB (38.3), at the end 57.3 MiB (39.8): the kept
+  contexts' records and the inline roots' kept fragments.
+
 Found, not part of B2: the paint crate's unit tests crash at times with
 `STATUS_ACCESS_VIOLATION` when run in parallel (2 of 3 runs once); with
 `--test-threads=1` they pass every time. Safe code cannot fault so; it is

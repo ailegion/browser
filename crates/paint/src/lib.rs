@@ -422,7 +422,7 @@ fn krect(r: &Rect) -> KRect {
 /// `a..b`, adjacent clusters merged into one span each.
 fn cluster_runs(t: &TextFragment, a: usize, b: usize) -> Vec<(f32, f32)> {
     let mut runs: Vec<(f32, f32)> = Vec::new();
-    for c in &t.clusters {
+    for c in t.clusters.iter() {
         if c.start >= b || c.end <= a {
             continue;
         }
@@ -1904,7 +1904,7 @@ fn text_clip_path(f: &Fragment) -> BezPath {
             let outlines = font.outline_glyphs();
             let coords: Vec<NormalizedCoord> = t.coords.iter().map(|&c| NormalizedCoord::from_bits(c)).collect();
             let skew = t.skew.map(|deg| (deg as f64).to_radians().tan()).unwrap_or(0.0);
-            for g in &t.glyphs {
+            for g in t.glyphs.iter() {
                 let Some(outline) = outlines.get(GlyphId::new(g.id)) else { continue };
                 let mut pen = Pen {
                     path,

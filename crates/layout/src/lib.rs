@@ -522,15 +522,17 @@ pub struct TextFragment {
     pub font_size: f32,
     /// Variable-font coordinates, if any.
     pub coords: Vec<i16>,
-    pub glyphs: Vec<PositionedGlyph>,
+    /// Shared (`Arc`): a fragment an inline root keeps from one layout to
+    /// the next (block B4) is handed out again without copying its glyphs.
+    pub glyphs: Arc<Vec<PositionedGlyph>>,
     /// The whole text of the inline root this fragment is part of, after
     /// white-space processing. Shared by every fragment of the root, so
     /// pointer equality tells whether two fragments belong together.
     pub text: Arc<str>,
     /// The bytes of `text` this fragment shows.
     pub range: std::ops::Range<usize>,
-    /// Clusters in visual order, left to right.
-    pub clusters: Vec<Cluster>,
+    /// Clusters in visual order, left to right (shared, as `glyphs`).
+    pub clusters: Arc<Vec<Cluster>>,
     pub color: Rgba,
     /// Synthetic bold requested because the font has no bold face.
     pub embolden: bool,
@@ -1070,9 +1072,11 @@ impl LayoutTree {
         }
     }
 
-    /// Build the paint order again from the fragments as they stand.
+    /// Build the paint order again from the fragments as they stand, the
+    /// stacking contexts that did not change put back (block B4).
     pub(crate) fn rebuild_paint_order(&mut self) {
-        self.paint = stacking::build(self);
+        let previous = self.paint.contexts.clone();
+        self.paint = stacking::build_reusing(self, Some(&previous));
     }
 
     /// Place every `position: sticky` box (CSS Positioned 3 §3.4): each

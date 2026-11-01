@@ -301,7 +301,7 @@ impl Decorator {
         // A synthetic italic skews the painted outline: x' = x + tan·y.
         let skew = text.skew.map(|deg| deg.to_radians().tan()).unwrap_or(0.0);
         let mut ranges: Vec<(f32, f32)> = Vec::new();
-        for g in &text.glyphs {
+        for g in text.glyphs.iter() {
             let outline = self.outline(text, g.id);
             // The band in the glyph's outline space: y up, origin at the
             // glyph's baseline point.

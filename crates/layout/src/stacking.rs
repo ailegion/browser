@@ -33,8 +33,8 @@ use browser_style::transform::Matrix4;
 use browser_style::{BackfaceVisibility, ComputedStyle, Display, Float, Overflow, PointerEvents, Position, Visibility, ZIndex};
 
 use crate::{
-    Affine2, Containing, Fragment, FragmentContent, IDENTITY, LayoutTree, Rect, affine_apply, affine_invert, affine_mul,
-    rounded_contains, rounded_contains_inset,
+    Affine2, BoxTransform, Containing, Fragment, FragmentContent, IDENTITY, LayoutTree, Rect, affine_apply, affine_invert,
+    affine_mul, rounded_contains, rounded_contains_inset,
 };
 
 /// Where an item is drawn: the accumulated transform of the boxes above
@@ -119,7 +119,7 @@ pub struct PaintList<'a> {
 type FragId = u32;
 
 /// `Op` with the fragments named by index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum StoredOp {
     PushGroup { opacity: f32 },
     PopGroup,
@@ -134,14 +134,14 @@ enum StoredOp {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct StoredItem {
     op: StoredOp,
     space: Space,
 }
 
 /// A clip with what hit testing needs of its box.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct StoredClip {
     parent: Option<usize>,
     fragment: FragId,
@@ -154,7 +154,7 @@ struct StoredClip {
 
 /// A box hit testing can find, in paint order: an element's box (its
 /// border box, corners rounded) or its text.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Hit {
     node: NodeId,
     rect: Rect,
@@ -173,10 +173,127 @@ pub struct PaintOrder {
     spaces: HashMap<NodeId, Space>,
     /// How many fragments the tree had, for resolving.
     fragments: usize,
+    /// What building each stacking context produced, by its root element
+    /// (block B4): the next build puts back a context whose fragments and
+    /// entry are the same (`ContextRecord`).
+    pub(crate) contexts: Arc<HashMap<NodeId, Arc<ContextRecord>>>,
 }
 
 impl PaintOrder {
-    /// The order resolved against the tree it was built from: one walk
+    /// Whether two orders paint, clip, hit test and place alike (the
+    /// kept contexts aside): an order with contexts put back against one
+    /// built from nothing (`BROWSER_VERIFY_LAYOUT`, tests).
+    pub fn same_as(&self, other: &PaintOrder) -> bool {
+        self.fragments == other.fragments
+            && self.items == other.items
+            && self.clips == other.clips
+            && self.hits == other.hits
+            && self.spaces == other.spaces
+    }
+}
+
+/// One fragment as a stacking context's paint order reads it (block B4):
+/// two subtrees whose fragments all compare equal build the same order.
+/// The style is held, so its address stays its own while compared.
+#[derive(Debug, Clone)]
+struct FragKey {
+    node: Option<NodeId>,
+    rect: [u32; 4],
+    style: Arc<ComputedStyle>,
+    content: ContentKey,
+    children: usize,
+    transform: Option<BoxTransform>,
+    fixed: Option<(bool, bool)>,
+    containing: Option<Containing>,
+    scroller: Option<crate::ScrollInfo>,
+}
+
+impl PartialEq for FragKey {
+    fn eq(&self, o: &Self) -> bool {
+        self.node == o.node
+            && self.rect == o.rect
+            && Arc::ptr_eq(&self.style, &o.style)
+            && self.content == o.content
+            && self.children == o.children
+            && self.transform == o.transform
+            && self.fixed == o.fixed
+            && self.containing == o.containing
+            && self.scroller == o.scroller
+    }
+}
+
+/// What kind of content a fragment is, as the paint order sorts it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ContentKey {
+    Box,
+    Anonymous,
+    Marker,
+    Text,
+    Image,
+    Control,
+    Inline { left: bool, right: bool },
+    Placeholder,
+}
+
+/// How a stacking context was entered (its walk and whether it is a flex
+/// item), less the clip, which is named by index (`ContextRecord`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EntryKey {
+    transform: Affine2,
+    fixed: bool,
+    base: Affine2,
+    matrix3d: Option<Matrix4>,
+    flex_item: bool,
+}
+
+/// A clip outside a stacking context that its order names: the clip it
+/// was entered under, or the clip in effect inside a containing block
+/// outside it (for its absolutely positioned boxes); `Missing` records a
+/// containing block that had none, as that decides too.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Outside {
+    Entry,
+    Of(NodeId),
+    Missing(NodeId),
+}
+
+/// What building one stacking context produced (block B4), with its
+/// fragment and clip indices as that build numbered them: put back with
+/// both shifted to where the new build has them.
+#[derive(Debug)]
+pub(crate) struct ContextRecord {
+    entry: EntryKey,
+    /// Its root's pre-order index, and the clips' count when it began.
+    root_id: FragId,
+    clip_base: usize,
+    /// The fragments of its subtree, in pre-order.
+    keys: Vec<FragKey>,
+    items: Vec<StoredItem>,
+    clips: Vec<StoredClip>,
+    /// The spaces it noted and the containing blocks' clips it set, in
+    /// order (both first-wins, as built).
+    spaces: Vec<(NodeId, Space)>,
+    cb: Vec<(NodeId, Option<usize>)>,
+    /// The outside clips its indices below `clip_base` are.
+    outside: Vec<(Option<usize>, Outside)>,
+    /// The contexts recorded inside it, carried along when it is put back.
+    nested: Vec<NodeId>,
+}
+
+/// A context being built while its output is recorded.
+struct Recording {
+    node: NodeId,
+    entry: EntryKey,
+    root: FragId,
+    item_base: usize,
+    clip_base: usize,
+    space_base: usize,
+    cb_base: usize,
+    outside: Vec<(Option<usize>, Outside)>,
+    nested: Vec<NodeId>,
+}
+
+impl PaintOrder {    /// The order resolved against the tree it was built from: one walk
     /// to find each fragment by its index.
     pub fn resolve<'a>(&'a self, root: &'a Fragment) -> PaintList<'a> {
         let mut table: Vec<&'a Fragment> = Vec::with_capacity(self.fragments);
@@ -281,8 +398,15 @@ impl PaintOrder {
     }
 }
 
-/// The paint order of `tree`.
+/// The paint order of `tree`, built from nothing.
 pub fn build(tree: &LayoutTree) -> PaintOrder {
+    build_reusing(tree, None)
+}
+
+/// The paint order of `tree`, putting back the stacking contexts of
+/// `previous` (an order built before, its records) whose fragments and
+/// entry are unchanged (block B4).
+pub(crate) fn build_reusing(tree: &LayoutTree, previous: Option<&HashMap<NodeId, Arc<ContextRecord>>>) -> PaintOrder {
     // Each fragment's subtree size in pre-order, so a child's index is
     // its parent's plus one plus the sizes of the siblings before it.
     let mut sizes: Vec<u32> = Vec::new();
@@ -303,12 +427,19 @@ pub fn build(tree: &LayoutTree) -> PaintOrder {
         list: PaintOrder::default(),
         seq: 0,
         cb_clips: HashMap::new(),
+        previous,
+        records: HashMap::new(),
+        recordings: Vec::new(),
+        space_log: Vec::new(),
+        cb_log: Vec::new(),
     };
     // The root element is the viewport fragment's first child.
     if let Some(html) = tree.root.children.first() {
         b.context(Sub::Box(Fr { f: html, id: 1 }), Walk::ROOT, false);
     }
+    let records = std::mem::take(&mut b.records);
     let mut list = b.list;
+    list.contexts = Arc::new(records);
     list.fragments = b.sizes.first().copied().unwrap_or(0) as usize;
     list.hits = hits(&tree.root, &list);
     list
@@ -435,6 +566,14 @@ struct Builder<'a> {
     /// overflow of the boxes between them and it does not, CSS Overflow
     /// 3 §3).
     cb_clips: HashMap<NodeId, Option<usize>>,
+    /// Block B4: the records of the order built before, those of this
+    /// build, the contexts being recorded (innermost last), and every
+    /// space noted and containing block clip set, in order, for them.
+    previous: Option<&'a HashMap<NodeId, Arc<ContextRecord>>>,
+    records: HashMap<NodeId, Arc<ContextRecord>>,
+    recordings: Vec<Recording>,
+    space_log: Vec<(NodeId, Space)>,
+    cb_log: Vec<(NodeId, Option<usize>)>,
 }
 
 /// Whether a fragment's element is the containing block of absolutely
@@ -479,6 +618,17 @@ impl<'a> Builder<'a> {
     fn note_space(&mut self, f: &Fragment, space: Space) {
         if let Some(n) = f.node {
             self.list.spaces.entry(n).or_insert(space);
+            if !self.recordings.is_empty() {
+                self.space_log.push((n, space));
+            }
+        }
+    }
+
+    /// The clip in effect inside containing block `n` (first set wins).
+    fn note_cb_clip(&mut self, n: NodeId, clip: Option<usize>) {
+        self.cb_clips.entry(n).or_insert(clip);
+        if !self.recordings.is_empty() {
+            self.cb_log.push((n, clip));
         }
     }
 
@@ -572,7 +722,7 @@ impl<'a> Builder<'a> {
         if is_containing_block(f)
             && let Some(n) = f.node
         {
-            self.cb_clips.entry(n).or_insert(w.space.clip);
+            self.note_cb_clip(n, w.space.clip);
         }
         w
     }
@@ -581,12 +731,24 @@ impl<'a> Builder<'a> {
     /// containing block and the boxes above that, not of the boxes
     /// between (an `overflow` box that is not its containing block, nor
     /// inside one, does not clip it).
-    fn escaping_walk(&self, f: &Fragment, walk: Walk) -> Walk {
+    fn escaping_walk(&mut self, f: &Fragment, walk: Walk) -> Walk {
         let clip = match f.containing {
-            Some(Containing::Element(n)) => match self.cb_clips.get(&n) {
-                Some(c) => *c,
-                None => return walk,
-            },
+            Some(Containing::Element(n)) => {
+                let found = self.cb_clips.get(&n).copied();
+                // A containing block outside a context being recorded:
+                // what it gave (or that it gave nothing) decides there.
+                for r in &mut self.recordings {
+                    match found {
+                        Some(c) if c.is_none_or(|i| i < r.clip_base) => r.outside.push((c, Outside::Of(n))),
+                        None => r.outside.push((None, Outside::Missing(n))),
+                        Some(_) => {}
+                    }
+                }
+                match found {
+                    Some(c) => c,
+                    None => return walk,
+                }
+            }
             Some(Containing::Initial) => None,
             None => return walk,
         };
@@ -606,8 +768,247 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// A real stacking context rooted at `sub`.
+    /// A real stacking context rooted at `sub`: a box's put back from the
+    /// order built before when nothing it reads changed (block B4), else
+    /// built, and recorded for the next build.
     fn context(&mut self, sub: Sub<'a>, walk: Walk, flex_item: bool) {
+        let entry = EntryKey {
+            transform: walk.space.transform,
+            fixed: walk.space.fixed,
+            base: walk.base,
+            matrix3d: walk.matrix3d,
+            flex_item,
+        };
+        let boxed = match &sub {
+            Sub::Box(fr) => fr.f.node.map(|n| (n, *fr)),
+            Sub::Inline(_) => None,
+        };
+        if let Some((n, fr)) = boxed {
+            if self.put_back(n, fr, entry, walk.space.clip) {
+                return;
+            }
+            self.recordings.push(Recording {
+                node: n,
+                entry,
+                root: fr.id,
+                item_base: self.list.items.len(),
+                clip_base: self.list.clips.len(),
+                space_base: self.space_log.len(),
+                cb_base: self.cb_log.len(),
+                outside: vec![(walk.space.clip, Outside::Entry)],
+                nested: Vec::new(),
+            });
+        }
+        self.build_context(sub, walk, flex_item);
+        if let Some((_, fr)) = boxed {
+            let r = self.recordings.pop().expect("pushed above");
+            let record = ContextRecord {
+                entry: r.entry,
+                root_id: r.root,
+                clip_base: r.clip_base,
+                keys: self.keys_of(fr),
+                items: self.list.items[r.item_base..].to_vec(),
+                clips: self.list.clips[r.clip_base..].to_vec(),
+                spaces: self.space_log[r.space_base..].to_vec(),
+                cb: self.cb_log[r.cb_base..].to_vec(),
+                outside: r.outside,
+                nested: r.nested,
+            };
+            if let Some(parent) = self.recordings.last_mut() {
+                parent.nested.push(r.node);
+                parent.nested.extend(record.nested.iter().copied());
+            } else {
+                self.space_log.clear();
+                self.cb_log.clear();
+            }
+            self.records.insert(r.node, Arc::new(record));
+        }
+    }
+
+    /// The fragments of the subtree at `fr`, in pre-order, as the paint
+    /// order reads them.
+    fn keys_of(&self, fr: Fr<'a>) -> Vec<FragKey> {
+        let mut out = Vec::with_capacity(self.sizes[fr.id as usize] as usize);
+        fn walk(b: &Builder<'_>, f: &Fragment, out: &mut Vec<FragKey>) {
+            out.push(b.key(f));
+            for c in &f.children {
+                walk(b, c, out);
+            }
+        }
+        walk(self, fr.f, &mut out);
+        out
+    }
+
+    fn key(&self, f: &Fragment) -> FragKey {
+        FragKey {
+            node: f.node,
+            rect: [f.rect.x.to_bits(), f.rect.y.to_bits(), f.rect.width.to_bits(), f.rect.height.to_bits()],
+            style: f.style.clone(),
+            content: match &f.content {
+                FragmentContent::Box => ContentKey::Box,
+                FragmentContent::Control(_) => ContentKey::Control,
+                FragmentContent::Anonymous => ContentKey::Anonymous,
+                FragmentContent::Text(_) => ContentKey::Text,
+                FragmentContent::Image(_) => ContentKey::Image,
+                FragmentContent::Marker => ContentKey::Marker,
+                FragmentContent::Inline { left, right, .. } => ContentKey::Inline { left: *left, right: *right },
+                FragmentContent::Placeholder(_) => ContentKey::Placeholder,
+            },
+            children: f.children.len(),
+            transform: f.transform.as_deref().cloned(),
+            fixed: f.fixed,
+            containing: f.containing,
+            scroller: self.scroller(f).cloned(),
+        }
+    }
+
+    /// Whether the subtree at `fr` reads as `keys` (pre-order), stopping
+    /// at the first fragment that differs.
+    fn keys_match(&self, fr: Fr<'a>, keys: &[FragKey]) -> bool {
+        fn walk(b: &Builder<'_>, f: &Fragment, keys: &[FragKey], at: &mut usize) -> bool {
+            let Some(k) = keys.get(*at) else { return false };
+            if b.key(f) != *k {
+                return false;
+            }
+            *at += 1;
+            f.children.iter().all(|c| walk(b, c, keys, at))
+        }
+        let mut at = 0;
+        keys.len() == self.sizes[fr.id as usize] as usize && walk(self, fr.f, keys, &mut at) && at == keys.len()
+    }
+
+    /// Put back the stacking context of `n` at `fr` from the order built
+    /// before, when its entry and fragments are as they were and every
+    /// outside clip it names has its counterpart here; its indices are
+    /// shifted to this build's. False (nothing changed) otherwise.
+    fn put_back(&mut self, n: NodeId, fr: Fr<'a>, entry: EntryKey, entry_clip: Option<usize>) -> bool {
+        let Some(rec) = self.previous.and_then(|p| p.get(&n)).cloned() else { return false };
+        if rec.entry != entry || !self.keys_match(fr, &rec.keys) {
+            return false;
+        }
+        // The outside clips, old index to new; a clip and no clip never
+        // stand for each other.
+        let set_inside = |m: NodeId| rec.cb.iter().any(|(c, _)| *c == m);
+        let mut outside: Vec<(usize, usize)> = Vec::new();
+        // The containing blocks outside it, as this build has them (for
+        // the contexts recorded around it, `escaping_walk`'s notes).
+        let mut lookups: Vec<(Option<usize>, Outside)> = Vec::new();
+        for (old, how) in &rec.outside {
+            let new = match how {
+                Outside::Entry => entry_clip,
+                Outside::Of(m) if set_inside(*m) => continue,
+                Outside::Of(m) => match self.cb_clips.get(m) {
+                    Some(c) => {
+                        lookups.push((*c, Outside::Of(*m)));
+                        *c
+                    }
+                    None => return false,
+                },
+                Outside::Missing(m) if set_inside(*m) => continue,
+                Outside::Missing(m) => {
+                    if self.cb_clips.contains_key(m) {
+                        return false;
+                    }
+                    lookups.push((None, Outside::Missing(*m)));
+                    continue;
+                }
+            };
+            match (*old, new) {
+                (None, None) => {}
+                (Some(o), Some(v)) => match outside.iter().find(|(k, _)| *k == o) {
+                    Some((_, w)) if *w != v => return false,
+                    Some(_) => {}
+                    None => outside.push((o, v)),
+                },
+                // A clip and no clip never stand for each other.
+                _ => return false,
+            }
+        }
+        let base = self.list.clips.len();
+        let map_clip = |c: Option<usize>| -> Result<Option<usize>, ()> {
+            match c {
+                None => Ok(None),
+                Some(i) if i >= rec.clip_base => Ok(Some(i - rec.clip_base + base)),
+                Some(i) => outside.iter().find(|(k, _)| *k == i).map(|(_, v)| Some(*v)).ok_or(()),
+            }
+        };
+        let shift = |id: FragId| -> FragId { id - rec.root_id + fr.id };
+        let space_of = |s: Space| -> Result<Space, ()> { Ok(Space { clip: map_clip(s.clip)?, ..s }) };
+        // Everything converted first: nothing is added unless all of it is.
+        let mut clips = Vec::with_capacity(rec.clips.len());
+        for c in &rec.clips {
+            let Ok(parent) = map_clip(c.parent) else { return false };
+            clips.push(StoredClip {
+                parent,
+                fragment: shift(c.fragment),
+                ..c.clone()
+            });
+        }
+        let mut items = Vec::with_capacity(rec.items.len());
+        for it in &rec.items {
+            let Ok(space) = space_of(it.space) else { return false };
+            let op = match &it.op {
+                StoredOp::Mask(ids) => StoredOp::Mask(ids.iter().map(|&i| shift(i)).collect()),
+                StoredOp::Decoration { fragment, sides } => StoredOp::Decoration {
+                    fragment: shift(*fragment),
+                    sides: *sides,
+                },
+                StoredOp::Content(f) => StoredOp::Content(shift(*f)),
+                StoredOp::Scrollbars(f) => StoredOp::Scrollbars(shift(*f)),
+                other => other.clone(),
+            };
+            items.push(StoredItem { op, space });
+        }
+        let mut spaces = Vec::with_capacity(rec.spaces.len());
+        for &(node, s) in &rec.spaces {
+            let Ok(s) = space_of(s) else { return false };
+            spaces.push((node, s));
+        }
+        let mut cbs = Vec::with_capacity(rec.cb.len());
+        for &(node, c) in &rec.cb {
+            let Ok(c) = map_clip(c) else { return false };
+            cbs.push((node, c));
+        }
+        self.list.clips.extend(clips);
+        self.list.items.extend(items);
+        for (node, s) in spaces {
+            self.list.spaces.entry(node).or_insert(s);
+            if !self.recordings.is_empty() {
+                self.space_log.push((node, s));
+            }
+        }
+        for (node, c) in cbs {
+            self.note_cb_clip(node, c);
+        }
+        // Its record, and those of the contexts inside it, stand for the
+        // next build too.
+        if let Some(prev) = self.previous {
+            for m in &rec.nested {
+                if let Some(r) = prev.get(m) {
+                    self.records.insert(*m, r.clone());
+                }
+            }
+        }
+        // The contexts recorded around it note its outside containing
+        // blocks as if built (`escaping_walk`).
+        for (c, how) in lookups {
+            for r in &mut self.recordings {
+                if c.is_none_or(|i| i < r.clip_base) {
+                    r.outside.push((c, how));
+                }
+            }
+        }
+        if let Some(parent) = self.recordings.last_mut() {
+            parent.nested.push(n);
+            parent.nested.extend(rec.nested.iter().copied());
+        }
+        self.records.insert(n, rec.clone());
+        crate::engine::count(|c| *c.contexts_reused += 1);
+        true
+    }
+
+    /// A real stacking context rooted at `sub`, built.
+    fn build_context(&mut self, sub: Sub<'a>, walk: Walk, flex_item: bool) {
         let mut walk = walk;
         if let Sub::Box(fr) = &sub
             && !self.enter(fr.f, &mut walk)
@@ -674,7 +1075,7 @@ impl<'a> Builder<'a> {
         if is_containing_block(f)
             && let Some(n) = f.node
         {
-            self.cb_clips.entry(n).or_insert(walk.space.clip);
+            self.note_cb_clip(n, walk.space.clip);
         }
         if visible(f) {
             ph.foreground.push(Fore::Item(StoredItem {

@@ -2889,7 +2889,9 @@ what breaks the most pages.
   2026-10-19 (record there); B2 partly built 2026-10-19, not done:
   persistent taffy tree, row-level rebuilds and full restyles laying out
   fully are SKIPPED (record there); all three done 2026-11-01 (record
-  there): B2 done; B3 done 2026-11-01 (record there); B4 next. B1–B3
+  there): B2 done; B3 done 2026-11-01 (record there); B4 done 2026-11-01
+  (record there; its paint order is slower for changes that touch many
+  small stacking contexts, and its records cost memory). B1–B3
   leave iana.org/protocols' load at 4.7 s: its load layouts are full for
   reasons outside them (record there). Original placement: (owner's 2026-10-18 placement; found with "Working
   sites first" 6i: every layout-affecting change lays out the whole page,
