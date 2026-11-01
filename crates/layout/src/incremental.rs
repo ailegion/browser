@@ -15,11 +15,12 @@
 //! that cannot be placed that way (the root or `body`, an element with no
 //! box above it, an unknown change) builds the whole tree.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use browser_dom::{Document, NodeId};
 
-use crate::boxes::{BoxBuilder, BoxKind, BoxNode, OutOfFlowBox, ScrollPlan};
+use crate::boxes::{BoxBuilder, BoxKind, BoxNode, OutOfFlowBox, ScrollPlan, TaffyId};
 use crate::generated::Generated;
 
 /// What changed since the last layout.
@@ -61,6 +62,7 @@ pub(crate) fn rebuild(
     doc: &Document,
     changes: &BoxChanges,
     viewport_source: Option<NodeId>,
+    removed: &RefCell<Vec<(u64, TaffyId)>>,
 ) -> bool {
     let BoxChanges::Known { elements, parents } = changes else { return false };
     if kept.viewport_source != viewport_source {
@@ -162,17 +164,29 @@ pub(crate) fn rebuild(
         tops: &tops,
         dirty: &dirty,
         builder,
+        removed,
     };
     // The out-of-flow boxes continue the kept list.
     *builder.oofs.borrow_mut() = std::mem::take(oofs);
     let _ = replace_node(&mut kept.root, &cx, &mut ok);
     // Boxes inside the out-of-flow boxes (whose placeholders stay put).
     let len = builder.oofs.borrow().len();
+    let mut oof_changed = false;
     for i in 0..len {
         let taken = builder.oofs.borrow_mut()[i].node.take();
         if let Some(mut node) = taken {
-            let _ = replace_node(&mut node, &cx, &mut ok);
+            oof_changed |= replace_node(&mut node, &cx, &mut ok);
             builder.oofs.borrow_mut()[i].node = Some(node);
+        }
+    }
+    // A change inside a positioned box: its kept layouts no longer hold,
+    // nor those of the positioned boxes it may be placed in (their
+    // layouts place the boxes whose containing block is in them).
+    if oof_changed {
+        for o in builder.oofs.borrow_mut().iter_mut() {
+            if let Some(own) = o.node.as_mut().and_then(|n| n.own.as_mut()) {
+                own.results.clear();
+            }
         }
     }
     // Reusable boxes the new builds did not take: gone, with the
@@ -189,6 +203,10 @@ pub(crate) fn rebuild(
     ok
 }
 
+/// In the removals: the tree of this tag was dropped with its box, so the
+/// removals from it are void.
+pub(crate) const DROPPED_TREE: TaffyId = TaffyId::new(u64::MAX);
+
 /// What a rebuild needs on its way down.
 struct Rebuild<'a, 'b> {
     /// The element boxes to build again.
@@ -196,13 +214,24 @@ struct Rebuild<'a, 'b> {
     /// The elements a change reaches (their boxes are not reused).
     dirty: &'a HashSet<NodeId>,
     builder: &'a BoxBuilder<'b>,
+    /// The taffy nodes of the boxes dropped, by tree, for the engine to
+    /// remove from its kept trees.
+    removed: &'a RefCell<Vec<(u64, TaffyId)>>,
 }
 
 /// Take apart a box being rebuilt (or one no longer wanted, `drop_all`):
 /// the element boxes and cells inside it that no change reaches go to the
 /// builder for reuse; out-of-flow boxes whose placeholders are inside it
-/// go too (their list entries emptied); the rest is dropped.
+/// go too (their list entries emptied); the rest is dropped, its taffy
+/// node with it (a tree of its own goes with the box).
 fn harvest(b: BoxNode, cx: &Rebuild<'_, '_>, drop_all: bool) {
+    // A tree of its own goes with it: no removals from that one.
+    if let Some(own) = &b.own {
+        cx.removed.borrow_mut().push((own.tag, DROPPED_TREE));
+    }
+    if let Some(id) = b.taffy {
+        cx.removed.borrow_mut().push((b.tree, id));
+    }
     let BoxNode { kind, children, marker, .. } = b;
     for c in children {
         offer(c, cx, drop_all);
@@ -246,6 +275,10 @@ fn harvest(b: BoxNode, cx: &Rebuild<'_, '_>, drop_all: bool) {
 /// element's box no change reaches, else taken apart in turn.
 fn offer(c: BoxNode, cx: &Rebuild<'_, '_>, drop_all: bool) {
     if let BoxKind::OutOfFlow(i) = c.kind {
+        // The placeholder goes; the box it stands for may be reused.
+        if let Some(id) = c.taffy {
+            cx.removed.borrow_mut().push((c.tree, id));
+        }
         offer_out_of_flow(i, c.node, cx, drop_all);
         return;
     }
@@ -372,6 +405,7 @@ fn replace_in(b: &mut BoxNode, cx: &Rebuild<'_, '_>, ok: &mut bool) -> bool {
             if inside {
                 content.cache.clear();
                 content.shaped = None;
+                b.dirty = true;
                 changed = true;
             }
         }
@@ -428,6 +462,7 @@ fn replace_in(b: &mut BoxNode, cx: &Rebuild<'_, '_>, ok: &mut bool) -> bool {
                 t.layouts.clear();
                 t.current = 0;
                 t.intrinsic = None;
+                b.dirty = true;
                 changed = true;
                 tracing::info!(target: "perf", table = ?b.node, "table caches cleared by a change inside");
             }
@@ -458,36 +493,34 @@ fn replace_node(b: &mut BoxNode, cx: &Rebuild<'_, '_>, ok: &mut bool) -> bool {
     }
 }
 
-/// Before a layout of the kept tree (block B2): clear what belongs to one
-/// layout only (taffy ids, scrollbar gutters, the `text-overflow` marker,
-/// a table's containing block width, the floats' bands with the line
-/// layouts made around them), keeping the caches the boxes' own content
-/// decides: line layouts keyed by width, atomics' results by question,
-/// tables' layouts by width, cells' and captions' measures.
+/// Before a layout of the kept tree (blocks B2): clear what belongs to one
+/// layout only (the `text-overflow` marker, which every layout makes
+/// again for its final lines), keeping what the kept taffy trees answer
+/// with: the taffy nodes, line layouts keyed by width, the floats' bands
+/// (the float pass starts again where they no longer hold), atomics'
+/// results by question, tables' layouts and containing block width,
+/// cells' and captions' measures. Scrollbar gutters added for overflow
+/// stay, marked as kept: each goes once its box's first pass shows that
+/// axis no longer overflowing.
 pub(crate) fn reset_layout_state(b: &mut BoxNode) {
-    b.taffy = None;
-    if let Some(plan) = &mut b.scroll {
-        let (inner_editor, caret_room) = (plan.inner_editor, plan.caret_room);
-        if let Some(mut fresh) = ScrollPlan::for_style(&b.style) {
-            fresh.inner_editor = inner_editor;
-            fresh.caret_room = caret_room;
-            *plan = fresh;
-        }
+    if let Some(plan) = &b.scroll {
+        b.kept_gutters = ScrollPlan::for_style(&b.style).is_some_and(|base| plan.has_added_gutters(&base));
     }
     match &mut b.kind {
         BoxKind::Inline(content) => {
-            // Line layouts made around floats are only good for those
-            // bands, which this layout works out again.
-            if !content.floats.is_empty() {
-                content.floats.clear();
-                content.cache.clear();
-            }
             content.ellipsis = None;
             for a in &mut content.atomics {
                 reset_layout_state(&mut a.node);
             }
         }
         BoxKind::Table(t) => {
+            // A layout starts with no definite containing block, as a full
+            // one does; a table taffy answers from its cache is not
+            // measured, so its finish takes the one it had (`table::finish`).
+            // (A table not laid out last time still holds the one before.)
+            if t.kept_available.is_none() {
+                t.kept_available = Some(t.available_width);
+            }
             t.available_width = 0.0;
             for c in &mut t.captions {
                 reset_layout_state(&mut c.node);

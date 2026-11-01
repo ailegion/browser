@@ -256,6 +256,13 @@ impl Cache {
         }
     }
 
+    /// Drop the final layout entry only, keeping the size measurements (a
+    /// descendant's final layout changed, so the layouts this entry left
+    /// below it may no longer be the ones in the tree; its sizes still hold).
+    pub fn clear_final_layout(&mut self) {
+        self.final_layout_entry = None;
+    }
+
     /// Clear all cache entries and reports clear operation outcome ([`ClearState`])
     pub fn clear(&mut self) -> ClearState {
         if self.is_empty {

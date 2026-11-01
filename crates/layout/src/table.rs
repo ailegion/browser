@@ -77,6 +77,8 @@ pub(crate) fn size_for(
 
 /// The width of `size_for`, from the intrinsic widths alone.
 pub(crate) fn width_for(engine: &mut LayoutEngine, table: &mut TableBox, sizing: Sizing, cb_width: Option<f32>) -> f32 {
+    // Measured in this layout: what it is asked decides, as in a full one.
+    table.kept_available = None;
     // Percentages resolve against the containing block taffy last gave
     // a definite width for (an intrinsic question has none).
     if let Some(cb) = cb_width {
@@ -95,6 +97,11 @@ pub(crate) fn width_for(engine: &mut LayoutEngine, table: &mut TableBox, sizing:
 /// gave the table box, filling a taller box (a stretched flex item, a
 /// sized wrapper) when taffy made it one.
 pub(crate) fn finish(engine: &mut LayoutEngine, table: &mut TableBox, width: f32, height: f32) {
+    // Not measured in this layout (taffy's kept result stood for it): the
+    // containing block it was laid out in last time.
+    if let Some(cb) = table.kept_available.take() {
+        table.available_width = cb;
+    }
     let natural = layout_at(engine, table, width, None);
     table.current = if height > table.layouts[natural].height + 0.01 {
         layout_at(engine, table, width, Some(height))

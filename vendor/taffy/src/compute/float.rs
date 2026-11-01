@@ -70,7 +70,7 @@ pub struct BfcSlot {
 }
 
 /// A floated box
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlacedFloatedBox {
     /// A user defined ID for the box
     // id: u64,
@@ -86,7 +86,7 @@ pub struct PlacedFloatedBox {
 }
 
 /// A non-overlapping horizontal segment of the Block Formatting Context container
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Segment {
     /// The vertical start and end points of the segment
     y: Range<f32>,
@@ -200,7 +200,7 @@ impl FloatFitter {
 }
 
 /// A context for placing floated boxes
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FloatContext {
     /// The available space constraint that applies to the root Block Formatting Context
     /// for which this `FloatContext` manages floats.

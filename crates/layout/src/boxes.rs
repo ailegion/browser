@@ -64,6 +64,9 @@ pub(crate) struct TableBox {
     /// The width of the table's containing block, which its percentage
     /// padding resolves against (zero while it is indefinite).
     pub available_width: f32,
+    /// The containing block width of the last layout, until this layout
+    /// measures the table (a kept taffy tree answering for it does not).
+    pub kept_available: Option<f32>,
 }
 
 /// A table caption: a block box in the table wrapper above the table box,
@@ -219,6 +222,27 @@ impl ScrollPlan {
         }
         added
     }
+
+    /// Take away the gutters added for overflow (those `base`, the plan
+    /// from the style, does not have) on the axes no longer overflowing;
+    /// true when one went.
+    pub fn drop_unneeded_gutters(&mut self, base: &ScrollPlan, overflow_x: bool, overflow_y: bool) -> bool {
+        let mut dropped = false;
+        if self.gutter_y && !base.gutter_y && !overflow_y {
+            self.gutter_y = false;
+            dropped = true;
+        }
+        if self.gutter_x && !base.gutter_x && !overflow_x {
+            self.gutter_x = false;
+            dropped = true;
+        }
+        dropped
+    }
+
+    /// Whether it has a gutter added for overflow (one `base` lacks).
+    pub fn has_added_gutters(&self, base: &ScrollPlan) -> bool {
+        (self.gutter_y && !base.gutter_y) || (self.gutter_x && !base.gutter_x)
+    }
 }
 
 pub(crate) struct BoxNode {
@@ -248,6 +272,19 @@ pub(crate) struct BoxNode {
     /// For an element's box: the nesting depth the builder built it at,
     /// so incremental layout (`incremental.rs`) builds it again exactly.
     pub depth: usize,
+    /// The taffy tree `taffy` is a node of (`engine::TaffyTag`): a box
+    /// moved into another tree by a rebuild gets a node there.
+    pub tree: u64,
+    /// Caches this box's taffy node answered from were cleared (a
+    /// rebuild inside it): its node is marked dirty before the next pass.
+    pub dirty: bool,
+    /// Its auto scrollbar gutters were kept from the last layout: once
+    /// its first pass shows an axis no longer overflowing, that gutter
+    /// goes (as browsers drop a scrollbar the content stops needing).
+    pub kept_gutters: bool,
+    /// For a box laid out on its own (atomic, cell, caption, positioned
+    /// box): the taffy tree of its subtree, kept between layouts.
+    pub own: Option<Box<crate::engine::OwnTree>>,
 }
 
 impl BoxNode {
@@ -270,6 +307,10 @@ impl BoxNode {
             marker: None,
             hangs: false,
             depth: 0,
+            tree: 0,
+            dirty: false,
+            kept_gutters: false,
+            own: None,
         }
     }
 
@@ -1707,6 +1748,7 @@ impl BoxBuilder<'_> {
             current: 0,
             intrinsic: None,
             available_width: 0.0,
+            kept_available: None,
         };
         let mut headers = Vec::new();
         let mut bodies = Vec::new();

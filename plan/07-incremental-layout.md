@@ -170,7 +170,7 @@ caption's measures. It logs "table caches cleared by a change inside".
 SKIPPED, so the block is not done:
 - the persistent taffy tree (`set_style`/`mark_dirty`, taffy's caches
   answering for clean subtrees): taffy is still built again on every
-  layout;
+  layout (done 2026-11-01, record below);
 - a change inside a table row rebuilds the whole table: rows have no
   element box of their own to rebuild, while browsers rebuild only the
   row;
@@ -194,6 +194,80 @@ Timing (release):
   before).
 - Heap after iana's load: 229 (B1) → 350.6 MiB; its peak 691 →
   630.7 MiB.
+
+**B2 part 1 (persistent taffy tree) done 2026-11-01** (first built with
+a coarse float rule, SKIPPED; replaced the same day by the float cache
+below). This part does not change page load time (a load is full
+layouts); it was never going to bring iana's load to the 600–700 ms /
+1.3 s target. The document's
+taffy tree (with the viewport node and its scroll plan) is kept on the
+engine (`DocTree`), and every box laid out on its own (atomic, cell,
+caption, positioned box) keeps its own on the box (`BoxNode::own`,
+`OwnTree`). Each box records which tree its node is in (`BoxNode::tree`,
+a tag per tree). `sync_taffy` replaces `build_taffy`: a box with a node
+in this tree keeps it, a new box or one moved from another tree gets one,
+children are set again only where they differ, a box whose caches a
+rebuild cleared (`BoxNode::dirty`, set by `replace_in`) is marked dirty.
+Leaves find their box through a per-pass map from node to leaf
+(`Leaf::Measured`, `LeafIndex`), so their contexts never change. Boxes a
+rebuild drops give their nodes back (`harvest`, `note_removed`,
+`apply_removals`; a dropped box's own tree goes with it). An independent
+root's style for each run comes from its own style (`taffy_style`), set
+only when it differs. Kept between layouts as well: float bands (a
+formatting context where the first pass gives a root other bands starts
+again without them, as a full layout does: `float_restarts`), scrollbar
+gutters added for overflow (`BoxNode::kept_gutters`, the viewport's in
+`DocTree::plan`: one goes after the first pass when its axis no longer
+overflows with it, as browsers drop a scrollbar the content stops
+needing), a table's containing block width for a table taffy answers for
+(`TableBox::kept_available`, used by `table::finish`; a full layout's
+start at 0 kept for its measures), positioned boxes' layouts per run
+(`OwnTree::results`, cleared for all of them when a change reaches inside
+any). Two taffy patches (`03-crates.md`, sixth and seventh additions):
+a recomputed final layout clears its ancestors' cached final layouts (a
+measure laying a float out at another width left them stale), and a float
+cache for nodes inside a block formatting context while floats are
+involved (a plain cached block did not place its floats, so the `h1`
+beside iana's side navigation lost its float avoidance): each such layout
+is kept with the context state it started from and the state it left
+(`BlockContextState`: the node's place in the context, its parent's
+flags, every float), reused only from an equal state, and the state it
+left is put back, so its floats are placed again exactly.
+`BROWSER_VERIFY_LAYOUT` now logs where a difference starts (the element
+chain). Tests: layout (`incremental_layout`: an unchanged page answered
+from the kept tree, a change measuring only its part, a table answered
+for, floats kept and restarted and removed, gutters kept, dropped and
+added again on a scroller and the page, a kept box moved into an
+inline-block's tree), taffy (both patches, each failing without it; the
+float cache: a page of blocks around floats changed four ways, each equal
+to a fresh tree and boxes before the change not laid out again, failing
+when the state is not put back). Verification: iana.org/protocols live,
+9 incremental layouts, 0 differences (with the float cache too). Wikipedia (Main Page, the Rust article) makes no incremental
+layout in the probe (its hover changes restyle fully: part 3), so it does
+not exercise this part.
+
+Timing (release, probe, live pages; the saved pages of the earlier
+records are gone, so these are not the same bytes as B2's numbers):
+- iana: load 4.81 s, 4 layouts; full relayout 508 ms (restyle 351–373 ms);
+  scroll-script layouts 28–30 ms (B2: ~70 ms); table-row changes
+  154–158 ms (B2: 230–275 ms), others 104–113 ms; first hover move
+  381 ms with a full restyle and layout (B2: 470–490 ms); heap after load
+  477.6 MiB, peak 701.9 MiB (B2: 350.6 / 630.7 MiB).
+- iana with the float cache: load 4.78 s; full relayout 489–491 ms;
+  scroll-script layouts 28–32 ms with taffy's run 0.0 ms (every box from
+  its kept result); table-row changes still 154–155 ms (2,585 taffy nodes
+  built, taffy's run 105 ms: the whole table is rebuilt, part 2, not the
+  floats); the 103–115 ms ones run taffy for 54 ms; first hover move
+  377 ms; heap after load 480.1 MiB, peak 703.2 MiB.
+- Wikipedia Main Page: load 733 ms (B2: 709 ms), full layouts 42–51 ms.
+
+Still SKIPPED in B2: row-level rebuilds inside tables (part 2) and full
+restyles laying out fully (part 3), as recorded above.
+
+Found, not part of B2: the paint crate's unit tests crash at times with
+`STATUS_ACCESS_VIOLATION` when run in parallel (2 of 3 runs once); with
+`--test-threads=1` they pass every time. Safe code cannot fault so; it is
+in the GPU path (wgpu and the driver).
 
 ## Risks
 

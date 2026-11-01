@@ -252,6 +252,52 @@ impl BlockContext<'_> {
     pub fn floated_content_height_contribution(&self) -> f32 {
         self.float_content_contribution
     }
+
+    /// Everything a node's layout reads from this context or leaves in it:
+    /// the node's place in the formatting context, the flags its parent
+    /// handed it, and the whole float state of the context. A layout that
+    /// started from an equal state gives the same result and leaves the
+    /// same state (`TaffyView::compute_child_layout`'s float cache).
+    pub(crate) fn state(&self) -> BlockContextState {
+        BlockContextState {
+            y_offset: self.y_offset,
+            insets: self.insets,
+            content_box_insets: self.content_box_insets,
+            float_content_contribution: self.float_content_contribution,
+            is_root: self.is_root,
+            adjoining_floats: self.adjoining_floats,
+            top_adjoining_floats: self.top_adjoining_floats,
+            floats: self.bfc.float_context.clone(),
+        }
+    }
+
+    /// Put back the state a layout left (its floats placed again, its
+    /// contributions and flags as the parent reads them after the call).
+    pub(crate) fn restore(&mut self, state: &BlockContextState) {
+        self.y_offset = state.y_offset;
+        self.insets = state.insets;
+        self.content_box_insets = state.content_box_insets;
+        self.float_content_contribution = state.float_content_contribution;
+        self.is_root = state.is_root;
+        self.adjoining_floats = state.adjoining_floats;
+        self.top_adjoining_floats = state.top_adjoining_floats;
+        self.bfc.float_context.clone_from(&state.floats);
+    }
+}
+
+/// A `BlockContext`'s state with its formatting context's floats
+/// (`BlockContext::state`).
+#[cfg(feature = "float_layout")]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BlockContextState {
+    y_offset: f32,
+    insets: [f32; 2],
+    content_box_insets: [f32; 2],
+    float_content_contribution: f32,
+    is_root: bool,
+    adjoining_floats: [bool; 2],
+    top_adjoining_floats: Option<[bool; 2]>,
+    floats: FloatContext,
 }
 
 #[cfg(not(feature = "float_layout"))]

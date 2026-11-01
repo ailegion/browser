@@ -119,6 +119,17 @@ struct NodeData {
     /// Whether the node has context data associated with it or not
     pub(crate) has_context: bool,
 
+    /// Last laid out in a block formatting context, the node depended on its
+    /// floats (there were floats around it, or it or a descendant in the
+    /// same context placed some): it is answered there only from
+    /// `float_cache`, never from the plain cache.
+    pub(crate) float_dependent: bool,
+
+    /// Its layouts while floats were involved, with the context states they
+    /// started from and left (`compute_child_layout`).
+    #[cfg(all(feature = "block_layout", feature = "float_layout"))]
+    pub(crate) float_cache: Vec<FloatCacheEntry>,
+
     /// The cached results of the layout computation
     pub(crate) cache: Cache,
 
@@ -137,6 +148,9 @@ impl NodeData {
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             has_context: false,
+            float_dependent: false,
+            #[cfg(all(feature = "block_layout", feature = "float_layout"))]
+            float_cache: Vec::new(),
             #[cfg(feature = "detailed_layout_info")]
             detailed_layout_info: DetailedLayoutInfo::None,
         }
@@ -148,9 +162,31 @@ impl NodeData {
     /// If the node was already marked as dirty, returns true
     #[inline]
     pub fn mark_dirty(&mut self) -> ClearState {
+        #[cfg(all(feature = "block_layout", feature = "float_layout"))]
+        if !self.float_cache.is_empty() {
+            self.float_cache.clear();
+            let _ = self.cache.clear();
+            return ClearState::Cleared;
+        }
         self.cache.clear()
     }
 }
+
+/// A layout of a node in a block formatting context while floats were
+/// involved: its inputs, the context state it started from and the state it
+/// left, and its result.
+#[cfg(all(feature = "block_layout", feature = "float_layout"))]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FloatCacheEntry {
+    inputs: LayoutInput,
+    before: crate::compute::block::BlockContextState,
+    after: crate::compute::block::BlockContextState,
+    output: LayoutOutput,
+}
+
+/// How many such layouts a node keeps (one final layout, the rest sizes).
+#[cfg(all(feature = "block_layout", feature = "float_layout"))]
+const FLOAT_CACHE_SIZE: usize = 8;
 
 /// An entire tree of UI nodes. The entry point to Taffy's high-level API.
 ///
@@ -306,17 +342,113 @@ where
             return compute_hidden_layout(self, node_id);
         }
 
-        // We run the following wrapped in "compute_cached_layout", which will check the cache for an entry matching the node and inputs and:
-        //   - Return that entry if exists
-        //   - Else call the passed closure (below) to compute the result
-        //
-        // If there was no cache match and a new result needs to be computed then that result will be added to the cache
+        // A node laid out inside a block formatting context shares its floats
+        // with its siblings, which the plain cache key does not see: a plain
+        // cached result would neither avoid the floats placed before it nor
+        // place its own for the boxes after it. While floats are involved
+        // (the context has some, or the node placed some the last time it
+        // was laid out in one) its results are kept with the context state
+        // they started from and the state they left (`FloatCacheEntry`): one
+        // is reused only from an equal state (its place in the context, the
+        // flags its parent handed it, every float), and the state it left is
+        // put back, so its floats are placed again exactly as laid out.
+        // Results are also stored in the plain cache, so it is not empty and
+        // `mark_dirty` carries on to the ancestors; the plain entries from
+        // while floats were involved go once they no longer are.
+        #[cfg(all(feature = "block_layout", feature = "float_layout"))]
+        {
+            let mut block_ctx = block_ctx;
+            let key = node_id.into();
+            let Some(ctx) = block_ctx.as_deref_mut() else {
+                return compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+                    Self::compute_uncached(tree, node_id, inputs, None)
+                });
+            };
+            let floats_before = ctx.has_floats();
+            let dependent = self.taffy.nodes[key].float_dependent;
+            let before = ctx.state();
+            let out = if floats_before || dependent {
+                let hit = self.taffy.nodes[key]
+                    .float_cache
+                    .iter()
+                    .find(|e| e.inputs == inputs && e.before == before)
+                    .map(|e| (e.after.clone(), e.output));
+                if let Some((after, out)) = hit {
+                    ctx.restore(&after);
+                    self.taffy.nodes[key].float_dependent = true;
+                    return out;
+                }
+                let out = Self::compute_uncached(self, node_id, inputs, Some(&mut *ctx));
+                if dependent && !floats_before && !ctx.has_floats() {
+                    let _ = self.taffy.nodes[key].cache.clear();
+                }
+                self.taffy.nodes[key].cache.store(&inputs, out);
+                out
+            } else {
+                compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+                    Self::compute_uncached(tree, node_id, inputs, Some(&mut *ctx))
+                })
+            };
+            let involved = floats_before || ctx.has_floats();
+            let node = &mut self.taffy.nodes[key];
+            node.float_dependent = involved;
+            if involved {
+                // One final layout entry, the latest: the children's
+                // layouts in the tree are its (as for the plain cache).
+                if inputs.run_mode == RunMode::PerformLayout {
+                    node.float_cache.retain(|e| e.inputs.run_mode != RunMode::PerformLayout);
+                }
+                if node.float_cache.len() >= FLOAT_CACHE_SIZE {
+                    node.float_cache.remove(0);
+                }
+                node.float_cache.push(FloatCacheEntry { inputs, before, after: ctx.state(), output: out });
+            } else {
+                node.float_cache.clear();
+            }
+            out
+        }
+        #[cfg(not(all(feature = "block_layout", feature = "float_layout")))]
         compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+            Self::compute_uncached(
+                tree,
+                node_id,
+                inputs,
+                #[cfg(feature = "block_layout")]
+                block_ctx,
+            )
+        })
+    }
+
+    /// Lay a node out (no cache lookup).
+    fn compute_uncached(
+        tree: &mut Self,
+        node_id: NodeId,
+        inputs: LayoutInput,
+        #[cfg(feature = "block_layout")] block_ctx: Option<&mut BlockContext<'_>>,
+    ) -> LayoutOutput {
+        {
             let display_mode = tree.taffy.nodes[node_id.into()].style.display;
             let has_children = tree.child_count(node_id) > 0;
 
             debug_log!(display_mode);
             debug_log_node!(inputs);
+
+            // A final layout computed here commits this node's children's
+            // layouts. An ancestor whose own final layout is cached would,
+            // on a cache hit, leave those as they are now, which need not be
+            // what it laid out (this node laid out again while an ancestor
+            // only measured its size). So every ancestor's final layout entry
+            // goes; those laying out right now store theirs again after.
+            if inputs.run_mode == RunMode::PerformLayout && has_children {
+                let mut parent = tree.taffy.parents.get(node_id.into()).copied().flatten();
+                while let Some(p) = parent {
+                    let ancestor = &mut tree.taffy.nodes[p.into()];
+                    ancestor.cache.clear_final_layout();
+                    #[cfg(all(feature = "block_layout", feature = "float_layout"))]
+                    ancestor.float_cache.retain(|e| e.inputs.run_mode != RunMode::PerformLayout);
+                    parent = tree.taffy.parents.get(p.into()).copied().flatten();
+                }
+            }
 
             // Dispatch to a layout algorithm based on the node's display style and whether the node has children or not.
             match (display_mode, has_children) {
@@ -344,7 +476,7 @@ where
                     (tree.measure_function)(inputs, node_id, node_context, style)
                 }
             }
-        })
+        }
     }
 }
 
@@ -1324,6 +1456,206 @@ mod tests {
 
         assert!(taffy.children(child0).unwrap().is_empty());
     }
+    /// A block measured at another width lays its floats out at that width
+    /// (a float is always laid out in full, its children's layouts set); a
+    /// cached final layout above it must not keep those layouts.
+    #[test]
+    fn cached_final_layout_does_not_keep_layouts_a_measure_left() {
+        use crate::geometry::Line;
+        use crate::style::Float;
+        use crate::tree::{LayoutInput, LayoutPartialTree, RequestedAxis, RunMode, SizingMode};
+        let block = |size: Size<Dimension>| Style { display: Display::Block, size, ..Style::default() };
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        // The layouts as computed (rounding copies them only at the end of
+        // a whole layout).
+        taffy.disable_rounding();
+        let g = taffy.new_leaf(block(Size { width: percent(0.5), height: length(10.0) })).unwrap();
+        let float = Style { float: Float::Left, ..block(Size { width: percent(1.0), height: auto() }) };
+        let c = taffy.new_with_children(float, &[g]).unwrap();
+        let p = taffy.new_with_children(block(Size::auto()), &[c]).unwrap();
+        let r = taffy.new_with_children(block(Size { width: length(100.0), height: auto() }), &[p]).unwrap();
+        let space = Size { width: AvailableSpace::Definite(100.0), height: AvailableSpace::MaxContent };
+        taffy.compute_layout(r, space).unwrap();
+        assert_eq!(taffy.layout(g).unwrap().size.width, 50.0);
+        // `p` measured at 200px: `c` is laid out at that width on the way.
+        taffy.as_layout_tree().compute_child_layout(
+            p,
+            LayoutInput {
+                run_mode: RunMode::ComputeSize,
+                sizing_mode: SizingMode::InherentSize,
+                axis: RequestedAxis::Both,
+                known_dimensions: Size { width: Some(200.0), height: None },
+                known_dimensions_are_definite: Size { width: true, height: true },
+                parent_size: Size { width: Some(200.0), height: None },
+                available_space: Size { width: AvailableSpace::Definite(200.0), height: AvailableSpace::MaxContent },
+                vertical_margins_are_collapsible: Line::FALSE,
+            },
+        );
+        assert_eq!(taffy.layout(g).unwrap().size.width, 100.0, "the measure laid the grandchild out at 200px");
+        taffy.compute_layout(r, space).unwrap();
+        assert_eq!(taffy.layout(g).unwrap().size.width, 50.0, "the final layout at 100px is in the tree again");
+    }
+
+    /// A block whose float the next sibling avoids: laid out again with only
+    /// the sibling changed, the block is not answered from its cache (it
+    /// would not place its float), so the sibling still avoids it.
+    #[test]
+    fn a_cached_block_still_places_its_floats() {
+        use crate::geometry::Point;
+        use crate::style::{Float, Overflow};
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let float = taffy
+            .new_leaf(Style {
+                display: Display::Block,
+                float: Float::Left,
+                size: Size { width: length(100.0), height: length(50.0) },
+                ..Style::default()
+            })
+            .unwrap();
+        let a = taffy.new_with_children(Style { display: Display::Block, ..Style::default() }, &[float]).unwrap();
+        let bfc = Style {
+            display: Display::Block,
+            overflow: Point { x: Overflow::Hidden, y: Overflow::Hidden },
+            size: Size { width: auto(), height: length(20.0) },
+            ..Style::default()
+        };
+        let b = taffy.new_leaf(bfc.clone()).unwrap();
+        let r = taffy
+            .new_with_children(Style { display: Display::Block, size: Size { width: length(300.0), height: auto() }, ..Style::default() }, &[a, b])
+            .unwrap();
+        let space = Size { width: AvailableSpace::Definite(300.0), height: AvailableSpace::MaxContent };
+        taffy.compute_layout(r, space).unwrap();
+        assert_eq!((taffy.layout(b).unwrap().location.x, taffy.layout(b).unwrap().size.width), (100.0, 200.0), "beside the float");
+        taffy.set_style(b, Style { size: Size { width: auto(), height: length(30.0) }, ..bfc }).unwrap();
+        taffy.compute_layout(r, space).unwrap();
+        assert_eq!((taffy.layout(b).unwrap().location.x, taffy.layout(b).unwrap().size.width), (100.0, 200.0), "still beside the float");
+    }
+
+    /// Floats with kept results: a page of blocks around floats, changed in
+    /// several ways; every change laid out on the kept tree gives exactly
+    /// what a fresh tree gives, and boxes whose float surroundings did not
+    /// change are not laid out again.
+    #[test]
+    fn kept_results_around_floats_equal_a_fresh_layout() {
+        use crate::geometry::Point;
+        use crate::style::{Clear, Float, Overflow};
+        use crate::util::sys::Vec;
+        #[derive(Clone, Copy)]
+        struct Page {
+            float_height: f32,
+            middle_height: f32,
+            last_height: f32,
+            float_side: Float,
+        }
+        // R: A (a block holding a left float), B (a formatting context
+        // beside it, measured), C (a block holding a right float), D (a
+        // measured block), E (clears both).
+        fn build(t: &mut TaffyTree<u32>, p: Page) -> (NodeId, Vec<NodeId>) {
+            let block = |h: Option<f32>| Style {
+                display: Display::Block,
+                size: Size { width: auto(), height: h.map_or(auto(), length) },
+                ..Style::default()
+            };
+            let f1 = t
+                .new_leaf(Style {
+                    float: p.float_side,
+                    size: Size { width: length(100.0), height: length(p.float_height) },
+                    ..block(None)
+                })
+                .unwrap();
+            let a = t.new_with_children(block(None), &[f1]).unwrap();
+            let b = t
+                .new_leaf_with_context(
+                    Style { overflow: Point { x: Overflow::Hidden, y: Overflow::Hidden }, ..block(Some(20.0)) },
+                    1,
+                )
+                .unwrap();
+            let f2 = t
+                .new_leaf(Style {
+                    float: Float::Right,
+                    size: Size { width: length(50.0), height: length(30.0) },
+                    ..block(None)
+                })
+                .unwrap();
+            let c = t.new_with_children(block(Some(p.middle_height)), &[f2]).unwrap();
+            let d = t.new_leaf_with_context(block(None), 2).unwrap();
+            let e = t.new_leaf(Style { clear: Clear::Both, ..block(Some(p.last_height)) }).unwrap();
+            let r = t
+                .new_with_children(
+                    Style { display: Display::Block, size: Size { width: length(300.0), height: auto() }, ..Style::default() },
+                    &[a, b, c, d, e],
+                )
+                .unwrap();
+            (r, Vec::from([f1, a, b, f2, c, d, e]))
+        }
+        let space = Size { width: AvailableSpace::Definite(300.0), height: AvailableSpace::MaxContent };
+        let measures = core::cell::Cell::new(0u32);
+        let run = |t: &mut TaffyTree<u32>, r: NodeId| {
+            t.compute_layout_with_measure(r, space, |inputs, _id, ctx, style| {
+                if ctx.is_some() {
+                    measures.set(measures.get() + 1);
+                }
+                compute_leaf_layout(inputs, style, |_, _| 0.0, |known, _| Size {
+                    width: known.width.unwrap_or(0.0),
+                    height: known.height.unwrap_or(16.0),
+                })
+            })
+            .unwrap();
+        };
+        let layouts = |t: &TaffyTree<u32>, ids: &[NodeId]| -> Vec<(f32, f32, f32, f32)> {
+            ids.iter()
+                .map(|&n| {
+                    let l = t.layout(n).unwrap();
+                    (l.location.x, l.location.y, l.size.width, l.size.height)
+                })
+                .collect()
+        };
+        let start = Page { float_height: 50.0, middle_height: 40.0, last_height: 10.0, float_side: Float::Left };
+        // Each change: (the page after it, how to make it on the kept tree).
+        let changes: [(Page, fn(&mut TaffyTree<u32>, &[NodeId], Page)); 4] = [
+            // The last box changes: everything above it stands.
+            (Page { last_height: 25.0, ..start }, |t, ids, p| {
+                let s = t.style(ids[6]).unwrap().clone();
+                t.set_style(ids[6], Style { size: Size { width: auto(), height: length(p.last_height) }, ..s }).unwrap();
+            }),
+            // The left float grows: what beside and below it moves.
+            (Page { float_height: 90.0, ..start }, |t, ids, p| {
+                let s = t.style(ids[0]).unwrap().clone();
+                t.set_style(ids[0], Style { size: Size { width: length(100.0), height: length(p.float_height) }, ..s })
+                    .unwrap();
+            }),
+            // The middle block grows: its float and what follows move.
+            (Page { middle_height: 70.0, ..start }, |t, ids, p| {
+                let s = t.style(ids[4]).unwrap().clone();
+                t.set_style(ids[4], Style { size: Size { width: auto(), height: length(p.middle_height) }, ..s }).unwrap();
+            }),
+            // The first float changes sides.
+            (Page { float_side: Float::Right, ..start }, |t, ids, p| {
+                let s = t.style(ids[0]).unwrap().clone();
+                t.set_style(ids[0], Style { float: p.float_side, ..s }).unwrap();
+            }),
+        ];
+        for (i, (after, change)) in changes.iter().enumerate() {
+            let mut kept = TaffyTree::new();
+            kept.disable_rounding();
+            let (r, ids) = build(&mut kept, start);
+            run(&mut kept, r);
+            change(&mut kept, &ids, *after);
+            measures.set(0);
+            run(&mut kept, r);
+            let kept_measures = measures.get();
+            let mut fresh = TaffyTree::new();
+            fresh.disable_rounding();
+            let (fr, fids) = build(&mut fresh, *after);
+            run(&mut fresh, fr);
+            assert_eq!(layouts(&kept, &ids), layouts(&fresh, &fids), "change {i}");
+            if i == 0 {
+                // B and D sit where they sat, among the same floats.
+                assert_eq!(kept_measures, 0, "boxes before the change are answered from their kept results");
+            }
+        }
+    }
+
     #[test]
     fn test_set_style() {
         let mut taffy: TaffyTree<()> = TaffyTree::new();

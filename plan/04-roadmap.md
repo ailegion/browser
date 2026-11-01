@@ -2888,7 +2888,9 @@ what breaks the most pages.
   in `07-incremental-layout.md` (go given), blocks B1–B4; B1 done
   2026-10-19 (record there); B2 partly built 2026-10-19, not done:
   persistent taffy tree, row-level rebuilds and full restyles laying out
-  fully are SKIPPED (record there). Original placement: (owner's 2026-10-18 placement; found with "Working
+  fully are SKIPPED (record there); the persistent taffy tree done
+  2026-11-01 (record there), the other two still SKIPPED. None of B1–B4
+  changes page load time. Original placement: (owner's 2026-10-18 placement; found with "Working
   sites first" 6i: every layout-affecting change lays out the whole page,
   ~550 ms on iana.org/protocols' 79,526 nodes, ~120 ms on Wikipedia's Main
   Page, and a web font arriving after load does the same). A core change

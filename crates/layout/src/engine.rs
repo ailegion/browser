@@ -72,6 +72,11 @@ pub struct LayoutEngine {
     /// layout, and what changed since (unknown until told).
     kept: Option<crate::incremental::KeptBoxes>,
     changes: crate::incremental::BoxChanges,
+    /// The document's taffy tree, kept with the boxes.
+    doc: Option<DocTree>,
+    /// Taffy nodes of dropped boxes (and of boxes moved to another tree),
+    /// by the tag of the tree they are in, removed when it is next used.
+    removed: HashMap<u64, Vec<TaffyId>>,
 }
 
 /// A web font registered for the current document.
@@ -105,11 +110,51 @@ impl Default for LayoutEngine {
 }
 
 /// Node context for taffy leaves.
-enum Leaf {
-    /// Index into the leaves that lay themselves out (inline roots,
-    /// tables), collected for the current subtree.
-    Measured(usize),
+pub(crate) enum Leaf {
+    /// A leaf that lays itself out (an inline root, a table): found among
+    /// the leaves collected for the pass by its node (`LeafIndex`), so the
+    /// context stays the same while the tree is kept.
+    Measured,
     Image { intrinsic: Option<(f32, f32)> },
+}
+
+/// Each pass's leaves that lay themselves out, by their taffy node.
+type LeafIndex = HashMap<TaffyId, usize>;
+
+/// A taffy tree kept between layouts (block B2), with the tag its boxes
+/// carry (`BoxNode::tree`).
+pub(crate) struct OwnTree {
+    pub tree: TaffyTree<Leaf>,
+    pub tag: u64,
+    /// An absolutely positioned box's layouts by run, kept until a change
+    /// reaches inside it (`incremental::rebuild`): its placement asks
+    /// them again on every pass and every layout. (Atomics, cells and
+    /// captions keep theirs on their own boxes.)
+    pub results: Vec<(Run, SubtreeResult)>,
+}
+
+impl OwnTree {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            tree: TaffyTree::new(),
+            tag: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            results: Vec::new(),
+        }
+    }
+}
+
+/// How many runs of a positioned box are kept (its intrinsic widths and
+/// the widths its containing blocks give it).
+const POSITIONED_RESULTS: usize = 6;
+
+/// The document's taffy tree kept between layouts: the viewport node
+/// above the root element's, and the viewport's scroll plan with the
+/// gutters the last layout gave it.
+struct DocTree {
+    own: OwnTree,
+    viewport: TaffyId,
+    plan: ScrollPlan,
 }
 
 /// One taffy node of the tree being laid out, recorded while building it so
@@ -168,6 +213,8 @@ impl LayoutEngine {
             local_names: None,
             kept: None,
             changes: crate::incremental::BoxChanges::Unknown,
+            doc: None,
+            removed: HashMap::new(),
         }
     }
 
@@ -552,11 +599,14 @@ impl LayoutEngine {
             crate::incremental::BoxChanges::Known { elements: Vec::new(), parents: Vec::new() },
         );
         let mut kept = self.kept.take();
+        let removed = std::cell::RefCell::new(Vec::new());
         let incremental = match &mut kept {
-            Some(k) => crate::incremental::rebuild(k, &mut self.oofs, &builder, doc, &changes, vo.source),
+            Some(k) => crate::incremental::rebuild(k, &mut self.oofs, &builder, doc, &changes, vo.source, &removed),
             None => false,
         };
         let html_box = if incremental {
+            // The taffy nodes of the boxes the rebuild dropped.
+            self.note_removed(removed.into_inner());
             let mut root = kept.take().map(|k| k.root);
             if let Some(r) = &mut root {
                 crate::incremental::reset_layout_state(r);
@@ -568,8 +618,11 @@ impl LayoutEngine {
             }
             root
         } else {
-            // The old tree goes before the new one is built.
+            // The old tree goes before the new one is built, its taffy
+            // trees with it.
             drop(kept.take());
+            self.doc = None;
+            self.removed.clear();
             counters(|c| c.full = true);
             // What a failed rebuild left in the list goes.
             builder.oofs.borrow_mut().clear();
@@ -623,12 +676,13 @@ impl LayoutEngine {
                 paint: Default::default(),
             };
             empty.rebuild_paint_order();
+            self.doc = None;
             return empty;
         };
         // The viewport is a scroll container whose `overflow` is the
         // propagated one and whose scrollbars are the root element's
         // (`scrollbar-width`, `scrollbar-gutter`, `direction`).
-        let mut viewport_plan = ScrollPlan::from_parts(vo.x, vo.y, &html.style).unwrap_or(ScrollPlan {
+        let base_plan = ScrollPlan::from_parts(vo.x, vo.y, &html.style).unwrap_or(ScrollPlan {
             overflow_x: vo.x,
             overflow_y: vo.y,
             thickness: 0.0,
@@ -643,37 +697,73 @@ impl LayoutEngine {
         let t_boxes = t_start.elapsed();
         self.prepare_markers(&mut html);
 
-        let mut tree: TaffyTree<Leaf> = TaffyTree::new();
+        // The document's taffy tree: the kept one with the boxes' changes
+        // (`sync_taffy`), or a new one for new boxes.
+        let mut dt = match self.doc.take() {
+            Some(d) => d,
+            None => {
+                let mut own = OwnTree::new();
+                let viewport = own.tree.new_leaf(Style::default()).expect("taffy root");
+                DocTree { own, viewport, plan: base_plan }
+            }
+        };
+        self.apply_removals(&mut dt.own);
+        // The page's scrollbar gutters the last layout added stay (while
+        // the content still overflows with them, below) when its plan is
+        // otherwise the same.
+        let mut viewport_plan = base_plan;
+        let mut kept_viewport_gutters = false;
+        {
+            let mut last = dt.plan;
+            last.gutter_x = base_plan.gutter_x;
+            last.gutter_y = base_plan.gutter_y;
+            if last == base_plan && dt.plan.has_added_gutters(&base_plan) {
+                viewport_plan = dt.plan;
+                kept_viewport_gutters = true;
+                let (gl, gr, gb) = plan_gutters(&viewport_plan);
+                self.viewport = (viewport_width - gl - gr, viewport_height - gb);
+            }
+        }
+        let tag = dt.own.tag;
+        let viewport_id = dt.viewport;
+        let tree = &mut dt.own.tree;
         let mut leaves: Vec<LeafRef<'_>> = Vec::new();
         let mut leaf_ids: Vec<TaffyId> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
-        let html_id = self.build_taffy(&mut tree, &mut html, &mut leaves, &mut leaf_ids, &mut entries);
+        let html_id = self.sync_taffy(tree, tag, &mut html, &mut leaves, &mut leaf_ids, &mut entries);
         drop(leaves);
+        let index: LeafIndex = leaf_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        if tree.child_count(viewport_id) != 1 || tree.child_at_index(viewport_id, 0).ok() != Some(html_id) {
+            let _ = tree.set_children(viewport_id, &[html_id]);
+        }
+        let style = viewport_style(viewport_width, viewport_height, &viewport_plan);
+        if tree.style(viewport_id).ok() != Some(&style) {
+            let _ = tree.set_style(viewport_id, style);
+        }
         let t_taffy_tree = t_start.elapsed() - t_boxes;
         let zero = std::time::Duration::ZERO;
         let (mut t_run, mut t_fragments, mut t_oof) = (zero, zero, zero);
 
-        let viewport_id = tree
-            .new_with_children(viewport_style(viewport_width, viewport_height, &viewport_plan), &[html_id])
-            .expect("taffy root");
         let available = Size {
             width: AvailableSpace::Definite(viewport_width),
             height: AvailableSpace::Definite(viewport_height),
         };
 
         // Lay out; where an `auto` axis overflows, reserve its gutter and
-        // lay out again (the browsers' second layout).
+        // lay out again (the browsers' second layout). Gutters kept from
+        // the last layout go after the first pass where their axis no
+        // longer overflows.
         let mut html_fragment;
         let mut pass = 0;
         loop {
             let t = std::time::Instant::now();
             let mut leaves: Vec<LeafRef<'_>> = Vec::new();
             collect_leaves(&mut html, &mut leaves);
-            self.run_with_floats(&mut tree, viewport_id, available, &mut leaves, &leaf_ids, &entries);
+            self.run_with_floats(tree, viewport_id, available, &mut leaves, &leaf_ids, &index, &entries);
             drop(leaves);
             t_run += t.elapsed();
             let t = std::time::Instant::now();
-            html_fragment = self.fragments(&html, &tree, 0.0, 0.0);
+            html_fragment = self.fragments(&html, tree, 0.0, 0.0);
             t_fragments += t.elapsed();
             // The absolutely positioned boxes left: against their
             // containing blocks in here, else the initial containing
@@ -689,9 +779,23 @@ impl LayoutEngine {
                 break;
             }
             let infos = self.scroll_infos(&html_fragment);
-            let mut changed = add_auto_gutters(&mut html, &infos, &mut tree);
+            let mut changed = false;
             let viewport_info = viewport_scroll_info(&html_fragment, viewport_rect, &viewport_plan);
             let (ox, oy) = viewport_info.overflows();
+            if pass == 1 {
+                changed |= drop_kept_gutters(&mut html, &infos, tree);
+                if kept_viewport_gutters && viewport_plan.drop_unneeded_gutters(&base_plan, ox, oy) {
+                    let _ = tree.set_style(viewport_id, viewport_style(viewport_width, viewport_height, &viewport_plan));
+                    changed = true;
+                    self.viewport = if viewport_plan.has_added_gutters(&base_plan) {
+                        let (gl, gr, gb) = plan_gutters(&viewport_plan);
+                        (viewport_width - gl - gr, viewport_height - gb)
+                    } else {
+                        (viewport_width, viewport_height)
+                    };
+                }
+            }
+            changed |= add_auto_gutters(&mut html, &infos, tree);
             if viewport_plan.add_gutters(ox, oy) {
                 let _ = tree.set_style(viewport_id, viewport_style(viewport_width, viewport_height, &viewport_plan));
                 changed = true;
@@ -764,6 +868,8 @@ impl LayoutEngine {
             independent_layouts = c.independent_layouts,
             full_box_build = c.full,
             boxes_rebuilt = c.boxes_rebuilt,
+            taffy_nodes_built = c.taffy_nodes_built,
+            float_restarts = c.float_restarts,
             boxes_ms = ms(t_boxes),
             taffy_tree_ms = ms(t_taffy_tree),
             passes = pass,
@@ -787,6 +893,8 @@ impl LayoutEngine {
             generated,
             viewport_source: vo.source,
         });
+        dt.plan = viewport_plan;
+        self.doc = Some(dt);
         // `BROWSER_VERIFY_LAYOUT=1`: an incremental layout checked against
         // a full one, any difference logged with the changes behind it.
         if incremental && std::env::var_os("BROWSER_VERIFY_LAYOUT").is_some() {
@@ -801,7 +909,63 @@ impl LayoutEngine {
             let differ = a.iter().zip(&b).filter(|(x, y)| x != y).count() + a.len().abs_diff(b.len());
             if differ > 0 {
                 let first = a.iter().zip(&b).find(|(x, y)| x != y);
-                tracing::warn!(target: "perf", differ, ?first, ?changes, "incremental layout differs from a full layout");
+                // Where it starts: the first difference in tree order whose
+                // children all agree (or whose children differ in number).
+                // With it, the nearest fragment above it with an element.
+                fn source<'f>(
+                    a: &'f Fragment,
+                    b: &'f Fragment,
+                    above: Option<(&'f Fragment, &'f Fragment)>,
+                ) -> Option<((&'f Fragment, &'f Fragment), Option<(&'f Fragment, &'f Fragment)>)> {
+                    if a.node != b.node || a.children.len() != b.children.len() {
+                        return Some(((a, b), above));
+                    }
+                    let here = if a.node.is_some() { Some((a, b)) } else { above };
+                    for (x, y) in a.children.iter().zip(&b.children) {
+                        if let Some(d) = source(x, y, here) {
+                            return Some(d);
+                        }
+                    }
+                    (a.rect != b.rect).then_some(((a, b), above))
+                }
+                let describe = |n: Option<NodeId>| match n.and_then(|n| doc.contains(n).then_some(n)) {
+                    Some(n) => {
+                        let mut chain = Vec::new();
+                        let mut cur = Some(n);
+                        while let Some(c) = cur
+                            && chain.len() < 8
+                        {
+                            if let Some(e) = doc.element(c) {
+                                let mut s = e.name.local.to_string();
+                                if let Some(id) = e.id() {
+                                    s.push('#');
+                                    s.push_str(id);
+                                }
+                                if let Some(cl) = e.attr("class") {
+                                    s.push('.');
+                                    s.push_str(&cl.split_ascii_whitespace().collect::<Vec<_>>().join("."));
+                                }
+                                chain.push(s);
+                            }
+                            cur = doc.parent(c);
+                        }
+                        chain.join(" < ")
+                    }
+                    None => "(anonymous)".to_owned(),
+                };
+                let one = |(x, y): (&Fragment, &Fragment)| {
+                    format!(
+                        "{} [{:?} children {}] incremental {:?} full {:?} children {}",
+                        describe(x.node),
+                        x.node,
+                        x.children.len(),
+                        x.rect,
+                        y.rect,
+                        y.children.len()
+                    )
+                };
+                let src = source(&out.root, &full.root, None).map(|(d, above)| format!("{} IN {}", one(d), above.map_or("-".into(), one)));
+                tracing::warn!(target: "perf", differ, ?first, ?src, ?changes, "incremental layout differs from a full layout");
             } else {
                 tracing::info!(target: "perf", fragments = a.len(), "incremental layout verified");
             }
@@ -1051,18 +1215,29 @@ impl LayoutEngine {
     /// how its root sits in its container (`Role`), `run` what it is laid
     /// out for (`Run`).
     pub(crate) fn layout_independent(&mut self, node: &mut BoxNode, role: Role, run: Run) -> SubtreeResult {
+        if role == Role::Positioned
+            && let Some(r) = node.own.as_ref().and_then(|o| o.results.iter().find(|(k, _)| *k == run))
+        {
+            counters(|c| c.positioned_reused += 1);
+            return r.1.clone();
+        }
         counters(|c| c.independent_layouts += 1);
         self.prepare_markers(node);
         // The plans this layout leaves are its own: the container's are
         // put back after (`SubtreeResult::plans`).
         let outer_plans = std::mem::take(&mut self.plans);
 
-        let mut tree: TaffyTree<Leaf> = TaffyTree::new();
+        // Its own taffy tree, kept on the box between layouts (block B2).
+        let mut kept_tree = node.own.take().map_or_else(OwnTree::new, |o| *o);
+        self.apply_removals(&mut kept_tree);
+        let tag = kept_tree.tag;
+        let tree = &mut kept_tree.tree;
         let mut leaves: Vec<LeafRef<'_>> = Vec::new();
         let mut leaf_ids: Vec<TaffyId> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
-        let root = self.build_taffy(&mut tree, node, &mut leaves, &mut leaf_ids, &mut entries);
+        let root = self.sync_taffy(tree, tag, node, &mut leaves, &mut leaf_ids, &mut entries);
         drop(leaves);
+        let index: LeafIndex = leaf_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
         // The root's style for this run, set again after a scrollbar pass
         // rebuilds it from the plan.
@@ -1135,11 +1310,17 @@ impl LayoutEngine {
                 style.size.height = Dimension::length(height);
             }
         };
-        if let Ok(style) = tree.style(root) {
-            let mut style = style.clone();
+        // The root's style for this run, from its own (the kept node holds
+        // the last run's): set only when it differs, so a run asked again
+        // is answered from taffy's cache.
+        let set_root_style = |tree: &mut TaffyTree<Leaf>, node: &BoxNode| {
+            let mut style = taffy_style(node);
             root_style(&mut style);
-            let _ = tree.set_style(root, style);
-        }
+            if tree.style(root).ok() != Some(&style) {
+                let _ = tree.set_style(root, style);
+            }
+        };
+        set_root_style(tree, node);
         let available = Size {
             width: match run {
                 Run::MinContent => AvailableSpace::MinContent,
@@ -1156,9 +1337,9 @@ impl LayoutEngine {
         loop {
             let mut leaves: Vec<LeafRef<'_>> = Vec::new();
             collect_leaves(node, &mut leaves);
-            self.run_with_floats(&mut tree, root, available, &mut leaves, &leaf_ids, &entries);
+            self.run_with_floats(tree, root, available, &mut leaves, &leaf_ids, &index, &entries);
             drop(leaves);
-            fragment = self.fragments(node, &tree, 0.0, 0.0);
+            fragment = self.fragments(node, tree, 0.0, 0.0);
             // An intrinsic size leaves the absolutely positioned boxes out
             // (they are out of flow); a layout places those whose
             // containing block is in it. A cell's own box is not final
@@ -1174,14 +1355,15 @@ impl LayoutEngine {
                 break;
             }
             let infos = self.scroll_infos(&fragment);
-            if !add_auto_gutters(node, &infos, &mut tree) {
+            // Gutters kept from the last layout go where their axis no
+            // longer overflows (first pass only); then any that overflow
+            // now are added.
+            let mut changed = pass == 1 && drop_kept_gutters(node, &infos, tree);
+            changed |= add_auto_gutters(node, &infos, tree);
+            if !changed {
                 break;
             }
-            if let Ok(style) = tree.style(root) {
-                let mut style = style.clone();
-                root_style(&mut style);
-                let _ = tree.set_style(root, style);
-            }
+            set_root_style(tree, node);
         }
 
         let layout = tree.layout(root).cloned().unwrap_or_default();
@@ -1196,7 +1378,7 @@ impl LayoutEngine {
         let first_baseline = first_baseline_of(std::slice::from_ref(&fragment));
         let last_baseline = last_baseline_of(std::slice::from_ref(&fragment));
         let plans = std::mem::replace(&mut self.plans, outer_plans).into_iter().collect();
-        SubtreeResult {
+        let result = SubtreeResult {
             width: layout.size.width,
             height: layout.size.height,
             margin,
@@ -1204,17 +1386,34 @@ impl LayoutEngine {
             first_baseline,
             last_baseline,
             plans,
+        };
+        if role == Role::Positioned {
+            if kept_tree.results.len() >= POSITIONED_RESULTS {
+                kept_tree.results.remove(0);
+            }
+            kept_tree.results.push((run, result.clone()));
         }
+        node.own = Some(Box::new(kept_tree));
+        result
     }
 
-    /// Create taffy nodes for a box subtree. Inline roots and tables
-    /// become leaves that lay themselves out, whose context indexes
-    /// `leaves` (`formatting::SelfLayout`). An absolutely positioned box
-    /// is a zero-size absolutely positioned leaf, whose place taffy works
-    /// out as its static position (`positioned.rs` lays the box out).
-    fn build_taffy<'a>(
+    /// Bring a kept taffy tree (tagged `tag`) in line with a box subtree
+    /// (block B2): a box with a node in this tree keeps it, a box without
+    /// one (new, or moved here from another tree) gets one; a box's
+    /// children are set again only when they differ, and a box whose
+    /// caches were cleared (`BoxNode::dirty`) is marked dirty, so taffy
+    /// answers every untouched subtree from its own cache. A kept box's
+    /// taffy style cannot have changed (a box whose element was restyled
+    /// is built again; scrollbar gutters set their own style when they
+    /// change). Inline roots and tables are leaves that lay themselves out
+    /// (`formatting::SelfLayout`), collected into `leaves` in tree order.
+    /// An absolutely positioned box is a zero-size absolutely positioned
+    /// leaf, whose place taffy works out as its static position
+    /// (`positioned.rs` lays the box out).
+    fn sync_taffy<'a>(
         &mut self,
         tree: &mut TaffyTree<Leaf>,
+        tag: u64,
         node: &'a mut BoxNode,
         leaves: &mut Vec<LeafRef<'a>>,
         leaf_ids: &mut Vec<TaffyId>,
@@ -1224,6 +1423,18 @@ impl LayoutEngine {
         let anonymous = node.anonymous;
         let style = node.style.clone();
         let placeholder = matches!(node.kind, BoxKind::OutOfFlow(_));
+        // A node in another tree: that tree drops it when next used.
+        let kept = match node.taffy {
+            Some(id) if node.tree == tag => Some(id),
+            Some(id) => {
+                self.removed.entry(node.tree).or_default().push(id);
+                None
+            }
+            None => None,
+        };
+        if kept.is_none() {
+            counters(|c| c.taffy_nodes_built += 1);
+        }
         let mut entry = Entry {
             taffy: TaffyId::new(0),
             inline: None,
@@ -1232,61 +1443,40 @@ impl LayoutEngine {
             isolates: false,
             flex: is_flex,
         };
+        // A new node's style, before the kind is borrowed below.
+        let fresh = kept.is_none().then(|| taffy_style(node));
         let id = match &mut node.kind {
-            BoxKind::OutOfFlow(_) => tree
-                .new_leaf(Style {
-                    display: taffy::Display::Block,
-                    position: taffy::Position::Absolute,
-                    ..Style::default()
-                })
-                .expect("taffy leaf"),
+            BoxKind::OutOfFlow(_) => kept.unwrap_or_else(|| tree.new_leaf(fresh.expect("new node")).expect("taffy leaf")),
             BoxKind::Inline(content) => {
-                let style = Style {
-                    display: taffy::Display::Block,
-                    ..Style::default()
-                };
-                let idx = leaves.len();
-                let id = tree
-                    .new_leaf_with_context(style, Leaf::Measured(idx))
-                    .expect("taffy leaf");
+                let id = kept.unwrap_or_else(|| {
+                    tree.new_leaf_with_context(fresh.expect("new node"), Leaf::Measured)
+                        .expect("taffy leaf")
+                });
+                entry.inline = Some(leaves.len());
                 leaves.push(LeafRef::Inline(content));
                 leaf_ids.push(id);
-                entry.inline = Some(idx);
                 id
             }
             BoxKind::Image { intrinsic, .. } => {
-                let mut style = to_taffy(&node.style, false, true, None);
-                if let Some((w, h)) = intrinsic
-                    && *h > 0.0
-                {
-                    style.aspect_ratio = Some(*w / *h);
-                }
-                tree.new_leaf_with_context(style, Leaf::Image { intrinsic: *intrinsic })
-                    .expect("taffy leaf")
+                let intrinsic = *intrinsic;
+                kept.unwrap_or_else(|| {
+                    tree.new_leaf_with_context(fresh.expect("new node"), Leaf::Image { intrinsic })
+                        .expect("taffy leaf")
+                })
             }
             // A table is a leaf laid out by `table.rs`; its border and
             // padding are the table box's, inside the measured size.
             BoxKind::Table(table) => {
-                let mut style = to_taffy(&node.style, false, false, None);
-                style.item_is_table = true;
-                style.padding = taffy::Rect::zero();
-                style.border = taffy::Rect::zero();
                 entry.isolates = true;
-                let idx = leaves.len();
-                let id = tree.new_leaf_with_context(style, Leaf::Measured(idx)).expect("taffy leaf");
+                let id = kept.unwrap_or_else(|| {
+                    tree.new_leaf_with_context(fresh.expect("new node"), Leaf::Measured)
+                        .expect("taffy leaf")
+                });
                 leaves.push(LeafRef::Table(&mut **table));
                 leaf_ids.push(id);
                 id
             }
             BoxKind::Block | BoxKind::Flex => {
-                let taffy_style = if anonymous {
-                    Style {
-                        display: taffy::Display::Block,
-                        ..Style::default()
-                    }
-                } else {
-                    to_taffy(&node.style, is_flex, false, node.scroll.as_ref())
-                };
                 // Same conditions under which taffy lays the box out as an
                 // independent formatting context, plus flex, whose items are.
                 entry.isolates = !anonymous
@@ -1297,17 +1487,60 @@ impl LayoutEngine {
                         || !matches!(style.overflow_y, Overflow::Visible));
                 let mut kids = Vec::with_capacity(node.children.len());
                 for child in &mut node.children {
-                    let child_id = self.build_taffy(tree, child, leaves, leaf_ids, entries);
+                    let child_id = self.sync_taffy(tree, tag, child, leaves, leaf_ids, entries);
                     entry.children.push(entries.len() - 1);
                     kids.push(child_id);
                 }
-                tree.new_with_children(taffy_style, &kids).expect("taffy node")
+                match kept {
+                    Some(id) => {
+                        let same = tree.child_count(id) == kids.len()
+                            && kids.iter().enumerate().all(|(i, k)| tree.child_at_index(id, i).ok() == Some(*k));
+                        if !same {
+                            let _ = tree.set_children(id, &kids);
+                        }
+                        id
+                    }
+                    None => tree.new_with_children(fresh.expect("new node"), &kids).expect("taffy node"),
+                }
             }
         };
+        if node.dirty {
+            node.dirty = false;
+            let _ = tree.mark_dirty(id);
+        }
         entry.taffy = id;
         entries.push(entry);
         node.taffy = Some(id);
+        node.tree = tag;
         id
+    }
+
+    /// The tree's tag: drop the nodes of the boxes gone since it was last
+    /// used.
+    fn apply_removals(&mut self, own: &mut OwnTree) {
+        if let Some(ids) = self.removed.remove(&own.tag) {
+            for id in ids {
+                let _ = own.tree.remove(id);
+            }
+        }
+    }
+
+    /// The taffy nodes a rebuild dropped (`incremental::rebuild`), noted
+    /// by tree; those of trees dropped with their boxes are void.
+    fn note_removed(&mut self, list: Vec<(u64, TaffyId)>) {
+        let dead: std::collections::HashSet<u64> = list
+            .iter()
+            .filter(|(_, id)| *id == crate::incremental::DROPPED_TREE)
+            .map(|(t, _)| *t)
+            .collect();
+        for t in &dead {
+            self.removed.remove(t);
+        }
+        for (t, id) in list {
+            if id != crate::incremental::DROPPED_TREE && !dead.contains(&t) {
+                self.removed.entry(t).or_default().push(id);
+            }
+        }
     }
 
     /// Lay the tree out, then shorten inline roots' lines around floats:
@@ -1315,6 +1548,13 @@ impl LayoutEngine {
     /// keep clear of, and lay out again so the roots' new heights move the
     /// content below them. Float-free trees take one pass. Ends with every
     /// leaf holding its final layout.
+    ///
+    /// A kept tree's roots start with the bands of the last layout (block
+    /// B2): in a formatting context where the first pass gives every root
+    /// the bands it had, nothing about its floats moved and they stand;
+    /// in one where any differ, its roots start again without bands, as
+    /// in a full layout, before the passes below.
+    #[allow(clippy::too_many_arguments)]
     fn run_with_floats(
         &mut self,
         tree: &mut TaffyTree<Leaf>,
@@ -1322,11 +1562,42 @@ impl LayoutEngine {
         available: Size<AvailableSpace>,
         leaves: &mut [LeafRef<'_>],
         leaf_ids: &[TaffyId],
+        index: &LeafIndex,
         entries: &[Entry],
     ) {
-        self.run_taffy(tree, root, available, leaves);
+        self.run_taffy(tree, root, available, leaves, index);
+        let (bands, bfcs) = float_bands(tree, entries, leaves.len());
+        let restart: std::collections::HashSet<usize> = bands
+            .iter()
+            .enumerate()
+            .filter(|(idx, b)| matches!(&leaves[*idx], LeafRef::Inline(c) if c.floats != **b))
+            .map(|(idx, _)| bfcs[idx])
+            .collect();
+        let mut first = Some(bands);
+        if !restart.is_empty() {
+            let mut cleared = false;
+            for (idx, leaf) in leaves.iter_mut().enumerate() {
+                if let LeafRef::Inline(content) = leaf
+                    && restart.contains(&bfcs[idx])
+                    && !content.floats.is_empty()
+                {
+                    content.floats.clear();
+                    content.cache.clear();
+                    let _ = tree.mark_dirty(leaf_ids[idx]);
+                    cleared = true;
+                }
+            }
+            if cleared {
+                counters(|c| c.float_restarts += 1);
+                self.run_taffy(tree, root, available, leaves, index);
+                first = None;
+            }
+        }
         for _ in 0..MAX_FLOAT_PASSES {
-            let bands = float_bands(tree, entries, leaves.len());
+            let bands = match first.take() {
+                Some(b) => b,
+                None => float_bands(tree, entries, leaves.len()).0,
+            };
             let mut changed = false;
             for (idx, bands) in bands.into_iter().enumerate() {
                 if let LeafRef::Inline(content) = &mut leaves[idx]
@@ -1341,25 +1612,33 @@ impl LayoutEngine {
             if !changed {
                 break;
             }
-            self.run_taffy(tree, root, available, leaves);
+            self.run_taffy(tree, root, available, leaves, index);
         }
         self.finalize_leaves(tree, leaves, leaf_ids);
     }
 
     /// One taffy pass. A leaf's measure question goes to the leaf itself
     /// (`formatting::measure`), which lays out whatever it holds for it.
-    fn run_taffy(&mut self, tree: &mut TaffyTree<Leaf>, root: TaffyId, available: Size<AvailableSpace>, leaves: &mut [LeafRef<'_>]) {
+    fn run_taffy(
+        &mut self,
+        tree: &mut TaffyTree<Leaf>,
+        root: TaffyId,
+        available: Size<AvailableSpace>,
+        leaves: &mut [LeafRef<'_>],
+        index: &LeafIndex,
+    ) {
         let engine = &mut *self;
         counters(|c| c.taffy_runs += 1);
-        let result = tree.compute_layout_with_measure(root, available, |inputs, _id, ctx, style| {
+        let result = tree.compute_layout_with_measure(root, available, |inputs, id, ctx, style| {
             let cb_width = inputs.parent_size.width;
             let width_only = inputs.run_mode == taffy::RunMode::ComputeSize && inputs.axis == taffy::RequestedAxis::Horizontal;
             let mut image;
             let mut kind = 0;
             let leaf: &mut dyn SelfLayout = match ctx {
-                Some(Leaf::Measured(idx)) => {
-                    kind = if matches!(leaves[*idx], LeafRef::Table(_)) { 2 } else { 1 };
-                    leaves[*idx].as_dyn()
+                Some(Leaf::Measured) => {
+                    let idx = index[&id];
+                    kind = if matches!(leaves[idx], LeafRef::Table(_)) { 2 } else { 1 };
+                    leaves[idx].as_dyn()
                 }
                 Some(Leaf::Image { intrinsic }) => {
                     image = ImageLeaf(*intrinsic);
@@ -1613,6 +1892,52 @@ impl LayoutEngine {
     }
 }
 
+/// A box's own taffy style (its node's, before an independent layout
+/// adjusts its root for the run): an inline root a plain block leaf, a
+/// placeholder a zero-size absolutely positioned leaf, an image with its
+/// ratio, a table without its border and padding (inside its measured
+/// size), an anonymous block plain, the rest from the computed style and
+/// the scrollbar gutters of its plan.
+fn taffy_style(node: &BoxNode) -> Style {
+    match &node.kind {
+        BoxKind::OutOfFlow(_) => Style {
+            display: taffy::Display::Block,
+            position: taffy::Position::Absolute,
+            ..Style::default()
+        },
+        BoxKind::Inline(_) => Style {
+            display: taffy::Display::Block,
+            ..Style::default()
+        },
+        BoxKind::Image { intrinsic, .. } => {
+            let mut style = to_taffy(&node.style, false, true, None);
+            if let Some((w, h)) = intrinsic
+                && *h > 0.0
+            {
+                style.aspect_ratio = Some(*w / *h);
+            }
+            style
+        }
+        BoxKind::Table(_) => {
+            let mut style = to_taffy(&node.style, false, false, None);
+            style.item_is_table = true;
+            style.padding = taffy::Rect::zero();
+            style.border = taffy::Rect::zero();
+            style
+        }
+        BoxKind::Block | BoxKind::Flex => {
+            if node.anonymous {
+                Style {
+                    display: taffy::Display::Block,
+                    ..Style::default()
+                }
+            } else {
+                to_taffy(&node.style, matches!(node.kind, BoxKind::Flex), false, node.scroll.as_ref())
+            }
+        }
+    }
+}
+
 /// How the root of an independently laid out subtree sits in its
 /// container.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1659,11 +1984,14 @@ pub(crate) struct SubtreeResult {
 
 /// For each inline root, the floats of its own block formatting context
 /// that overlap it vertically and intrude on it horizontally, as bands in
-/// the root's coordinates. All empty when the tree has no floats.
-fn float_bands(tree: &TaffyTree<Leaf>, entries: &[Entry], inline_count: usize) -> Vec<Vec<FloatBand>> {
+/// the root's coordinates. All empty when the tree has no floats. With
+/// them, each root's block formatting context (numbered per call; all 0
+/// when there are no floats).
+fn float_bands(tree: &TaffyTree<Leaf>, entries: &[Entry], inline_count: usize) -> (Vec<Vec<FloatBand>>, Vec<usize>) {
     let mut out = vec![Vec::new(); inline_count];
+    let mut bfcs = vec![0; inline_count];
     if entries.is_empty() || !entries.iter().any(|e| e.float != Float::None) {
-        return out;
+        return (out, bfcs);
     }
     let mut floats = Vec::new();
     let mut roots = Vec::new();
@@ -1671,6 +1999,7 @@ fn float_bands(tree: &TaffyTree<Leaf>, entries: &[Entry], inline_count: usize) -
     walk_entries(tree, entries, entries.len() - 1, 0.0, 0.0, 0, &mut next_bfc, &mut floats, &mut roots);
 
     for root in &roots {
+        bfcs[root.inline] = root.bfc;
         let r = root.rect;
         let bands = &mut out[root.inline];
         for f in &floats {
@@ -1696,7 +2025,7 @@ fn float_bands(tree: &TaffyTree<Leaf>, entries: &[Entry], inline_count: usize) -
             });
         }
     }
-    out
+    (out, bfcs)
 }
 
 /// Collect float margin boxes and inline root boxes in root coordinates,
@@ -1919,6 +2248,12 @@ struct Counters {
     /// whether the whole tree was built.
     boxes_rebuilt: u32,
     full: bool,
+    /// Kept taffy trees (block B2): nodes made (every one for new boxes),
+    /// and float passes started again where kept bands no longer held.
+    taffy_nodes_built: u32,
+    float_restarts: u32,
+    /// Positioned boxes' layouts taken from their kept results.
+    positioned_reused: u32,
 }
 
 /// The timing log's counters, for the other layout modules.
@@ -2299,6 +2634,33 @@ fn add_auto_gutters(node: &mut BoxNode, infos: &HashMap<NodeId, ScrollInfo>, tre
     }
     for c in &mut node.children {
         changed |= add_auto_gutters(c, infos, tree);
+    }
+    changed
+}
+
+/// After the first pass of a kept tree (block B2): every scroller whose
+/// auto gutters were kept from the last layout loses those on the axes
+/// its content no longer overflows (with them in place), updating its
+/// taffy style; true when one went (another pass is needed). Each box's
+/// mark is cleared, so later passes only add gutters, as before.
+fn drop_kept_gutters(node: &mut BoxNode, infos: &HashMap<NodeId, ScrollInfo>, tree: &mut TaffyTree<Leaf>) -> bool {
+    let mut changed = false;
+    if std::mem::take(&mut node.kept_gutters)
+        && let (Some(n), Some(id)) = (node.node, node.taffy)
+        && let Some(base) = ScrollPlan::for_style(&node.style)
+        && let Some(plan) = node.scroll.as_mut()
+        && let Some(info) = infos.get(&n)
+    {
+        let (ox, oy) = info.overflows();
+        if plan.drop_unneeded_gutters(&base, ox, oy) {
+            let is_flex = matches!(node.kind, BoxKind::Flex);
+            let style = to_taffy(&node.style, is_flex, false, Some(&*plan));
+            let _ = tree.set_style(id, style);
+            changed = true;
+        }
+    }
+    for c in &mut node.children {
+        changed |= drop_kept_gutters(c, infos, tree);
     }
     changed
 }
@@ -6948,7 +7310,7 @@ mod tests {
         assert!(long.y >= 50.0, "long word should drop below the float, got y {}", long.y);
         assert!(long.x < 1.0);
         let p = find_by_tag(&doc, &tree, "p");
-        assert!(p.height >= 50.0 + 16.0);
+        assert!(p.height >= 50.0 + 16.0, "p is {p:?}, the long word {long:?}");
     }
 
     #[test]
@@ -7360,6 +7722,22 @@ mod incremental_layout {
     /// must equal a fresh full layout. Returns the boxes rebuilt counter
     /// (whether it really was incremental).
     fn check(html: &str, css: &str, change: impl FnOnce(&mut Document) -> (Vec<NodeId>, Vec<NodeId>)) -> bool {
+        !check_counted(html, css, change).full
+    }
+
+    /// `check`, returning the counters of the incremental layout.
+    fn check_counted(html: &str, css: &str, change: impl FnOnce(&mut Document) -> (Vec<NodeId>, Vec<NodeId>)) -> Counters {
+        check_at(html, css, 800.0, 600.0, change)
+    }
+
+    /// `check` in a viewport of the given size.
+    fn check_at(
+        html: &str,
+        css: &str,
+        width: f32,
+        height: f32,
+        change: impl FnOnce(&mut Document) -> (Vec<NodeId>, Vec<NodeId>),
+    ) -> Counters {
         let mut doc = browser_dom::parse_html(html.as_bytes());
         let mut stylist = Stylist::new();
         stylist.add_sheet(ua_stylesheet());
@@ -7369,7 +7747,7 @@ mod incremental_layout {
         sync_pseudo_elements(&mut doc, &styles);
         let mut engine = LayoutEngine::new();
         let none = HashMap::new();
-        let _ = engine.layout_with_scrolls(&doc, &styles, 800.0, 600.0, &(), &none, (0.0, 0.0));
+        let _ = engine.layout_with_scrolls(&doc, &styles, width, height, &(), &none, (0.0, 0.0));
         let (attrs, parents) = change(&mut doc);
         let new_styles = compute_styles(&doc, &stylist, &vp);
         sync_pseudo_elements(&mut doc, &new_styles);
@@ -7381,11 +7759,149 @@ mod incremental_layout {
             .collect();
         changed.extend(attrs);
         engine.note_box_changes(&changed, &parents);
-        let incremental = engine.layout_with_scrolls(&doc, &new_styles, 800.0, 600.0, &(), &none, (0.0, 0.0));
-        let was_incremental = !COUNTERS.with(std::cell::Cell::get).full;
-        let full = LayoutEngine::new().layout(&doc, &new_styles, 800.0, 600.0, &());
+        let incremental = engine.layout_with_scrolls(&doc, &new_styles, width, height, &(), &none, (0.0, 0.0));
+        let counted = COUNTERS.with(std::cell::Cell::get);
+        let full = LayoutEngine::new().layout(&doc, &new_styles, width, height, &());
         assert_eq!(shown(&incremental), shown(&full), "incremental layout differs from a full one");
-        was_incremental
+        assert_eq!(
+            (incremental.content_width, incremental.content_height, incremental.viewport.vertical_bar, incremental.viewport.horizontal_bar),
+            (full.content_width, full.content_height, full.viewport.vertical_bar, full.viewport.horizontal_bar),
+            "the page's extent and scrollbars differ from a full layout"
+        );
+        counted
+    }
+
+    /// The counters of a full layout of `html`.
+    fn full_counted(html: &str, css: &str) -> Counters {
+        let doc = browser_dom::parse_html(html.as_bytes());
+        let mut stylist = Stylist::new();
+        stylist.add_sheet(ua_stylesheet());
+        stylist.add_sheet(Arc::new(Stylesheet::parse(css, Origin::Author)));
+        let styles = compute_styles(&doc, &stylist, &Viewport::default());
+        let _ = LayoutEngine::new().layout(&doc, &styles, 800.0, 600.0, &());
+        COUNTERS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn an_unchanged_page_is_answered_from_the_kept_taffy_tree() {
+        let c = check_counted(PAGE, CSS, |_| (vec![], vec![]));
+        assert!(!c.full);
+        assert_eq!(c.taffy_nodes_built, 0, "no taffy node made");
+        assert_eq!((c.inline_measures, c.table_measures, c.independent_layouts), (0, 0, 0), "nothing measured again");
+    }
+
+    #[test]
+    fn a_change_measures_only_its_part_again() {
+        let full = full_counted(PAGE, CSS);
+        let c = check_counted(PAGE, CSS, |doc| {
+            let p = by_id(doc, "p");
+            set_attr(doc, p, "class", "b");
+            (vec![p], vec![])
+        });
+        assert!(!c.full);
+        assert!(c.taffy_nodes_built > 0 && c.taffy_nodes_built < full.taffy_nodes_built / 2, "{} of {}", c.taffy_nodes_built, full.taffy_nodes_built);
+        assert!(c.inline_measures < full.inline_measures, "{} measures, {} in a full layout", c.inline_measures, full.inline_measures);
+        assert_eq!(c.table_measures, 0, "the table beside it is not measured again");
+    }
+
+    #[test]
+    fn a_table_taffy_answers_for_keeps_its_containing_block() {
+        // The table's percentage padding resolves against its containing
+        // block, which only its measure records: answered from taffy's
+        // cache, the table must still be finished in that block.
+        let page = "<body><div><p id=p>text</p><table style='padding:10%'><tr><td>cell</td></tr></table></div></body>";
+        let c = check_counted(page, CSS, |doc| {
+            let p = by_id(doc, "p");
+            set_attr(doc, p, "class", "red");
+            (vec![p], vec![])
+        });
+        assert!(!c.full);
+        assert_eq!(c.table_measures, 0);
+    }
+
+    #[test]
+    fn floats_keep_their_bands_unless_they_move() {
+        let page = "<body><div id=fl><i id=f style='float:left;width:30px;height:30px'></i>\
+            <p id=a>beside the float, a line of text long enough to wrap around it twice or more</p></div>\
+            <p id=far>far away</p></body>";
+        let css = ".tall { height: 90px !important } .red { color: rgb(255, 0, 0) }";
+        // A change elsewhere: the bands stand.
+        let c = check_counted(page, css, |doc| {
+            let far = by_id(doc, "far");
+            set_attr(doc, far, "class", "red");
+            (vec![far], vec![])
+        });
+        assert_eq!(c.float_restarts, 0);
+        // The float grows: the roots beside it start again without bands.
+        let c = check_counted(page, css, |doc| {
+            let f = by_id(doc, "f");
+            set_attr(doc, f, "class", "tall");
+            (vec![f], vec![])
+        });
+        assert!(!c.full);
+        assert_eq!(c.float_restarts, 1);
+        // The float goes: its bands with it.
+        check_counted(page, css, |doc| {
+            let f = by_id(doc, "f");
+            let fl = by_id(doc, "fl");
+            doc.remove_subtree(f);
+            (vec![], vec![fl])
+        });
+    }
+
+    #[test]
+    fn scrollbar_gutters_stay_while_needed_and_go_when_not() {
+        let page = "<body><div id=sc style='overflow:auto;height:50px;width:200px'><p id=c>one</p><p>two</p><p>three</p></div>\
+            <div id=page style='height:2000px'></div></body>";
+        let css = ".short { display: none } .red { color: rgb(255, 0, 0) } .tall { height: 2000px }";
+        // Both still overflow: the gutters stay.
+        check_at(page, css, 800.0, 600.0, |doc| {
+            let c = by_id(doc, "c");
+            set_attr(doc, c, "class", "red");
+            (vec![c], vec![])
+        });
+        // The scroller's content fits now: its gutter goes.
+        check_at(page, css, 800.0, 600.0, |doc| {
+            let sc = by_id(doc, "sc");
+            let kids: Vec<NodeId> = doc.children(sc).collect();
+            for k in kids.into_iter().skip(1) {
+                doc.remove_subtree(k);
+            }
+            (vec![], vec![sc])
+        });
+        // The page fits now: its scrollbar goes.
+        check_at(page, css, 800.0, 600.0, |doc| {
+            let p = by_id(doc, "page");
+            set_attr(doc, p, "class", "short");
+            (vec![p], vec![])
+        });
+        // And comes when it overflows again.
+        let short = page.replace("height:2000px", "height:20px");
+        check_at(&short, css, 800.0, 600.0, |doc| {
+            let p = by_id(doc, "page");
+            set_attr(doc, p, "class", "tall");
+            (vec![p], vec![])
+        });
+    }
+
+    #[test]
+    fn a_kept_box_moved_into_another_tree_gets_a_node_there() {
+        // `#mv` becomes an inline-block: laid out on its own, in its own
+        // taffy tree; its paragraph's box is reused and moves there.
+        let page = "<body><div id=wrap><div id=mv><p id=inner>moved text</p></div><p>after</p></div></body>";
+        let css = ".ib { display: inline-block }";
+        let c = check_counted(page, css, |doc| {
+            let mv = by_id(doc, "mv");
+            set_attr(doc, mv, "class", "ib");
+            (vec![mv], vec![])
+        });
+        assert!(!c.full);
+        // And back.
+        check_counted(&page.replace("id=mv", "id=mv class=ib"), css, |doc| {
+            let mv = by_id(doc, "mv");
+            set_attr(doc, mv, "class", "");
+            (vec![mv], vec![])
+        });
     }
 
     const PAGE: &str = "<body><div id=wrap><p id=p class=a>text <span id=s>in a span</span> more</p>\
