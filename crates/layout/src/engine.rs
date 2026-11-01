@@ -77,6 +77,12 @@ pub struct LayoutEngine {
     /// Taffy nodes of dropped boxes (and of boxes moved to another tree),
     /// by the tag of the tree they are in, removed when it is next used.
     removed: HashMap<u64, Vec<TaffyId>>,
+    /// Incremental layout (block B3): the font families (lowercased) whose
+    /// fonts changed since the last layout (a face registered, the faces
+    /// synced again, a family declared or no longer declared); the next
+    /// layout builds again the boxes of the elements whose `font-family`
+    /// names one of them.
+    font_changes: std::collections::HashSet<String>,
 }
 
 /// A web font registered for the current document.
@@ -215,7 +221,25 @@ impl LayoutEngine {
             changes: crate::incremental::BoxChanges::Unknown,
             doc: None,
             removed: HashMap::new(),
+            font_changes: std::collections::HashSet::new(),
         }
+    }
+
+    /// Block B3: the fonts of family `name` changed.
+    fn note_font_family(&mut self, name: &str) {
+        self.font_changes.insert(name.to_lowercase());
+    }
+
+    /// Block B3: every web font's and declared family's fonts may have
+    /// changed (the collection was rebuilt).
+    fn note_all_web_families(&mut self) {
+        let names: Vec<String> = self
+            .web_fonts
+            .iter()
+            .map(|w| w.face.family.to_lowercase())
+            .chain(self.web_families.iter().cloned())
+            .collect();
+        self.font_changes.extend(names);
     }
 
     /// Incremental layout: since the last layout, the computed styles of
@@ -303,6 +327,18 @@ impl LayoutEngine {
         let position = |face: &Arc<browser_style::fontface::FontFaceRule>| faces.iter().position(|f| Arc::ptr_eq(f, face)).map(|i| i as u32);
         let stale = self.web_fonts.iter().any(|w| position(&w.face) != Some(w.order));
         if stale {
+            // The families whose fonts change: those of the faces dropped
+            // or moved (the rest are registered again as they were). The
+            // collection is declared again below; the families it declared
+            // before count as declared still.
+            let moved: Vec<String> = self
+                .web_fonts
+                .iter()
+                .filter(|w| position(&w.face) != Some(w.order))
+                .map(|w| w.face.family.to_lowercase())
+                .collect();
+            self.font_changes.extend(moved);
+            let declared = std::mem::take(&mut self.web_families);
             let kept: Vec<WebFont> = std::mem::take(&mut self.web_fonts)
                 .into_iter()
                 .filter_map(|mut w| {
@@ -311,12 +347,14 @@ impl LayoutEngine {
                 })
                 .collect();
             self.fonts.collection.clear();
-            self.web_families.clear();
             for w in &kept {
                 self.register_blob(w);
             }
             self.web_fonts = kept;
             self.decor.forget_metrics();
+            let names: Vec<&str> = faces.iter().map(|f| &*f.family).collect();
+            self.declare_families(&names, declared, true);
+            return;
         }
         let names: Vec<&str> = faces.iter().map(|f| &*f.family).collect();
         self.declare_web_families(&names);
@@ -357,6 +395,7 @@ impl LayoutEngine {
         if !self.register_blob(&font) {
             return false;
         }
+        self.note_font_family(&font.face.family);
         self.web_fonts.push(font);
         self.decor.forget_metrics();
         true
@@ -436,13 +475,32 @@ impl LayoutEngine {
     /// list. A name no longer declared stops hiding: the collection is
     /// rebuilt with the fonts of the families still declared.
     pub fn declare_web_families(&mut self, names: &[&str]) {
+        let previous = self.web_families.clone();
+        self.declare_families(names, previous, false);
+    }
+
+    /// `declare_web_families` against the families `previous` declared;
+    /// `rebuilt`: the collection was just built again (`sync_web_faces`),
+    /// so every name is declared on it whatever changed. The families whose
+    /// fonts change (block B3) are those declared or no longer declared:
+    /// the fonts of the others are registered again as they were.
+    fn declare_families(&mut self, names: &[&str], previous: Vec<String>, rebuilt: bool) {
         let mut wanted: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
         wanted.sort();
         wanted.dedup();
-        if wanted == self.web_families {
+        if wanted == previous && !rebuilt {
             return;
         }
-        let dropped = self.web_families.iter().any(|n| wanted.binary_search(n).is_err());
+        // A family declared now hides an installed one of its name; one no
+        // longer declared shows it again.
+        let differ: Vec<String> = wanted
+            .iter()
+            .filter(|n| previous.binary_search(n).is_err())
+            .chain(previous.iter().filter(|n| wanted.binary_search(n).is_err()))
+            .cloned()
+            .collect();
+        self.font_changes.extend(differ);
+        let dropped = previous.iter().any(|n| wanted.binary_search(n).is_err());
         if dropped {
             self.fonts.collection.clear();
             let kept: Vec<_> = std::mem::take(&mut self.web_fonts)
@@ -468,6 +526,7 @@ impl LayoutEngine {
         // registered or set on the collection, so the installed fonts and
         // generic families stay as they were.
         let had = !self.web_fonts.is_empty() || !self.web_families.is_empty();
+        self.note_all_web_families();
         self.web_fonts.clear();
         self.web_families.clear();
         if had {
@@ -600,6 +659,31 @@ impl LayoutEngine {
         let mut builder = BoxBuilder::new(doc, styles, images, vo.source);
         // The boxes: the kept tree with what changed rebuilt
         // (`incremental.rs`), else every box built.
+        // Fonts that changed (block B3): the elements whose `font-family`
+        // names one of their families (or whose pseudo-elements' or
+        // marker's does) are built again; the lists are shared between
+        // elements, so each is read once.
+        let fonts = std::mem::take(&mut self.font_changes);
+        if !fonts.is_empty()
+            && let crate::incremental::BoxChanges::Known { elements, .. } = &mut self.changes
+        {
+            let mut seen: HashMap<*const u8, bool> = HashMap::new();
+            let mut uses = |s: &ComputedStyle| {
+                *seen.entry(Arc::as_ptr(&s.font_family) as *const u8).or_insert_with(|| {
+                    browser_style::fontface::family_names(&s.font_family)
+                        .iter()
+                        .any(|(name, _)| fonts.contains(&name.to_lowercase()))
+                })
+            };
+            for (id, s) in styles.iter() {
+                let pseudo = s.pseudo.as_deref().is_some_and(|p| {
+                    [&p.marker, &p.before, &p.after].into_iter().flatten().any(|ps| uses(ps))
+                });
+                if uses(s) || pseudo {
+                    elements.push(id);
+                }
+            }
+        }
         let changes = std::mem::replace(
             &mut self.changes,
             crate::incremental::BoxChanges::Known { elements: Vec::new(), parents: Vec::new() },

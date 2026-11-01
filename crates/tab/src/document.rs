@@ -2062,8 +2062,11 @@ impl TabState {
         // A web font's block period ended (its text is drawn in the
         // fallback) or its swap period (the fallback stays for good): the
         // fonts are walked again after the next layout.
+        // No font changes with a period (the engine notes the families of
+        // fonts that do change): the boxes stay; the layout is for the
+        // walk after it, which decides the invisible text.
         if self.web_fonts.tick(now) {
-            self.want_layout("web font period ended");
+            self.want_layout_noted("web font period ended");
         }
         // `document.fonts`: its promises and events run as a task here,
         // never from inside rendering or a network handler.
@@ -2810,7 +2813,9 @@ impl TabState {
                     self.web_fonts.dirty = true;
                 }
                 if registered {
-                    self.want_layout("web font arrived");
+                    // The engine noted the families it registered: their
+                    // text is laid out again.
+                    self.want_layout_noted("web font arrived");
                 } else {
                     tracing::debug!(tab = self.id.0, url = url.as_str(), "web font failed");
                     self.web_fonts.failed.insert(Source::Url(url));
@@ -3677,13 +3682,23 @@ impl TabState {
             self.want_layout("image arrived before the first layout");
             return;
         };
-        let mut sized = false;
+        // The elements whose boxes take their size from the image (block
+        // B3: only their boxes are built again): those showing it (an
+        // `<img>`, a `content` image's owner), and below those whose list
+        // marker or generated content names it.
+        let mut elements: Vec<NodeId> = Vec::new();
         let href = url.as_str();
-        tree.root.walk(&mut |f| {
-            if let browser_layout::FragmentContent::Image(browser_layout::ImageSource::Url(u)) = &f.content {
-                sized |= u.as_str() == href;
-            }
-        });
+        if let Some(doc) = &self.doc {
+            tree.root.walk(&mut |f| {
+                if let browser_layout::FragmentContent::Image(browser_layout::ImageSource::Url(u)) = &f.content
+                    && u.as_str() == href
+                    && let Some(n) = f.node.filter(|&n| doc.contains(n))
+                {
+                    // A pseudo-element's box: its element's.
+                    elements.push(if doc.get(n).pseudo_kind().is_some() { doc.parent(n).unwrap_or(n) } else { n });
+                }
+            });
+        }
         // A marker image, and a `content` image of a `::before`/`::after`
         // or marker, get their boxes only once decoded.
         let scale = self.viewport.scale_factor;
@@ -3698,13 +3713,18 @@ impl TabState {
                 })
             })
         };
-        sized = sized
-            || self.styles.iter().any(|(_, s)| {
-                s.list_style_image.iter().any(|u| &**u == href)
-                    || s.pseudo.as_deref().is_some_and(|p| [&p.marker, &p.before, &p.after].into_iter().flatten().any(|ps| in_content(ps)))
-            });
-        if sized {
-            self.want_layout("image arrived that sizes a box");
+        elements.extend(
+            self.styles
+                .iter()
+                .filter(|(_, s)| {
+                    s.list_style_image.iter().any(|u| &**u == href)
+                        || s.pseudo.as_deref().is_some_and(|p| [&p.marker, &p.before, &p.after].into_iter().flatten().any(|ps| in_content(ps)))
+                })
+                .map(|(id, _)| id),
+        );
+        if !elements.is_empty() {
+            self.note_box_changes(&elements, &[]);
+            self.want_layout_noted("image arrived that sizes a box");
         } else {
             self.needs_paint = true;
         }
@@ -3917,7 +3937,8 @@ impl TabState {
             let Some(data) = self.web_fonts.script_data.get(&id).cloned() else { continue };
             if self.engine.as_mut().is_some_and(|e| e.register_web_font(&data, face, order as u32)) {
                 self.web_fonts.loaded.insert(key);
-                self.want_layout("script font face registered");
+                // The engine noted the family it registered.
+                self.want_layout_noted("script font face registered");
             }
         }
         if faces.is_empty() && self.web_fonts.forced_script.is_empty() {
@@ -4092,7 +4113,8 @@ impl TabState {
             let face = &faces[order as usize];
             if self.engine.as_mut().is_some_and(|e| e.register_local_font(&name, face, order)) {
                 self.web_fonts.loaded.insert(face_key(face));
-                self.want_layout("local font face registered");
+                // The engine noted the family it registered.
+                self.want_layout_noted("local font face registered");
             } else {
                 self.web_fonts.failed.insert(Source::Local(name.to_lowercase()));
                 local_changed = true;
@@ -8345,6 +8367,84 @@ mod tests {
         h.pump_until(|h| h.state.images.get_svg(&img).is_some());
         h.pump();
         assert!(h.state.layouts > before, "an <img> takes its size from the image");
+    }
+
+    /// Block B3 of incremental layout: a web font and images arriving lay
+    /// out again only the boxes they reach; each result is a full layout's,
+    /// and the text in the web font is drawn in it.
+    #[test]
+    fn fonts_and_images_arriving_lay_out_only_what_they_reach() {
+        let mut collection = fontique::Collection::new(fontique::CollectionOptions::default());
+        let mut cache = fontique::SourceCache::default();
+        let names: Vec<String> = collection.family_names().map(str::to_owned).collect();
+        let ttf = names
+            .iter()
+            .filter_map(|n| collection.family_by_name(n))
+            .flat_map(|fam| fam.fonts().to_vec())
+            .filter_map(|f| f.load(Some(&mut cache)))
+            .map(|b| b.data().to_vec())
+            .find(|d| {
+                use read_fonts::TableProvider;
+                let Ok(read_fonts::FileRef::Font(f)) = read_fonts::FileRef::new(d) else { return false };
+                f.cmap().is_ok_and(|cmap| "webfont text".chars().all(|c| c == ' ' || cmap.map_codepoint(c).is_some_and(|g| g.to_u32() != 0)))
+            })
+            .expect("an installed single-font file");
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='30'><rect width='40' height='30'/></svg>";
+        let page = "<!DOCTYPE html><style>@font-face { font-family: Arriving; src: url(/f.ttf) }</style>\
+            <body><div><p>before</p><img src='/i.svg'><ul style='list-style-image: url(/m.svg)'><li>item</li></ul>\
+            <p id=w style='font-family: Arriving, monospace'>webfont text</p><p>after</p></div>";
+        let html = vec![("Content-Type".to_owned(), "text/html; charset=utf-8".to_owned())];
+        let svg_type = vec![("Content-Type".to_owned(), "image/svg+xml".to_owned())];
+        let server = Server::start_with(
+            vec![
+                ("/page".to_owned(), html, page.as_bytes().to_vec()),
+                ("/f.ttf".to_owned(), vec![("Content-Type".to_owned(), "font/ttf".to_owned())], ttf.clone()),
+                ("/i.svg".to_owned(), svg_type.clone(), svg.as_bytes().to_vec()),
+                ("/m.svg".to_owned(), svg_type, svg.as_bytes().to_vec()),
+            ],
+            &["/f.ttf", "/i.svg", "/m.svg"],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.layout.is_some() && h.state.lifecycle == Lifecycle::ContentLoaded);
+        // The layout just made was incremental, and equals a full one made
+        // by the same engine (the same fonts registered).
+        let check = |h: &mut Harness, what: &str| {
+            assert!(!browser_layout::last_layout_was_full(), "{what}: laid out incrementally");
+            let rects = |t: &browser_layout::LayoutTree| {
+                let mut v = Vec::new();
+                t.root.walk(&mut |f| v.push((f.node, f.rect)));
+                v
+            };
+            let incremental = rects(h.state.layout.as_ref().expect("layout"));
+            let st = &mut h.state;
+            let (w, ht) = (st.viewport.width, st.viewport.height);
+            let full = st.engine.as_mut().expect("engine").layout(st.doc.as_ref().expect("doc"), &st.styles, w, ht, &st.images);
+            assert_eq!(incremental, rects(&full), "{what}: equal to a full layout");
+        };
+        for (path, what) in [("/i.svg", "an <img>'s image"), ("/m.svg", "a list marker's image")] {
+            let layouts = h.state.layouts;
+            let url = server.url(path);
+            server.release(path);
+            h.pump_until(|h| h.state.images.get_svg(&url).is_some());
+            h.pump();
+            assert!(h.state.layouts > layouts, "{what}: laid out again");
+            check(&mut h, what);
+        }
+        let layouts = h.state.layouts;
+        server.release("/f.ttf");
+        h.pump_until(|h| h.state.layouts > layouts);
+        h.pump();
+        check(&mut h, "a web font");
+        let mut font = None;
+        h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+            if let browser_layout::FragmentContent::Text(t) = &f.content
+                && t.text.contains("webfont")
+                && font.is_none()
+            {
+                font = Some(t.font.data.data().to_vec());
+            }
+        });
+        assert!(font == Some(ttf), "the text is drawn in the arrived font");
     }
 
     /// Where the time goes on a real page, served over loopback from a

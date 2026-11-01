@@ -315,6 +315,45 @@ that took 10 s; alone they pass 3 of 3.
 B2 is done. Still open in this design: B3 (fonts and images) and B4
 (fragments and paint order).
 
+**B3 (fonts and images) done 2026-11-01.** Fonts: the engine records the
+families (lowercased) whose fonts change, where its collection changes
+(`font_changes`: a face registered, `register_web_font`/
+`register_local_font`; faces synced again, only the families of the faces
+dropped or moved, the others registered again as they were; a family
+declared or no longer declared, `declare_families`), and the next layout
+builds again the boxes of the elements whose `font-family` (or a
+pseudo-element's or marker's) names one of them (each list read once per
+layout). The tab's "web font arrived", "script/local font face
+registered" layouts are described; a font-display period ending changes
+no font (the walk after the layout decides the invisible text) and lays
+out with no box rebuilt. Images: an arriving image that sizes a box notes
+the elements showing it (its fragments' elements, a pseudo-element's
+owner) and those whose `list-style-image` or generated content names it.
+The design's family-to-roots index is these element lists, made when a
+font changes. Test `fonts_and_images_arriving_lay_out_only_what_they_reach`
+(an `<img>`, a list marker image, a web font: each incremental, equal to a
+full layout of the same engine, the text in the arrived font). The
+timing log now says why a layout builds every box (`every box built`).
+Verification (release probe, live): iana 12, Wikipedia Main Page 7, the
+Rust article 4 incremental layouts, 0 differences.
+
+Timing (release probe, live): Wikipedia Main Page load 677–688 ms (733–769
+ms before B3), its load layouts after the first 4.5–5.7 ms each (~45 ms,
+full, before); iana load 4.68–4.73 s, unchanged: its load layouts are full
+for reasons outside B3, from the log: its first layout; a script change
+past the change log's limit (the log becomes one undescribed change,
+1.0 s); a script restyling `html` (0.5 s); `body` among the changed
+elements twice (0.5 s each: `body` names the web font, so every text
+changes font).
+
+Found, not changed: the tab tests' `pump_until` waits for network events
+up to its 10 s deadline without running timers, so a test waiting on a
+font-display period can time out on a busy machine
+(`font_display_blocks_swaps_and_gives_up` failed so in two workspace
+runs; alone it passes 5 of 5).
+
+Still open in this design: B4 (fragments and paint order).
+
 Found, not part of B2: the paint crate's unit tests crash at times with
 `STATUS_ACCESS_VIOLATION` when run in parallel (2 of 3 runs once); with
 `--test-threads=1` they pass every time. Safe code cannot fault so; it is

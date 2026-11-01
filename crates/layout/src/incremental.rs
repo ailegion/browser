@@ -83,11 +83,17 @@ pub(crate) fn rebuild(
     viewport_source: Option<NodeId>,
     removed: &RefCell<Vec<(u64, TaffyId)>>,
 ) -> bool {
-    let BoxChanges::Known { elements, parents } = changes else { return false };
+    // The timing log: why every box is built.
+    let full = |why: &str, n: Option<NodeId>| {
+        let element = n.and_then(|n| doc.element(n)).map(|e| e.name.local.to_string());
+        tracing::info!(target: "perf", why, ?element, "every box built");
+        false
+    };
+    let BoxChanges::Known { elements, parents } = changes else { return full("a change not described", None) };
     if kept.viewport_source != viewport_source {
-        return false;
+        return full("the element the viewport's overflow comes from changed", None);
     }
-    let Some(html) = doc.document_element() else { return false };
+    let Some(html) = doc.document_element() else { return full("no root element", None) };
     let body = doc.body();
     // The boxes the tree has, by element.
     let mut places: HashMap<NodeId, Place> = HashMap::new();
@@ -102,7 +108,7 @@ pub(crate) fn rebuild(
             continue;
         }
         if e == html || Some(e) == body {
-            return false;
+            return full("the root element or body changed", Some(e));
         }
         if let Some(d) = places.get(&e).and_then(|p| p.table_display())
             && builder.display_of(e) == Some(d)
@@ -112,7 +118,7 @@ pub(crate) fn rebuild(
         }
         match doc.parent(e) {
             Some(p) => starts.push(p),
-            None => return false,
+            None => return full("a changed element has no parent", Some(e)),
         }
     }
     for &p in parents {
@@ -145,7 +151,7 @@ pub(crate) fn rebuild(
                 continue 'starts;
             }
             if Some(n) == Some(html) || Some(n) == body {
-                return false;
+                return full("a change reached the root element or body", Some(s));
             }
             if places.contains_key(&n) {
                 found = Some(n);
@@ -158,7 +164,7 @@ pub(crate) fn rebuild(
                 roots.insert(n);
                 led.push((s, n));
             }
-            None => return false,
+            None => return full("a change has no element box above it", Some(s)),
         }
     }
     if roots.is_empty() {
