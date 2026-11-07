@@ -937,6 +937,24 @@ impl LetterSpacingValue {
     }
 }
 
+/// `word-spacing` as written: `normal | <length-percentage>` (CSS Text 4
+/// §8.1; Chrome 145 and Firefox 45 take percentages, WPT
+/// `word-spacing-valid.html`), a percentage of the element's font size.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WordSpacingValue {
+    Normal,
+    Lp(LengthPercentage),
+}
+
+impl WordSpacingValue {
+    pub fn to_css(&self) -> String {
+        match self {
+            WordSpacingValue::Normal => "normal".to_owned(),
+            WordSpacingValue::Lp(l) => l.to_css(),
+        }
+    }
+}
+
 /// `text-indent` as written (CSS Text 3 §8.1): `<length-percentage> &&
 /// hanging? && each-line?`.
 #[derive(Debug, Clone, PartialEq)]
@@ -2557,6 +2575,7 @@ longhands! {
     TextTransform: "text-transform" => TextTransform, true;
     WhiteSpace: "white-space" => WhiteSpace, true;
     LetterSpacing: "letter-spacing" => LetterSpacingValue, true;
+    WordSpacing: "word-spacing" => WordSpacingValue, true;
     TextIndent: "text-indent" => TextIndentValue, true;
     WordBreak: "word-break" => WordBreak, true;
     OverflowWrap: "overflow-wrap" => OverflowWrap, true;
@@ -2964,6 +2983,7 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "pre-wrap" => WhiteSpace::PreWrap, "pre-line" => WhiteSpace::PreLine,
             "break-spaces" => WhiteSpace::BreakSpaces, _ => return None }))?),
         PropertyId::LetterSpacing => P::LetterSpacing(parse_letter_spacing(input)?),
+        PropertyId::WordSpacing => P::WordSpacing(parse_word_spacing(input)?),
         PropertyId::TextIndent => P::TextIndent(parse_text_indent(input)?),
         PropertyId::WordBreak => P::WordBreak(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "normal" => WordBreak::Normal, "break-all" => WordBreak::BreakAll, "keep-all" => WordBreak::KeepAll,
@@ -3996,6 +4016,14 @@ fn parse_letter_spacing<'i>(input: &mut Parser<'i, '_>) -> Result<LetterSpacingV
         LengthPercentage::Calc(c) => LetterSpacingValue::Calc(c),
         LengthPercentage::Percent(_) => return Err(input.new_custom_error(())),
     })
+}
+
+/// `word-spacing: normal | <length-percentage>`.
+fn parse_word_spacing<'i>(input: &mut Parser<'i, '_>) -> Result<WordSpacingValue, ParseErr<'i>> {
+    if input.try_parse(|i| i.expect_ident_matching("normal")).is_ok() {
+        return Ok(WordSpacingValue::Normal);
+    }
+    Ok(WordSpacingValue::Lp(parse_length_percentage(input)?))
 }
 
 fn parse_overflow_wrap<'i>(input: &mut Parser<'i, '_>) -> Result<OverflowWrap, ParseErr<'i>> {

@@ -109,6 +109,12 @@ impl ImageStore {
     pub fn is_empty(&self) -> bool {
         self.images.is_empty() && self.svgs.is_empty()
     }
+
+    /// Keep only the images whose URL `keep` accepts.
+    pub fn retain(&mut self, keep: impl Fn(&Url) -> bool) {
+        self.images.retain(|u, _| keep(u));
+        self.svgs.retain(|u, _| keep(u));
+    }
 }
 
 impl browser_layout::ImageSizes for ImageStore {

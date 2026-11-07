@@ -126,6 +126,10 @@ pub enum DomChange {
     /// came or went with them: the sheets change (the whole document is
     /// restyled), and the boxes there are built again.
     Sheets { parent: NodeId, generation: u64 },
+    /// An `<img>`'s current image request or its dimension attribute
+    /// source changed ("Working sites first" 6m): its style (the
+    /// `width`/`height` hints) and its box are computed again.
+    Image { element: NodeId, generation: u64 },
 }
 
 /// The parsed form of `text` from the cache, parsing it once. `None` if
@@ -218,6 +222,27 @@ impl Dom {
         self.changes.push(DomChange::Tree { generation: self.generation });
     }
 
+    /// The image algorithms changed what an `<img>` shows or its
+    /// dimension attribute source (`Document::images_changed`).
+    pub(crate) fn note_images_changed(&mut self) {
+        let changed = std::mem::take(&mut self.doc.images_changed);
+        for element in changed {
+            if !self.doc.contains(element) || !self.doc.is_connected(element) {
+                continue;
+            }
+            self.mutated = true;
+            self.generation += 1;
+            if self.changes.len() >= CHANGE_LOG_LIMIT {
+                self.note_tree();
+                continue;
+            }
+            self.changes.push(DomChange::Image {
+                element,
+                generation: self.generation,
+            });
+        }
+    }
+
     pub(crate) fn take_changes(&mut self) -> Vec<DomChange> {
         std::mem::take(&mut self.changes)
     }
@@ -235,6 +260,89 @@ impl Dom {
             return;
         }
         self.doc.remove_subtree(id);
+    }
+}
+
+/// `HTMLImageElement.currentSrc`: the current request's current URL
+/// (HTML §4.8.3).
+fn current_src(this: &JsValue, _: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let node = this_node(this)?;
+    let shared = dom(context)?;
+    let dom = shared.borrow();
+    let Some(id) = node.resolve(&dom.doc).filter(|&id| dom.doc.is_html_img(id)) else {
+        return Err(illegal_invocation());
+    };
+    Ok(js_str(&browser_style::responsive::current_src(&dom.doc, id)).into())
+}
+
+/// The image algorithms' environment from the lent view: the viewport
+/// and device pixel ratio, the images already decoded (the list of
+/// available images), and the concrete widths of laid-out images.
+fn with_image_env<R>(dom: &mut Dom, f: impl FnOnce(&mut Document, &browser_style::responsive::ImageEnv<'_>) -> R) -> R {
+    let Dom { doc, view, parsing, .. } = dom;
+    // While parsing, the lent layout is the document's before.
+    let parsing = *parsing;
+    let (viewport, images, layout) = match view {
+        Some(v) => (
+            browser_style::Viewport {
+                width: v.viewport.0,
+                height: v.viewport.1,
+                scale_factor: v.scale,
+                prefers_dark: false,
+            },
+            Some(&v.images),
+            v.layout.as_ref().filter(|_| !parsing),
+        ),
+        None => (browser_style::Viewport::default(), None, None),
+    };
+    let available = |u: &url::Url| images.is_some_and(|m| m.0.contains_key(u));
+    // One walk of the tree for every image the run asks about.
+    let auto: Vec<NodeId> = match layout {
+        Some(_) => doc.images_with_data().into_iter().filter(|&i| browser_style::responsive::allows_auto_sizes(doc, i)).collect(),
+        None => Vec::new(),
+    };
+    let widths: std::cell::RefCell<Option<HashMap<NodeId, f32>>> = std::cell::RefCell::new(None);
+    let rendered = |n: NodeId| {
+        let layout = layout?;
+        let mut cache = widths.borrow_mut();
+        let map = cache.get_or_insert_with(|| layout.content_widths(&auto));
+        if !map.contains_key(&n) && !auto.contains(&n) {
+            return layout.content_widths(&[n]).get(&n).copied();
+        }
+        map.get(&n).copied()
+    };
+    let env = browser_style::responsive::ImageEnv {
+        viewport: &viewport,
+        available: &available,
+        rendered_width: &rendered,
+    };
+    f(doc, &env)
+}
+
+/// After a DOM call ("Working sites first" 6m): every `<img>` created or
+/// mutated in a way relevant to it runs the first half of "update the
+/// image data" now and queues the rest as a microtask (HTML §4.8.4.3.5
+/// step 9), so a later run in the same task supersedes it and promise
+/// callbacks queued after the change see its result.
+pub(crate) fn flush_images(context: &mut Context) {
+    let Ok(shared) = dom(context) else { return };
+    let jobs = {
+        let mut guard = shared.borrow_mut();
+        let dom = &mut *guard;
+        let jobs = with_image_env(dom, browser_style::responsive::run_image_mutations);
+        dom.note_images_changed();
+        jobs
+    };
+    for (img, generation) in jobs {
+        context.enqueue_job(boa_engine::job::Job::PromiseJob(boa_engine::job::PromiseJob::new(move |ctx| {
+            if let Ok(shared) = dom(ctx) {
+                let mut guard = shared.borrow_mut();
+                let dom = &mut *guard;
+                with_image_env(dom, |doc, env| browser_style::responsive::update_image_data_rest(doc, img, generation, env));
+                dom.note_images_changed();
+            }
+            Ok(JsValue::undefined())
+        })));
     }
 }
 
@@ -327,6 +435,14 @@ dom_class!(HtmlElementClass, "HTMLElement", |class| {
     crate::view::add_html_element_geometry(class);
     Ok(())
 });
+// The `img` interface ("Working sites first" 6m: `currentSrc`; its other
+// members are Phase 5's DOM bindings).
+dom_class!(HtmlImageElementClass, "HTMLImageElement", |class| {
+    let get = NativeFunction::from_fn_ptr(current_src);
+    let get = getter(class.context(), "currentSrc", get);
+    class.accessor(js_string!("currentSrc"), Some(get), None, ATTR);
+    Ok(())
+});
 dom_class!(CharacterDataClass, "CharacterData", init_character_data);
 dom_class!(TextClass, "Text", |_| Ok(()));
 dom_class!(CommentClass, "Comment", |_| Ok(()));
@@ -365,6 +481,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     }
     context.register_global_class::<ElementClass>()?;
     context.register_global_class::<HtmlElementClass>()?;
+    context.register_global_class::<HtmlImageElementClass>()?;
     context.register_global_class::<CharacterDataClass>()?;
     context.register_global_class::<TextClass>()?;
     context.register_global_class::<CommentClass>()?;
@@ -375,6 +492,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     context.register_global_class::<HtmlCollectionClass>()?;
     inherit::<ElementClass, NodeClass>(context)?;
     inherit::<HtmlElementClass, ElementClass>(context)?;
+    inherit::<HtmlImageElementClass, HtmlElementClass>(context)?;
     inherit::<CharacterDataClass, NodeClass>(context)?;
     inherit::<TextClass, CharacterDataClass>(context)?;
     inherit::<CommentClass, CharacterDataClass>(context)?;
@@ -670,6 +788,7 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         NativeFunction::from_fn_ptr(crate::view::document_scrolling_element),
     );
     class.accessor(js_string!("scrollingElement"), Some(get), None, ATTR);
+    crate::view::add_document_geometry(class);
     // Item 3.1's properties, which read the tab's `DocumentInfo`.
     for (name, part) in [
         ("URL", DOC_URL),
@@ -754,6 +873,7 @@ enum Proto {
     Node,
     Element,
     HtmlElement,
+    HtmlImage,
     Text,
     Comment,
     DocumentFragment,
@@ -774,6 +894,7 @@ pub(crate) fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
             return Ok(JsValue::null());
         }
         match &dom.doc.get(id).kind {
+            NodeKind::Element(e) if e.is_html() && &*e.name.local == "img" => Proto::HtmlImage,
             NodeKind::Element(e) if e.is_html() => Proto::HtmlElement,
             NodeKind::Element(_) => Proto::Element,
             NodeKind::Text(_) => Proto::Text,
@@ -786,6 +907,7 @@ pub(crate) fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
         Proto::Node => prototype_of::<NodeClass>(context)?,
         Proto::Element => prototype_of::<ElementClass>(context)?,
         Proto::HtmlElement => prototype_of::<HtmlElementClass>(context)?,
+        Proto::HtmlImage => prototype_of::<HtmlImageElementClass>(context)?,
         Proto::Text => prototype_of::<TextClass>(context)?,
         Proto::Comment => prototype_of::<CommentClass>(context)?,
         Proto::DocumentFragment => prototype_of::<DocumentFragmentClass>(context)?,
@@ -1276,6 +1398,14 @@ fn replace_children_with_html(dom: &mut Dom, id: NodeId, html: &str) {
 }
 
 fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) -> JsResult<JsValue> {
+    let result = set_prop(this, args, prop, context);
+    // `innerHTML` may have made `<img>` elements; `textContent` may have
+    // taken some out of a `<picture>`.
+    flush_images(context);
+    result
+}
+
+fn set_prop(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) -> JsResult<JsValue> {
     let node = this_node(this)?;
     let value = args.get_or_undefined(0);
     // `nodeValue` and `textContent` take null as the empty string.
@@ -1599,6 +1729,7 @@ fn mutate_call(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &m
         let mut dom = shared.borrow_mut();
         mutate(&mut dom, node, args, method, &strings, &items, force)
     };
+    flush_images(context);
     match result {
         Ok(out) => finish(out, context),
         Err(fail) => Err(fail.into_error(context)),
@@ -1655,6 +1786,10 @@ fn mutate(
     let mut connected = dom.doc.is_connected(id);
     // An attribute method's attribute and its value before, for the log.
     let mut attr_change: Option<(String, Option<String>)> = None;
+    // The attribute method changed nothing (a removal of an absent
+    // attribute, a forced toggle that keeps the state).
+    let mut attr_noop = false;
+    let mut attr_namespaced = false;
     // The parents whose children changed and what was placed under each;
     // a removed stylesheet makes it a plain tree change.
     let mut tree_changes: Vec<(NodeId, Vec<NodeId>)> = Vec::new();
@@ -1805,6 +1940,8 @@ fn mutate(
             let (ns, qualified) = (&strings[0], &strings[1]);
             let local = qualified.rsplit(':').next().unwrap_or(qualified);
             attr_change = Some((local.to_ascii_lowercase(), e.attr_ns(ns, qualified).map(str::to_owned)));
+            // Only attributes in no namespace are the image's.
+            attr_namespaced = !ns.is_empty();
             match method {
                 SetAttributeNs => {
                     let local = qualified.rsplit(':').next().unwrap_or(qualified);
@@ -1817,7 +1954,8 @@ fn mutate(
                     e.set_attr_ns(ns, qualified, &strings[2]);
                 }
                 _ => {
-                    connected &= e.attr_ns(ns, qualified).is_some();
+                    attr_noop = e.attr_ns(ns, qualified).is_none();
+                    connected &= !attr_noop;
                     e.remove_attr_ns(ns, qualified);
                 }
             }
@@ -1838,7 +1976,8 @@ fn mutate(
                     Out::Value(JsValue::undefined())
                 }
                 RemoveAttribute => {
-                    connected &= e.attr(&name).is_some();
+                    attr_noop = e.attr(&name).is_none();
+                    connected &= !attr_noop;
                     e.remove_attr(&name);
                     Out::Value(JsValue::undefined())
                 }
@@ -1847,6 +1986,7 @@ fn mutate(
                     let keep = match (present, force) {
                         (true, Some(true)) | (false, Some(false)) => {
                             connected = false;
+                            attr_noop = true;
                             present
                         }
                         (true, _) => {
@@ -1866,6 +2006,14 @@ fn mutate(
             unreachable!("handled above")
         }
     };
+    // Connected or not, an `<img>` reacts to its attributes and those of
+    // its `<picture>`'s sources ("Working sites first" 6m).
+    if let Some((name, _)) = &attr_change
+        && !attr_noop
+        && !attr_namespaced
+    {
+        dom.doc.note_image_attribute(id, name);
+    }
     if connected {
         match attr_change {
             Some((name, old)) => dom.note_attr(id, &name, old),

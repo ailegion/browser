@@ -366,6 +366,20 @@ impl PaintOrder {    /// The order resolved against the tree it was built from: 
         })
     }
 
+    /// Every box under the page point, topmost first (what
+    /// `elementsFromPoint` lists), with `hit_test`'s rules.
+    pub fn hit_test_all(&self, x: f32, y: f32, page_scroll: (f32, f32)) -> Vec<NodeId> {
+        self.hits
+            .iter()
+            .rev()
+            .filter(|h| {
+                let inside = |lx: f32, ly: f32| if h.rounded { rounded_contains(&h.rect, &h.style, lx, ly) } else { h.rect.contains(lx, ly) };
+                self.point_in(&h.space, x, y, page_scroll, &inside)
+            })
+            .map(|h| h.node)
+            .collect()
+    }
+
     /// Whether the page point, taken into `space`, satisfies `inside` and
     /// lies within every clip of the space's chain.
     fn point_in(&self, space: &Space, x: f32, y: f32, page_scroll: (f32, f32), inside: &dyn Fn(f32, f32) -> bool) -> bool {

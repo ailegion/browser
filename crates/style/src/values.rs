@@ -929,6 +929,17 @@ fn length_from_unit(value: f32, unit: &str) -> Option<Length> {
     })
 }
 
+/// A percentage token's value in percent. cssparser keeps it divided by
+/// 100 (`unit_value`); multiplying back in `f32` leaves noise
+/// (`120%` became 120.000008), so a whole number comes from the token's
+/// integer and the rest is multiplied in `f64`.
+pub(crate) fn percent_of(unit_value: f32, int_value: Option<i32>) -> f32 {
+    match int_value {
+        Some(i) => i as f32,
+        None => (unit_value as f64 * 100.0) as f32,
+    }
+}
+
 pub fn parse_length_percentage<'i>(
     input: &mut Parser<'i, '_>,
 ) -> Result<LengthPercentage, ParseErr<'i>> {
@@ -938,7 +949,7 @@ pub fn parse_length_percentage<'i>(
         Token::Dimension { value, unit, .. } => length_from_unit(value, &unit)
             .map(LengthPercentage::Length)
             .ok_or_else(|| location.new_unexpected_token_error(Token::Ident(unit))),
-        Token::Percentage { unit_value, .. } => Ok(LengthPercentage::Percent(unit_value * 100.0)),
+        Token::Percentage { unit_value, int_value, .. } => Ok(LengthPercentage::Percent(percent_of(unit_value, int_value))),
         Token::Number { value, .. } if value == 0.0 => Ok(LengthPercentage::ZERO),
         Token::Function(ref name) if is_math_function(name) => {
             let name = name.to_ascii_lowercase();
@@ -1018,7 +1029,7 @@ fn parse_calc_value<'i>(input: &mut Parser<'i, '_>) -> Result<CalcNode, ParseErr
     let token = input.next()?.clone();
     match token {
         Token::Number { value, .. } => Ok(CalcNode::Number(value)),
-        Token::Percentage { unit_value, .. } => Ok(CalcNode::Percent(unit_value * 100.0)),
+        Token::Percentage { unit_value, int_value, .. } => Ok(CalcNode::Percent(percent_of(unit_value, int_value))),
         Token::Dimension { value, unit, .. } => length_from_unit(value, &unit)
             .map(CalcNode::Length)
             .ok_or_else(|| location.new_unexpected_token_error(Token::Ident(unit))),

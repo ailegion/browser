@@ -8,6 +8,7 @@
 
 pub mod encoding;
 mod fragment;
+pub mod image;
 mod sink;
 
 use std::fmt::Write as _;
@@ -274,6 +275,24 @@ pub struct Document {
     /// The encoding the bytes were decoded with, set when the parser
     /// finishes; `None` for a document that was not parsed from bytes.
     pub encoding: Option<&'static encoding_rs::Encoding>,
+    /// The image state of each `<img>` element that has run "update the
+    /// image data" (`image.rs`).
+    images: std::collections::HashMap<NodeId, image::ImageData>,
+    /// HTML `<img>` elements created since the last `take_created_images`:
+    /// each updates its image data on creation (HTML §4.8.4.3.1).
+    created_images: Vec<NodeId>,
+    /// Tasks the image algorithms queued, for the tab to run.
+    pub image_tasks: Vec<image::ImageTask>,
+    /// URLs the image algorithms want fetched, with whether the fetch
+    /// waits for rendering and does not delay the load event.
+    pub image_fetches: Vec<(Url, bool)>,
+    /// `<img>` elements whose current request or dimension attribute
+    /// source changed: their boxes (and styles) are built again.
+    pub images_changed: Vec<NodeId>,
+    /// `<img>` elements that saw a relevant mutation of the tree
+    /// (`picture_child_moved`, `detach`) or of an attribute
+    /// (`note_image_attribute`), for the image algorithms' drivers.
+    image_mutations: Vec<NodeId>,
 }
 
 impl Default for Document {
@@ -292,7 +311,44 @@ impl Document {
             quirks_mode: QuirksMode::NoQuirks,
             base_url: None,
             encoding: None,
+            images: std::collections::HashMap::new(),
+            created_images: Vec::new(),
+            image_tasks: Vec::new(),
+            image_fetches: Vec::new(),
+            images_changed: Vec::new(),
+            image_mutations: Vec::new(),
         }
+    }
+
+    /// The image state of an `<img>` element, once it has run "update the
+    /// image data".
+    pub fn image_data(&self, img: NodeId) -> Option<&image::ImageData> {
+        self.images.get(&img)
+    }
+
+    /// The image state of an `<img>` element, made when it has none.
+    pub fn image_data_mut(&mut self, img: NodeId) -> &mut image::ImageData {
+        self.images.entry(img).or_default()
+    }
+
+    /// Every `<img>` element with image state.
+    pub fn images_with_data(&self) -> Vec<NodeId> {
+        self.images.keys().copied().filter(|&id| self.nodes.contains_key(id)).collect()
+    }
+
+    /// The `<img>` elements created since the last call (still existing).
+    pub fn take_created_images(&mut self) -> Vec<NodeId> {
+        let mut out = std::mem::take(&mut self.created_images);
+        out.retain(|&id| self.nodes.contains_key(id));
+        out
+    }
+
+    /// Whether `id` is an `<img>` in the HTML namespace.
+    pub fn is_html_img(&self, id: NodeId) -> bool {
+        self.nodes
+            .get(id)
+            .and_then(Node::as_element)
+            .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("img"))
     }
 
     /// The document node.
@@ -555,7 +611,12 @@ impl Document {
     // ----- mutation -----
 
     pub fn create_node(&mut self, kind: NodeKind) -> NodeId {
-        self.nodes.insert(Node::new(kind))
+        let img = matches!(&kind, NodeKind::Element(e) if e.name.ns == ns!(html) && e.name.local == local_name!("img"));
+        let id = self.nodes.insert(Node::new(kind));
+        if img {
+            self.created_images.push(id);
+        }
+        id
     }
 
     pub fn create_element(&mut self, name: QualName, attrs: Vec<Attribute>) -> NodeId {
@@ -677,6 +738,82 @@ impl Document {
             None => self.nodes[parent].first_child = Some(child),
         }
         self.nodes[parent].last_child = Some(child);
+        self.picture_child_moved(child, parent);
+    }
+
+    /// An `<img>` or `<source>` placed in or taken out of a `<picture>`:
+    /// a relevant mutation for the `<img>`, or for each `<img>` of the
+    /// `<picture>` (HTML §4.8.2, §4.8.3 insertion, moving and removing
+    /// steps).
+    fn picture_child_moved(&mut self, child: NodeId, picture: NodeId) {
+        let is = |doc: &Self, id: NodeId, local: LocalName| {
+            doc.nodes[id].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local)
+        };
+        if !is(self, picture, local_name!("picture")) {
+            return;
+        }
+        if is(self, child, local_name!("img")) {
+            self.image_mutations.push(child);
+        } else if is(self, child, local_name!("source")) {
+            let imgs: Vec<NodeId> = self.children(picture).filter(|&c| is(self, c, local_name!("img"))).collect();
+            self.image_mutations.extend(imgs);
+        }
+    }
+
+    /// An attribute of `element` was set, changed or removed: the
+    /// `<img>` elements this is a relevant mutation for (HTML
+    /// §4.8.4.3.2) are listed in `image_mutations`; a `<source>`'s
+    /// `width`/`height` also restyles the `<img>` it is the dimension
+    /// attribute source of.
+    pub fn note_image_attribute(&mut self, element: NodeId, name: &str) {
+        let Some(e) = self.nodes.get(element).and_then(Node::as_element) else { return };
+        if e.name.ns != ns!(html) {
+            return;
+        }
+        if e.name.local == local_name!("img") {
+            if matches!(name, "src" | "srcset" | "sizes" | "crossorigin" | "referrerpolicy") {
+                self.image_mutations.push(element);
+            }
+            return;
+        }
+        if e.name.local != local_name!("source") || !matches!(name, "srcset" | "sizes" | "media" | "type" | "width" | "height") {
+            return;
+        }
+        let Some(picture) = self.parent(element).filter(|&p| {
+            self.nodes[p].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("picture"))
+        }) else {
+            return;
+        };
+        // The `<img>` elements after the source.
+        let mut after = false;
+        let mut imgs = Vec::new();
+        for c in self.children(picture) {
+            if c == element {
+                after = true;
+            } else if after && self.is_html_img(c) {
+                imgs.push(c);
+            }
+        }
+        if matches!(name, "width" | "height") {
+            for &img in &imgs {
+                if self.images.get(&img).is_some_and(|d| d.dimension_source == Some(element)) {
+                    self.images_changed.push(img);
+                }
+            }
+        }
+        self.image_mutations.extend(imgs);
+    }
+
+    /// The `<img>` elements that saw relevant mutations since the last
+    /// call, each once, in order.
+    pub fn take_image_mutations(&mut self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        for id in std::mem::take(&mut self.image_mutations) {
+            if self.nodes.contains_key(id) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// Insert `new` immediately before `sibling`. `new` must be detached.
@@ -698,6 +835,7 @@ impl Document {
             Some(prev) => self.nodes[prev].next_sibling = Some(new),
             None => self.nodes[parent].first_child = Some(new),
         }
+        self.picture_child_moved(new, parent);
     }
 
     /// Detach `id` from its parent. The node stays in the arena.
@@ -723,6 +861,21 @@ impl Document {
         n.parent = None;
         n.prev_sibling = None;
         n.next_sibling = None;
+        // A removed `<img>` leaves its `<picture>` (a relevant mutation
+        // for it), a removed `<source>` changes the picture's images.
+        if self.nodes[parent].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("picture")) {
+            if self.is_html_img(id) {
+                self.image_mutations.push(id);
+            } else if self.nodes[id].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("source")) {
+                let imgs: Vec<NodeId> = self.children(parent).filter(|&c| self.is_html_img(c)).collect();
+                self.image_mutations.extend(imgs);
+            }
+        }
+        // A removed `<img>`'s last auto-sizes width goes (HTML §4.8.3
+        // removing steps).
+        if let Some(d) = self.images.get_mut(&id) {
+            d.last_auto_width = None;
+        }
     }
 
     /// Detach `id` and free it and all its descendants.
@@ -754,6 +907,7 @@ impl Document {
             for p in self.nodes[n].pseudos.into_iter().flatten() {
                 self.nodes.remove(p);
             }
+            self.images.remove(&n);
             self.nodes.remove(n);
         }
     }

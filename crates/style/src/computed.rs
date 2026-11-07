@@ -280,6 +280,11 @@ pub struct ComputedStyle {
     pub text_transform: TextTransform,
     pub white_space: WhiteSpace,
     pub letter_spacing: LetterSpacing,
+    /// Computed `word-spacing`: an absolute length and/or a percentage of
+    /// the font size (`normal` computes to zero, WPT
+    /// `word-spacing-computed.html`); inherited as such, so a percentage
+    /// resolves against each element's own font size (`word_spacing_px`).
+    pub word_spacing: ComputedLp,
     pub text_indent: TextIndent,
     pub word_break: WordBreak,
     pub overflow_wrap: OverflowWrap,
@@ -628,6 +633,7 @@ impl ComputedStyle {
             text_transform: TextTransform::None,
             white_space: WhiteSpace::Normal,
             letter_spacing: LetterSpacing::Normal,
+            word_spacing: ComputedLp::ZERO,
             text_indent: TextIndent::default(),
             word_break: WordBreak::Normal,
             overflow_wrap: OverflowWrap::Normal,
@@ -739,6 +745,7 @@ impl ComputedStyle {
         self.text_transform = p.text_transform;
         self.white_space = p.white_space;
         self.letter_spacing = p.letter_spacing;
+        self.word_spacing = p.word_spacing;
         self.word_break = p.word_break;
         self.overflow_wrap = p.overflow_wrap;
         self.list_style_type = p.list_style_type;
@@ -830,6 +837,12 @@ impl ComputedStyle {
         self.mask_images.iter().any(|i| !matches!(i, ComputedImage::None))
     }
 
+    /// The used `word-spacing` in px: a percentage of the font size (CSS
+    /// Text 4 §8.1; WPT `word-spacing-percent-001.html`).
+    pub fn word_spacing_px(&self) -> f32 {
+        self.word_spacing.resolve(self.font_size)
+    }
+
     pub fn has_visible_border(&self) -> bool {
         self.border_width.top > 0.0
             || self.border_width.right > 0.0
@@ -877,6 +890,7 @@ impl ComputedStyle {
             || self.text_transform != other.text_transform
             || self.white_space != other.white_space
             || self.letter_spacing != other.letter_spacing
+            || self.word_spacing != other.word_spacing
             || self.text_indent != other.text_indent
             || self.word_break != other.word_break
             || self.overflow_wrap != other.overflow_wrap
@@ -1362,6 +1376,10 @@ pub fn compute(
             ComputedLp::Percent(_) => LetterSpacing::Normal,
             ComputedLp::Calc(_) => LetterSpacing::Normal,
         },
+    });
+    pick!(word_spacing, WordSpacing, WordSpacing, |v| match v {
+        WordSpacingValue::Normal => ComputedLp::ZERO,
+        WordSpacingValue::Lp(l) => lp(l),
     });
     pick!(text_indent, TextIndent, TextIndent, |v| TextIndent {
         length: lp(&v.length),

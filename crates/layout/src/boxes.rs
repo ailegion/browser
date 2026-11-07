@@ -1580,12 +1580,33 @@ impl BoxBuilder<'_> {
             return b;
         }
         if self.is_image(id) {
-            let url = self
-                .doc
-                .element(id)
-                .and_then(|e| e.attr("src"))
-                .and_then(|src| self.doc.resolve_url(src));
-            let intrinsic = url.as_ref().and_then(|u| self.images.intrinsic_size(u));
+            // An `<img>` with image state shows its current request, at its
+            // density-corrected natural size (HTML §4.8.4.3, "Working sites
+            // first" 6m); without (a document no tab drives) its `src`.
+            let (url, density) = match self.doc.image_data(id) {
+                Some(data) => match browser_style::responsive::shown_image(data) {
+                    Some((u, d)) => (Some(u.clone()), d),
+                    None => (None, 1.0),
+                },
+                None => (
+                    self.doc.element(id).and_then(|e| e.attr("src")).and_then(|src| self.doc.resolve_url(src)),
+                    1.0,
+                ),
+            };
+            let intrinsic = url.as_ref().and_then(|u| self.images.intrinsic_size(u)).map(|(w, h)| {
+                if density > 0.0 && density != 1.0 {
+                    ((w as f64 / density) as f32, (h as f64 / density) as f32)
+                } else if density <= 0.0 {
+                    // A zero density: infinite natural dimensions (HTML
+                    // §4.8.4.3.10), which user agents are expected to
+                    // limit; the limit here is 2^24 px, where f32 stops
+                    // holding every whole pixel.
+                    const LIMIT: f32 = 16_777_216.0;
+                    (if w > 0.0 { LIMIT } else { 0.0 }, if h > 0.0 { LIMIT } else { 0.0 })
+                } else {
+                    (w, h)
+                }
+            });
             return BoxNode::new(BoxKind::Image { source: url.map(ImageSource::Url), intrinsic }, Some(id), style);
         }
 

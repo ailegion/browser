@@ -2162,6 +2162,13 @@ mod tests {
                        a.push(st.wordWrap, st.cssText); st.letterSpacing = '10%'; a.push(st.letterSpacing); a.join('|')").as_deref(),
             Ok("\"break-word|break-word|break-word|overflow-wrap: break-word;|anywhere|overflow-wrap: anywhere; letter-spacing: 0.5em; word-break: break-all; text-overflow: ellipsis;|0.5em\"")
         );
+        // `word-spacing` ("Working sites first" 6h): camelCase and dashed,
+        // percentages kept, an invalid value ignored.
+        assert_eq!(
+            s(&mut h, "st.cssText = ''; st.wordSpacing = '.5em'; var a = [st.wordSpacing, st['word-spacing']]; st.wordSpacing = '20%'; a.push(st.wordSpacing); \
+                       st.wordSpacing = 'auto'; a.push(st.wordSpacing, st.cssText); a.join('|')").as_deref(),
+            Ok("\"0.5em|0.5em|20%|20%|word-spacing: 20%;\"")
+        );
         // Computed style without a view lent: empty, and read-only.
         assert_eq!(
             s(&mut h, "var cs = getComputedStyle(d); var errs = []; var tryit = f => { try { f() } catch (e) { errs.push(e.name) } }; \

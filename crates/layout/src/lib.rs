@@ -1138,6 +1138,28 @@ impl LayoutTree {
         found
     }
 
+    /// The content box width of each of `nodes` that has a box: for a
+    /// replaced element its concrete object size width, which `sizes=auto`
+    /// uses (HTML §4.8.4.3.11). Its first fragment's.
+    pub fn content_widths(&self, nodes: &[NodeId]) -> HashMap<NodeId, f32> {
+        let mut out = HashMap::new();
+        if nodes.is_empty() {
+            return out;
+        }
+        let wanted: std::collections::HashSet<NodeId> = nodes.iter().copied().collect();
+        self.root.walk(&mut |f| {
+            if let Some(n) = f.node
+                && wanted.contains(&n)
+                && !out.contains_key(&n)
+            {
+                let b = &f.style.border_width;
+                let w = f.rect.width - f.padding.left - f.padding.right - b.left - b.right;
+                out.insert(n, w.max(0.0));
+            }
+        });
+        out
+    }
+
     /// The topmost fragment with a node at the page point, if any: the
     /// last one in paint order (`paint_list`) whose box is under the
     /// point, through the transforms and clips above it. A scroll
@@ -1147,6 +1169,12 @@ impl LayoutTree {
     /// (`set_page_scroll`).
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         self.paint.hit_test(x, y, self.viewport.offset)
+    }
+
+    /// Every box with a node under the page point, topmost first, with
+    /// `hit_test`'s rules.
+    pub fn hit_test_all(&self, x: f32, y: f32) -> Vec<NodeId> {
+        self.paint.hit_test_all(x, y, self.viewport.offset)
     }
 
     /// Everything to paint, in paint order (CSS 2.1 Appendix E with the

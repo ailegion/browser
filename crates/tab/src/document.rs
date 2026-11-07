@@ -61,6 +61,9 @@ enum PendingKind {
     },
     Image {
         url: Url,
+        /// Whether the document's load event waits for it (not for a
+        /// lazily loaded `<img>`'s, HTML §4.8.4.3.5 step 26).
+        delays_load: bool,
     },
     /// A web font's source ("Working sites first" line 6).
     Font {
@@ -419,6 +422,19 @@ pub(crate) struct TabState {
     pending: HashMap<RequestId, Pending>,
     sheets: Vec<SheetSlot>,
     fetched_urls: std::collections::HashSet<Url>,
+    /// Image URLs fetched or being fetched for the current document's
+    /// `<img>` elements (one fetch per URL).
+    fetched_images: std::collections::HashSet<Url>,
+    /// Every image URL the current document asked for, fetched or found
+    /// decoded already: what stays when the parsed document replaces the
+    /// one before.
+    wanted_images: std::collections::HashSet<Url>,
+    /// Image URLs whose fetch failed or did not decode: a request for one
+    /// is broken at once ("Working sites first" 6m).
+    failed_images: std::collections::HashSet<Url>,
+    /// Image fetches that wait for their `<img>` to be rendered (one that
+    /// allows auto-sizes, lazily loaded), with the URL they fetch.
+    deferred_images: Vec<(NodeId, Url)>,
     /// External sheets already parsed, by URL, so a script that adds a
     /// `<link>` or `<style>` again does not fetch again.
     loaded_sheets: std::collections::HashMap<Url, Arc<Stylesheet>>,
@@ -754,6 +770,10 @@ impl TabState {
             pending: HashMap::new(),
             sheets: Vec::new(),
             fetched_urls: Default::default(),
+            fetched_images: Default::default(),
+            wanted_images: Default::default(),
+            failed_images: Default::default(),
+            deferred_images: Vec::new(),
             loaded_sheets: Default::default(),
             images: ImageStore::new(),
             web_fonts: WebFonts::default(),
@@ -898,6 +918,8 @@ impl TabState {
                     self.viewport = vp;
                     // Media queries may change with the viewport.
                     self.want_style("viewport resized");
+                    // And the image each `srcset` or `<picture>` selects.
+                    self.images_react_to_environment();
                 }
             }
             ShellToTab::Screen { window, screen } => {
@@ -1938,7 +1960,7 @@ impl TabState {
         // The parser exists only once a navigation has committed.
         if let Some(parser) = self.parser.take() {
             let doc = parser.finish();
-            self.set_document(doc);
+            self.set_document(doc, true);
         }
         self.state_dirty = true;
         // Nothing is being fetched any more: the document is complete.
@@ -1965,6 +1987,13 @@ impl TabState {
         self.pending.retain(|k, _| *k == id);
         self.parser = None;
         self.main_done = false;
+        // The new document's images load while it parses; the old one's
+        // stay decoded (it is on screen until the new one is) and go when
+        // parsing ends, unless the new one asked for them too.
+        self.fetched_images.clear();
+        self.failed_images.clear();
+        self.deferred_images.clear();
+        self.wanted_images.clear();
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_reported = (0.0, 0.0);
@@ -2601,6 +2630,10 @@ impl TabState {
             NetToTab::Failed { id, error } => {
                 let Some(p) = self.pending.remove(&id) else { return };
                 tracing::warn!(tab = self.id.0, "request {} failed: {error}", id.0);
+                if let PendingKind::Image { url, .. } = &p.kind {
+                    let url = url.clone();
+                    self.image_fetch_finished(&url, false);
+                }
                 if matches!(p.kind, PendingKind::Main)
                     && let Some(nav) = self.nav.take_if(|n| n.request == id)
                 {
@@ -2627,7 +2660,8 @@ impl TabState {
         loop {
             let parsed = self.parser.is_none() && self.doc.is_some() && self.script.is_some();
             let deferred_done = self.scripts.deferred.is_empty() && !self.scripts.running_deferred;
-            let fetched = self.nav.is_none() && self.pending.is_empty();
+            let fetched = self.nav.is_none()
+                && self.pending.values().all(|p| matches!(p.kind, PendingKind::Image { delays_load: false, .. }));
             // `document.fonts.ready` waits for the document to be parsed:
             // a step of the lifecycle is news for it.
             if parsed && self.lifecycle != Lifecycle::Complete {
@@ -2725,7 +2759,7 @@ impl TabState {
                     parser.feed(html.as_bytes());
                     parser.finish()
                 };
-                self.set_document(doc);
+                self.set_document(doc, false);
             }
             PendingKind::Stylesheet { url, depth } => {
                 if p.status == 0 || (200..300).contains(&p.status) {
@@ -2748,17 +2782,24 @@ impl TabState {
                     self.want_style("stylesheet arrived");
                 }
             }
-            PendingKind::Image { url } => {
-                if let Some(img) = decode_image(&p.body) {
+            PendingKind::Image { url, .. } => {
+                // The body is the image whatever the status (HTML: a 404
+                // carrying image data shows it).
+                let ok = if let Some(img) = decode_image(&p.body) {
                     self.image_arrived(&url);
-                    self.images.insert(url, img);
+                    self.images.insert(url.clone(), img);
                     self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
+                    true
                 } else if let Some(svg) = browser_paint::decode_svg(&p.body) {
                     // An SVG image: kept as vector drawing (line 6b).
                     self.image_arrived(&url);
-                    self.images.insert_svg(url, svg);
+                    self.images.insert_svg(url.clone(), svg);
                     self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
-                }
+                    true
+                } else {
+                    false
+                };
+                self.image_fetch_finished(&url, ok);
             }
             PendingKind::Font { url } => {
                 // A CORS-mode load (CSS Fonts 4 §4.8.2): a font from another
@@ -2890,15 +2931,35 @@ impl TabState {
         let mut parser = HtmlParser::new(self.url.clone());
         parser.feed(html.as_bytes());
         let doc = parser.finish();
-        self.set_document(doc);
+        self.set_document(doc, false);
+    }
+
+    /// The images of the document before go ("Working sites first" 6m):
+    /// the decoded ones, the fetched and failed URLs, the deferred fetches.
+    fn reset_images(&mut self) {
+        self.images = ImageStore::new();
+        self.image_sizes = ImageSizeMap::default();
+        self.fetched_images.clear();
+        self.failed_images.clear();
+        self.deferred_images.clear();
+        self.wanted_images.clear();
     }
 
     /// A finished document: collect its stylesheets and images, then render.
-    fn set_document(&mut self, doc: Document) {
+    /// `from_parser`: the document the parser built, whose images loaded
+    /// while it parsed (kept); else a document made here, replacing what
+    /// was before.
+    fn set_document(&mut self, doc: Document, from_parser: bool) {
         self.sheets.clear();
         self.fetched_urls.clear();
         self.loaded_sheets.clear();
-        self.images = ImageStore::new();
+        if from_parser {
+            let wanted = &self.wanted_images;
+            self.images.retain(|u| wanted.contains(u));
+            self.image_sizes = ImageSizeMap(Arc::new(self.images.sizes()));
+        } else {
+            self.reset_images();
+        }
         // The old document's web fonts are its own.
         self.web_fonts = WebFonts::default();
         if let Some(engine) = &mut self.engine {
@@ -2929,7 +2990,7 @@ impl TabState {
             f.current_ranges = SelectionRanges::default();
         }
         self.sync_stylesheets();
-        self.collect_images();
+        self.drive_images();
         self.pending_fragment = self.url.as_ref().is_some_and(|u| u.fragment().is_some());
         self.schedule_refresh();
         // A parsed document already has its context (made at commit);
@@ -3156,6 +3217,9 @@ impl TabState {
                 parser.resume();
             }
         }
+        // The `<img>` elements parsed so far update their image data
+        // (HTML: on creation), so their fetches start while parsing goes on.
+        self.drive_images();
         if self.main_done
             && self.parser.as_ref().is_some_and(HtmlParser::is_done)
             && let Some(parser) = self.parser.take()
@@ -3163,7 +3227,7 @@ impl TabState {
             let started = std::time::Instant::now();
             let doc = parser.finish();
             let finish_ms = started.elapsed().as_millis();
-            self.set_document(doc);
+            self.set_document(doc, true);
             tracing::debug!(tab = self.id.0, finish_ms, set_ms = started.elapsed().as_millis() - finish_ms, "document parsed");
         }
     }
@@ -3406,6 +3470,9 @@ impl TabState {
         }
         self.apply_host_requests(host_requests);
         self.apply_font_requests();
+        // The images the script created or changed: their fetches and
+        // tasks (the script ran the algorithms; what it left undone runs).
+        self.drive_images();
     }
 
     /// A script changed the tree: restyle what the changes reach (the
@@ -3430,23 +3497,6 @@ impl TabState {
             }
             self.want_style("script change needing a full restyle");
             self.want_layout_noted("script change needing a full restyle");
-        }
-        // An `<img>` inserted, or given another `src`: fetch what is new
-        // (URLs already fetched are skipped).
-        let images_touched = changes.iter().any(|c| match c {
-            browser_script::DomChange::Tree { .. } | browser_script::DomChange::Sheets { .. } => true,
-            browser_script::DomChange::Children { inserted, .. } => !inserted.is_empty(),
-            browser_script::DomChange::Attr { element, name, .. } => {
-                name == "src"
-                    && self
-                        .doc
-                        .as_ref()
-                        .and_then(|d| d.element(*element))
-                        .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("img"))
-            }
-        });
-        if images_touched {
-            self.collect_images();
         }
         let live = |doc: &Document, id: NodeId| doc.contains(id) && doc.is_connected(id);
         let (focus_lost, hover_lost, press_control_lost, press_lost) = match (&self.parser, &self.doc) {
@@ -3643,34 +3693,257 @@ impl TabState {
         insert_at - slot
     }
 
-    fn collect_images(&mut self) {
-        let Some(doc) = &self.doc else { return };
-        let mut urls = Vec::new();
-        for id in doc.descendants(doc.root()) {
-            let Some(e) = doc.element(id) else { continue };
-            if e.name.ns == ns!(html)
-                && e.name.local == local_name!("img")
-                && let Some(src) = e.attr("src")
-                && let Some(url) = doc.resolve_url(src)
-            {
-                urls.push(url);
+    // ----- images ("Working sites first" 6m) -----
+
+    /// Run `f` on the document the image algorithms work on (the parser's
+    /// while it parses) with their environment: the viewport and device
+    /// pixel ratio, the decoded images (the list of available images),
+    /// the laid-out images' concrete widths.
+    fn with_image_doc<R>(&mut self, f: impl FnOnce(&mut Document, &browser_style::responsive::ImageEnv<'_>) -> R) -> Option<R> {
+        let viewport = self.style_viewport();
+        let images = &self.images;
+        // While parsing, the layout on hand is the old document's.
+        let layout = self.layout.as_ref().filter(|_| self.parser.is_none());
+        let available = |u: &Url| images.contains(u);
+        // One walk of the tree for every image the run asks about.
+        let auto: Vec<NodeId> = match (&self.doc, layout) {
+            (Some(doc), Some(_)) => {
+                doc.images_with_data().into_iter().filter(|&i| browser_style::responsive::allows_auto_sizes(doc, i)).collect()
             }
-        }
-        for url in urls {
-            self.fetch_image(url);
+            _ => Vec::new(),
+        };
+        let widths: std::cell::RefCell<Option<HashMap<NodeId, f32>>> = std::cell::RefCell::new(None);
+        let rendered = |n: NodeId| {
+            let layout = layout?;
+            let mut cache = widths.borrow_mut();
+            let map = cache.get_or_insert_with(|| layout.content_widths(&auto));
+            if !map.contains_key(&n) && !auto.contains(&n) {
+                return layout.content_widths(&[n]).get(&n).copied();
+            }
+            map.get(&n).copied()
+        };
+        let env = browser_style::responsive::ImageEnv {
+            viewport: &viewport,
+            available: &available,
+            rendered_width: &rendered,
+        };
+        match (&mut self.parser, &mut self.doc) {
+            (Some(parser), _) => Some(f(&mut parser.document_mut(), &env)),
+            (None, Some(doc)) => Some(f(doc, &env)),
+            (None, None) => None,
         }
     }
 
-    fn fetch_image(&mut self, url: Url) {
-        if self.fetched_urls.contains(&url) || self.images.contains(&url) {
+    /// The image algorithms for what happened to the document's images:
+    /// every `<img>` created or mutated in a way relevant to it runs
+    /// "update the image data" (both halves at once: no script runs here,
+    /// so the microtask would follow at once), then their fetches, box
+    /// changes and tasks are carried out.
+    fn drive_images(&mut self) {
+        self.with_image_doc(|doc, env| {
+            for (img, generation) in browser_style::responsive::run_image_mutations(doc, env) {
+                browser_style::responsive::update_image_data_rest(doc, img, generation, env);
+            }
+        });
+        self.image_outputs();
+    }
+
+    /// Carry out what the image algorithms asked for, until they ask for
+    /// nothing more: fetch the URLs (an available or failed one ends at
+    /// once), build again the boxes (and styles) of the `<img>` elements
+    /// whose image changed, and run the queued tasks (`currentSrc`
+    /// updates, `load`/`error` events, each a task of its own).
+    fn image_outputs(&mut self) {
+        loop {
+            let Some((fetches, changed, tasks)) = self.with_image_doc(|doc, _| {
+                (
+                    std::mem::take(&mut doc.image_fetches),
+                    std::mem::take(&mut doc.images_changed),
+                    std::mem::take(&mut doc.image_tasks),
+                )
+            }) else {
+                return;
+            };
+            if fetches.is_empty() && changed.is_empty() && tasks.is_empty() {
+                return;
+            }
+            for (url, deferred) in fetches {
+                self.request_image(url, deferred);
+            }
+            self.images_changed(changed);
+            for task in tasks {
+                self.run_image_task(task);
+            }
+        }
+    }
+
+    /// A request wants `url`: done at once when it is decoded already or
+    /// failed before, else fetched (once per URL; requests share it). A
+    /// deferred one waits until its `<img>` is rendered (`after_layout_images`).
+    fn request_image(&mut self, url: Url, deferred: bool) {
+        self.wanted_images.insert(url.clone());
+        if self.images.contains(&url) {
+            self.with_image_doc(|doc, _| browser_style::responsive::image_fetch_done(doc, &url, true));
+            return;
+        }
+        if self.failed_images.contains(&url) || !matches!(url.scheme(), "http" | "https" | "data") {
+            self.with_image_doc(|doc, _| browser_style::responsive::image_fetch_done(doc, &url, false));
+            return;
+        }
+        if deferred {
+            let imgs: Vec<NodeId> = self
+                .with_image_doc(|doc, _| {
+                    doc.images_with_data()
+                        .into_iter()
+                        .filter(|&i| {
+                            doc.image_data(i).is_some_and(|d| {
+                                d.current.url.as_ref() == Some(&url) || d.pending.as_ref().is_some_and(|(p, _)| p.url.as_ref() == Some(&url))
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for img in imgs {
+                if !self.deferred_images.contains(&(img, url.clone())) {
+                    self.deferred_images.push((img, url.clone()));
+                }
+            }
+            return;
+        }
+        self.fetch_image(url, true);
+    }
+
+    fn fetch_image(&mut self, url: Url, delays_load: bool) {
+        self.wanted_images.insert(url.clone());
+        if self.fetched_images.contains(&url) || self.images.contains(&url) {
             return;
         }
         if !matches!(url.scheme(), "http" | "https" | "data") {
             return;
         }
-        self.fetched_urls.insert(url.clone());
+        self.fetched_images.insert(url.clone());
         let request = self.subresource(url.clone());
-        self.fetch(request, PendingKind::Image { url });
+        self.fetch(request, PendingKind::Image { url, delays_load });
+    }
+
+    /// An image fetch ended: the requests waiting on it complete.
+    fn image_fetch_finished(&mut self, url: &Url, ok: bool) {
+        if !ok {
+            self.failed_images.insert(url.clone());
+        }
+        self.with_image_doc(|doc, _| browser_style::responsive::image_fetch_done(doc, url, ok));
+        self.image_outputs();
+    }
+
+    /// The `<img>` elements whose current image or dimension attribute
+    /// source changed: restyled (their `width`/`height` hints) and laid
+    /// out again, through the same path as a script's changes.
+    fn images_changed(&mut self, changed: Vec<NodeId>) {
+        if changed.is_empty() {
+            return;
+        }
+        let changes: Vec<browser_script::DomChange> =
+            changed.iter().map(|&element| browser_script::DomChange::Image { element, generation: 0 }).collect();
+        if !self.restyle_changes(&changes) {
+            // A restyle or the first layout is still to come: it builds
+            // these boxes; the elements are noted for it.
+            self.note_box_changes(&changed, &[]);
+            if self.layout.is_some() {
+                self.want_style("image changed before styles were current");
+                self.want_layout_noted("image changed before styles were current");
+            }
+        }
+        self.needs_paint = true;
+    }
+
+    /// A task an image algorithm queued: the current request's URL set
+    /// (what `currentSrc` reads), then its event fired at the `<img>`
+    /// (`load` and `error` do not bubble).
+    fn run_image_task(&mut self, task: browser_dom::image::ImageTask) {
+        let element = task.element;
+        let alive = self
+            .with_image_doc(|doc, _| {
+                if !doc.contains(element) {
+                    return false;
+                }
+                if let Some(url) = task.set_current_url {
+                    doc.image_data_mut(element).current.current_url = url;
+                }
+                true
+            })
+            .unwrap_or(false);
+        if alive && let Some(event) = task.event {
+            self.fire_lifecycle_event(EventTargetRef::Node(element), event, false);
+        }
+    }
+
+    /// After a layout: an `<img>` that allows auto-sizes and has started
+    /// being rendered or changed its concrete width selects again (with
+    /// "maybe omit events", HTML §4.8.4.3.2), then the fetches that waited
+    /// for their `<img>` to be rendered go out (not delaying the load
+    /// event).
+    fn after_layout_images(&mut self) {
+        let Some(layout) = &self.layout else { return };
+        let candidates: Vec<NodeId> = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.images_with_data().into_iter().filter(|&i| browser_style::responsive::allows_auto_sizes(doc, i)).collect())
+            .unwrap_or_default();
+        let deferred: Vec<NodeId> = self.deferred_images.iter().map(|d| d.0).collect();
+        let mut wanted = candidates.clone();
+        wanted.extend(deferred);
+        if wanted.is_empty() {
+            return;
+        }
+        let widths = layout.content_widths(&wanted);
+        let mut ran = false;
+        self.with_image_doc(|doc, env| {
+            for img in candidates {
+                let Some(&w) = widths.get(&img) else {
+                    // Not rendered: the next time it is counts as new.
+                    doc.image_data_mut(img).rendered_width_seen = None;
+                    continue;
+                };
+                if doc.image_data(img).is_some_and(|d| d.rendered_width_seen == Some(w)) {
+                    continue;
+                }
+                doc.image_data_mut(img).rendered_width_seen = Some(w);
+                if let Some(generation) = browser_style::responsive::update_image_data(doc, img, env, true) {
+                    browser_style::responsive::update_image_data_rest(doc, img, generation, env);
+                }
+                ran = true;
+            }
+        });
+        if ran {
+            self.image_outputs();
+        }
+        // The deferred fetches whose `<img>` is rendered and still wants
+        // that URL.
+        let pending = std::mem::take(&mut self.deferred_images);
+        for (img, url) in pending {
+            let state = self.with_image_doc(|doc, _| {
+                doc.image_data(img).map(|d| {
+                    d.current.url.as_ref() == Some(&url) && d.current.state == browser_dom::image::RequestState::Unavailable
+                        || d.pending.as_ref().is_some_and(|(p, _)| p.url.as_ref() == Some(&url))
+                })
+            });
+            match state.flatten() {
+                Some(true) if widths.contains_key(&img) => self.fetch_image(url, false),
+                Some(true) => self.deferred_images.push((img, url)),
+                _ => {}
+            }
+        }
+    }
+
+    /// The viewport or device pixel ratio changed: every `<img>` that uses
+    /// `srcset` or `<picture>` reacts (HTML §4.8.4.3.13).
+    fn images_react_to_environment(&mut self) {
+        self.with_image_doc(|doc, env| {
+            for img in doc.images_with_data() {
+                browser_style::responsive::react_to_environment_changes(doc, img, env);
+            }
+        });
+        self.image_outputs();
     }
 
     /// An image finished loading: layout only when a box takes its size
@@ -3768,7 +4041,7 @@ impl TabState {
             }
         }
         for url in urls {
-            self.fetch_image(url);
+            self.fetch_image(url, true);
         }
     }
 
@@ -4324,6 +4597,7 @@ impl TabState {
     /// focus ring and caret placed again.
     fn after_layout(&mut self) {
         self.sync_scrolls_after_layout();
+        self.after_layout_images();
         if self.find.is_some() {
             let prefer = self.current_match_start();
             self.refresh_find(prefer, false);
@@ -8042,6 +8316,16 @@ mod tests {
                             c = cs(a); [c.letterSpacing, c.wordWrap, c.overflowWrap, c.wordBreak, c.textOverflow, cs(em).letterSpacing, cs(em).overflowWrap, cs(em).textOverflow, w2 - w1 >= 20, c.getPropertyValue('word-wrap')].join('|')"),
             "\"10px|break-word|break-word|keep-all|ellipsis|10px|break-word|clip|true|break-word\""
         );
+        // "Working sites first" 6h: `word-spacing` resolves to its computed
+        // value (`normal` as 0px, percentages kept, inherited), and a write
+        // widens each space of the laid-out text at once.
+        assert_eq!(
+            run_js(&mut h, "var ws = document.createElement('span'); ws.textContent = 'a b c'; ws.style.display = 'inline-block'; ws.style.whiteSpace = 'nowrap'; \
+                            var wsi = document.createElement('b'); wsi.textContent = 'x'; ws.append(wsi); document.body.append(ws); \
+                            var v0 = cs(ws).wordSpacing; var w0 = ws.offsetWidth; ws.style.wordSpacing = '10px'; var w1 = ws.offsetWidth; var v1 = cs(wsi).wordSpacing; \
+                            ws.style.wordSpacing = '50%'; var v2 = cs(wsi).wordSpacing; ws.remove(); [v0, Math.round(w1 - w0), v1, v2].join('|')"),
+            "\"0px|20|10px|50%\""
+        );
         // Roadmap 4a block 3, the inline box model: an inline element has
         // line fragments of its own, so its rects grow with its padding
         // and its used padding is reported; `box-decoration-break`
@@ -8339,6 +8623,217 @@ mod tests {
         assert_eq!(width_of(&h, "j"), Some(20.0), "an inserted image");
     }
 
+    /// "Working sites first" 6m: `srcset` by density and by width with
+    /// `sizes`, `<picture>` sources by `type` and `media` with their
+    /// dimension attributes, only the chosen candidate fetched, its density
+    /// sizing the box, `currentSrc`, `load`/`error` events, and selection
+    /// again when the viewport and the device pixel ratio change (no fetch
+    /// when only the density changes).
+    #[test]
+    fn responsive_images_select_load_and_react() {
+        let svg = |w: u32| format!("<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='10'><rect width='{w}' height='10'/></svg>");
+        let page = "<!DOCTYPE html><body style='margin:0'>\
+            <img id=x src='/fallback.svg' srcset='/a1.svg 1x, /a2.svg 2x'>\
+            <img id=w srcset='/w200.svg 200w, /w450.svg 450w, /w800.svg 800w' sizes='(max-width: 500px) 100vw, 300px'>\
+            <picture><source srcset='/p.avif' type='image/avif'><source media='(max-width: 500px)' srcset='/narrow.svg'>\
+              <source srcset='/wide.svg' width=50 height=20><img id=p src='/pfallback.svg'></picture>\
+            <img id=e srcset=''>\
+            <script>var log = []; document.querySelectorAll('img').forEach(i => { i.onload = () => log.push('load:' + i.id); i.onerror = () => log.push('error:' + i.id); });</script>";
+        let a2 = "<svg xmlns='http://www.w3.org/2000/svg' width='80' height='20'><rect width='80' height='20'/></svg>".to_owned();
+        let (a1, wide, narrow) = (svg(40), svg(70), svg(35));
+        let (w200, w450, w800) = (svg(200), svg(450), svg(800));
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/fallback.svg", "image/svg+xml", &a1),
+                ("/a1.svg", "image/svg+xml", &a1),
+                ("/a2.svg", "image/svg+xml", &a2),
+                ("/w200.svg", "image/svg+xml", &w200),
+                ("/w450.svg", "image/svg+xml", &w450),
+                ("/w800.svg", "image/svg+xml", &w800),
+                ("/p.avif", "image/avif", "x"),
+                ("/narrow.svg", "image/svg+xml", &narrow),
+                ("/wide.svg", "image/svg+xml", &wide),
+                ("/pfallback.svg", "image/svg+xml", &a1),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.pump();
+        let size_of = |h: &Harness, id: &str| {
+            let doc = h.state.doc.as_ref().expect("doc");
+            let node = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| e.id() == Some(id)))?;
+            h.state.layout.as_ref()?.first_rect(|n| n == node).map(|r| (r.width, r.height))
+        };
+        let current = |h: &mut Harness| run_js(h, "['x', 'w', 'p', 'e'].map(id => document.getElementById(id).currentSrc.replace(location.origin, '')).join(' ')");
+        assert_eq!(current(&mut h), "\"/a1.svg /w450.svg /wide.svg \"");
+        // Only the chosen candidates were fetched.
+        for path in ["/fallback.svg", "/a2.svg", "/w200.svg", "/w800.svg", "/p.avif", "/narrow.svg", "/pfallback.svg"] {
+            assert!(server.requests(path).is_empty(), "{path} was fetched");
+        }
+        // Density-corrected sizes: 450w at 1.5x is 300px; the source's
+        // width and height size the picture's image.
+        assert_eq!(size_of(&h, "x"), Some((40.0, 10.0)));
+        let (w, _) = size_of(&h, "w").expect("w");
+        assert!((w - 300.0).abs() < 0.01, "{w}");
+        assert_eq!(size_of(&h, "p"), Some((50.0, 20.0)));
+        assert_eq!(run_js(&mut h, "log.sort().join(' ')"), "\"error:e load:p load:w load:x\"");
+        assert_eq!(run_js(&mut h, "[document.getElementById('x') instanceof HTMLImageElement, 'currentSrc' in document.body].join()"), "\"true,false\"");
+
+        // Narrower: the picture's media source wins (fetched, shown once
+        // loaded, its own size: no dimension attributes); the 450w
+        // candidate stays at another density, with no new fetch.
+        run_js(&mut h, "log.length = 0");
+        h.send(ShellToTab::Resize(Viewport { width: 400.0, height: 600.0, scale_factor: 1.0 }));
+        h.pump_until(|h| h.state.images.get_svg(&server.url("/narrow.svg")).is_some());
+        h.pump();
+        assert_eq!(current(&mut h), "\"/a1.svg /w450.svg /narrow.svg \"");
+        assert_eq!(size_of(&h, "p"), Some((35.0, 10.0)));
+        let (w, _) = size_of(&h, "w").expect("w");
+        assert!((w - 400.0).abs() < 0.01, "450w at 1.125x: {w}");
+        assert_eq!(server.requests("/w450.svg").len(), 1, "no new fetch for another density");
+        assert_eq!(run_js(&mut h, "log.sort().join(' ')"), "\"load:p load:w\"");
+
+        // Twice the pixels: the 2x candidate, drawn at half its size.
+        h.send(ShellToTab::Resize(Viewport { width: 400.0, height: 600.0, scale_factor: 2.0 }));
+        h.pump_until(|h| h.state.images.get_svg(&server.url("/a2.svg")).is_some());
+        h.pump();
+        assert_eq!(current(&mut h), "\"/a2.svg /w800.svg /narrow.svg \"");
+        assert_eq!(size_of(&h, "x"), Some((40.0, 10.0)));
+        let (w, _) = size_of(&h, "w").expect("w");
+        assert!((w - 400.0).abs() < 0.01, "800w at 2x: {w}");
+    }
+
+    /// `document.elementFromPoint`/`elementsFromPoint` ("Working sites
+    /// first" line 7; CSSOM View §5, the WPT `elementsFromPoint` cases):
+    /// viewport coordinates through the page scroll, topmost first,
+    /// `pointer-events: none` passed over, text as its element once, a
+    /// `::before` box as its element, the root appended, points outside
+    /// the viewport empty, non-finite or missing arguments a TypeError.
+    #[test]
+    fn elements_from_point_list_the_boxes_under_a_point() {
+        let page = "<!DOCTYPE html><body style='margin:0;height:3000px'>\
+            <div id=purple style='position:absolute;left:0;top:0;width:50px;height:50px;background:purple'></div>\
+            <div id=yellow style='position:absolute;left:0;top:60px;width:50px;height:50px'></div>\
+            <div id=teal style='position:absolute;left:0;top:60px;width:50px;height:50px;pointer-events:none'></div>\
+            <div id=c style='position:absolute;left:100px;top:0'><span id=s1><span id=s2>text here</span></span></div>\
+            <div id=p style='position:absolute;left:200px;top:0;width:40px;height:40px'><b id=mid style='position:absolute;left:0;top:0;width:40px;height:40px;z-index:1'></b></div>\
+            <style>#p::before { content: ''; position: absolute; left: 0; top: 0; width: 40px; height: 40px; z-index: 2 }</style>\
+            <div id=low style='position:absolute;left:0;top:1000px;width:50px;height:50px'></div>";
+        let mut h = Harness::load(page);
+        let ids = |h: &mut Harness, x: &str, y: &str| {
+            run_js(h, &format!("document.elementsFromPoint({x}, {y}).map(e => e.id || e.localName).join(' ')"))
+        };
+        assert_eq!(ids(&mut h, "10", "10"), "\"purple body html\"");
+        assert_eq!(ids(&mut h, "10", "80"), "\"yellow body html\"", "pointer-events: none passed over");
+        assert_eq!(ids(&mut h, "105", "8"), "\"s2 s1 c body html\"", "text and its inline box once");
+        assert_eq!(ids(&mut h, "210", "10"), "\"p mid p body html\"", "the ::before box is its element's");
+        assert_eq!(ids(&mut h, "700", "500"), "\"body html\"");
+        assert_eq!(run_js(&mut h, "document.elementFromPoint(10, 80).id"), "\"yellow\"");
+        // Outside the viewport: nothing.
+        assert_eq!(ids(&mut h, "-1", "10"), "\"\"");
+        assert_eq!(ids(&mut h, "10", "-1"), "\"\"");
+        assert_eq!(ids(&mut h, "innerWidth + 100", "10"), "\"\"");
+        assert_eq!(run_js(&mut h, "String(document.elementFromPoint(10, innerHeight + 100))"), "\"null\"");
+        // Arguments: WebIDL doubles, both required.
+        assert_eq!(
+            run_js(&mut h, "var r = []; for (const f of [() => document.elementFromPoint(NaN, 0), () => document.elementsFromPoint(0, Infinity), () => document.elementFromPoint(1)]) { try { f(); r.push('ok') } catch (e) { r.push(e.name) } } r.join()"),
+            "\"TypeError,TypeError,TypeError\""
+        );
+        // Through the page scroll: viewport coordinates.
+        run_js(&mut h, "scrollTo(0, 990)");
+        assert_eq!(ids(&mut h, "10", "20"), "\"low body html\"");
+    }
+
+    /// `sizes=auto` (HTML §4.8.4.3.11): a lazily loaded `<img>` that allows
+    /// auto-sizes selects by its rendered width once laid out, and only
+    /// that candidate is fetched (its fetch waits for layout and does not
+    /// hold the load event); an eager one ignores `auto` (100vw); a width
+    /// change selects again.
+    #[test]
+    fn auto_sizes_select_by_the_rendered_width() {
+        let svg = |w: u32| format!("<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='10'><rect width='{w}' height='10'/></svg>");
+        let page = "<!DOCTYPE html><body style='margin:0'>\
+            <img id=lazy loading=lazy sizes=auto width=100 srcset='/a100.svg 100w, /a300.svg 300w'>\
+            <img id=eager sizes=auto width=100 srcset='/b100.svg 100w, /b300.svg 300w'>";
+        let (s100, s300) = (svg(100), svg(300));
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/a100.svg", "image/svg+xml", &s100),
+                ("/a300.svg", "image/svg+xml", &s300),
+                ("/b100.svg", "image/svg+xml", &s100),
+                ("/b300.svg", "image/svg+xml", &s300),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.images.get_svg(&server.url("/a100.svg")).is_some() && h.state.lifecycle == Lifecycle::Complete);
+        h.pump();
+        let current = |h: &mut Harness| run_js(h, "['lazy', 'eager'].map(id => document.getElementById(id).currentSrc.replace(location.origin, '')).join(' ')");
+        assert_eq!(current(&mut h), "\"/a100.svg /b300.svg\"");
+        assert!(server.requests("/a300.svg").is_empty(), "the 100vw candidate is never fetched");
+        assert!(server.requests("/b100.svg").is_empty());
+        // A wider rendering selects again.
+        run_js(&mut h, "document.getElementById('lazy').setAttribute('width', '300')");
+        h.pump_until(|h| h.state.images.get_svg(&server.url("/a300.svg")).is_some());
+        h.pump();
+        assert_eq!(current(&mut h), "\"/a300.svg /b300.svg\"");
+    }
+
+    /// "Update the image data" from script: the first request becomes
+    /// current in the microtask, so a promise callback queued after the
+    /// change sees `currentSrc` while the synchronous read does not; a
+    /// later change in the same task supersedes it (one fetch); a failed
+    /// fetch fires `error`; an available image loads at once; a removal
+    /// from a `<picture>` selects again.
+    #[test]
+    fn script_image_updates_follow_the_microtask() {
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='10'><rect width='20' height='10'/></svg>";
+        let page = "<!DOCTYPE html><body><picture id=pic><source id=s srcset='/s.svg'><img id=pi src='/f.svg'></picture>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/one.svg", "image/svg+xml", svg),
+                ("/two.svg", "image/svg+xml", svg),
+                ("/s.svg", "image/svg+xml", svg),
+                ("/f.svg", "image/svg+xml", svg),
+                ("/bad.svg", "image/svg+xml", "not an image"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        assert_eq!(
+            run_js(&mut h, "var log = []; var i = document.createElement('img'); i.onload = () => log.push('load ' + i.currentSrc.replace(location.origin, '')); \
+                            i.onerror = () => log.push('error'); i.setAttribute('srcset', '/one.svg'); i.setAttribute('srcset', '/two.svg'); \
+                            var sync = i.currentSrc; Promise.resolve().then(() => log.push('micro ' + i.currentSrc.replace(location.origin, ''))); 'sync:' + sync"),
+            "\"sync:\""
+        );
+        h.pump_until(|h| h.state.images.get_svg(&server.url("/two.svg")).is_some());
+        h.pump();
+        assert_eq!(run_js(&mut h, "log.join('|')"), "\"micro /two.svg|load /two.svg\"");
+        assert!(server.requests("/one.svg").is_empty(), "superseded in the same task");
+        // An undecodable image: `error`.
+        run_js(&mut h, "log.length = 0; i.setAttribute('src', '/bad.svg'); i.removeAttribute('srcset')");
+        h.pump_until(|h| h.state.failed_images.contains(&server.url("/bad.svg")));
+        h.pump();
+        assert_eq!(run_js(&mut h, "log.join('|')"), "\"error\"");
+        // An available image without srcset: shown at once, `load` as a task.
+        assert_eq!(
+            run_js(&mut h, "log.length = 0; i.setAttribute('src', '/two.svg'); log.push('after set'); 'ok'"),
+            "\"ok\""
+        );
+        assert_eq!(run_js(&mut h, "log.join('|')"), "\"after set|load /two.svg\"");
+        // The picture's source removed: its image selects its own `src`.
+        assert_eq!(run_js(&mut h, "document.getElementById('pi').currentSrc.replace(location.origin, '')"), "\"/s.svg\"");
+        run_js(&mut h, "document.getElementById('s').remove()");
+        h.pump_until(|h| h.state.images.get_svg(&server.url("/f.svg")).is_some());
+        h.pump();
+        assert_eq!(run_js(&mut h, "document.getElementById('pi').currentSrc.replace(location.origin, '')"), "\"/f.svg\"");
+    }
+
     /// An image arriving lays the page out again only when a box takes its
     /// size from it: a background repaints, an `<img>` relayouts.
     #[test]
@@ -8491,7 +8986,7 @@ mod tests {
                     .map(|p| match &p.kind {
                         PendingKind::Main => format!("main({} bytes buffered)", p.body.len()),
                         PendingKind::Stylesheet { url, .. } => format!("css {url}"),
-                        PendingKind::Image { url } => format!("img {url}"),
+                        PendingKind::Image { url, .. } => format!("img {url}"),
                         PendingKind::Script { .. } => "script".to_owned(),
                         _ => "other".to_owned(),
                     })

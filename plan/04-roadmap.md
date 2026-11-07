@@ -531,6 +531,44 @@ remaining lists as they stand.
       separator (CSS Text 3 §7.1: spaces, no-break spaces and the other
       word-separator characters), in shaping, line breaking, justification
       and intrinsic sizes.
+      Built 2026-11-07, not ticked: SKIPPED: a preserved tab under
+      `word-spacing` (tabs are four spaces, no `tab-size`; see the end);
+      not verified: the spacing goes after each separator, where CSS Text
+      3 says "should be applied half on each side" (what Chrome and
+      Firefox do was not checked). Grammar `normal | <length-percentage>`: CSS Text 3
+      says `<length>`, but Chrome (145) and Firefox (45) take percentages
+      (MDN browser-compat-data) and WPT's parsing tests expect them (CSS
+      Text 4), so the line's "a length" was widened to what both browsers
+      do. Style: `WordSpacingValue`, inherited; computed as `ComputedLp`
+      (`normal` 0px, a percentage kept and inherited as one, resolved
+      against each element's own font size, `word_spacing_px`); specified
+      and computed serialization as WPT's `word-spacing-valid`,
+      `-invalid`, `-computed` and `word-spacing-computed-001` have them;
+      `layout_differs` counts it. Layout: handed to parley per span; the
+      vendored parley adds it to every word separator of §7.1 and not to
+      one without advance (fifth parley addition, `03-crates.md`), after
+      shaping and before line breaking, so breaking, justification (its
+      share on top), min/max-content and cluster hit testing see it; the
+      space carries its own element's spacing. Found on the way and fixed:
+      every percentage serialized with float noise (`120%` read back as
+      `120.000008%`, any property), now whole percentages come from the
+      token's integer (`values::percent_of`). Tests: style
+      (`word_spacing_parses_serializes_and_computes`), layout (each
+      separator and non-separator, negative, `em`, `calc()`, %, a
+      preserved leading space, the space's own style, inheritance of a
+      percentage, letter spacing on top, breaking, justification, both
+      intrinsic sizes; the separator test fails without the parley
+      addition), script (`style.wordSpacing`), tab (`getComputedStyle`, a
+      write widening the laid-out text). Timing (release probe, live):
+      iana load 4.69 s (previous build 4.65 s, same session), restyle
+      372–373 ms (374), relayout 37–38 ms (35–48); Wikipedia Main Page load
+      629–637 ms (616–720), relayout 3.1–3.3 ms (3.1–3.4). Found, not
+      changed: a preserved tab is four spaces (no `tab-size`), so under
+      `word-spacing` it widens by four spacings, where browsers' tab
+      stops are `tab-size` times the space's advance with its spacing;
+      `letter-spacing` refuses percentages, which Chrome and Firefox may
+      take (not checked); the engine has no CSS transitions or animations,
+      so `word-spacing`'s animation type has nothing to drive it.
 - [x] 6i. DOM-change style invalidation (owner, 2026-10-18; iana.org/
       protocols, 79,526 nodes: its scroll handler toggles one class and the
       tab restyled and laid out the whole document each time, ~0.9 s): a
@@ -643,6 +681,80 @@ remaining lists as they stand.
       image source selection, the device scale and the layout width),
       `currentSrc`, the density giving the intrinsic size, and selection
       run again when the viewport or scale changes.
+      Built 2026-11-07 (not ticked: parts not verified, listed at the
+      end). DOM (`browser_dom::image`): each `<img>` carries its image
+      state (current and pending request with state, current URL, density
+      and fetched URL; last selected source; dimension attribute source;
+      last auto-sizes width) on the `Document`, which also queues the
+      `<img>` elements created (`create_node`) and those that saw a
+      relevant mutation (an `<img>` or `<source>` placed in or taken out of
+      a `<picture>`, `picture_child_moved`/`detach`; `note_image_attribute`
+      for `src`/`srcset`/`sizes`/`crossorigin`/`referrerpolicy` on an
+      `<img>` and `srcset`/`sizes`/`media`/`type`/`width`/`height` on a
+      `<picture>`'s `<source>` before it). Style (`responsive.rs`): HTML's
+      srcset parser with its descriptor tokenizer and parser (every case
+      of WPT `parse-a-srcset-attribute.html` that this harness can state),
+      the sizes parser (media conditions, `MediaCondition`; lengths and
+      math functions, no percentages or other functions, negatives
+      refused, `auto`; font units at the initial size), creating and
+      normalizing a source set, selection (first density reaching the
+      device pixel ratio, else the densest), update the source set
+      (`<picture>` sources by `srcset`, `media`, `type`: PNG, APNG, JPEG,
+      GIF, WebP, SVG by the MIME essence; `width`/`height` making the
+      source the dimension attribute source), "update the image data"
+      (its synchronous half, the rest in a microtask; superseded runs
+      return), "react to environment changes", what a fetch's end does to
+      current and pending requests (an environment request dropped on
+      failure or after a mutation), and the `load`/`error` tasks with the
+      `maybe omit events` rules. Cascade: an `<img>`'s `width`/`height`
+      hints from its dimension attribute source. Layout: an `<img>` shows
+      its current request (none when broken) at its natural size divided
+      by the density (`density 0`: 2^24 px). Script: the algorithms run
+      after each DOM call (`flush_images`) with the rest as a Boa promise
+      job, so a promise callback queued after a change sees its
+      `currentSrc`; `DomChange::Image` restyles and lays out an `<img>`
+      whose image changed; `HTMLImageElement` with `currentSrc` (its other
+      members are Phase 5's DOM bindings). Tab: parser-created images
+      update while parsing (fetches start then; they used to start when
+      parsing ended), a script's leftovers after it, a resize or scale
+      change reacts, one fetch per URL with available and failed URLs
+      completing at once, an undecodable body or a network error breaks
+      the request, the old document's decoded images stay until the new
+      one is parsed (only those it asked for are kept), `load`/`error`
+      fire at the `<img>` (none fired before 6m, for any image). An `<img>`
+      that allows auto-sizes (`loading=lazy`, `sizes=auto`) selects by
+      its laid-out content width: its fetch waits for its first layout
+      (lazy loading's deferral; it does not hold the load event) and a
+      width change selects again. Tests: style (srcset, sizes, selection,
+      types), tab (`responsive_images_select_load_and_react`: density and
+      width descriptors, `<picture>` by type and media with dimension
+      attributes, only chosen candidates fetched, sizes from densities,
+      events, a resize changing the picture's source and the width
+      candidate's density with no new fetch, a 2x screen;
+      `script_image_updates_follow_the_microtask`: the microtask timing,
+      a superseded change never fetched, an undecodable image's `error`,
+      an available image's `load`, a removed `<source>`;
+      `auto_sizes_select_by_the_rendered_width`). Verification (release
+      probe, live, `BROWSER_VERIFY_LAYOUT=1`): Wikipedia Main Page 5, the
+      Rust article 3, iana 12 incremental layouts, layouts and paint
+      orders 0 differences.
+      Timing (release probe, live, against the 6h build, two runs each):
+      the Rust article heap after load 135.9 MiB (133.7–134.2), peak 196.7
+      MiB (195.2–195.3), load 1.018–1.027 s (1.049–1.056); Wikipedia Main
+      Page load 587–602 ms (626–652), heap 41.8 MiB (41.7–42.0); iana load
+      4.63 s both runs (4.59–5.21), heap unchanged 459.7 MiB.
+      Not verified against Chrome and Firefox, so not ticked: selection's
+      optional step 8 (taking a denser source already available) is not
+      taken; recording the last selected source when "update the image
+      data" selects (the spec text fetched does not show where; WPT
+      `viewport-change.html` needs it); `image/jpg` and other unregistered
+      types refused in `<source type>`; the 2^24 px limit for a 0x
+      density. Found, not changed: `crossorigin` and `referrerpolicy`
+      re-run the selection but image fetches use neither (no CORS mode,
+      no referrer policy for images); lazy loading itself (Phase 5,
+      Images) is not built, so other `loading=lazy` images load at once
+      and the auto-sizes ones wait for layout, not for the viewport;
+      `width`/`height` give no aspect ratio (`aspect-ratio`, Phase 5).
 - [x] 6n. Large-page speed (owner, 2026-10-19; iana.org/protocols took
       ~20 s to load in the release shell and did not scroll). Timing log
       kept for good: a `perf` line per tab batch (events by kind, script,
@@ -671,6 +783,22 @@ remaining lists as they stand.
       `elementsFromPoint` (new, next to the 3.3.4 geometry).
       `requestAnimationFrame` exists (Phase 3 item 1). Later: streams,
       AbortController, ResizeObserver, custom elements and shadow DOM.
+      Started 2026-11-07, not done: `elementFromPoint`/`elementsFromPoint`
+      built (`view.rs` `elements_at`, `PaintOrder::hit_test_all`): viewport
+      coordinates through the page scroll, a point past the viewport less
+      its scrollbars (or negative) gives `null`/`[]`, every box hit testing
+      targets topmost first (`pointer-events: none` passed over, a text's
+      or pseudo-element's box as its element, a box right after one of the
+      same element adding nothing: WPT `elementsFromPoint-inline-nested`
+      lists a span holding text once and `-simple` an element twice with
+      another between its boxes), the root element appended, two finite
+      `double`s required (TypeError). Test
+      `elements_from_point_list_the_boxes_under_a_point`. Not verified: the
+      right and bottom edges (a box's `contains` as hit testing has it;
+      WPT's legacy `elementFromPosition.html` takes them as inside).
+      Still to build in this line: `fetch`/`XMLHttpRequest`, storage,
+      `history.pushState`/`popstate`, `MutationObserver`,
+      `IntersectionObserver`.
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,

@@ -1266,10 +1266,18 @@ fn presentational_hints(doc: &Document, id: NodeId, e: &browser_dom::Element) ->
     };
 
     if matches!(tag, "img" | "video" | "iframe" | "canvas" | "embed" | "object" | "table" | "td" | "th" | "hr" | "input") {
-        if let Some(w) = e.attr("width").and_then(dim) {
+        // An `<img>` takes them from its dimension attribute source: the
+        // selected `<source>` of its `<picture>` when that one has them
+        // (HTML §4.8.4.3.9, "Working sites first" 6m).
+        let source = if tag == "img" && e.name.ns == html5ever::ns!(html) {
+            doc.image_data(id).and_then(|d| d.dimension_source).and_then(|s| doc.element(s)).unwrap_or(e)
+        } else {
+            e
+        };
+        if let Some(w) = source.attr("width").and_then(dim) {
             push(&mut out, P::Width(w));
         }
-        if let Some(h) = e.attr("height").and_then(dim) {
+        if let Some(h) = source.attr("height").and_then(dim) {
             push(&mut out, P::Height(h));
         }
     }

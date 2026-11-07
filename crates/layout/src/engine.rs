@@ -3419,7 +3419,7 @@ fn push_style(
     };
     // Decoration lines are not parley's: the engine places them per
     // decorating box (`crate::decor`).
-    let props: [StyleProperty<'_, Brush>; 11] = [
+    let props: [StyleProperty<'_, Brush>; 12] = [
         StyleProperty::FontFamily(FontFamily::Source(Cow::Borrowed(&style.font_family))),
         StyleProperty::FontSize(style.font_size.max(0.0)),
         StyleProperty::FontWeight(FontWeight::new(style.font_weight as f32)),
@@ -3436,6 +3436,10 @@ fn push_style(
             LineHeight::Px(px) => PLineHeight::Absolute(px),
         }),
         StyleProperty::LetterSpacing(style.letter_spacing.to_px()),
+        // Added to each word-separator character by the vendored parley
+        // (CSS Text 3 §7.1), so line breaking, justification, intrinsic
+        // sizes and hit testing all see it.
+        StyleProperty::WordSpacing(style.word_spacing_px()),
         StyleProperty::WordBreak(word_break),
         StyleProperty::OverflowWrap(overflow_wrap),
         StyleProperty::TextWrapMode(wrap_mode),
@@ -6335,6 +6339,119 @@ mod tests {
         let (texts, _) = texts_of(&doc2, &spaced, "p");
         let c = &texts[0].1.clusters;
         assert!((c[1].x - c[0].x - c[0].advance).abs() < 0.01 && c[0].advance > 4.0);
+    }
+
+    /// The right edge of the page's rightmost text fragment.
+    fn text_right(tree: &LayoutTree) -> f32 {
+        let mut right = 0.0f32;
+        tree.root.walk(&mut |f| {
+            if matches!(f.content, FragmentContent::Text(_)) {
+                right = right.max(f.rect.right());
+            }
+        });
+        right
+    }
+
+    #[test]
+    fn word_spacing_widens_each_word_separator() {
+        // One unwrapped line; `ws` is the paragraph's `word-spacing`.
+        let line = |ws: &str, text: &str| {
+            let (_, tree) = layout(
+                &format!(
+                    "<body style='margin:0;font-size:20px'><p style='margin:0;white-space:pre;word-spacing:{ws}'>{text}</p></body>"
+                ),
+                "",
+            );
+            text_right(&tree)
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        // Three spaces, 10px each; negative values narrow; `em` of the
+        // element's font size; `calc()`.
+        let plain = line("normal", "a b c d");
+        assert!(close(line("10px", "a b c d"), plain + 30.0), "{plain}");
+        assert!(close(line("-2px", "a b c d"), plain - 6.0));
+        assert!(close(line("0.5em", "a b c d"), plain + 30.0));
+        assert!(close(line("calc(1em - 10px)", "a b c d"), plain + 30.0));
+        assert!(close(line("0", "a b c d"), plain));
+        // A preserved space at the line's start is spaced too (WPT
+        // `word-spacing-003.html`).
+        assert!(close(line("10px", " a"), line("normal", " a") + 10.0));
+        // Percentages of the font size (CSS Text 4), alone or in a sum.
+        assert!(close(line("50%", "a b c d"), plain + 30.0));
+        assert!(close(line("calc(25% + 5px)", "a b c d"), plain + 30.0));
+        // The other word separators of CSS Text 3 §7.1.
+        for sep in ["&nbsp;", "\u{1361}", "\u{10100}", "\u{10101}", "\u{1039F}", "\u{1091F}"] {
+            let base = line("normal", &format!("a{sep}b"));
+            assert!(close(line("10px", &format!("a{sep}b")), base + 10.0), "{sep:?}");
+        }
+        // Not word separators: fixed-width and ideographic spaces, the
+        // zero-width space, punctuation.
+        for other in ["\u{2003}", "\u{3000}", "\u{200B}", ",", "-"] {
+            let base = line("normal", &format!("a{other}b"));
+            assert!(close(line("10px", &format!("a{other}b")), base), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn word_spacing_follows_the_space_s_own_style() {
+        let right = |body: &str| {
+            let (_, tree) = layout(&format!("<body style='margin:0;font-size:20px;white-space:pre'>{body}</body>"), "");
+            text_right(&tree)
+        };
+        let plain = right("a b");
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        // The space is inside the spaced span: spaced, before or after
+        // the word; outside it: not.
+        assert!(close(right("<span style='word-spacing:20px'>a </span>b"), plain + 20.0));
+        assert!(close(right("a<span style='word-spacing:20px'> b</span>"), plain + 20.0));
+        assert!(close(right("<span style='word-spacing:20px'>a</span> b"), plain));
+        // Inherited by descendants; a percentage is inherited as one and
+        // resolves against each element's own font size (WPT
+        // `word-spacing-percent-001.html`).
+        assert!(close(right("<span style='word-spacing:20px'><b>a b</b></span>"), right("<b>a b</b>") + 20.0));
+        let small = right("<span style='font-size:10px'>a b</span>");
+        assert!(close(right("<span style='word-spacing:100%'><span style='font-size:10px'>a b</span></span>"), small + 10.0));
+        // Letter spacing adds to the separator too.
+        assert!(close(right("<span style='word-spacing:20px;letter-spacing:3px'>a b</span>"), plain + 20.0 + 9.0));
+    }
+
+    #[test]
+    fn word_spacing_counts_in_breaking_justification_and_intrinsic_sizes() {
+        let page = |css: &str, text: &str| {
+            layout(&format!("<body style='margin:0;font-size:20px'><p id=p style='margin:0;{css}'>{text}</p></body>"), "")
+        };
+        let lines = |doc: &Document, tree: &LayoutTree| {
+            let (texts, _) = texts_of(doc, tree, "p");
+            let mut ys: Vec<i32> = texts.iter().map(|(r, _)| r.y.round() as i32).collect();
+            ys.sort();
+            ys.dedup();
+            ys.len()
+        };
+        // Intrinsic sizes: a float's max-content width takes both spaces'
+        // spacing; its min-content width (the longest word) none.
+        let width = |css: &str| {
+            let (doc, tree) = page(css, "aa bb cc");
+            rect_by_id(&doc, &tree, "p").width
+        };
+        let max0 = width("float:left");
+        assert!((width("float:left;word-spacing:15px") - (max0 + 30.0)).abs() < 0.5, "{max0}");
+        let min0 = width("float:left;width:min-content");
+        assert!((width("float:left;width:min-content;word-spacing:15px") - min0).abs() < 0.5, "{min0}");
+        // Breaking: the line that held "aa bb cc" at its max-content width
+        // no longer does once the spaces widen.
+        let (doc, tree) = page(&format!("width:{}px", max0.ceil()), "aa bb cc");
+        assert_eq!(lines(&doc, &tree), 1);
+        let (doc, tree) = page(&format!("width:{}px;word-spacing:15px", max0.ceil()), "aa bb cc");
+        assert_eq!(lines(&doc, &tree), 2);
+        // Justification spreads the rest over the widened spaces: the
+        // first line still ends at the box's edge, and its last word is
+        // no further than without the extra spacing would put it.
+        let (doc, tree) = page("width:300px;text-align:justify;word-spacing:10px", "aa bb cc dd ee ff gg hh ii jj kk ll mm nn");
+        assert!(lines(&doc, &tree) >= 2);
+        let (texts, _) = texts_of(&doc, &tree, "p");
+        let first_y = texts.iter().map(|(r, _)| r.y).fold(f32::MAX, f32::min);
+        let first_right = texts.iter().filter(|(r, _)| (r.y - first_y).abs() < 0.5).map(|(r, _)| r.right()).fold(0.0f32, f32::max);
+        assert!((first_right - 300.0).abs() < 0.5, "justified line ends at {first_right}");
     }
 
     #[test]

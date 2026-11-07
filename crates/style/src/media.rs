@@ -172,6 +172,25 @@ impl MediaQueryList {
     }
 }
 
+/// A `<media-condition>` on its own (no media type), as a `sizes`
+/// attribute's entries carry (HTML §4.8.4.3.11).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaCondition(Condition);
+
+impl MediaCondition {
+    /// Parse a whole input as one media condition.
+    pub fn parse_all<'i>(input: &mut Parser<'i, '_>) -> Result<Self, ParseErr<'i>> {
+        let c = parse_condition(input)?;
+        input.expect_exhausted()?;
+        Ok(MediaCondition(c))
+    }
+
+    /// True only when the condition holds (an unknown result does not).
+    pub fn matches(&self, vp: &Viewport) -> bool {
+        eval(&self.0, vp) == Some(true)
+    }
+}
+
 fn parse_query<'i>(input: &mut Parser<'i, '_>) -> Result<MediaQuery, ParseErr<'i>> {
     let mut negated = false;
     let mut media_type = MediaType::All;

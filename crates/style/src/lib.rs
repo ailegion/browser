@@ -19,6 +19,7 @@ pub mod image;
 pub mod mask;
 pub mod media;
 pub mod properties;
+pub mod responsive;
 pub mod selector_impl;
 pub mod serialize;
 pub mod state;
@@ -47,7 +48,7 @@ pub use image::{
     LinearDirection, RadialShape, RadialSize,
 };
 pub use properties::*;
-pub use media::MediaQueryList;
+pub use media::{MediaCondition, MediaQueryList};
 pub use serialize::{UsedGrid, UsedTracks, UsedValues, resolved_value, serialize_block, serialize_declared, serialize_shorthand};
 pub use stylesheet::{
     Origin, Rule, StyleRule, Stylesheet, parse_cssom_block, parse_declaration_block, parse_declaration_value,

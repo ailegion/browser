@@ -114,6 +114,17 @@ const fn to_whitespace(c: char) -> Whitespace {
     }
 }
 
+/// The word-separator characters of CSS Text 3 §7.1 (patch,
+/// plan/03-crates.md): the space, the no-break space, the Ethiopic word
+/// space, the Aegean word separators, the Ugaritic word divider and the
+/// Phoenician word separator. Fixed-width spaces and punctuation are not.
+pub(crate) const fn is_word_separator(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\u{00A0}' | '\u{1361}' | '\u{10100}' | '\u{10101}' | '\u{1039F}' | '\u{1091F}'
+    )
+}
+
 /// `HarfRust`-based run data
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RunData {
@@ -555,7 +566,14 @@ impl<B: Brush> LayoutData<B> {
             let clusters = &mut self.clusters[run.cluster_range.clone()];
             for cluster in clusters {
                 let mut spacing = letter;
-                if !nearly_zero(word) && cluster.info.whitespace().is_space_or_nbsp() {
+                // Patch (plan/03-crates.md): `word-spacing` goes on every
+                // word-separator character of CSS Text 3 §7.1, not only the
+                // space and the no-break space, and not on one the font
+                // gives no advance.
+                if !nearly_zero(word)
+                    && is_word_separator(cluster.info.source_char())
+                    && !nearly_zero(cluster.advance)
+                {
                     spacing += word;
                 }
                 if !nearly_zero(spacing) {

@@ -97,6 +97,7 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::TextTransform(t) => t.keyword().to_owned(),
         P::WhiteSpace(w) => w.keyword().to_owned(),
         P::LetterSpacing(l) => l.to_css(),
+        P::WordSpacing(w) => w.to_css(),
         P::TextIndent(t) => t.to_css(),
         P::WordBreak(w) => w.keyword().to_owned(),
         P::OverflowWrap(w) => w.keyword().to_owned(),
@@ -1169,6 +1170,7 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
             LetterSpacing::Normal => "normal".to_owned(),
             LetterSpacing::Px(p) => px(p),
         },
+        Id::WordSpacing => lp_css(style.word_spacing),
         Id::TextIndent => {
             let t = style.text_indent;
             let mut s = lp_css(t.length);
@@ -1380,6 +1382,75 @@ mod tests {
         let s = styles.get(p).expect("style");
         assert_eq!(resolved_value(s, PropertyId::FontOpticalSizing, None), "none");
         assert_eq!(resolved_value(s, PropertyId::FontVariationSettings, None), "\"slnt\" -10");
+    }
+
+    /// "Working sites first" line 6h: `word-spacing`, as WPT's
+    /// `css-text/parsing/word-spacing-{valid,invalid,computed}.html` and
+    /// `word-spacing/word-spacing-computed-001.html` have it.
+    #[test]
+    fn word_spacing_parses_serializes_and_computes() {
+        let cases = [
+            ("word-spacing: normal", "word-spacing: normal;"),
+            ("word-spacing: 0", "word-spacing: 0px;"),
+            ("word-spacing: 10px", "word-spacing: 10px;"),
+            ("word-spacing: -20px", "word-spacing: -20px;"),
+            ("word-spacing: calc(2em + 3ex)", "word-spacing: calc(2em + 3ex);"),
+            ("word-spacing: 120%", "word-spacing: 120%;"),
+            ("word-spacing: -10%", "word-spacing: -10%;"),
+            ("word-spacing: calc(2ch - 30%)", "word-spacing: calc(-30% + 2ch);"),
+            ("word-spacing: calc(40% + 50px)", "word-spacing: calc(40% + 50px);"),
+            ("word-spacing: NORMAL", "word-spacing: normal;"),
+            ("word-spacing: auto", ""),
+            ("word-spacing: normal 10px", ""),
+            ("word-spacing: 10% 10px", ""),
+            ("word-spacing: 2", ""),
+        ];
+        for (css, want) in cases {
+            assert_eq!(block(css), want, "{css}");
+        }
+        use crate::{Stylist, Viewport, cascade::compute_styles, ua::ua_stylesheet};
+        let computed = |value: &str, font_size: &str| {
+            let html = format!("<div style='font-size:{font_size}; word-spacing:{value}'><p id=p>x</p></div>");
+            let doc = browser_dom::parse_html(html.as_bytes());
+            let mut stylist = Stylist::new();
+            stylist.add_sheet(ua_stylesheet());
+            let styles = compute_styles(&doc, &stylist, &Viewport::default());
+            let div = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "div")).expect("div");
+            let p = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "p")).expect("p");
+            let own = resolved_value(styles.get(div).expect("style"), PropertyId::WordSpacing, None);
+            let inherited = resolved_value(styles.get(p).expect("style"), PropertyId::WordSpacing, None);
+            assert_eq!(own, inherited, "inherited as computed: {value}");
+            own
+        };
+        // word-spacing-computed.html (font-size 40px).
+        for (value, want) in [
+            ("normal", "0px"),
+            ("0", "0px"),
+            ("10px", "10px"),
+            ("-20px", "-20px"),
+            ("calc(10px - 0.5em)", "-10px"),
+            ("110%", "110%"),
+            ("-5%", "-5%"),
+            ("calc(10% - 20%)", "-10%"),
+            ("calc(10px - (5% + 10%))", "calc(-15% + 10px)"),
+        ] {
+            assert_eq!(computed(value, "40px"), want, "{value}");
+        }
+        // word-spacing-computed-001.html (font-size 20px).
+        for (value, want) in [
+            ("1.27cm", "48px"),
+            ("1em", "20px"),
+            ("0.5in", "48px"),
+            ("25.4mm", "96px"),
+            ("5pc", "80px"),
+            ("18pt", "24px"),
+            ("7px", "7px"),
+            ("101.6Q", "96px"),
+            ("3rem", "48px"),
+            ("0ch", "0px"),
+        ] {
+            assert_eq!(computed(value, "20px"), want, "{value}");
+        }
     }
 
     /// "Working sites first" line 6c: the `mask-*` longhands, the `mask`

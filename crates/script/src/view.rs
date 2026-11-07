@@ -68,7 +68,11 @@ pub fn dom_box_changes(changes: &[DomChange], since: Option<u64>) -> Option<(Vec
         match change {
             DomChange::Tree { generation } if since.is_none_or(|s| *generation > s) => return None,
             DomChange::Tree { .. } => {}
-            DomChange::Attr { element, generation, .. } if since.is_none_or(|s| *generation > s) => elements.push(*element),
+            DomChange::Attr { element, generation, .. } | DomChange::Image { element, generation }
+                if since.is_none_or(|s| *generation > s) =>
+            {
+                elements.push(*element)
+            }
             DomChange::Children { parent, generation, .. } | DomChange::Sheets { parent, generation }
                 if since.is_none_or(|s| *generation > s) =>
             {
@@ -102,9 +106,18 @@ pub fn feature_changes(doc: &Document, changes: &[DomChange], since: Option<u64>
                 return None;
             }
             DomChange::Tree { .. } | DomChange::Sheets { .. } => continue,
-            DomChange::Children { generation, .. } | DomChange::Attr { generation, .. }
+            DomChange::Children { generation, .. } | DomChange::Attr { generation, .. } | DomChange::Image { generation, .. }
                 if since.is_some_and(|s| *generation <= s) =>
             {
+                continue;
+            }
+            // The `<img>` itself is restyled (its `width`/`height` hints
+            // may come from another element now) and laid out again.
+            DomChange::Image { element, .. } => {
+                delta.layout = true;
+                if !delta.changes.iter().any(|c| c.element == *element) {
+                    delta.changes.push(FeatureChange { element: *element, features: Vec::new() });
+                }
                 continue;
             }
             DomChange::Children { parent, inserted, .. } => {
@@ -1510,6 +1523,89 @@ pub(crate) fn add_element_geometry(class: &mut ClassBuilder<'_>) {
 }
 
 /// The `offset*` members of `HTMLElement`.
+/// `Document.elementFromPoint` and `elementsFromPoint` (CSSOM View §5;
+/// "Working sites first" line 7).
+pub(crate) fn add_document_geometry(class: &mut ClassBuilder<'_>) {
+    class.method(js_string!("elementFromPoint"), 2, NativeFunction::from_fn_ptr(element_from_point));
+    class.method(js_string!("elementsFromPoint"), 2, NativeFunction::from_fn_ptr(elements_from_point));
+}
+
+/// The elements under the viewport point `(x, y)`, topmost first: the
+/// element of each box hit testing would target (pointer-events: none
+/// passed over; a text's or a pseudo-element's box is its element's; a
+/// box right after one of the same element adds nothing, so a text and
+/// its inline box count once, as WPT's `elementsFromPoint-inline-nested`
+/// has it), then the root element if it is not last. `None` for a point
+/// outside the viewport (less its scrollbars), a document with no view,
+/// or one that is not the lent one.
+fn elements_at(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<Option<Vec<NodeId>>> {
+    // WebIDL: two required `double`s, finite.
+    if args.len() < 2 {
+        return Err(JsNativeError::typ()
+            .with_message(format!("2 arguments required, but only {} present", args.len()))
+            .into());
+    }
+    let mut coords = [0.0f64; 2];
+    for (i, c) in coords.iter_mut().enumerate() {
+        let v = args[i].to_number(context)?;
+        if !v.is_finite() {
+            return Err(JsNativeError::typ().with_message("The provided double value is non-finite.").into());
+        }
+        *c = v;
+    }
+    let is_document = this
+        .as_object()
+        .and_then(|o| o.downcast_ref::<crate::dom::DomNode>().map(|d| d.id.is_none()))
+        .ok_or_else(crate::dom::illegal_invocation)?;
+    if !is_document {
+        return Ok(None);
+    }
+    let (x, y) = (coords[0], coords[1]);
+    with_layout(context, |view, doc, _| {
+        let tree = view.layout.as_ref()?;
+        let port = tree.viewport.scrollport;
+        if x < 0.0 || y < 0.0 || x > f64::from(port.width) || y > f64::from(port.height) {
+            return None;
+        }
+        let (px, py) = (x as f32 + view.scroll.0, y as f32 + view.scroll.1);
+        let mut out: Vec<NodeId> = Vec::new();
+        for n in tree.hit_test_all(px, py) {
+            if !doc.contains(n) {
+                continue;
+            }
+            // Text and pseudo-element boxes belong to their element.
+            let element = if doc.get(n).is_element() { n } else { doc.parent(n).unwrap_or(n) };
+            if !doc.get(element).is_element() || out.last() == Some(&element) {
+                continue;
+            }
+            out.push(element);
+        }
+        if let Some(root) = doc.document_element()
+            && out.last() != Some(&root)
+        {
+            out.push(root);
+        }
+        Some(out)
+    })
+    .map(Option::flatten)
+}
+
+fn element_from_point(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    match elements_at(this, args, context)?.and_then(|v| v.first().copied()) {
+        Some(id) => crate::dom::wrap(id, context),
+        None => Ok(JsValue::null()),
+    }
+}
+
+fn elements_from_point(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let ids = elements_at(this, args, context)?.unwrap_or_default();
+    let mut items = Vec::with_capacity(ids.len());
+    for id in ids {
+        items.push(crate::dom::wrap(id, context)?);
+    }
+    Ok(boa_engine::object::builtins::JsArray::from_iter(items, context).into())
+}
+
 pub(crate) fn add_html_element_geometry(class: &mut ClassBuilder<'_>) {
     for (name, prop) in [
         ("offsetWidth", GeoProp::OffsetWidth),
