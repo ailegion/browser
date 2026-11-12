@@ -288,7 +288,7 @@ fn mark_handled(promise: &JsPromise, context: &mut Context) -> JsResult<()> {
 
 /// The bytes of an `ArrayBuffer`, a typed array or a `DataView`; `None`
 /// for any other object.
-fn buffer_bytes(o: &JsObject, context: &mut Context) -> JsResult<Option<Vec<u8>>> {
+pub(crate) fn buffer_bytes(o: &JsObject, context: &mut Context) -> JsResult<Option<Vec<u8>>> {
     if let Ok(buffer) = JsArrayBuffer::from_object(o.clone()) {
         return Ok(Some(buffer.to_vec().unwrap_or_default()));
     }

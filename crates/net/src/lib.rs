@@ -67,6 +67,18 @@ pub struct FetchRequest {
     /// Whether cookies go with the request and are taken from its
     /// responses (Fetch's credentials mode).
     pub credentials: Credentials,
+    /// Whether redirects are followed here or handed back.
+    pub redirect: Redirect,
+}
+
+/// What a redirect response does: followed (up to the limit), or
+/// delivered as the response it is, for a caller that follows redirects
+/// itself (a script's `fetch`, whose every hop has checks of its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Redirect {
+    #[default]
+    Follow,
+    Manual,
 }
 
 /// Fetch's credentials mode: cookies on every hop, only on hops to the
@@ -100,6 +112,7 @@ impl FetchRequest {
             body: None,
             cache: CacheMode::Default,
             credentials: Credentials::Include,
+            redirect: Redirect::Follow,
         }
     }
 }
@@ -230,6 +243,21 @@ enum FetchError {
     TooLarge,
     #[error("decompression failed: {0}")]
     Decode(std::io::Error),
+    #[error("not in the cache")]
+    NotCached,
+}
+
+/// The reason phrase of a response's status line: what the server sent
+/// over HTTP/1 (hyper keeps it only when it is not the canonical one),
+/// nothing over HTTP/2 and later.
+fn reason_phrase<B>(response: &hyper::Response<B>) -> String {
+    if response.version() >= http::Version::HTTP_2 {
+        return String::new();
+    }
+    match response.extensions().get::<hyper::ext::ReasonPhrase>() {
+        Some(reason) => String::from_utf8_lossy(reason.as_bytes()).into_owned(),
+        None => response.status().canonical_reason().unwrap_or("").to_owned(),
+    }
 }
 
 async fn run(
@@ -260,7 +288,15 @@ async fn run(
         headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
         headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate, br"));
         for (k, v) in &request.headers {
-            if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+            // A value is a byte string: a script's header may carry code
+            // points up to U+00FF, one byte each (Fetch's isomorphic
+            // encoding); anything else is sent as its UTF-8.
+            let bytes: Vec<u8> = if v.chars().all(|c| (c as u32) <= 0xFF) {
+                v.chars().map(|c| c as u8).collect()
+            } else {
+                v.as_bytes().to_vec()
+            };
+            if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(&bytes)) {
                 headers.insert(name, value);
             }
         }
@@ -294,6 +330,9 @@ async fn run(
                 }
                 Lookup::Miss => {}
             }
+        }
+        if mode == CacheMode::OnlyIfCached {
+            return Err(FetchError::NotCached);
         }
 
         let mut req = Request::builder()
@@ -334,7 +373,8 @@ async fn run(
             continue;
         }
 
-        if status.is_redirection()
+        if request.redirect == Redirect::Follow
+            && status.is_redirection()
             && let Some(location) = response.headers().get(header::LOCATION)
             && let Ok(location) = location.to_str()
             && let Ok(next) = url.join(location)
@@ -351,7 +391,11 @@ async fn run(
         }
 
         let headers = header_list(response.headers());
-        let policy = if method == Method::GET {
+        // A redirect handed back to the caller is not stored: an entry
+        // for it would be served as the final response to a request that
+        // follows redirects here.
+        let handed_back = request.redirect == Redirect::Manual && status.is_redirection();
+        let policy = if method == Method::GET && mode != CacheMode::NoStore && !handed_back {
             shared.cache().policy(status.as_u16(), &headers, &request_headers, timing)
         } else {
             None
@@ -364,9 +408,11 @@ async fn run(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or(""),
         );
+        let status_text = reason_phrase(&response);
         sink(NetToTab::ResponseStart {
             id,
             status: status.as_u16(),
+            status_text: status_text.clone(),
             headers: headers.clone(),
             final_url: url.clone(),
         });
@@ -400,9 +446,9 @@ async fn run(
         }
         sink(NetToTab::ResponseEnd { id });
         if let (Some(policy), Some(copy)) = (policy, copy) {
-            shared
-                .cache()
-                .store(key, status.as_u16(), headers, Bytes::from(copy), policy, timing);
+            let mut cache = shared.cache();
+            cache.store(key.clone(), status.as_u16(), headers, Bytes::from(copy), policy, timing);
+            cache.set_status_text(&key, status_text);
         }
         return Ok(());
     }
@@ -426,6 +472,7 @@ fn serve_cached(id: RequestId, url: &Url, cached: CachedResponse, sink: &Sink) {
     sink(NetToTab::ResponseStart {
         id,
         status: cached.status,
+        status_text: cached.status_text,
         headers,
         final_url: url.clone(),
     });
@@ -464,6 +511,7 @@ fn fetch_data_url(id: RequestId, url: &Url, sink: &Sink) {
     sink(NetToTab::ResponseStart {
         id,
         status: 200,
+        status_text: "OK".to_owned(),
         headers: vec![("content-type".to_owned(), mime)],
         final_url: url.clone(),
     });

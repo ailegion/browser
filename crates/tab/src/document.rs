@@ -26,8 +26,12 @@ impl browser_script::CookieAccess for TabCookies {
 use browser_paint::scrollbar::{ScrollbarState, draw_corner_colored, draw_scrollbar};
 use browser_paint::{ImageStore, PaintOptions, decode_image, paint};
 use browser_script::{
-    ConsoleLevel, ConsoleLine, EventTargetRef, HostRequest, ImageSizeMap, ModuleProgress, ModuleScript, ScriptHost, View,
+    ConsoleLevel, ConsoleLine, EventTargetRef, HostRequest, ImageSizeMap, MAX_HISTORY_ENTRIES, ModuleProgress, ModuleScript,
+    NetFailure, NetOp, ScriptHost, SerializedState, StorageArea, View,
 };
+
+use crate::scriptnet::{Action, BlockingNet, Job, SharedPreflights};
+use crate::storage::{OriginStorage, StorageChange, TabStores};
 use browser_style::media::MediaQueryList;
 use browser_style::ua::ua_stylesheet;
 use browser_style::{
@@ -173,6 +177,8 @@ enum Prepared {
 struct Pending {
     kind: PendingKind,
     status: u16,
+    /// The status line's reason phrase (empty over HTTP/2).
+    status_text: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     /// Where the response came from after redirects.
@@ -357,6 +363,39 @@ enum NavKind {
     Replace,
     /// Back or forward to the entry at the index.
     Traverse(usize),
+}
+
+/// One entry of the tab's session history (HTML §7.4.1).
+#[derive(Debug, Clone, PartialEq)]
+struct HistoryEntry {
+    url: Url,
+    /// Which document the entry belongs to (HTML's document sequence
+    /// number): entries a document made with `pushState` or a fragment
+    /// navigation share it, and a traversal between them loads nothing.
+    /// It stays with the entry across a reload.
+    document: u64,
+    /// The state `pushState`/`replaceState` gave the entry.
+    state: Option<SerializedState>,
+    /// Where the page was scrolled when the entry was left.
+    scroll: Option<(f32, f32)>,
+    /// `history.scrollRestoration` is `manual` for the entry.
+    manual_scroll: bool,
+}
+
+/// A request a script made (`fetch`, `XMLHttpRequest`) on its way through
+/// the fetch algorithm.
+struct ScriptFetch {
+    job: Job,
+    /// The network request of the hop under way.
+    hop: Option<RequestId>,
+    started: std::time::Instant,
+    /// `XMLHttpRequest.timeout`.
+    timeout: Option<std::time::Duration>,
+    /// The request goes on when its document is replaced (`keepalive`,
+    /// a beacon).
+    keepalive: bool,
+    /// Its document is gone: it is carried to its end and nobody is told.
+    detached: bool,
 }
 
 /// A navigation in flight. Until the first response bytes arrive nothing
@@ -597,10 +636,32 @@ pub(crate) struct TabState {
     /// Recent console output, for tests and tools; the log gets it too.
     console: Vec<ConsoleLine>,
 
-    history: Vec<Url>,
+    history: Vec<HistoryEntry>,
     history_index: usize,
+    /// The next document sequence number.
+    next_document: u64,
     /// The URL's fragment must be scrolled to after the next layout.
     pending_fragment: bool,
+    /// Whether that scrolls (it only moves `:target` otherwise).
+    fragment_scrolls: bool,
+    /// The tab changed the layout tree (a layout, a scroll) since the
+    /// script view last indexed its boxes.
+    view_rects_stale: bool,
+    /// A traversal reached an entry with a scroll position to restore,
+    /// once the document is laid out.
+    pending_scroll_restore: Option<(f32, f32)>,
+    /// The requests scripts have under way, by the script's id for each,
+    /// and the network request each one's current hop is.
+    script_fetches: HashMap<u64, ScriptFetch>,
+    net_to_script: HashMap<RequestId, u64>,
+    /// The key the next request that outlives its document is kept
+    /// under: from the top of the range down, clear of the scripts' ids.
+    next_detached: u64,
+    preflights: SharedPreflights,
+    /// The browser's local storage and the tab's session storage, and
+    /// the current document's view of them (none for an opaque origin).
+    stores: TabStores,
+    origin_storage: Option<std::rc::Rc<OriginStorage>>,
     /// A `<meta http-equiv=refresh>` or `Refresh` header due at the instant.
     refresh: Option<(std::time::Instant, Url)>,
     /// `Refresh` header of the main response, applied when the document lands.
@@ -752,8 +813,18 @@ impl TabState {
         );
     }
 
-    pub fn new(id: TabId, net: Arc<NetService>, net_sink: Sink, viewport: Viewport, output: Arc<OutputSink>) -> Self {
+    pub fn new(id: TabId, net: Arc<NetService>, net_sink: Sink, stores: TabStores, viewport: Viewport, output: Arc<OutputSink>) -> Self {
         Self {
+            next_document: 1,
+            fragment_scrolls: true,
+            view_rects_stale: false,
+            pending_scroll_restore: None,
+            script_fetches: HashMap::new(),
+            net_to_script: HashMap::new(),
+            next_detached: u64::MAX,
+            preflights: SharedPreflights::default(),
+            stores,
+            origin_storage: None,
             id,
             net,
             net_sink,
@@ -903,14 +974,12 @@ impl TabState {
             ShellToTab::Stop => self.stop(),
             ShellToTab::GoBack => {
                 if self.history_index > 0 {
-                    let i = self.history_index - 1;
-                    self.go(self.history[i].clone(), NavKind::Traverse(i));
+                    self.traverse_to(self.history_index - 1);
                 }
             }
             ShellToTab::GoForward => {
                 if self.history_index + 1 < self.history.len() {
-                    let i = self.history_index + 1;
-                    self.go(self.history[i].clone(), NavKind::Traverse(i));
+                    self.traverse_to(self.history_index + 1);
                 }
             }
             ShellToTab::Resize(vp) => {
@@ -1268,7 +1337,11 @@ impl TabState {
     fn set_control_value(&mut self, id: NodeId, value: &str) {
         let Some(doc) = &mut self.doc else { return };
         if doc.element(id).is_some_and(is_textarea) {
+            // The user's typing is the control's value, not a change to
+            // its children a `MutationObserver` hears of.
+            doc.suppress_mutations();
             doc.set_text_content(id, value);
+            doc.resume_mutations();
         } else if let Some(e) = doc.get_mut(id).as_element_mut() {
             e.set_attr("value", value);
         }
@@ -1891,12 +1964,159 @@ impl TabState {
         self.cancel_pending_nav();
         if kind != NavKind::Reload && self.is_same_document(&url) {
             tracing::info!(tab = self.id.0, "fragment navigation {url}");
-            self.apply_history(url, kind);
+            let old = self.url.clone();
+            if kind == NavKind::Push {
+                self.leave_entry();
+            }
+            self.apply_history(url, kind, true);
             self.pending_fragment = true;
             self.state_dirty = true;
+            self.same_document_navigated(old);
         } else {
             self.navigate(url, kind);
         }
+    }
+
+    /// Remember where the page is scrolled in the entry being left, for
+    /// a traversal back to it.
+    fn leave_entry(&mut self) {
+        let scroll = (self.scroll_x, self.scroll_y);
+        if let Some(entry) = self.history.get_mut(self.history_index) {
+            entry.scroll = Some(scroll);
+        }
+    }
+
+    fn fresh_document(&mut self) -> u64 {
+        let document = self.next_document;
+        self.next_document += 1;
+        document
+    }
+
+    /// Back or forward to the entry at `index`: within the document when
+    /// the entry is one of its own (`pushState`, a fragment navigation),
+    /// else by loading the entry's URL.
+    fn traverse_to(&mut self, index: usize) {
+        let Some(target) = self.history.get(index).cloned() else { return };
+        let same_document = self.history.get(self.history_index).is_some_and(|c| c.document == target.document)
+            && self.nav.is_none()
+            && (self.doc.is_some() || self.parser.is_some());
+        if !same_document {
+            self.go(target.url, NavKind::Traverse(index));
+            return;
+        }
+        if index == self.history_index {
+            return;
+        }
+        tracing::info!(tab = self.id.0, "traversal within the document to {}", target.url);
+        let old = self.url.clone();
+        self.leave_entry();
+        self.history_index = index;
+        self.url = Some(target.url.clone());
+        self.state_dirty = true;
+        // The entry's `:target`, and its scroll position unless the page
+        // restores it itself (`history.scrollRestoration = 'manual'`).
+        self.pending_fragment = true;
+        self.fragment_scrolls = !target.manual_scroll;
+        self.pending_scroll_restore = if target.manual_scroll { None } else { target.scroll };
+        self.same_document_navigated(old);
+    }
+
+    /// The document's URL changed without a load (a fragment navigation
+    /// or a traversal between its entries): the document and its scripts
+    /// follow, `popstate` fires with the entry's state, and `hashchange`
+    /// when the fragment differs (HTML §7.4.6.2, "update document for
+    /// history step application").
+    fn same_document_navigated(&mut self, old: Option<Url>) {
+        let Some(new) = self.url.clone() else { return };
+        self.document_url_changed(old.as_ref(), &new);
+        let Some(entry) = self.history.get(self.history_index).cloned() else { return };
+        if self.script.is_none() {
+            return;
+        }
+        let (index, length) = (self.history_index, self.history.len());
+        self.sync_document_info();
+        self.with_script(|host| {
+            host.set_history(index, length, entry.state.clone(), entry.manual_scroll);
+            host.fire_popstate(entry.state.clone());
+        });
+        self.after_script();
+        if let Some(old) = old
+            && old.fragment() != new.fragment()
+            && self.url.as_ref() == Some(&new)
+        {
+            self.sync_document_info();
+            self.with_script(|host| host.fire_hashchange(&old, &new));
+            self.after_script();
+        }
+    }
+
+    /// The displayed document's URL is now `new`: what relative URLs
+    /// resolve against (unless a `<base>` says otherwise) and what its
+    /// storage events name follow.
+    fn document_url_changed(&mut self, old: Option<&Url>, new: &Url) {
+        if self.parser.is_none() {
+            self.doc_url = Some(new.clone());
+        }
+        let rebase = |doc: &mut Document| {
+            if doc.base_url.as_ref() == old {
+                doc.base_url = Some(new.clone());
+            }
+        };
+        match (&mut self.parser, &mut self.doc) {
+            (Some(parser), _) => rebase(&mut parser.document_mut()),
+            (None, Some(doc)) => rebase(doc),
+            (None, None) => {}
+        }
+        if let Some(storage) = &self.origin_storage {
+            *storage.url.borrow_mut() = new.to_string();
+        }
+    }
+
+    /// `history.pushState` (a new entry after the current one) or
+    /// `replaceState` (the current one): the entry carries the state and
+    /// the URL; the script has already adopted both.
+    fn push_state(&mut self, url: Url, state: SerializedState, replace: bool) {
+        let old = self.url.clone();
+        if replace {
+            if let Some(entry) = self.history.get_mut(self.history_index) {
+                entry.url = url.clone();
+                entry.state = Some(state);
+            }
+        } else {
+            self.leave_entry();
+            let (document, manual_scroll) = match self.history.get(self.history_index) {
+                Some(entry) => (entry.document, entry.manual_scroll),
+                None => (self.fresh_document(), false),
+            };
+            if !self.history.is_empty() {
+                self.history.truncate(self.history_index + 1);
+            }
+            self.history.push(HistoryEntry {
+                url: url.clone(),
+                document,
+                state: Some(state),
+                scroll: None,
+                manual_scroll,
+            });
+            self.cap_history();
+        }
+        self.url = Some(url.clone());
+        self.document_url_changed(old.as_ref(), &url);
+        self.state_dirty = true;
+        let (index, length) = (self.history_index, self.history.len());
+        if let (Some(host), Some(entry)) = (&mut self.script, self.history.get(index)) {
+            host.set_history(index, length, entry.state.clone(), entry.manual_scroll);
+        }
+    }
+
+    /// Keep the list at the most entries a tab holds (the oldest go) and
+    /// make the last one current.
+    fn cap_history(&mut self) {
+        if self.history.len() > MAX_HISTORY_ENTRIES {
+            let excess = self.history.len() - MAX_HISTORY_ENTRIES;
+            self.history.drain(..excess);
+        }
+        self.history_index = self.history.len() - 1;
     }
 
     /// Whether `url` names the displayed document, fragment aside.
@@ -1911,26 +2131,52 @@ impl TabState {
     }
 
     /// Record a committed navigation in the history list and adopt its URL.
-    fn apply_history(&mut self, url: Url, kind: NavKind) {
+    /// `same_document` says the URL is the displayed document's own (a
+    /// fragment navigation): the entry then belongs to that document.
+    fn apply_history(&mut self, url: Url, kind: NavKind, same_document: bool) {
+        let current = self.history.get(self.history_index).cloned();
+        let has_entry = current.is_some();
+        // A new entry: the current document's, or a new document's.
+        let new_entry = |state: &mut Self| {
+            let (document, manual_scroll) = match (&current, same_document) {
+                (Some(c), true) => (c.document, c.manual_scroll),
+                _ => (state.fresh_document(), false),
+            };
+            HistoryEntry {
+                url: url.clone(),
+                document,
+                state: None,
+                scroll: None,
+                manual_scroll,
+            }
+        };
         match kind {
             NavKind::Push => {
                 if !self.history.is_empty() {
                     self.history.truncate(self.history_index + 1);
                 }
-                self.history.push(url.clone());
+                let entry = new_entry(self);
+                self.history.push(entry);
+                self.cap_history();
+            }
+            NavKind::Reload if has_entry => {
+                // The same entry, document and state: only the URL may
+                // have moved (a redirect).
+                self.history[self.history_index].url = url.clone();
+            }
+            NavKind::Replace if has_entry => {
+                let entry = new_entry(self);
+                self.history[self.history_index] = entry;
+            }
+            NavKind::Reload | NavKind::Replace => {
+                let entry = new_entry(self);
+                self.history.push(entry);
                 self.history_index = self.history.len() - 1;
             }
-            NavKind::Reload | NavKind::Replace => match self.history.get_mut(self.history_index) {
-                Some(entry) => *entry = url.clone(),
-                None => {
-                    self.history.push(url.clone());
-                    self.history_index = self.history.len() - 1;
-                }
-            },
             NavKind::Traverse(i) => {
                 if let Some(entry) = self.history.get_mut(i) {
                     // A redirect on the way back lands on the new URL.
-                    *entry = url.clone();
+                    entry.url = url.clone();
                     self.history_index = i;
                 }
             }
@@ -1976,7 +2222,17 @@ impl TabState {
         nav.committed = true;
         let kind = nav.kind;
         tracing::info!(tab = self.id.0, "committed {final_url}");
-        self.apply_history(final_url.clone(), kind);
+        // The entry being left keeps where it was scrolled; one reached
+        // by a traversal gets its own position back once it is laid out.
+        if matches!(kind, NavKind::Push | NavKind::Traverse(_)) {
+            self.leave_entry();
+        }
+        self.apply_history(final_url.clone(), kind, false);
+        self.pending_scroll_restore = match kind {
+            NavKind::Traverse(_) => self.history.get(self.history_index).filter(|e| !e.manual_scroll).and_then(|e| e.scroll),
+            _ => None,
+        };
+        self.fragment_scrolls = true;
         self.doc_cache = if kind == NavKind::Reload {
             CacheMode::NoCache
         } else {
@@ -2034,9 +2290,14 @@ impl TabState {
         };
         if fragment.as_deref().is_some_and(|f| !f.is_empty() && f != "top") && target.is_none() {
             tracing::debug!(tab = self.id.0, "no element for fragment {fragment:?}");
+            self.fragment_scrolls = true;
             return;
         }
+        // A traversal to an entry whose page restores its own scroll
+        // position only moves `:target`.
+        let scrolls = std::mem::replace(&mut self.fragment_scrolls, true);
         match target {
+            _ if !scrolls => {}
             // The element's top at the top of every scroller above it and
             // of the viewport, its `scroll-margin` counted.
             Some(t) => self.reveal(
@@ -2069,6 +2330,7 @@ impl TabState {
             self.script.as_ref().and_then(ScriptHost::next_wake),
             self.frame_due,
             self.web_fonts.next_wake(),
+            self.script_fetch_wake(),
             // A `document.fonts` task is due.
             (self.web_fonts.dirty && self.script.is_some()).then(std::time::Instant::now),
         ]
@@ -2100,6 +2362,7 @@ impl TabState {
         // `document.fonts`: its promises and events run as a task here,
         // never from inside rendering or a network handler.
         self.report_fonts();
+        self.script_fetch_tick(now);
         // Script timers, then an animation frame if one is due: each
         // callback is a task with its own microtask checkpoint.
         if self
@@ -2525,6 +2788,7 @@ impl TabState {
             Pending {
                 kind,
                 status: 0,
+                status_text: String::new(),
                 headers: Vec::new(),
                 body: Vec::new(),
                 final_url: None,
@@ -2546,6 +2810,7 @@ impl TabState {
             Pending {
                 kind: PendingKind::Main,
                 status: 0,
+                status_text: String::new(),
                 headers: Vec::new(),
                 body: Vec::new(),
                 final_url: None,
@@ -2556,6 +2821,7 @@ impl TabState {
                 (self.net_sink)(NetToTab::ResponseStart {
                     id,
                     status: 200,
+                    status_text: "OK".to_owned(),
                     headers: vec![("content-type".to_owned(), "text/html".to_owned())],
                     final_url: url,
                 });
@@ -2580,15 +2846,28 @@ impl TabState {
     // ----- network messages -----
 
     pub fn handle_net(&mut self, msg: NetToTab) {
+        // A hop of a request a script made goes to its job.
+        let net_id = match &msg {
+            NetToTab::ResponseStart { id, .. }
+            | NetToTab::ResponseChunk { id, .. }
+            | NetToTab::ResponseEnd { id }
+            | NetToTab::Failed { id, .. } => *id,
+        };
+        if let Some(&script_id) = self.net_to_script.get(&net_id) {
+            self.script_fetch_event(script_id, msg);
+            return;
+        }
         match msg {
             NetToTab::ResponseStart {
                 id,
                 status,
+                status_text,
                 headers,
                 final_url,
             } => {
                 let Some(p) = self.pending.get_mut(&id) else { return };
                 p.status = status;
+                p.status_text = status_text;
                 p.headers = headers;
                 p.final_url = Some(final_url.clone());
                 if matches!(p.kind, PendingKind::Main) {
@@ -2639,7 +2918,7 @@ impl TabState {
                 {
                     // The error page takes the entry the page would have.
                     if !nav.committed {
-                        self.apply_history(nav.url.clone(), nav.kind);
+                        self.apply_history(nav.url.clone(), nav.kind, false);
                         self.pending.clear();
                     }
                     self.show_error_page(nav.url.as_str(), &error);
@@ -2649,6 +2928,171 @@ impl TabState {
         }
         // A finished fetch may have been the last one the load waited on.
         self.update_readiness();
+    }
+
+    // ----- requests scripts make (fetch, XMLHttpRequest) -----
+
+    /// Run `f` on the script host as a task: the document lent, then what
+    /// the script asked for carried out.
+    fn script_task(&mut self, f: impl FnOnce(&mut ScriptHost)) {
+        self.sync_document_info();
+        self.with_script(f);
+        self.after_script();
+    }
+
+    /// Carry out what scripts asked of the network.
+    fn apply_net_ops(&mut self, ops: Vec<NetOp>) {
+        for op in ops {
+            match op {
+                NetOp::Start(request) => {
+                    let Some(document_url) = self.url.clone() else { continue };
+                    let (id, timeout, keepalive) = (request.id, request.timeout, request.keepalive);
+                    let (job, actions) = {
+                        let mut preflights = self.preflights.lock().unwrap_or_else(|e| e.into_inner());
+                        Job::start(request, &document_url, &mut preflights)
+                    };
+                    self.script_fetches.insert(
+                        id,
+                        ScriptFetch {
+                            job,
+                            hop: None,
+                            started: std::time::Instant::now(),
+                            timeout,
+                            keepalive,
+                            detached: false,
+                        },
+                    );
+                    self.apply_fetch_actions(id, actions);
+                }
+                NetOp::Abort(id) => self.finish_script_fetch(id),
+                NetOp::SetTimeout(id, timeout) => {
+                    if let Some(fetch) = self.script_fetches.get_mut(&id) {
+                        fetch.timeout = timeout;
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_script_fetch(&mut self, id: u64) {
+        if let Some(fetch) = self.script_fetches.remove(&id)
+            && let Some(hop) = fetch.hop
+        {
+            self.net_to_script.remove(&hop);
+        }
+    }
+
+    /// The network answered the current hop of a script's request.
+    fn script_fetch_event(&mut self, id: u64, msg: NetToTab) {
+        let Some(fetch) = self.script_fetches.get_mut(&id) else { return };
+        let actions = {
+            let mut preflights = self.preflights.lock().unwrap_or_else(|e| e.into_inner());
+            match msg {
+                NetToTab::ResponseStart {
+                    status,
+                    status_text,
+                    headers,
+                    ..
+                } => fetch.job.on_start(status, status_text, headers, &mut preflights),
+                NetToTab::ResponseChunk { bytes, .. } => fetch.job.on_chunk(bytes),
+                NetToTab::ResponseEnd { .. } => fetch.job.on_end(),
+                NetToTab::Failed { error, .. } => fetch.job.on_failed(error),
+            }
+        };
+        self.apply_fetch_actions(id, actions);
+    }
+
+    /// Do what a job asks: send its next request, or tell the script.
+    fn apply_fetch_actions(&mut self, id: u64, actions: Vec<Action>) {
+        // A request that outlived its document has nobody to tell.
+        let detached = self.script_fetches.get(&id).is_some_and(|f| f.detached);
+        for action in actions {
+            match action {
+                Action::Head(_) | Action::Data(_) if detached => {}
+                Action::Done | Action::Fail(_) if detached => self.finish_script_fetch(id),
+                Action::Send(request) => {
+                    let Some(fetch) = self.script_fetches.get_mut(&id) else { return };
+                    let hop = RequestId(self.next_request);
+                    self.next_request += 1;
+                    if let Some(old) = fetch.hop.replace(hop) {
+                        self.net_to_script.remove(&old);
+                    }
+                    self.net_to_script.insert(hop, id);
+                    self.net.fetch(hop, request, self.net_sink.clone());
+                }
+                Action::Head(head) => self.script_task(|host| host.net_response(id, head)),
+                Action::Data(bytes) => self.script_task(|host| host.net_data(id, bytes)),
+                Action::Done => {
+                    self.finish_script_fetch(id);
+                    self.script_task(|host| host.net_done(id));
+                }
+                Action::Fail(failure) => {
+                    self.finish_script_fetch(id);
+                    if let NetFailure::Network(why) = &failure {
+                        tracing::warn!(tab = self.id.0, "script request failed: {why}");
+                        if let Some(host) = &mut self.script {
+                            host.report_error(format!("Fetch failed: {why}"));
+                        }
+                    }
+                    self.script_task(|host| host.net_failed(id, failure));
+                }
+            }
+        }
+    }
+
+    /// When the earliest `XMLHttpRequest.timeout` runs out.
+    fn script_fetch_wake(&self) -> Option<std::time::Instant> {
+        self.script_fetches.values().filter_map(|f| f.timeout.map(|t| f.started + t)).min()
+    }
+
+    /// Fail the requests whose timeout ran out.
+    fn script_fetch_tick(&mut self, now: std::time::Instant) {
+        let expired: Vec<u64> = self
+            .script_fetches
+            .iter()
+            .filter(|(_, f)| f.timeout.is_some_and(|t| now >= f.started + t))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.finish_script_fetch(id);
+            self.script_task(|host| host.net_failed(id, NetFailure::Timeout));
+        }
+    }
+
+    /// Another tab changed the local storage of an origin: the document
+    /// fires `storage` when the origin is its own.
+    pub fn handle_storage(&mut self, change: StorageChange) {
+        if self.origin_storage.as_ref().is_none_or(|s| s.origin != change.origin) || self.script.is_none() {
+            return;
+        }
+        self.script_task(|host| {
+            host.fire_storage_event(
+                StorageArea::Local,
+                change.key.as_deref(),
+                change.old.as_deref(),
+                change.new.as_deref(),
+                &change.url,
+            );
+        });
+    }
+
+    /// The "update intersection observations" step of updating the
+    /// rendering: after layout and the scroll events, before painting.
+    /// Returns whether a callback ran (it may have changed the tree).
+    fn update_intersection_observers(&mut self) -> bool {
+        let due = match &mut self.script {
+            Some(host) => host.has_intersection_observers() && (self.needs_paint || host.intersection_observers_dirty()),
+            None => false,
+        };
+        if !due || self.layout.is_none() || self.parser.is_some() {
+            return false;
+        }
+        let time_ms = self.doc_started.elapsed().as_secs_f64() * 1000.0;
+        let mut ran = false;
+        self.sync_document_info();
+        self.with_script(|host| ran = host.update_intersection_observers(time_ms));
+        self.after_script();
+        ran
     }
 
     /// Move the document along its lifecycle and fire what each step
@@ -3019,9 +3463,47 @@ impl TabState {
         self.doc_started = std::time::Instant::now();
         self.scripts = Scripts::default();
         self.lifecycle = Lifecycle::Loading;
+        // The old document's requests are no longer anyone's; the ones it
+        // asked to be kept alive (a beacon sent while leaving) go on to
+        // their end under keys no new request takes.
+        let kept: Vec<ScriptFetch> = self.script_fetches.drain().map(|(_, f)| f).filter(|f| f.keepalive).collect();
+        self.net_to_script.clear();
+        for mut fetch in kept {
+            fetch.detached = true;
+            fetch.timeout = None;
+            let key = self.next_detached;
+            self.next_detached -= 1;
+            if let Some(hop) = fetch.hop {
+                self.net_to_script.insert(hop, key);
+            }
+            self.script_fetches.insert(key, fetch);
+        }
+        // Storage is by origin; an opaque one (`data:`, `about:`) has none.
+        self.origin_storage = match &self.url {
+            Some(url) if matches!(url.scheme(), "http" | "https") => Some(OriginStorage::new(
+                self.id,
+                url.origin().ascii_serialization(),
+                url.as_str(),
+                self.stores.clone(),
+            )),
+            _ => None,
+        };
         self.script = match ScriptHost::new(self.url.clone(), browser_net::USER_AGENT) {
             Ok(mut host) => {
                 host.set_cookie_access(std::rc::Rc::new(TabCookies(self.net.clone())));
+                if let Some(storage) = &self.origin_storage {
+                    host.set_storage_access(storage.clone());
+                }
+                if let Some(url) = &self.url {
+                    host.set_sync_net(std::rc::Rc::new(BlockingNet {
+                        net: self.net.clone(),
+                        document_url: url.clone(),
+                        preflights: self.preflights.clone(),
+                    }));
+                }
+                if let Some(entry) = self.history.get(self.history_index) {
+                    host.set_history(self.history_index, self.history.len(), entry.state.clone(), entry.manual_scroll);
+                }
                 Some(host)
             }
             Err(e) => {
@@ -3060,6 +3542,11 @@ impl TabState {
         view.engine = self.engine.take();
         view.styles = std::mem::take(&mut self.styles);
         view.layout = self.layout.take();
+        // The tab laid out or scrolled since the view last indexed the
+        // tree's boxes: the index is built again when a script asks.
+        if std::mem::take(&mut self.view_rects_stale) {
+            view.forget_rects();
+        }
         view.deps = std::mem::take(&mut self.deps);
         view.loaded_sheets = std::mem::take(&mut self.loaded_sheets);
         view.images = self.image_sizes.clone();
@@ -3071,6 +3558,9 @@ impl TabState {
         self.host_layout_fresh = false;
         host.lend_view(view);
         let started = std::time::Instant::now();
+        // What the parser (or the tab) changed since the last task: the
+        // mutation observers hear of it before this one runs.
+        host.deliver_mutations();
         f(host);
         self.perf.script += started.elapsed();
         self.perf.scripts += 1;
@@ -3158,13 +3648,25 @@ impl TabState {
     fn apply_host_requests(&mut self, requests: Vec<HostRequest>) {
         for request in requests {
             match request {
-                HostRequest::SetTitle(title) => {
-                    match (&mut self.parser, &mut self.doc) {
-                        (Some(parser), _) => parser.document_mut().set_title(&title),
-                        (None, Some(doc)) => doc.set_title(&title),
-                        (None, None) => {}
+                // The script changed the document itself; the shell hears
+                // of the new title.
+                HostRequest::SetTitle(_) => self.state_dirty = true,
+                HostRequest::PushState { url, state, replace } => self.push_state(url, state, replace),
+                HostRequest::Traverse { delta } => {
+                    let target = self.history_index as i64 + i64::from(delta);
+                    if target >= 0 && (target as usize) < self.history.len() {
+                        self.traverse_to(target as usize);
+                        // A traversal to another document: later requests
+                        // belong to one that is going away.
+                        if self.nav.is_some() {
+                            break;
+                        }
                     }
-                    self.state_dirty = true;
+                }
+                HostRequest::ScrollRestoration { manual } => {
+                    if let Some(entry) = self.history.get_mut(self.history_index) {
+                        entry.manual_scroll = manual;
+                    }
                 }
                 HostRequest::Navigate { url, replace } => {
                     if !matches!(url.scheme(), "http" | "https" | "data" | "about") {
@@ -3187,8 +3689,23 @@ impl TabState {
     /// script is ready.
     fn pump_scripts(&mut self) {
         self.drive_parser();
+        self.deliver_parser_mutations();
         self.run_ready_scripts();
         self.update_readiness();
+    }
+
+    /// The parser added to a document a `MutationObserver` watches: its
+    /// callbacks run at the end of the parser's turn, script following or
+    /// not.
+    fn deliver_parser_mutations(&mut self) {
+        let pending = match (&self.parser, &self.doc) {
+            (Some(parser), _) => parser.document().has_logged_mutations(),
+            (None, Some(doc)) => doc.has_logged_mutations(),
+            (None, None) => false,
+        };
+        if pending && self.script.is_some() {
+            self.script_task(|_| {});
+        }
     }
 
     /// Run the parser until it runs dry or waits on a script fetch. Every
@@ -3441,6 +3958,7 @@ impl TabState {
         let host_requests = host.take_requests();
         let mutated = host.take_dom_mutated();
         let changes = host.take_dom_changes();
+        let net_ops = host.take_net_ops();
         for line in host.take_console() {
             match line.level {
                 ConsoleLevel::Warn | ConsoleLevel::Error => {
@@ -3469,6 +3987,8 @@ impl TabState {
             self.dom_changed(&changes);
         }
         self.apply_host_requests(host_requests);
+        // The requests the script made (`fetch`, `XMLHttpRequest`) start.
+        self.apply_net_ops(net_ops);
         self.apply_font_requests();
         // The images the script created or changed: their fetches and
         // tasks (the script ran the algorithms; what it left undone runs).
@@ -4476,6 +4996,11 @@ impl TabState {
         if again {
             self.settle();
         }
+        // Intersection observers see the layout and scroll offsets the
+        // frame will paint; what their callbacks change is laid out too.
+        if self.update_intersection_observers() {
+            self.settle();
+        }
         self.report_caret();
         if self.needs_paint && self.layout.is_some() {
             self.repaint();
@@ -4512,6 +5037,16 @@ impl TabState {
             if self.pending_fragment && self.layout.is_some() {
                 self.pending_fragment = false;
                 self.scroll_to_fragment();
+            }
+            // The position a traversal's entry was left at, once its
+            // document is the one laid out.
+            if self.layout.is_some()
+                && self.parser.is_none()
+                && self.nav.is_none()
+                && let Some(to) = self.pending_scroll_restore.take()
+            {
+                self.programmatic_scroll(ScrollTarget::Page, to, false);
+                self.needs_paint = true;
             }
             if !self.needs_style && !self.needs_layout {
                 break;
@@ -4588,6 +5123,7 @@ impl TabState {
             "relayout"
         );
         self.layout = Some(tree);
+        self.view_rects_stale = true;
         self.after_layout();
         self.fetch_web_fonts();
     }
@@ -4951,6 +5487,11 @@ mod tests {
 
         /// Start a navigation without delivering any of its events yet.
         fn start(url: Url) -> Self {
+            Self::start_in(url, TabId(1), TabStores::default())
+        }
+
+        /// `start` for a tab of a browser whose storage is `stores`.
+        fn start_in(url: Url, id: TabId, stores: TabStores) -> Self {
             let net = Arc::new(NetService::new().expect("net service"));
             let (tx, net_events) = channel();
             let net_sink: Sink = Arc::new(move |ev| {
@@ -4968,7 +5509,7 @@ mod tests {
                 height: 600.0,
                 scale_factor: 1.0,
             };
-            let state = TabState::new(TabId(1), net, net_sink, viewport, output);
+            let state = TabState::new(id, net, net_sink, stores, viewport, output);
             let mut h = Self {
                 state,
                 net_events,
@@ -5435,7 +5976,7 @@ mod tests {
         h.send(ShellToTab::Navigate { url: page("Four") });
         assert_eq!(h.title().as_deref(), Some("Four"));
         assert_eq!((h.state.history.len(), h.state.history_index), (3, 2));
-        assert_eq!(h.state.history[1], page("Two"));
+        assert_eq!(h.state.history[1].url, page("Two"));
 
         h.send(ShellToTab::Reload);
         assert_eq!(h.title().as_deref(), Some("Four"));
@@ -6289,7 +6830,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         h.pump();
         assert_eq!(h.title().as_deref(), Some("Replaced"));
-        assert_eq!(h.state.history, vec![target], "replace overwrote the only entry");
+        assert_eq!(h.state.history.iter().map(|e| e.url.clone()).collect::<Vec<_>>(), vec![target], "replace overwrote the only entry");
         assert_eq!(h.state.doc_cache, CacheMode::Default, "a replace is not a reload");
     }
 
@@ -7156,8 +7697,11 @@ mod tests {
                         }
                         let response = match routes.get(&path) {
                             Some((headers, body)) => {
-                                let mut r = b"HTTP/1.1 200 OK\r\nConnection: close\r\n".to_vec();
-                                for (k, v) in headers {
+                                // A `:status` pseudo-header gives a route
+                                // another status line than `200 OK`.
+                                let status = headers.iter().find(|(k, _)| k == ":status").map_or("200 OK", |(_, v)| v.as_str());
+                                let mut r = format!("HTTP/1.1 {status}\r\nConnection: close\r\n").into_bytes();
+                                for (k, v) in headers.iter().filter(|(k, _)| k != ":status") {
                                     r.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
                                 }
                                 r.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
@@ -8832,6 +9376,384 @@ mod tests {
         h.pump_until(|h| h.state.images.get_svg(&server.url("/f.svg")).is_some());
         h.pump();
         assert_eq!(run_js(&mut h, "document.getElementById('pi').currentSrc.replace(location.origin, '')"), "\"/f.svg\"");
+    }
+
+    // ----- "Working sites first" line 7 -----
+
+    /// Pump the tab until `condition` (a script expression) is true.
+    fn wait_js(h: &mut Harness, condition: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            h.pump_for(std::time::Duration::from_millis(15));
+            if js(h, condition) == "true" {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for `{condition}`; console: {:?}", console_texts(h));
+        }
+    }
+
+    /// A string a script expression evaluates to, unquoted.
+    fn js_text(h: &mut Harness, src: &str) -> String {
+        js(h, src).trim_matches('"').to_owned()
+    }
+
+    fn route(path: &str, headers: &[(&str, &str)], body: &str) -> (String, Vec<(String, String)>, Vec<u8>) {
+        (
+            path.to_owned(),
+            headers.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            body.as_bytes().to_vec(),
+        )
+    }
+
+    fn request_header(head: &str, name: &str) -> Option<String> {
+        head.lines()
+            .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_owned()))
+    }
+
+    /// `fetch` and `XMLHttpRequest` over real sockets: same-origin
+    /// responses in full, cross-origin ones by CORS (the check, exposed
+    /// headers, credentials, preflights and their cache), the request
+    /// modes, redirects in each mode, opaque responses, `data:` URLs,
+    /// integrity, cookies only where the credentials mode sends them, and
+    /// a synchronous request.
+    #[test]
+    fn script_requests_follow_the_fetch_algorithm() {
+        let a = Server::start_with(
+            vec![
+                route("/page", &[("Content-Type", "text/html")], "<!DOCTYPE html><title>Fetch</title><p>x</p>"),
+                route("/same.json", &[("Content-Type", "application/json"), ("X-Secret", "s"), ("Set-Cookie", "sc=1; Path=/")], "{\"a\":1}"),
+                route("/redir", &[(":status", "302 Found"), ("Location", "/same.json")], ""),
+                route("/post-redir", &[(":status", "303 See Other"), ("Location", "/same.json")], ""),
+                route("/hello", &[("Content-Type", "text/plain")], "hello"),
+            ],
+            &[],
+        );
+        let origin = a.base.origin().ascii_serialization();
+        let b = Server::start_with(
+            vec![
+                route(
+                    "/cors.txt",
+                    &[("Content-Type", "text/plain"), ("Access-Control-Allow-Origin", "*"), ("X-Hidden", "h"), ("X-Shown", "s"), ("Access-Control-Expose-Headers", "X-Shown")],
+                    "cross",
+                ),
+                route("/nocors.txt", &[("Content-Type", "text/plain")], "secret"),
+                route("/cred.txt", &[("Access-Control-Allow-Origin", &origin), ("Access-Control-Allow-Credentials", "true")], "with credentials"),
+                route(
+                    "/pre",
+                    &[("Access-Control-Allow-Origin", &origin), ("Access-Control-Allow-Methods", "PUT"), ("Access-Control-Allow-Headers", "X-Custom, Content-Type"), ("Access-Control-Max-Age", "60")],
+                    "preflighted",
+                ),
+                route("/pre-denied", &[("Access-Control-Allow-Origin", "*")], "never"),
+                route("/corp", &[("Cross-Origin-Resource-Policy", "same-origin")], "kept"),
+            ],
+            &[],
+        );
+        // A redirect from the document's origin to the other one.
+        let hop = Server::start_with(
+            vec![route("/to-b", &[(":status", "307 Temporary Redirect"), ("Location", b.url("/cors.txt").as_str()), ("Access-Control-Allow-Origin", "*")], "")],
+            &[],
+        );
+        let mut h = Harness::load_url(a.url("/page"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        let script = format!(
+            "var B = '{b}', HOP = '{hop}'; var out = {{}}; var done = 0; var rec = k => v => {{ out[k] = String(v); done++; }}; var err = e => 'rejected ' + e.name; \
+             fetch('/same.json').then(r => r.json().then(j => [r.status, r.statusText, r.ok, r.type, r.headers.get('x-secret'), String(r.headers.get('set-cookie')), j.a, r.url.endsWith('/same.json'), r.redirected].join(' '))).then(rec('same'), e => rec('same')(err(e))); \
+             fetch('/redir').then(r => r.text().then(t => [r.redirected, r.url.endsWith('/same.json'), t].join(' '))).then(rec('redir'), e => rec('redir')(err(e))); \
+             fetch('/redir', {{redirect: 'error'}}).then(r => 'resolved', err).then(rec('redirect-error')); \
+             fetch('/redir', {{redirect: 'manual'}}).then(r => [r.type, r.status, r.url.endsWith('/redir'), r.headers.has('location')].join(' '), err).then(rec('redirect-manual')); \
+             fetch('/post-redir', {{method: 'POST', body: 'x'}}).then(r => r.text(), err).then(rec('post-redirect')); \
+             fetch(B + 'cors.txt').then(r => r.text().then(t => [r.type, r.status, t, String(r.headers.get('x-hidden')), r.headers.get('x-shown'), r.headers.get('content-type')].join(' '))).then(rec('cors'), e => rec('cors')(err(e))); \
+             fetch(B + 'nocors.txt').then(r => 'resolved', err).then(rec('blocked')); \
+             fetch(B + 'nocors.txt', {{mode: 'no-cors'}}).then(r => r.text().then(t => [r.type, r.status, t.length, [...r.headers].length].join(' ')), err).then(rec('opaque')); \
+             fetch(B + 'corp', {{mode: 'no-cors'}}).then(r => 'resolved', err).then(rec('corp')); \
+             fetch(B + 'cors.txt', {{mode: 'same-origin'}}).then(r => 'resolved', err).then(rec('same-origin-mode')); \
+             fetch(HOP + 'to-b').then(r => r.text().then(t => [r.type, r.redirected, t, r.url === B + 'cors.txt'].join(' ')), err).then(rec('cross-redirect')); \
+             fetch(B + 'pre', {{method: 'PUT', headers: {{'X-Custom': '1', 'Content-Type': 'application/json'}}, body: '{{}}'}}).then(r => r.text(), err).then(rec('preflight')) \
+                 .then(() => fetch(B + 'pre', {{method: 'PUT', headers: {{'X-Custom': '2'}}}})).then(r => r.text(), err).then(rec('preflight-cached')); \
+             fetch(B + 'pre-denied', {{method: 'DELETE'}}).then(r => 'resolved', err).then(rec('preflight-denied')); \
+             fetch(B + 'cred.txt', {{credentials: 'include'}}).then(r => r.text(), err).then(rec('credentials')); \
+             fetch(B + 'cors.txt', {{credentials: 'include'}}).then(r => 'resolved', err).then(rec('credentials-star')); \
+             fetch('data:text/plain,hi%20there').then(r => r.text().then(t => r.type + ' ' + r.status + ' ' + t), err).then(rec('data')); \
+             fetch('/hello', {{integrity: 'sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ='}}).then(r => r.text(), err).then(rec('integrity')); \
+             fetch('/hello', {{integrity: 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='}}).then(r => 'resolved', err).then(rec('integrity-bad')); \
+             fetch('ftp://example.test/x').then(r => 'resolved', err).then(rec('scheme')); \
+             var x = new XMLHttpRequest(); x.open('GET', B + 'cors.txt'); x.onload = () => rec('xhr')([x.status, x.statusText, x.responseText, String(x.getResponseHeader('x-hidden')), x.getResponseHeader('x-shown')].join(' ')); x.onerror = () => rec('xhr')('error'); x.send(); \
+             var xe = new XMLHttpRequest(); xe.open('GET', B + 'nocors.txt'); xe.onerror = () => rec('xhr-blocked')(xe.status + ' error ' + xe.readyState); xe.onload = () => rec('xhr-blocked')('loaded'); xe.send(); \
+             var xu = new XMLHttpRequest(); xu.open('POST', B + 'pre-denied'); xu.upload.onprogress = () => {{}}; xu.onerror = () => rec('xhr-upload-preflight')('error'); xu.onload = () => rec('xhr-upload-preflight')('loaded'); xu.send('body'); \
+             var xs = new XMLHttpRequest(); xs.open('GET', '/same.json', false); xs.send(); out.sync = [xs.status, xs.responseText, xs.getResponseHeader('content-type')].join(' '); \
+             var xt = ''; var xb = new XMLHttpRequest(); xb.open('GET', B + 'nocors.txt', false); try {{ xb.send() }} catch (e) {{ xt = e.name }} out['sync-blocked'] = xt; 'started'",
+            b = b.base,
+            hop = hop.base,
+        );
+        assert_eq!(run_js(&mut h, &script), "\"started\"");
+        wait_js(&mut h, "done >= 23");
+        let got = |h: &mut Harness, key: &str| js_text(h, &format!("out['{key}']"));
+        assert_eq!(got(&mut h, "same"), "200 OK true basic s null 1 true false", "Set-Cookie is never shown");
+        assert_eq!(got(&mut h, "redir"), "true true {\\\"a\\\":1}");
+        assert_eq!(got(&mut h, "redirect-error"), "rejected TypeError");
+        assert_eq!(got(&mut h, "redirect-manual"), "opaqueredirect 0 true false");
+        assert_eq!(got(&mut h, "post-redirect"), "{\\\"a\\\":1}");
+        assert_eq!(got(&mut h, "cors"), "cors 200 cross null s text/plain", "only safelisted and exposed headers show");
+        assert_eq!(got(&mut h, "blocked"), "rejected TypeError");
+        assert_eq!(got(&mut h, "opaque"), "opaque 0 0 0");
+        assert_eq!(got(&mut h, "corp"), "rejected TypeError");
+        assert_eq!(got(&mut h, "same-origin-mode"), "rejected TypeError");
+        assert_eq!(got(&mut h, "cross-redirect"), "cors true cross true");
+        assert_eq!(got(&mut h, "preflight"), "preflighted");
+        assert_eq!(got(&mut h, "preflight-cached"), "preflighted");
+        assert_eq!(got(&mut h, "preflight-denied"), "rejected TypeError");
+        assert_eq!(got(&mut h, "credentials"), "with credentials");
+        assert_eq!(got(&mut h, "credentials-star"), "rejected TypeError", "a wildcard does not allow credentials");
+        assert_eq!(got(&mut h, "data"), "basic 200 hi there");
+        assert_eq!(got(&mut h, "integrity"), "hello");
+        assert_eq!(got(&mut h, "integrity-bad"), "rejected TypeError");
+        assert_eq!(got(&mut h, "scheme"), "rejected TypeError");
+        assert_eq!(got(&mut h, "xhr"), "200 OK cross null s");
+        assert_eq!(got(&mut h, "xhr-blocked"), "0 error 4");
+        assert_eq!(got(&mut h, "xhr-upload-preflight"), "loaded", "upload listeners force a preflight, which a simple POST passes");
+        assert_eq!(got(&mut h, "sync"), "200 {\\\"a\\\":1} application/json");
+        assert_eq!(got(&mut h, "sync-blocked"), "NetworkError");
+
+        // What went over the wire.
+        let method = |head: &str| head.split_whitespace().next().unwrap_or("").to_owned();
+        let pre = b.requests("/pre");
+        assert_eq!(pre.iter().map(|r| method(r)).collect::<Vec<_>>(), vec!["OPTIONS", "PUT", "PUT"], "one preflight; the second request is covered by its cached result");
+        assert_eq!(request_header(&pre[0], "access-control-request-method").as_deref(), Some("PUT"));
+        assert_eq!(request_header(&pre[0], "access-control-request-headers").as_deref(), Some("content-type,x-custom"));
+        assert_eq!(request_header(&pre[0], "origin").as_deref(), Some(origin.as_str()));
+        assert_eq!(request_header(&pre[0], "cookie"), None, "a preflight carries no credentials");
+        assert_eq!(request_header(&pre[1], "x-custom").as_deref(), Some("1"));
+        assert_eq!(request_header(&pre[1], "content-type").as_deref(), Some("application/json"));
+        let denied = b.requests("/pre-denied");
+        let mut methods: Vec<String> = denied.iter().map(|r| method(r)).collect();
+        methods.sort();
+        assert_eq!(methods, vec!["OPTIONS", "OPTIONS", "POST"], "the DELETE's preflight (refused: no DELETE follows), the upload's forced one and its POST");
+        let cors = b.requests("/cors.txt");
+        assert!(cors.iter().all(|r| request_header(r, "origin").is_some()), "every CORS request names its origin");
+        assert_eq!(cors.iter().filter(|r| request_header(r, "cookie").is_some()).count(), 1, "cookies only with credentials: 'include'");
+        assert_eq!(request_header(&b.requests("/cred.txt")[0], "cookie").as_deref(), Some("sc=1"));
+        assert_eq!(request_header(&b.requests("/nocors.txt")[0], "cookie"), None);
+        let same = a.requests("/same.json");
+        assert!(same.iter().skip(1).all(|r| request_header(r, "cookie").as_deref() == Some("sc=1")), "same-origin requests carry the cookie once it is set");
+        assert!(same.iter().any(|r| method(r) == "GET" && request_header(r, "accept").as_deref() == Some("*/*")));
+        let posted = a.requests("/post-redir");
+        assert_eq!((method(&posted[0]), request_header(&posted[0], "origin")), ("POST".to_owned(), Some(origin.clone())), "a same-origin POST names its origin too");
+        assert_eq!(request_header(&posted[0], "content-type").as_deref(), Some("text/plain;charset=UTF-8"));
+        assert!(same.iter().all(|r| method(r) == "GET"), "a 303 turns the POST into a GET");
+    }
+
+    /// `XMLHttpRequest.timeout`: the request fails with `timeout` when the
+    /// server has not answered in time; a late answer changes nothing.
+    #[test]
+    fn xml_http_request_times_out() {
+        let server = Server::start(&[("/page", "text/html", "<!DOCTYPE html><title>T</title>"), ("/slow", "text/plain", "late")], &["/slow"]);
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        run_js(&mut h, "var log = []; var x = new XMLHttpRequest(); x.timeout = 60; x.open('GET', '/slow'); ['timeout', 'error', 'load', 'loadend'].forEach(k => x.addEventListener(k, () => log.push(k + x.readyState + x.status))); x.send();");
+        assert!(h.state.next_wake().is_some(), "the tab wakes for the timeout");
+        wait_js(&mut h, "log.length >= 2");
+        assert_eq!(js_text(&mut h, "log.join(' ')"), "timeout40 loadend40");
+        server.release("/slow");
+        h.pump_for(std::time::Duration::from_millis(100));
+        assert_eq!(js_text(&mut h, "log.join(' ') + ' ' + JSON.stringify(x.responseText) + ' end'"), "timeout40 loadend40 \\\"\\\" end");
+    }
+
+    /// Storage through the tab: per origin, the local area the browser's
+    /// (another tab sees it and hears of changes), the session area the
+    /// tab's, both kept across navigations; none for a `data:` document.
+    #[test]
+    fn storage_is_by_origin_and_tells_other_tabs() {
+        let server = Server::start(
+            &[
+                ("/one", "text/html", "<!DOCTYPE html><title>One</title><script>localStorage.setItem('k', 'v'); sessionStorage.s = '1';</script>"),
+                ("/two", "text/html", "<!DOCTYPE html><title>Two</title><script>var ev = []; onstorage = e => ev.push([e.key, e.oldValue, e.newValue, e.url, e.storageArea === localStorage].join(' '));</script>"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/one"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.send(ShellToTab::Navigate { url: server.url("/two") });
+        h.pump_until(|h| h.title().as_deref() == Some("Two") && h.state.lifecycle == Lifecycle::Complete);
+        assert_eq!(js_text(&mut h, "[localStorage.k, sessionStorage.s, localStorage.length].join(' ')"), "v 1 1", "both areas outlive the document");
+        // Another tab of the browser: the same local storage, its own
+        // session storage; its changes arrive here as events.
+        let stores = TabStores {
+            local: h.state.stores.local.clone(),
+            session: Default::default(),
+        };
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        stores.local.subscribe(TabId(1), Arc::new(move |change| sink.lock().expect("lock").push(change)));
+        let mut other = Harness::start_in(server.url("/two"), TabId(2), stores);
+        other.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        assert_eq!(js_text(&mut other, "[localStorage.k, String(sessionStorage.s)].join(' ')"), "v undefined");
+        run_js(&mut other, "localStorage.k = 'w'; localStorage.setItem('k', 'w'); localStorage.n = '1'; delete localStorage.n; sessionStorage.only = 'here'; localStorage.clear();");
+        let changes: Vec<StorageChange> = std::mem::take(&mut *heard.lock().expect("lock"));
+        assert_eq!(changes.len(), 4, "a set, a new key, its removal, the clear; not the unchanged set, not the session area");
+        for change in changes {
+            h.state.handle_storage(change);
+        }
+        h.pump();
+        let two = server.url("/two");
+        assert_eq!(
+            js_text(&mut h, "ev.join('|')"),
+            format!("k v w {two} true|n  1 {two} true|n 1  {two} true|   {two} true")
+        );
+        assert_eq!(js_text(&mut h, "localStorage.length + ' ' + sessionStorage.s"), "0 1");
+        assert_eq!(js_text(&mut other, "ev.length"), "0", "the tab that made the changes hears nothing");
+        // A change in another origin is not this document's business.
+        h.state.handle_storage(StorageChange {
+            origin: "https://elsewhere.test".to_owned(),
+            key: None,
+            old: None,
+            new: None,
+            url: String::new(),
+        });
+        h.pump();
+        assert_eq!(js_text(&mut h, "ev.length"), "4");
+        // An opaque origin has no storage.
+        let mut data = Harness::load("<!DOCTYPE html><title>D</title>");
+        assert_eq!(js_text(&mut data, "var n = ''; try { localStorage } catch (e) { n = e.name } n"), "SecurityError");
+    }
+
+    /// `history.pushState`, `replaceState` and traversals: the entries
+    /// are the tab's (the shell's back button walks them), a traversal
+    /// between a document's own entries loads nothing and fires
+    /// `popstate` (then `hashchange` when the fragment differs), the
+    /// state survives a reload and a trip to another document.
+    #[test]
+    fn push_state_entries_traverse_without_loading() {
+        let server = Server::start(
+            &[
+                ("/app", "text/html", "<!DOCTYPE html><title>App</title><body style='margin:0'><div style='height:3000px'></div><a id=frag href='#here'>frag</a><p id=here>here</p>\
+                  <script>var ev = []; onpopstate = e => ev.push('pop:' + JSON.stringify(e.state) + ':' + location.pathname + location.hash + ':' + (e.state === history.state)); onhashchange = e => ev.push('hash:' + URL0(e.oldURL) + '>' + URL0(e.newURL)); function URL0(u) { return u.slice(u.indexOf('/', 8)); }</script>"),
+                ("/other", "text/html", "<!DOCTYPE html><title>Other</title>"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/app"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        let loads = |s: &Server| s.requests("/app").len() + s.requests("/app/one").len() + s.requests("/app/two").len();
+        assert_eq!(run_js(&mut h, "history.pushState({n: 1}, '', '/app/one'); history.pushState({n: 2}, '', '/app/two?q#h'); history.replaceState({n: 22}, '', '/app/two'); [history.length, history.state.n, location.pathname, ev.length].join(' ')"), "\"3 22 /app/two 0\"");
+        assert_eq!(h.state.history.len(), 3);
+        assert_eq!(h.state.history.iter().map(|e| e.url.path().to_owned()).collect::<Vec<_>>(), vec!["/app", "/app/one", "/app/two"]);
+        assert_eq!(h.last_state().map(|(url, _, back, forward)| (url.path().to_owned(), back, forward)), Some(("/app/two".to_owned(), true, false)));
+        // The shell's back button, then the script's own traversals.
+        h.send(ShellToTab::GoBack);
+        assert_eq!(js_text(&mut h, "[ev.join(' '), history.state.n, location.pathname, history.length].join(' ')"), "pop:{\\\"n\\\":1}:/app/one:true 1 /app/one 3");
+        run_js(&mut h, "ev = []; history.back();");
+        assert_eq!(js_text(&mut h, "[ev.join(' '), String(history.state), location.pathname].join(' ')"), "pop:null:/app:true null /app");
+        run_js(&mut h, "ev = []; history.go(2);");
+        assert_eq!(js_text(&mut h, "[ev.join(' '), history.state.n].join(' ')"), "pop:{\\\"n\\\":22}:/app/two:true 22");
+        run_js(&mut h, "ev = []; history.go(5); history.forward();");
+        assert_eq!(js_text(&mut h, "ev.length + location.pathname"), "0/app/two", "nowhere to go: nothing happens");
+        assert_eq!(loads(&server), 1, "none of it loaded anything");
+        // A fragment navigation is an entry of the document too: popstate
+        // with no state, then hashchange.
+        run_js(&mut h, "ev = []; location.hash = 'here';");
+        assert_eq!(js_text(&mut h, "[ev.join(' '), String(history.state), history.length].join(' ')"), "pop:null:/app/two#here:true hash:/app/two>/app/two#here null 4");
+        assert!(h.state.scroll_y > 0.0, "and it scrolled to the fragment");
+        // Back: the entry's state and scroll position return.
+        let at_fragment = h.state.scroll_y;
+        h.send(ShellToTab::GoBack);
+        assert_eq!(js_text(&mut h, "ev.slice(2).join(' ')"), "pop:{\\\"n\\\":22}:/app/two:true hash:/app/two#here>/app/two");
+        assert_eq!(h.state.scroll_y, 0.0, "the position the entry was left at");
+        h.send(ShellToTab::GoForward);
+        assert_eq!(h.state.scroll_y, at_fragment);
+        // `scrollRestoration = 'manual'`: the page keeps its position.
+        run_js(&mut h, "history.scrollRestoration = 'manual'; history.pushState(null, '', '/app/three'); scrollTo(0, 40);");
+        h.send(ShellToTab::GoBack);
+        assert_eq!(h.state.scroll_y, 40.0);
+        assert_eq!(loads(&server) + server.requests("/app/three").len(), 1);
+        // Another document, and back: the entry is loaded again (at the
+        // URL it was pushed with) and has its state.
+        h.send(ShellToTab::GoBack);
+        assert_eq!(js_text(&mut h, "location.pathname + history.state.n"), "/app/two22");
+        h.send(ShellToTab::Navigate { url: server.url("/other") });
+        h.pump_until(|h| h.title().as_deref() == Some("Other") && h.state.lifecycle == Lifecycle::Complete);
+        assert_eq!(js_text(&mut h, "String(history.state) + history.length"), "null4", "the entries after the current one went");
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.state.nav.is_none() && h.state.lifecycle == Lifecycle::Complete);
+        assert_eq!(server.requests("/app/two").len(), 1, "the pushed URL is what loads");
+        // The server knows no such path: whatever came, the entry's state did too.
+        assert_eq!(js_text(&mut h, "location.pathname + ' ' + JSON.stringify(history.state) + ' ' + history.length"), "/app/two {\\\"n\\\":22} 4");
+        // A reload keeps it as well.
+        h.send(ShellToTab::Reload);
+        h.pump_until(|h| h.state.nav.is_none() && h.state.lifecycle == Lifecycle::Complete);
+        assert_eq!(js_text(&mut h, "JSON.stringify(history.state)"), "{\\\"n\\\":22}");
+    }
+
+    /// `IntersectionObserver` through the tab: an entry for every target
+    /// when it is first observed, then when it crosses a threshold as the
+    /// page scrolls or a scroller between it and the root does; root
+    /// margins, an element root, a target that is not rendered.
+    #[test]
+    fn intersection_observers_follow_scrolling_and_layout() {
+        let html = "<!DOCTYPE html><title>IO</title><style>body { margin: 0 } #far { margin-top: 1000px; width: 200px; height: 100px } \
+             #box { width: 300px; height: 200px; overflow: auto; margin-top: 500px } #inner { margin-top: 400px; width: 50px; height: 50px } #none { display: none } #tail { height: 2000px }</style>\
+             <div id=far></div><div id=box><div id=inner></div></div><div id=none></div><div id=tail></div>\
+             <script>var log = []; var show = e => [e.target.id, e.isIntersecting, e.intersectionRatio.toFixed(2), Math.round(e.boundingClientRect.top), Math.round(e.intersectionRect.height), e.rootBounds && Math.round(e.rootBounds.height), e instanceof IntersectionObserverEntry, e.time >= 0].join(',');\
+             var io = new IntersectionObserver(function (list, o) { log.push(list.map(show).join(' ') + (o === io && this === io ? '' : '!')); }, {threshold: [0, 0.5, 1]});\
+             var far = document.getElementById('far'), inner = document.getElementById('inner'), box = document.getElementById('box');\
+             io.observe(far); io.observe(document.getElementById('none')); io.observe(far);</script>";
+        let mut h = Harness::load(html);
+        assert_eq!(js_text(&mut h, "[String(io.root), io.rootMargin, io.scrollMargin, io.thresholds.join('/'), Object.isFrozen(io.thresholds)].join(' ')"), "null 0px 0px 0px 0px 0px 0px 0px 0px 0/0.5/1 true");
+        // The first entries: both targets, neither intersecting.
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "far,false,0.00,1000,0,600,true,true none,false,0.00,0,0,600,true,true");
+        // Scrolled so half of it shows, then all of it, then past it.
+        run_js(&mut h, "log = []; scrollTo(0, 450);");
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "far,true,0.50,550,50,600,true,true");
+        run_js(&mut h, "log = []; scrollTo(0, 500);");
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "far,true,1.00,500,100,600,true,true");
+        run_js(&mut h, "log = []; scrollTo(0, 520);");
+        assert_eq!(js_text(&mut h, "log.length"), "0", "no threshold crossed: no entry");
+        run_js(&mut h, "log = []; scrollTo(0, 1200);");
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "far,false,0.00,-200,0,600,true,true");
+        // A layout change moves it back in; takeRecords, unobserve, disconnect.
+        run_js(&mut h, "log = []; far.style.marginTop = '1300px';");
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "far,true,1.00,100,100,600,true,true");
+        assert_eq!(run_js(&mut h, "log = []; io.unobserve(far); far.style.marginTop = '5000px'; io.takeRecords().length"), "0");
+        assert_eq!(js_text(&mut h, "log.length"), "0");
+        // A root margin grows the root; an element root clips to its own box, and a scroller in between clips too.
+        run_js(&mut h, "scrollTo(0, 0); far.style.marginTop = '700px'; log = []; \
+             var wide = new IntersectionObserver(l => log.push('wide ' + l.map(show).join(' ')), {rootMargin: '0px 0px 150px 0px'}); wide.observe(far); \
+             var inbox = new IntersectionObserver(l => log.push('inbox ' + l.map(show).join(' ')), {root: box}); inbox.observe(inner); inbox.observe(far); \
+             var page = new IntersectionObserver(l => log.push('page ' + l.map(show).join(' '))); page.observe(inner);");
+        assert_eq!(
+            js_text(&mut h, "log.join(' | ')"),
+            "wide far,true,0.50,700,50,750,true,true | inbox inner,false,0.00,1700,0,200,true,true far,false,0.00,0,0,200,true,true | page inner,false,0.00,1700,0,600,true,true"
+        );
+        // The box scrolls its content into its own view, still below the page's: only the observer rooted at the box sees it.
+        run_js(&mut h, "log = []; box.scrollTop = 300;");
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "inbox inner,true,1.00,1450,50,200,true,true");
+        // The page scrolls the box into view: now the page-rooted one does (through the box's clip).
+        run_js(&mut h, "log = []; scrollTo(0, 1000);");
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "wide far,false,0.00,-300,0,750,true,true | page inner,true,1.00,450,50,600,true,true");
+        run_js(&mut h, "log = []; box.scrollTop = 0;");
+        assert_eq!(js_text(&mut h, "log.join(' | ')"), "inbox inner,false,0.00,700,0,200,true,true | page inner,false,0.00,700,0,600,true,true");
+        // Bad arguments.
+        assert_eq!(
+            js_text(&mut h, "var errs = []; for (var f of [() => new IntersectionObserver(1), () => new IntersectionObserver(() => {}, {threshold: 2}), () => new IntersectionObserver(() => {}, {threshold: [0.5, NaN]}), () => new IntersectionObserver(() => {}, {rootMargin: '1em'}), \
+                          () => new IntersectionObserver(() => {}, {rootMargin: '1px 2px 3px 4px 5px'}), () => new IntersectionObserver(() => {}, {root: document.createTextNode('x')}), () => io.observe(document), () => io.observe(null)]) \
+                          { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } errs.join(',') + ' ' + new IntersectionObserver(() => {}, {rootMargin: '10px 5%', root: document}).rootMargin"),
+            "TypeError,RangeError,TypeError,SyntaxError,SyntaxError,TypeError,TypeError,TypeError 10px 5% 10px 5%"
+        );
+        assert_eq!(console_texts(&h), Vec::<String>::new());
+    }
+
+    /// A `MutationObserver` made while the page parses hears of what the
+    /// parser adds after it, at the next microtask checkpoint.
+    #[test]
+    fn mutation_observers_see_the_parser_at_work() {
+        let html = "<!DOCTYPE html><html><head><title>MO</title>\
+             <script>var seen = []; new MutationObserver(list => { for (var r of list) for (var n of r.addedNodes) seen.push((r.target.nodeName + '>' + n.nodeName).toLowerCase()); }).observe(document, {childList: true, subtree: true});</script>\
+             </head><body><div id=a><b>x</b></div><script>var first = seen.slice();</script><p>late</p></body></html>";
+        let mut h = Harness::load(html);
+        assert_eq!(js_text(&mut h, "first.join(' ')"), "html>body body>div div>b b>#text body>script script>#text", "what was parsed before the second script ran, in order");
+        assert_eq!(js_text(&mut h, "seen.slice(first.length).join(' ')"), "body>p p>#text");
+        run_js(&mut h, "seen = []; document.title = 'Changed'; document.body.append(document.createElement('hr'));");
+        assert_eq!(js_text(&mut h, "seen.join(' ')"), "title>#text body>hr");
+        assert_eq!(h.title().as_deref(), Some("Changed"));
     }
 
     /// An image arriving lays the page out again only when a box takes its

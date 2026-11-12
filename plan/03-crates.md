@@ -74,6 +74,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `cookie` | 0.18.2 | Cookie parsing | Jar and policy are ours (`crates/net/src/cookies.rs`) |
 | `httpdate` | 1.0.3 | HTTP date parsing for the cache (`Date`, `Expires`, `Last-Modified`) | Added 2026-09-27 (D14). No dependencies, pure Rust |
 | `http`, `http-body-util`, `bytes` | 1.x, 0.1, 1.x | HTTP types | |
+| `sha2` | 0.10.9 | SHA-256/384/512 for subresource integrity | Direct dep of `tab` since 2026-11-12 (D14, "Working sites first" line 7): `fetch(url, { integrity })` checks the body against its hash before the response is handed over. RustCrypto, pure Rust; already in the tree under `rustls-rustcrypto`, same version, so nothing new is compiled |
 | `adblock` | not added | Filter engine | Phase 4 |
 
 ### Store and shell

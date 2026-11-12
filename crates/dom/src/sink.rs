@@ -177,13 +177,27 @@ impl TreeSink for Sink {
 
     fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<Attribute>) {
         let mut doc = self.doc.borrow_mut();
-        let Some(e) = doc.get_mut(*target).as_element_mut() else {
-            return;
-        };
-        for a in attrs {
-            if !e.attrs.iter().any(|x| x.name == a.name) {
-                e.attrs.push(a);
+        let mut added = Vec::new();
+        {
+            let Some(e) = doc.get_mut(*target).as_element_mut() else {
+                return;
+            };
+            for a in attrs {
+                if !e.attrs.iter().any(|x| x.name == a.name) {
+                    added.push(a.name.clone());
+                    e.attrs.push(a);
+                }
             }
+        }
+        // Each is an attribute appended to an element in the tree: a
+        // record for whoever observes it.
+        for name in added {
+            doc.log_primitive(crate::TreeMutation::Attribute {
+                element: *target,
+                name: name.local.to_string(),
+                namespace: (!name.ns.is_empty()).then(|| name.ns.to_string()),
+                old: None,
+            });
         }
     }
 

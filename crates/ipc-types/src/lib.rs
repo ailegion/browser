@@ -251,6 +251,10 @@ pub enum NetToTab {
     ResponseStart {
         id: RequestId,
         status: u16,
+        /// The status line's reason phrase as the server sent it over
+        /// HTTP/1; empty over HTTP/2 and later, which carry none
+        /// (`Response.statusText`, `XMLHttpRequest.statusText`).
+        status_text: String,
         headers: Vec<(String, String)>,
         final_url: Url,
     },

@@ -293,6 +293,39 @@ pub struct Document {
     /// (`picture_child_moved`, `detach`) or of an attribute
     /// (`note_image_attribute`), for the image algorithms' drivers.
     image_mutations: Vec<NodeId>,
+    /// What changed, while a `MutationObserver` watches (`None`
+    /// otherwise): each mutation with its target's inclusive ancestors at
+    /// the time, target first.
+    mutation_log: Option<Vec<(TreeMutation, Vec<NodeId>)>>,
+    /// Above zero, the insertion and removal primitives do not log: a
+    /// caller that logs the operation's own record is at work.
+    mutations_suppressed: u32,
+}
+
+/// One change to the tree, as a `MutationObserver` is told of it (DOM
+/// §4.3.2, "queue a mutation record").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeMutation {
+    /// Children of `parent` were added and/or removed between `previous`
+    /// and `next`.
+    ChildList {
+        parent: NodeId,
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        previous: Option<NodeId>,
+        next: Option<NodeId>,
+    },
+    /// An attribute was set, changed or removed; `name` is its local
+    /// name, `old` its value before.
+    Attribute {
+        element: NodeId,
+        name: String,
+        namespace: Option<String>,
+        old: Option<String>,
+    },
+    /// The data of a text, comment or processing instruction node was
+    /// replaced; `old` is the data before.
+    CharacterData { node: NodeId, old: String },
 }
 
 impl Default for Document {
@@ -317,7 +350,87 @@ impl Document {
             image_fetches: Vec::new(),
             images_changed: Vec::new(),
             image_mutations: Vec::new(),
+            mutation_log: None,
+            mutations_suppressed: 0,
         }
+    }
+
+    // ----- the mutation log -----
+
+    /// Start or stop logging mutations (a `MutationObserver` came or the
+    /// last one went). Stopping drops what was logged.
+    pub fn observe_mutations(&mut self, on: bool) {
+        match (on, self.mutation_log.is_some()) {
+            (true, false) => self.mutation_log = Some(Vec::new()),
+            (false, true) => self.mutation_log = None,
+            _ => {}
+        }
+    }
+
+    pub fn mutations_observed(&self) -> bool {
+        self.mutation_log.is_some()
+    }
+
+    /// Whether anything was logged that no one has taken yet.
+    pub fn has_logged_mutations(&self) -> bool {
+        self.mutation_log.as_ref().is_some_and(|log| !log.is_empty())
+    }
+
+    /// Keep the insertion and removal primitives from logging until the
+    /// matching `resume_mutations`: the caller logs the record its
+    /// operation makes (`log_mutation`).
+    pub fn suppress_mutations(&mut self) {
+        self.mutations_suppressed += 1;
+    }
+
+    pub fn resume_mutations(&mut self) {
+        self.mutations_suppressed = self.mutations_suppressed.saturating_sub(1);
+    }
+
+    /// Log a mutation (when anyone observes), whatever the suppression.
+    pub fn log_mutation(&mut self, mutation: TreeMutation) {
+        if self.mutation_log.is_none() {
+            return;
+        }
+        let target = match &mutation {
+            TreeMutation::ChildList { parent, .. } => *parent,
+            TreeMutation::Attribute { element, .. } => *element,
+            TreeMutation::CharacterData { node, .. } => *node,
+        };
+        if !self.nodes.contains_key(target) {
+            return;
+        }
+        let path: Vec<NodeId> = std::iter::once(target).chain(self.ancestors(target)).collect();
+        if let Some(log) = &mut self.mutation_log {
+            log.push((mutation, path));
+        }
+    }
+
+    /// Log a mutation unless a caller has suppressed the primitives' own
+    /// records (the parser's direct changes).
+    pub fn log_primitive(&mut self, mutation: TreeMutation) {
+        if self.mutations_suppressed == 0 {
+            self.log_mutation(mutation);
+        }
+    }
+
+    /// What was logged since the last call.
+    pub fn take_mutations(&mut self) -> Vec<(TreeMutation, Vec<NodeId>)> {
+        self.mutation_log.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// A primitive's own record, unless a caller logs for it.
+    fn log_child_list(&mut self, parent: NodeId, added: Option<NodeId>, removed: Option<NodeId>, previous: Option<NodeId>, next: Option<NodeId>) {
+        if self.mutation_log.is_none() || self.mutations_suppressed > 0 {
+            return;
+        }
+        self.log_mutation(TreeMutation::ChildList {
+            parent,
+            added: added.into_iter().collect(),
+            removed: removed.into_iter().collect(),
+            previous,
+            next,
+        });
     }
 
     /// The image state of an `<img>` element, once it has run "update the
@@ -739,6 +852,7 @@ impl Document {
         }
         self.nodes[parent].last_child = Some(child);
         self.picture_child_moved(child, parent);
+        self.log_child_list(parent, Some(child), None, last, None);
     }
 
     /// An `<img>` or `<source>` placed in or taken out of a `<picture>`:
@@ -836,6 +950,7 @@ impl Document {
             None => self.nodes[parent].first_child = Some(new),
         }
         self.picture_child_moved(new, parent);
+        self.log_child_list(parent, Some(new), None, prev, Some(sibling));
     }
 
     /// Detach `id` from its parent. The node stays in the arena.
@@ -849,6 +964,7 @@ impl Document {
             (n.parent, n.prev_sibling, n.next_sibling)
         };
         let Some(parent) = parent else { return };
+        self.log_child_list(parent, None, Some(id), prev, next);
         match prev {
             Some(prev) => self.nodes[prev].next_sibling = next,
             None => self.nodes[parent].first_child = next,
@@ -882,12 +998,36 @@ impl Document {
     /// Replace every child of `id` with one text node holding `text`
     /// (an empty text leaves no children).
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
-        while let Some(c) = self.nodes[id].first_child {
-            self.remove_subtree(c);
+        // Observed, this is the DOM's "string replace all": one record
+        // with every child removed and the text node added, and the
+        // removed children stay in the arena for whoever reads the record.
+        // A caller that suppressed the log (the tab keeping a control's
+        // value in its children) gets no record.
+        let observed = self.mutation_log.is_some() && self.mutations_suppressed == 0;
+        let removed: Vec<NodeId> = self.children(id).collect();
+        self.suppress_mutations();
+        for &c in &removed {
+            if observed {
+                self.detach(c);
+            } else {
+                self.remove_subtree(c);
+            }
         }
+        let mut added = Vec::new();
         if !text.is_empty() {
             let t = self.create_text(text);
             self.append_child(id, t);
+            added.push(t);
+        }
+        self.resume_mutations();
+        if observed && (!added.is_empty() || !removed.is_empty()) {
+            self.log_mutation(TreeMutation::ChildList {
+                parent: id,
+                added,
+                removed,
+                previous: None,
+                next: None,
+            });
         }
     }
 

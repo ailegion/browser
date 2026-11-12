@@ -26,7 +26,7 @@ use browser_ipc_types::{
     Cursor as PageCursor, Key as PageKey, MouseButton as PageButton, ShellToTab, TabId, TabToShell, Viewport,
 };
 use browser_net::NetService;
-use browser_tab::{TabHandle, TabOutput, spawn_tab};
+use browser_tab::{TabHandle, TabOutput, WebStorage, spawn_tab};
 use url::Url;
 use vello::kurbo::{Affine, Rect, RoundedRect};
 use vello::peniko::{Color, Fill};
@@ -131,6 +131,8 @@ struct App {
     context: RenderContext,
     proxy: EventLoopProxy<UserEvent>,
     net: Option<Arc<NetService>>,
+    /// The browser's local storage (`localStorage`), shared by every tab.
+    storage: Arc<WebStorage>,
     active: Option<Active>,
     /// The toolbar above the page.
     chrome: Chrome,
@@ -167,6 +169,7 @@ impl App {
             context: RenderContext::new(),
             proxy,
             net: None,
+            storage: Arc::new(WebStorage::new()),
             active: None,
             chrome: Chrome::new(),
             clipboard: None,
@@ -379,7 +382,7 @@ impl App {
         });
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
-        let handle = spawn_tab(id, net, viewport, sink);
+        let handle = spawn_tab(id, net, self.storage.clone(), viewport, sink);
         handle.send(ShellToTab::Navigate { url });
         self.tabs.push(Tab {
             handle,

@@ -110,16 +110,56 @@ pub struct UiEventInit {
     pub media_matches: bool,
 }
 
-#[derive(Clone)]
-struct Listener {
+#[derive(Clone, Trace, Finalize)]
+pub(crate) struct Listener {
+    #[unsafe_ignore_trace]
     kind: String,
     callback: JsObject,
+    #[unsafe_ignore_trace]
     capture: bool,
+    #[unsafe_ignore_trace]
     once: bool,
+    #[unsafe_ignore_trace]
     passive: bool,
     /// The slot of an `on<type>` handler: replaced in place when the
     /// property is set again, and its `return false` cancels.
+    #[unsafe_ignore_trace]
     handler: bool,
+}
+
+/// Run `f` on the listener list of a target: the object's own for one
+/// that keeps its listeners with it (an `XMLHttpRequest`, its upload
+/// object: the collector traces them there, so the object and its
+/// handlers go together), else the document's table. `f` must not run
+/// script.
+fn with_listeners<R>(
+    target: EventTargetRef,
+    object: Option<&JsObject>,
+    context: &mut Context,
+    f: impl FnOnce(&mut Vec<Listener>) -> R,
+) -> JsResult<R> {
+    if let Some(object) = object {
+        if let Some(mut own) = object.downcast_mut::<crate::xhr::XhrData>() {
+            return Ok(f(&mut own.listeners));
+        }
+        if let Some(mut own) = object.downcast_mut::<crate::xhr::UploadData>() {
+            return Ok(f(&mut own.listeners));
+        }
+    }
+    let shared = dom(context)?;
+    let mut dom = shared.borrow_mut();
+    match dom.events.listeners.get_mut(&target) {
+        Some(list) => Ok(f(list)),
+        // No entry is made for a target nobody listens on.
+        None => {
+            let mut fresh = Vec::new();
+            let result = f(&mut fresh);
+            if !fresh.is_empty() {
+                dom.events.listeners.insert(target, fresh);
+            }
+            Ok(result)
+        }
+    }
 }
 
 /// Listener storage and what dispatch needs besides the document.
@@ -1189,6 +1229,7 @@ const HANDLER_NAMES: &[&str] = &[
     "oncompositionstart",
     "oncompositionupdate",
     "oncompositionend",
+    "onstorage",
 ];
 
 /// The handlers a `body` element forwards to `window`: `<body
@@ -1203,6 +1244,7 @@ const WINDOW_FORWARDED: &[&str] = &[
     "scroll",
     "hashchange",
     "popstate",
+    "storage",
     "unload",
     "beforeunload",
     "pagehide",
@@ -1292,6 +1334,12 @@ fn this_target(this: &JsValue, context: &mut Context) -> JsResult<EventTargetRef
     if let Some(plain) = o.downcast_ref::<PlainTarget>() {
         return Ok(EventTargetRef::Plain(plain.id));
     }
+    if let Some(xhr) = o.downcast_ref::<crate::xhr::XhrData>() {
+        return Ok(EventTargetRef::Plain(xhr.id));
+    }
+    if let Some(upload) = o.downcast_ref::<crate::xhr::UploadData>() {
+        return Ok(EventTargetRef::Plain(upload.id));
+    }
     Err(illegal_invocation())
 }
 
@@ -1358,20 +1406,19 @@ fn add_event_listener(this: &JsValue, args: &[JsValue], context: &mut Context) -
         return Ok(JsValue::undefined());
     };
     let (capture, once, passive) = listener_options(args.get_or_undefined(2), context)?;
-    let shared = dom(context)?;
-    let mut dom = shared.borrow_mut();
-    let list = dom.events.listeners.entry(target).or_default();
-    if list.iter().any(|l| l.kind == kind && l.callback == callback && l.capture == capture && !l.handler) {
-        return Ok(JsValue::undefined());
-    }
-    list.push(Listener {
-        kind,
-        callback,
-        capture,
-        once,
-        passive,
-        handler: false,
-    });
+    with_listeners(target, this.as_object().as_ref(), context, |list| {
+        if list.iter().any(|l| l.kind == kind && l.callback == callback && l.capture == capture && !l.handler) {
+            return;
+        }
+        list.push(Listener {
+            kind,
+            callback,
+            capture,
+            once,
+            passive,
+            handler: false,
+        });
+    })?;
     Ok(JsValue::undefined())
 }
 
@@ -1382,11 +1429,9 @@ fn remove_event_listener(this: &JsValue, args: &[JsValue], context: &mut Context
         return Ok(JsValue::undefined());
     };
     let (capture, _, _) = listener_options(args.get_or_undefined(2), context)?;
-    let shared = dom(context)?;
-    let mut dom = shared.borrow_mut();
-    if let Some(list) = dom.events.listeners.get_mut(&target) {
+    with_listeners(target, this.as_object().as_ref(), context, |list| {
         list.retain(|l| !(l.kind == kind && l.callback == callback && l.capture == capture && !l.handler));
-    }
+    })?;
     Ok(JsValue::undefined())
 }
 
@@ -1492,20 +1537,12 @@ fn invoke(
     context: &mut Context,
 ) -> JsResult<()> {
     ensure_attribute_handler(target, kind, context)?;
-    let listeners: Vec<Listener> = {
-        let shared = dom(context)?;
-        let dom = shared.borrow();
-        dom.events
-            .listeners
-            .get(&target)
-            .map(|list| {
-                list.iter()
-                    .filter(|l| l.kind == kind && (phase == AT_TARGET || l.capture == (phase == CAPTURING_PHASE)))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let listeners: Vec<Listener> = with_listeners(target, Some(object), context, |list| {
+        list.iter()
+            .filter(|l| l.kind == kind && (phase == AT_TARGET || l.capture == (phase == CAPTURING_PHASE)))
+            .cloned()
+            .collect()
+    })?;
     if listeners.is_empty() {
         return Ok(());
     }
@@ -1515,20 +1552,21 @@ fn invoke(
         data.flags.phase = phase;
     }
     for listener in listeners {
-        {
-            let shared = dom(context)?;
-            let mut dom = shared.borrow_mut();
-            let Some(list) = dom.events.listeners.get_mut(&target) else { break };
-            // Removed by an earlier listener of this dispatch: skip it.
+        // Removed by an earlier listener of this dispatch: skip it.
+        let still_there = with_listeners(target, Some(object), context, |list| {
             let Some(at) = list
                 .iter()
                 .position(|l| l.callback == listener.callback && l.capture == listener.capture && l.kind == listener.kind)
             else {
-                continue;
+                return false;
             };
             if listener.once {
                 list.remove(at);
             }
+            true
+        })?;
+        if !still_there {
+            continue;
         }
         if event
             .downcast_ref::<EventData>()
@@ -1586,7 +1624,38 @@ fn handler_kind(index: u8) -> &'static str {
 
 /// `on<type>` handlers only some objects have (not `Element`, `Document`
 /// or `window`): indexed after `HANDLER_NAMES`.
-const OWN_HANDLER_NAMES: &[&str] = &["onloading", "onloadingdone", "onloadingerror"];
+const OWN_HANDLER_NAMES: &[&str] = &[
+    "onloading",
+    "onloadingdone",
+    "onloadingerror",
+    // `XMLHttpRequestEventTarget`'s that are not among `HANDLER_NAMES`.
+    "onloadstart",
+    "onprogress",
+    "ontimeout",
+    "onloadend",
+];
+
+/// Put the `on<type>` accessors named on a class's prototype
+/// (`XMLHttpRequestEventTarget`, `XMLHttpRequest`); the names must be
+/// among `HANDLER_NAMES` or `OWN_HANDLER_NAMES`.
+pub(crate) fn add_named_handler_attributes(class: &mut ClassBuilder<'_>, names: &[&str]) {
+    for name in names {
+        let Some(index) = HANDLER_NAMES.iter().chain(OWN_HANDLER_NAMES).position(|n| n == name) else {
+            continue;
+        };
+        let get = getter(
+            class.context(),
+            name,
+            NativeFunction::from_copy_closure_with_captures(handler_get, index as u8),
+        );
+        let set = setter(
+            class.context(),
+            name,
+            NativeFunction::from_copy_closure_with_captures(handler_set, index as u8),
+        );
+        class.accessor(JsString::from(*name), Some(get), Some(set), ATTR);
+    }
+}
 
 /// `on<type>="code"` on an element: compile it (once per source text)
 /// and make it the target's handler listener, unless the property was
@@ -1622,7 +1691,7 @@ fn ensure_attribute_handler(target: EventTargetRef, kind: &str, context: &mut Co
     match action {
         Action::Keep => {}
         Action::Clear => {
-            set_handler(target, kind, None, context)?;
+            set_handler(target, None, kind, None, context)?;
             dom(context)?.borrow_mut().events.attr_handlers.remove(&key);
         }
         Action::Compile(source) => {
@@ -1636,10 +1705,10 @@ fn ensure_attribute_handler(target: EventTargetRef, kind: &str, context: &mut Co
                 },
             );
             match function {
-                Ok(function) => set_handler(target, kind, Some(function), context)?,
+                Ok(function) => set_handler(target, None, kind, Some(function), context)?,
                 Err(err) => {
                     // A syntax error leaves no handler, as in browsers.
-                    set_handler(target, kind, None, context)?;
+                    set_handler(target, None, kind, None, context)?;
                     shared.borrow_mut().events.errors.push(format!("Uncaught {err}"));
                 }
             }
@@ -1661,41 +1730,42 @@ fn compile_handler(code: &str, context: &mut Context) -> JsResult<JsObject> {
 }
 
 /// Set, replace or clear the handler listener of `target` for `kind`.
-fn set_handler(target: EventTargetRef, kind: &str, callback: Option<JsObject>, context: &mut Context) -> JsResult<()> {
-    let shared = dom(context)?;
-    let mut dom = shared.borrow_mut();
-    let list = dom.events.listeners.entry(target).or_default();
-    let at = list.iter().position(|l| l.handler && l.kind == kind);
-    match (at, callback) {
-        (Some(at), Some(callback)) => list[at].callback = callback,
-        (Some(at), None) => {
-            list.remove(at);
+fn set_handler(
+    target: EventTargetRef,
+    object: Option<&JsObject>,
+    kind: &str,
+    callback: Option<JsObject>,
+    context: &mut Context,
+) -> JsResult<()> {
+    with_listeners(target, object, context, |list| {
+        let at = list.iter().position(|l| l.handler && l.kind == kind);
+        match (at, callback) {
+            (Some(at), Some(callback)) => list[at].callback = callback,
+            (Some(at), None) => {
+                list.remove(at);
+            }
+            (None, Some(callback)) => list.push(Listener {
+                kind: kind.to_owned(),
+                callback,
+                capture: false,
+                once: false,
+                passive: false,
+                handler: true,
+            }),
+            (None, None) => {}
         }
-        (None, Some(callback)) => list.push(Listener {
-            kind: kind.to_owned(),
-            callback,
-            capture: false,
-            once: false,
-            passive: false,
-            handler: true,
-        }),
-        (None, None) => {}
-    }
-    Ok(())
+    })
 }
 
 fn handler_get(this: &JsValue, _: &[JsValue], index: &u8, context: &mut Context) -> JsResult<JsValue> {
     let kind = handler_kind(*index);
     let target = forward_body(this_target(this, context)?, kind, context)?;
     ensure_attribute_handler(target, kind, context)?;
-    let shared = dom(context)?;
-    let dom = shared.borrow();
-    Ok(dom
-        .events
-        .listeners
-        .get(&target)
-        .and_then(|l| l.iter().find(|l| l.handler && l.kind == kind))
-        .map_or(JsValue::null(), |l| l.callback.clone().into()))
+    with_listeners(target, this.as_object().as_ref(), context, |list| {
+        list.iter()
+            .find(|l| l.handler && l.kind == kind)
+            .map_or(JsValue::null(), |l| l.callback.clone().into())
+    })
 }
 
 fn handler_set(this: &JsValue, args: &[JsValue], index: &u8, context: &mut Context) -> JsResult<JsValue> {
@@ -1721,7 +1791,7 @@ fn handler_set(this: &JsValue, args: &[JsValue], index: &u8, context: &mut Conte
             },
         );
     }
-    set_handler(target, kind, callback, context)?;
+    set_handler(target, this.as_object().as_ref(), kind, callback, context)?;
     Ok(JsValue::undefined())
 }
 

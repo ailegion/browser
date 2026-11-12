@@ -34,7 +34,7 @@ use boa_engine::{
     Context, JsArgs, JsData, JsNativeError, JsObject, JsResult, JsString, JsValue, NativeFunction, js_string,
 };
 use boa_gc::{Finalize, Trace};
-use browser_dom::{Document, NodeId, NodeKind};
+use browser_dom::{Document, NodeId, NodeKind, TreeMutation};
 use browser_style::ElementStates;
 use browser_style::selector_impl::{Selectors, element_matches, parse_selector_list, query_selector};
 
@@ -100,6 +100,11 @@ pub(crate) struct Dom {
     /// The window's named objects by name, as of a generation: built once
     /// after a change, so a global lookup that misses costs no tree walk.
     named: Option<(u64, HashMap<String, Vec<NodeId>>)>,
+    /// Subtrees a script removed while a `MutationObserver` watched: kept
+    /// in the arena until their records are made (a record names its
+    /// removed nodes), then freed unless a wrapper holds them
+    /// (`free_unreferenced`).
+    pending_free: Vec<NodeId>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -253,6 +258,10 @@ impl Dom {
     /// stays, detached, as a browser keeps a node a reference points at.
     fn discard(&mut self, id: NodeId) {
         self.doc.detach(id);
+        if self.doc.mutations_observed() {
+            self.pending_free.push(id);
+            return;
+        }
         if self.parsing || self.wrappers.contains_key(&id) {
             return;
         }
@@ -261,6 +270,70 @@ impl Dom {
         }
         self.doc.remove_subtree(id);
     }
+
+    /// Free the removed subtrees no record's reader holds (see
+    /// `pending_free`); one that was put back in a tree stays.
+    pub(crate) fn free_unreferenced(&mut self) {
+        for id in std::mem::take(&mut self.pending_free) {
+            if !self.doc.contains(id) || self.doc.parent(id).is_some() {
+                continue;
+            }
+            if self.parsing || self.wrappers.contains_key(&id) {
+                continue;
+            }
+            if self.doc.descendants(id).any(|d| self.wrappers.contains_key(&d)) {
+                continue;
+            }
+            // Freed without a record: nobody observes a detached subtree
+            // nothing refers to.
+            self.doc.suppress_mutations();
+            self.doc.remove_subtree(id);
+            self.doc.resume_mutations();
+        }
+    }
+
+    /// An attribute of `element` was set, changed or removed (connected
+    /// or not): the record a `MutationObserver` gets. `name` is the local
+    /// name.
+    pub(crate) fn record_attr(&mut self, element: NodeId, name: &str, namespace: Option<&str>, old: Option<String>) {
+        if self.doc.mutations_observed() {
+            self.doc.log_mutation(browser_dom::TreeMutation::Attribute {
+                element,
+                name: name.to_owned(),
+                namespace: namespace.map(str::to_owned),
+                old,
+            });
+        }
+    }
+}
+
+/// The node a value is the wrapper of, if it is one and the node exists
+/// (the document node for `document`).
+pub(crate) fn node_id_of(value: &JsValue, context: &mut Context) -> JsResult<Option<NodeId>> {
+    let Some(node) = value.as_object().and_then(|o| o.downcast_ref::<DomNode>().map(|d| d.clone())) else {
+        return Ok(None);
+    };
+    let shared = dom(context)?;
+    let dom = shared.borrow();
+    Ok(node.resolve(&dom.doc))
+}
+
+/// A static `NodeList` of these nodes.
+pub(crate) fn static_node_list(ids: Vec<NodeId>, context: &mut Context) -> JsResult<JsValue> {
+    collection_proxy(CollectionKind::Static(ids), context)
+}
+
+/// `XMLHttpRequest.send(document)`: the document's serialization and
+/// whether it is an HTML document; `None` when the object is not the
+/// document.
+pub(crate) fn serialize_document_argument(object: &JsObject, context: &mut Context) -> Option<(String, bool)> {
+    let is_document = object.downcast_ref::<DomNode>().is_some_and(|d| d.id.is_none());
+    if !is_document {
+        return None;
+    }
+    let shared = dom(context).ok()?;
+    let dom = shared.borrow();
+    Some((dom.doc.serialize_html(dom.doc.root(), false), true))
 }
 
 /// `HTMLImageElement.currentSrc`: the current request's current URL
@@ -1342,13 +1415,34 @@ fn set_data(doc: &mut Document, id: NodeId, text: String) {
 /// Replace every child of `id` with one text node (none for empty text).
 fn replace_children_with_text(dom: &mut Dom, id: NodeId, text: &str) {
     let children: Vec<NodeId> = dom.doc.children(id).collect();
-    for c in children {
+    // The DOM's "replace all": one record for the whole exchange.
+    dom.doc.suppress_mutations();
+    for &c in &children {
         dom.discard(c);
     }
+    let mut added = Vec::new();
     if !text.is_empty() {
         let t = dom.doc.create_text(text);
         dom.doc.append_child(id, t);
+        added.push(t);
     }
+    dom.doc.resume_mutations();
+    log_replace_all(&mut dom.doc, id, added, children);
+}
+
+/// The record of a "replace all": every old child removed, the new ones
+/// added; none when both lists are empty.
+fn log_replace_all(doc: &mut Document, parent: NodeId, added: Vec<NodeId>, removed: Vec<NodeId>) {
+    if !doc.mutations_observed() || (added.is_empty() && removed.is_empty()) {
+        return;
+    }
+    doc.log_mutation(TreeMutation::ChildList {
+        parent,
+        added,
+        removed,
+        previous: None,
+        next: None,
+    });
 }
 
 /// An attribute name a script may set: not empty, no whitespace or
@@ -1389,12 +1483,18 @@ fn replace_children_with_html(dom: &mut Dom, id: NodeId, html: &str) {
         .and_then(|e| e.template_contents)
         .unwrap_or(id);
     let children: Vec<NodeId> = dom.doc.children(target).collect();
-    for c in children {
+    // One "replace all": the parser's own insertions (of detached nodes)
+    // and the exchange make a single record.
+    dom.doc.suppress_mutations();
+    for &c in &children {
         dom.discard(c);
     }
-    for n in dom.doc.parse_fragment(id, html) {
+    let nodes = dom.doc.parse_fragment(id, html);
+    for &n in &nodes {
         dom.doc.append_child(target, n);
     }
+    dom.doc.resume_mutations();
+    log_replace_all(&mut dom.doc, target, nodes, children);
 }
 
 fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) -> JsResult<JsValue> {
@@ -1402,6 +1502,7 @@ fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) 
     // `innerHTML` may have made `<img>` elements; `textContent` may have
     // taken some out of a `<picture>`.
     flush_images(context);
+    crate::observers::drain(context);
     result
 }
 
@@ -1448,14 +1549,26 @@ fn set_prop(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Cont
         }
         SetProp::InnerHtml => return Ok(JsValue::undefined()),
         SetProp::TextContent | SetProp::NodeValue | SetProp::Data => {
+            // The DOM's "replace data": a record with the data before.
+            let old = match &dom.doc.get(id).kind {
+                NodeKind::Text(t) | NodeKind::Comment(t) | NodeKind::ProcessingInstruction { data: t, .. } => Some(t.clone()),
+                _ => None,
+            };
+            if let Some(old) = old
+                && dom.doc.mutations_observed()
+            {
+                dom.doc.log_mutation(TreeMutation::CharacterData { node: id, old });
+            }
             set_data(&mut dom.doc, id, text);
             children_change = dom.doc.parent(id).map(|p| (p, Vec::new()));
         }
         SetProp::Id | SetProp::ClassName => {
             let name = if matches!(prop, SetProp::Id) { "id" } else { "class" };
             if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
-                attr_change = Some((name, e.attr(name).map(str::to_owned)));
+                let old = e.attr(name).map(str::to_owned);
+                attr_change = Some((name, old.clone()));
                 e.set_attr(name, &text);
+                dom.record_attr(id, name, None, old);
             }
         }
     }
@@ -1600,18 +1713,203 @@ fn insert_node(doc: &mut Document, parent: NodeId, child: NodeId, reference: Opt
     for n in &nodes {
         check_insert(doc, parent, *n, reference)?;
     }
-    for n in nodes {
-        connected |= doc.is_connected(n);
-        if reference == Some(n) {
-            reference = doc.next_sibling(n);
+    if matches!(doc.get(child).kind, NodeKind::DocumentFragment) {
+        take_fragment_children(doc, child, &nodes);
+    } else {
+        for &n in &nodes {
+            connected |= doc.is_connected(n);
+            if reference == Some(n) {
+                reference = doc.next_sibling(n);
+            }
+            // Leaving its old parent is a record of its own.
+            doc.detach(n);
         }
+    }
+    place(doc, parent, &nodes, reference);
+    Ok(connected)
+}
+
+/// A fragment's children leave it for an insertion: one record for the
+/// fragment (DOM "insert", step 4).
+fn take_fragment_children(doc: &mut Document, fragment: NodeId, children: &[NodeId]) {
+    doc.suppress_mutations();
+    for &n in children {
         doc.detach(n);
+    }
+    doc.resume_mutations();
+    if !children.is_empty() && doc.mutations_observed() {
+        doc.log_mutation(TreeMutation::ChildList {
+            parent: fragment,
+            added: Vec::new(),
+            removed: children.to_vec(),
+            previous: None,
+            next: None,
+        });
+    }
+}
+
+/// Put the detached `nodes` under `parent` before `reference` (at the end
+/// without one), as the one record an insertion makes.
+fn place(doc: &mut Document, parent: NodeId, nodes: &[NodeId], reference: Option<NodeId>) {
+    if nodes.is_empty() {
+        return;
+    }
+    let previous = match reference {
+        Some(r) => doc.prev_sibling(r),
+        None => doc.last_child(parent),
+    };
+    insert_quietly(doc, parent, nodes, reference);
+    if doc.mutations_observed() {
+        doc.log_mutation(TreeMutation::ChildList {
+            parent,
+            added: nodes.to_vec(),
+            removed: Vec::new(),
+            previous,
+            next: reference,
+        });
+    }
+}
+
+/// Insert detached nodes without a record of their own (the caller logs
+/// its operation's).
+fn insert_quietly(doc: &mut Document, parent: NodeId, nodes: &[NodeId], reference: Option<NodeId>) {
+    doc.suppress_mutations();
+    for &n in nodes {
         match reference {
             Some(r) => doc.insert_before(r, n),
             None => doc.append_child(parent, n),
         }
     }
+    doc.resume_mutations();
+}
+
+/// The DOM's "replace": `nodes` take the place of `old` under `parent`,
+/// before `reference` (the sibling after `old` that is not one of them).
+/// One record names `old` removed and the nodes added; a node that comes
+/// from elsewhere leaves a record there. Returns whether a connected node
+/// moved.
+fn replace_node(doc: &mut Document, parent: NodeId, old: NodeId, nodes: &[NodeId], reference: Option<NodeId>) -> Result<bool, Fail> {
+    for &n in nodes {
+        check_insert(doc, parent, n, reference)?;
+        for c in nodes_to_insert(doc, n) {
+            check_insert(doc, parent, c, reference)?;
+        }
+    }
+    let mut reference = reference;
+    let single = match nodes {
+        [one] if !matches!(doc.get(*one).kind, NodeKind::DocumentFragment) => Some(*one),
+        _ => None,
+    };
+    let (flat, connected, previous, removed) = match single {
+        // One node: `old` goes first, then the node is adopted.
+        Some(one) => {
+            let previous = doc.prev_sibling(old);
+            doc.suppress_mutations();
+            doc.detach(old);
+            doc.resume_mutations();
+            let connected = doc.is_connected(one);
+            doc.detach(one);
+            (vec![one], connected, previous, vec![old])
+        }
+        // Several: they are gathered first (`old` may be among them).
+        None => {
+            let (flat, connected) = gather(doc, nodes, &mut reference);
+            if doc.parent(old) != Some(parent) {
+                place(doc, parent, &flat, reference);
+                return Ok(connected);
+            }
+            let previous = doc.prev_sibling(old);
+            doc.suppress_mutations();
+            doc.detach(old);
+            doc.resume_mutations();
+            (flat, connected, previous, vec![old])
+        }
+    };
+    insert_quietly(doc, parent, &flat, reference);
+    if doc.mutations_observed() {
+        doc.log_mutation(TreeMutation::ChildList {
+            parent,
+            added: flat,
+            removed,
+            previous,
+            next: reference,
+        });
+    }
     Ok(connected)
+}
+
+/// `normalize()` while a `MutationObserver` watches, as the DOM words it:
+/// each text node takes the data of the text nodes that follow it (a
+/// record of its data before), which are then removed (a record each);
+/// empty ones are removed. Template contents are covered as
+/// `Document::normalize` covers them.
+fn normalize_observed(dom: &mut Dom, id: NodeId) {
+    let mut roots = vec![id];
+    while let Some(root) = roots.pop() {
+        let nodes: Vec<NodeId> = dom.doc.descendants(root).collect();
+        for n in nodes {
+            if !dom.doc.contains(n) {
+                continue;
+            }
+            if let Some(contents) = dom.doc.element(n).and_then(|e| e.template_contents) {
+                roots.push(contents);
+                continue;
+            }
+            // Removed by an earlier merge.
+            if dom.doc.parent(n).is_none() {
+                continue;
+            }
+            let Some(data) = dom.doc.get(n).as_text().map(str::to_owned) else { continue };
+            if data.is_empty() {
+                dom.discard(n);
+                continue;
+            }
+            let mut following = Vec::new();
+            let mut more = String::new();
+            let mut next = dom.doc.next_sibling(n);
+            while let Some(s) = next {
+                let Some(text) = dom.doc.get(s).as_text() else { break };
+                more.push_str(text);
+                following.push(s);
+                next = dom.doc.next_sibling(s);
+            }
+            if following.is_empty() {
+                continue;
+            }
+            dom.doc.log_mutation(TreeMutation::CharacterData { node: n, old: data.clone() });
+            set_data(&mut dom.doc, n, data + &more);
+            for s in following {
+                dom.discard(s);
+            }
+        }
+    }
+}
+
+/// Take `nodes` out of where they are, as the DOM's "convert nodes into a
+/// node" does when it gathers several in a fragment: each leaves its
+/// parent (a record there), a fragment gives up its children (one record
+/// for it). Returns them flattened in order, a node named twice at its
+/// last place, and whether any was connected; `reference` moves past a
+/// node that was it.
+fn gather(doc: &mut Document, nodes: &[NodeId], reference: &mut Option<NodeId>) -> (Vec<NodeId>, bool) {
+    let mut flat: Vec<NodeId> = Vec::new();
+    let mut connected = false;
+    for &n in nodes {
+        if matches!(doc.get(n).kind, NodeKind::DocumentFragment) {
+            let children: Vec<NodeId> = doc.children(n).collect();
+            take_fragment_children(doc, n, &children);
+            flat.extend(children);
+        } else {
+            connected |= doc.is_connected(n);
+            if *reference == Some(n) {
+                *reference = doc.next_sibling(n);
+            }
+            doc.detach(n);
+            flat.retain(|x| *x != n);
+            flat.push(n);
+        }
+    }
+    (flat, connected)
 }
 
 /// Turn node-or-string arguments into nodes (strings become text nodes).
@@ -1632,10 +1930,20 @@ fn materialize(doc: &mut Document, items: &[NodeOrText]) -> Result<Vec<NodeId>, 
 /// `prepend`, `before` and `after` do. Returns whether anything
 /// connected changed.
 fn insert_all(doc: &mut Document, parent: NodeId, nodes: &[NodeId], reference: Option<NodeId>) -> Result<bool, Fail> {
-    let mut connected = false;
-    for &n in nodes {
-        connected |= insert_node(doc, parent, n, reference)?;
+    // One node goes in as itself; several as the fragment the DOM gathers
+    // them in: all leave where they were, then one insertion places them.
+    if let [one] = nodes {
+        return insert_node(doc, parent, *one, reference);
     }
+    for &n in nodes {
+        check_insert(doc, parent, n, reference)?;
+        for c in nodes_to_insert(doc, n) {
+            check_insert(doc, parent, c, reference)?;
+        }
+    }
+    let mut reference = reference;
+    let (flat, connected) = gather(doc, nodes, &mut reference);
+    place(doc, parent, &flat, reference);
     Ok(connected)
 }
 
@@ -1730,6 +2038,7 @@ fn mutate_call(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &m
         mutate(&mut dom, node, args, method, &strings, &items, force)
     };
     flush_images(context);
+    crate::observers::drain(context);
     match result {
         Ok(out) => finish(out, context),
         Err(fail) => Err(fail.into_error(context)),
@@ -1790,6 +2099,8 @@ fn mutate(
     // attribute, a forced toggle that keeps the state).
     let mut attr_noop = false;
     let mut attr_namespaced = false;
+    // The attribute's local name and namespace, for the mutation record.
+    let mut attr_record: Option<(String, Option<String>)> = None;
     // The parents whose children changed and what was placed under each;
     // a removed stylesheet makes it a plain tree change.
     let mut tree_changes: Vec<(NodeId, Vec<NodeId>)> = Vec::new();
@@ -1822,8 +2133,7 @@ fn mutate(
             let reference = viable_sibling(&dom.doc, old, &[new], false);
             let placing = placing(&dom.doc, &[new]);
             sheet_removed |= holds_sheet(&dom.doc, &[old]);
-            dom.doc.detach(old);
-            connected |= insert_node(&mut dom.doc, id, new, reference)?;
+            connected |= replace_node(&mut dom.doc, id, old, &[new], reference)?;
             placed(&mut tree_changes, id, placing);
             Out::Node(Some(old))
         }
@@ -1851,7 +2161,11 @@ fn mutate(
             Out::Node(Some(dom.doc.clone_subtree(id, force.unwrap_or(false))))
         }
         Normalize => {
-            dom.doc.normalize(id);
+            if dom.doc.mutations_observed() {
+                normalize_observed(dom, id);
+            } else {
+                dom.doc.normalize(id);
+            }
             Out::Value(JsValue::undefined())
         }
         Append | Prepend => {
@@ -1867,18 +2181,40 @@ fn mutate(
             for n in &nodes {
                 check_insert(&dom.doc, id, *n, None)?;
             }
-            let children: Vec<NodeId> = dom.doc.children(id).collect();
-            let leaving: Vec<NodeId> = children.iter().copied().filter(|c| !nodes.contains(c)).collect();
+            let leaving: Vec<NodeId> = dom.doc.children(id).filter(|c| !nodes.contains(c)).collect();
             sheet_removed |= holds_sheet(&dom.doc, &leaving);
-            for c in children {
-                if !nodes.contains(&c) {
-                    dom.discard(c);
-                } else {
+            let placing = placing(&dom.doc, &nodes);
+            // The DOM's "replace all". Several nodes are gathered first
+            // (each leaves where it was, this parent included); one node
+            // stays put until the old children have gone.
+            let single = match nodes.as_slice() {
+                [one] if !matches!(dom.doc.get(*one).kind, NodeKind::DocumentFragment) => Some(*one),
+                _ => None,
+            };
+            let mut flat = Vec::new();
+            if single.is_none() {
+                let mut no_reference = None;
+                let (gathered, moved) = gather(&mut dom.doc, &nodes, &mut no_reference);
+                flat = gathered;
+                connected |= moved;
+            }
+            let children: Vec<NodeId> = dom.doc.children(id).collect();
+            dom.doc.suppress_mutations();
+            for &c in &children {
+                if single == Some(c) {
                     dom.doc.detach(c);
+                } else {
+                    dom.discard(c);
                 }
             }
-            let placing = placing(&dom.doc, &nodes);
-            connected |= insert_all(&mut dom.doc, id, &nodes, None)?;
+            dom.doc.resume_mutations();
+            if let Some(one) = single {
+                connected |= dom.doc.is_connected(one);
+                dom.doc.detach(one);
+                flat.push(one);
+            }
+            insert_quietly(&mut dom.doc, id, &flat, None);
+            log_replace_all(&mut dom.doc, id, flat, children);
             placed(&mut tree_changes, id, placing);
             Out::Value(JsValue::undefined())
         }
@@ -1895,9 +2231,15 @@ fn mutate(
             let placing = placing(&dom.doc, &nodes);
             if matches!(method, ReplaceWith) {
                 sheet_removed |= !nodes.contains(&id) && holds_sheet(&dom.doc, &[id]);
-                dom.doc.detach(id);
+                if nodes.is_empty() {
+                    // Replaced by nothing: a removal.
+                    dom.doc.detach(id);
+                } else {
+                    connected |= replace_node(&mut dom.doc, parent, id, &nodes, reference)?;
+                }
+            } else {
+                connected |= insert_all(&mut dom.doc, parent, &nodes, reference)?;
             }
-            connected |= insert_all(&mut dom.doc, parent, &nodes, reference)?;
             placed(&mut tree_changes, parent, placing);
             Out::Value(JsValue::undefined())
         }
@@ -1942,6 +2284,7 @@ fn mutate(
             attr_change = Some((local.to_ascii_lowercase(), e.attr_ns(ns, qualified).map(str::to_owned)));
             // Only attributes in no namespace are the image's.
             attr_namespaced = !ns.is_empty();
+            attr_record = Some((local.to_owned(), (!ns.is_empty()).then(|| ns.clone())));
             match method {
                 SetAttributeNs => {
                     let local = qualified.rsplit(':').next().unwrap_or(qualified);
@@ -1970,6 +2313,7 @@ fn mutate(
                 return Err(Fail::Dom("InvalidCharacterError", format!("'{}' is not a valid attribute name", strings[0])));
             }
             attr_change = Some((name.to_ascii_lowercase(), e.attr(&name).map(str::to_owned)));
+            attr_record = Some((name.clone(), None));
             match method {
                 SetAttribute => {
                     e.set_attr(&name, &strings[1]);
@@ -2013,6 +2357,11 @@ fn mutate(
         && !attr_namespaced
     {
         dom.doc.note_image_attribute(id, name);
+    }
+    if let (Some((_, old)), Some((local, namespace))) = (&attr_change, &attr_record)
+        && !attr_noop
+    {
+        dom.record_attr(id, local, namespace.as_deref(), old.clone());
     }
     if connected {
         match attr_change {
@@ -2625,11 +2974,14 @@ fn dataset_set(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
         if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
             let old = e.attr(&attr).map(str::to_owned);
             e.set_attr(&attr, &value);
+            dom.record_attr(id, &attr, None, old.clone());
             if connected {
                 dom.note_attr(id, &attr, old);
             }
         }
     }
+    drop(dom);
+    crate::observers::drain(context);
     Ok(true.into())
 }
 
@@ -2662,11 +3014,14 @@ fn dataset_delete(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         {
             let old = e.attr(&attr).map(str::to_owned);
             e.remove_attr(&attr);
+            dom.record_attr(id, &attr, None, old.clone());
             if connected {
                 dom.note_attr(id, &attr, old);
             }
         }
     }
+    drop(dom);
+    crate::observers::drain(context);
     Ok(true.into())
 }
 
@@ -2810,6 +3165,7 @@ fn token_call(this: &JsValue, args: &[JsValue], method: &TokenMethod, context: &
         let mut dom = shared.borrow_mut();
         token_mutate(&mut dom, list.id, method, index, &strings, force)
     };
+    crate::observers::drain(context);
     result.map_err(|fail| fail.into_error(context))
 }
 
@@ -2906,6 +3262,7 @@ fn token_mutate(
             if let Some(e) = dom.doc.get_mut(id).as_element_mut() {
                 e.set_attr("class", &serialized);
             }
+            dom.record_attr(id, "class", None, old.clone());
             if dom.doc.contains(id) && dom.doc.is_connected(id) {
                 dom.note_attr(id, "class", old.map(|s| s.to_string()));
             }

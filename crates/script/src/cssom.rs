@@ -287,6 +287,7 @@ fn write_inline(target: &JsObject, dom: &mut Dom, decls: Vec<Declaration>) {
     e.set_attr("style", &text);
     *data.cache.borrow_mut() = Some((text, decls));
     dom.generation += 1;
+    dom.record_attr(id, "style", None, old.clone());
     if connected {
         dom.note_attr(id, "style", old);
     }
@@ -592,11 +593,14 @@ fn set_property(target: &JsObject, name: &str, value: &str, priority: &str, cont
         return Ok(());
     };
     let shared = dom(context)?;
-    let mut dom = shared.borrow_mut();
-    let mut decls = inline_declarations(target, &dom);
-    if set_in(&mut decls, values, important) {
-        write_inline(target, &mut dom, decls);
+    {
+        let mut dom = shared.borrow_mut();
+        let mut decls = inline_declarations(target, &dom);
+        if set_in(&mut decls, values, important) {
+            write_inline(target, &mut dom, decls);
+        }
     }
+    crate::observers::drain(context);
     Ok(())
 }
 
@@ -608,12 +612,16 @@ fn remove_property(target: &JsObject, name: &str, context: &mut Context) -> JsRe
     }
     let name = normalize_name(name);
     let shared = dom(context)?;
-    let mut dom = shared.borrow_mut();
-    let mut decls = inline_declarations(target, &dom);
-    let old = value_from(&decls, &name);
-    if remove_from(&mut decls, &name) {
-        write_inline(target, &mut dom, decls);
-    }
+    let old = {
+        let mut dom = shared.borrow_mut();
+        let mut decls = inline_declarations(target, &dom);
+        let old = value_from(&decls, &name);
+        if remove_from(&mut decls, &name) {
+            write_inline(target, &mut dom, decls);
+        }
+        old
+    };
+    crate::observers::drain(context);
     Ok(old)
 }
 
@@ -651,8 +659,11 @@ fn member_set(this: &JsValue, args: &[JsValue], member: &Member, context: &mut C
             }
             let decls = parse_cssom_block(&text);
             let shared = dom(context)?;
-            let mut dom = shared.borrow_mut();
-            write_inline(&target, &mut dom, decls);
+            {
+                let mut dom = shared.borrow_mut();
+                write_inline(&target, &mut dom, decls);
+            }
+            crate::observers::drain(context);
         }
         _ => {}
     }

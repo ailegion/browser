@@ -323,6 +323,12 @@ impl TabState {
     /// and the like may move it). True when the offset changed.
     pub(super) fn set_scroll(&mut self, target: ScrollTarget, want: (f32, f32), user: bool) -> bool {
         let Some(tree) = self.layout.as_mut() else { return false };
+        // Whether the scroll moves boxes in the tree: a scroller's
+        // content does; the page's only moves its sticky boxes.
+        let moves_boxes = match target {
+            ScrollTarget::Page => tree.has_sticky,
+            ScrollTarget::Element(_) => true,
+        };
         let changed = match target {
             ScrollTarget::Page => {
                 let info = &tree.viewport;
@@ -351,6 +357,9 @@ impl TabState {
         if changed {
             self.needs_paint = true;
             self.hover_dirty = true;
+            // Boxes moved in the tree: what scripts read of it is found
+            // again.
+            self.view_rects_stale |= moves_boxes;
             if !self.pending_scroll_targets.contains(&target) {
                 self.pending_scroll_targets.push(target);
             }

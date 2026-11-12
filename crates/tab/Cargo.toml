@@ -22,6 +22,8 @@ browser-script.workspace = true
 browser-platform.workspace = true
 vello.workspace = true
 url.workspace = true
+# Subresource integrity of script fetches.
+sha2.workspace = true
 html5ever.workspace = true
 tracing.workspace = true
 

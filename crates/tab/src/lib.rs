@@ -11,6 +11,10 @@
 #![forbid(unsafe_code)]
 
 mod document;
+mod scriptnet;
+mod storage;
+
+pub use storage::{SessionStorage, StorageChange, TabStores, WebStorage};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -47,6 +51,8 @@ pub type OutputSink = Box<dyn Fn(TabId, TabOutput) + Send>;
 enum TabEvent {
     Shell(ShellToTab),
     Net(NetToTab),
+    /// Another tab changed the local storage of an origin.
+    Storage(StorageChange),
 }
 
 /// Shell-side handle to a tab thread.
@@ -101,14 +107,15 @@ impl Drop for TabHandle {
     }
 }
 
-/// Start a tab thread.
-pub fn spawn_tab(id: TabId, net: Arc<NetService>, viewport: Viewport, output: OutputSink) -> TabHandle {
+/// Start a tab thread. `storage` is the browser's local storage, shared
+/// by every tab.
+pub fn spawn_tab(id: TabId, net: Arc<NetService>, storage: Arc<WebStorage>, viewport: Viewport, output: OutputSink) -> TabHandle {
     let (sender, receiver) = channel::<TabEvent>();
     let net_sender = sender.clone();
     let thread = std::thread::Builder::new()
         .name(format!("tab-{}", id.0))
         .stack_size(16 * 1024 * 1024)
-        .spawn(move || tab_thread(id, net, viewport, receiver, net_sender, output))
+        .spawn(move || tab_thread(id, net, storage, viewport, receiver, net_sender, output))
         .expect("spawn tab thread");
     TabHandle {
         id,
@@ -122,11 +129,28 @@ pub fn spawn_tab(id: TabId, net: Arc<NetService>, viewport: Viewport, output: Ou
 fn tab_thread(
     id: TabId,
     net: Arc<NetService>,
+    storage: Arc<WebStorage>,
     viewport: Viewport,
     inbox: Receiver<TabEvent>,
     net_sender: Sender<TabEvent>,
     output: OutputSink,
 ) {
+    // The tab's storage: the browser's local storage and a session
+    // storage of its own, which outlives a crashed state. What other tabs
+    // change in the local storage arrives as events.
+    let stores = TabStores {
+        local: storage.clone(),
+        session: Arc::new(SessionStorage::default()),
+    };
+    let storage_sender = Mutex::new(net_sender.clone());
+    storage.subscribe(
+        id,
+        Arc::new(move |change| {
+            if let Ok(sender) = storage_sender.lock() {
+                let _ = sender.send(TabEvent::Storage(change));
+            }
+        }),
+    );
     // The last URL the tab reported, so the crash page can offer it again.
     let last_url: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
     let seen = last_url.clone();
@@ -142,7 +166,7 @@ fn tab_thread(
         let _ = net_sender.send(TabEvent::Net(ev));
     });
 
-    let mut state = TabState::new(id, net.clone(), net_sink.clone(), viewport, output.clone());
+    let mut state = TabState::new(id, net.clone(), net_sink.clone(), stores.clone(), viewport, output.clone());
     loop {
         let result = catch_unwind(AssertUnwindSafe(|| run(&mut state, &inbox)));
         match result {
@@ -158,13 +182,14 @@ fn tab_thread(
                 // The old state is unwound and may be inconsistent; drop it
                 // whole and start over with the crash page.
                 let url = last_url.lock().ok().and_then(|l| l.clone());
-                state = TabState::new(id, net.clone(), net_sink.clone(), viewport, output.clone());
+                state = TabState::new(id, net.clone(), net_sink.clone(), stores.clone(), viewport, output.clone());
                 state.handle_shell(ShellToTab::Navigate {
                     url: crash_page_url(&message, url.as_ref()),
                 });
             }
         }
     }
+    storage.unsubscribe(id);
     state.send(TabToShell::Closed);
 }
 
@@ -263,6 +288,10 @@ fn run(state: &mut TabState, inbox: &Receiver<TabEvent>) {
                     state.handle_net(msg);
                     "net"
                 }
+                TabEvent::Storage(change) => {
+                    state.handle_storage(change);
+                    "storage"
+                }
             };
             state.note_event(kind, started.elapsed());
         }
@@ -312,7 +341,7 @@ mod tests {
             scale_factor: 1.0,
         };
         Spawned {
-            tab: spawn_tab(TabId(id), net.clone(), viewport, sink),
+            tab: spawn_tab(TabId(id), net.clone(), Arc::new(WebStorage::new()), viewport, sink),
             messages,
             token: weak,
         }

@@ -24,6 +24,14 @@ pub enum CacheMode {
     NoCache,
     /// Ignore the cache for the lookup; still store the response.
     Reload,
+    /// Neither look the response up nor store it (`no-store`).
+    NoStore,
+    /// Use any stored response, stale or not, without validation; fetch
+    /// when there is none (`force-cache`).
+    ForceCache,
+    /// Use any stored response, stale or not; a network error when there
+    /// is none (`only-if-cached`).
+    OnlyIfCached,
 }
 
 /// Default size limits.
@@ -56,6 +64,8 @@ impl Timing {
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
     pub status: u16,
+    /// The reason phrase the response was received with.
+    pub status_text: String,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
     /// Current age in seconds, for the `Age` header.
@@ -88,6 +98,8 @@ pub struct Policy {
 #[derive(Debug)]
 struct Entry {
     status: u16,
+    /// The status line's reason phrase as received.
+    status_text: String,
     headers: Vec<(String, String)>,
     body: Bytes,
     response_time: Instant,
@@ -103,6 +115,7 @@ impl Entry {
     fn response(&self, now: Instant) -> CachedResponse {
         CachedResponse {
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             body: self.body.clone(),
             age: self.current_age(now).as_secs(),
@@ -173,7 +186,7 @@ impl HttpCache {
     /// Look for a stored response for a `GET` of `key` with these request
     /// headers.
     pub fn lookup(&mut self, key: &str, request_headers: &[(String, String)], mode: CacheMode, now: Instant) -> Lookup {
-        if mode == CacheMode::Reload {
+        if matches!(mode, CacheMode::Reload | CacheMode::NoStore) {
             return Lookup::Miss;
         }
         self.clock += 1;
@@ -190,6 +203,9 @@ impl HttpCache {
             return Lookup::Miss;
         }
         entry.last_used = clock;
+        if matches!(mode, CacheMode::ForceCache | CacheMode::OnlyIfCached) {
+            return Lookup::Fresh(entry.response(now));
+        }
         let fresh = mode == CacheMode::Default && !entry.policy.no_cache && entry.current_age(now) < entry.policy.freshness;
         if fresh {
             return Lookup::Fresh(entry.response(now));
@@ -272,6 +288,7 @@ impl HttpCache {
             key,
             Entry {
                 status,
+                status_text: String::new(),
                 headers,
                 body,
                 response_time: timing.response,
@@ -280,6 +297,14 @@ impl HttpCache {
             },
         );
         self.evict();
+    }
+
+    /// The reason phrase the entry under `key` was received with (empty
+    /// over HTTP/2), for whoever is served the entry later.
+    pub fn set_status_text(&mut self, key: &str, status_text: String) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.status_text = status_text;
+        }
     }
 
     /// A conditional request for `key` answered `304`: refresh the entry

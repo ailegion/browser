@@ -262,6 +262,13 @@ fn hash_text(text: &str) -> u64 {
 }
 
 impl View {
+    /// The layout tree was changed by its owner (a new layout, boxes
+    /// moved by a scroll): the index of its boxes is built again when
+    /// next needed.
+    pub fn forget_rects(&mut self) {
+        self.rect_index = None;
+    }
+
     /// Make `styles` and `layout` current for the lent document, if
     /// they are not: the cascade with the document's sheets as they are
     /// now, then layout.
@@ -746,6 +753,193 @@ fn padding_box(rect: Rect, style: &browser_style::ComputedStyle) -> Rect {
         (rect.width - b.left - b.right).max(0.0),
         (rect.height - b.top - b.bottom).max(0.0),
     )
+}
+
+// ----- intersection geometry (IntersectionObserver) -----
+
+/// One side of a root margin or scroll margin: pixels, or a percentage of
+/// the rectangle it grows (of its width for left and right, of its height
+/// for top and bottom).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Margin {
+    Px(f32),
+    Percent(f32),
+}
+
+/// What an intersection observer needs of one target, in viewport
+/// coordinates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IntersectionGeometry {
+    /// The root intersection rectangle, margins applied.
+    pub(crate) root: Rect,
+    /// The target's bounding rectangle and its intersection with the root
+    /// through every clip between them (none when they do not meet, not
+    /// even at an edge). `None` when the target has no box, or is not
+    /// below the root in the containing block chain.
+    pub(crate) hit: Option<(Rect, Option<Rect>)>,
+}
+
+/// Grow `rect` by `margin` (top, right, bottom, left).
+fn grow(rect: Rect, margin: &[Margin; 4]) -> Rect {
+    let side = |m: Margin, basis: f32| match m {
+        Margin::Px(v) => v,
+        Margin::Percent(p) => basis * p / 100.0,
+    };
+    let (top, right, bottom, left) = (
+        side(margin[0], rect.height),
+        side(margin[1], rect.width),
+        side(margin[2], rect.height),
+        side(margin[3], rect.width),
+    );
+    Rect::new(
+        rect.x - left,
+        rect.y - top,
+        (rect.width + left + right).max(0.0),
+        (rect.height + top + bottom).max(0.0),
+    )
+}
+
+/// The intersection of two rectangles, edges included: rectangles that
+/// only touch meet in a rectangle of no area.
+fn intersect_inclusive(a: Rect, b: Rect) -> Option<Rect> {
+    let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+    let (x1, y1) = (a.right().min(b.right()), a.bottom().min(b.bottom()));
+    (x1 >= x0 && y1 >= y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+}
+
+impl View {
+    /// The padding box of `id`'s first box as it shows, in page
+    /// coordinates.
+    fn shown_padding_box(&mut self, id: NodeId) -> Option<Rect> {
+        let style = self.styles.get(id).cloned()?;
+        let scroll = self.scroll;
+        let b = self.own_box(id)?;
+        let inner = padding_box(b.rect, &style);
+        let shown = affine_bounds(&b.space.transform, &inner);
+        Some(if b.space.fixed { shown.translate(scroll.0, scroll.1) } else { shown })
+    }
+
+    /// The element whose box is `id`'s containing block, by its
+    /// `position`: the nearest ancestor that contains fixed boxes for a
+    /// fixed one, the nearest positioned one for an absolute one, else
+    /// the parent. `None` is the viewport (the initial containing block).
+    fn containing_block_element(&self, doc: &Document, id: NodeId) -> Option<NodeId> {
+        let position = self.styles.get(id).map(|s| s.position);
+        let mut ancestors = doc.ancestors(id).filter(|&a| a != doc.root() && doc.get(a).is_element());
+        match position {
+            Some(browser_style::Position::Fixed) => ancestors.find(|&a| self.styles.get(a).is_some_and(|s| s.contains_fixed())),
+            Some(browser_style::Position::Absolute) => {
+                ancestors.find(|&a| self.styles.get(a).is_some_and(|s| s.is_positioned() || s.contains_fixed()))
+            }
+            _ => ancestors.next(),
+        }
+    }
+
+    /// Intersection Observer's geometry for `target` against `root` (the
+    /// viewport when `None`): the root intersection rectangle, the
+    /// target's bounding rectangle, and what is left of it after every
+    /// box that clips between the two ("compute the intersection").
+    pub(crate) fn intersection_geometry(
+        &mut self,
+        doc: &Document,
+        target: NodeId,
+        root: Option<NodeId>,
+        root_margin: &[Margin; 4],
+        scroll_margin: &[Margin; 4],
+    ) -> IntersectionGeometry {
+        let scroll = self.scroll;
+        let to_client = |r: Rect| r.translate(-scroll.0, -scroll.1);
+        let clips = |view: &Self, id: NodeId| -> (bool, bool) {
+            // The root element's (or `body`'s) overflow is the viewport's.
+            let propagated = Some(id) == doc.document_element()
+                || (Some(id) == doc.body()
+                    && doc.document_element().and_then(|h| view.styles.get(h)).is_some_and(|s| {
+                        s.overflow_x == browser_style::Overflow::Visible && s.overflow_y == browser_style::Overflow::Visible
+                    }));
+            if propagated {
+                return (false, false);
+            }
+            view.styles.get(id).map_or((false, false), |s| {
+                (s.overflow_x != browser_style::Overflow::Visible, s.overflow_y != browser_style::Overflow::Visible)
+            })
+        };
+        // The root intersection rectangle, in page coordinates.
+        let root_rect = match root {
+            None => {
+                let port = self
+                    .layout
+                    .as_ref()
+                    .map(|t| t.viewport.scrollport)
+                    .unwrap_or(Rect::new(0.0, 0.0, self.viewport.0, self.viewport.1));
+                Rect::new(scroll.0 + port.x, scroll.1, port.width, port.height)
+            }
+            Some(r) => {
+                let (cx, cy) = clips(self, r);
+                match (cx || cy).then(|| self.shown_padding_box(r)).flatten() {
+                    Some(inner) => inner,
+                    None => self.bounding(doc, r),
+                }
+            }
+        };
+        let root_rect = grow(root_rect, root_margin);
+        let rects = self.rects_of(doc, target);
+        if rects.is_empty() {
+            return IntersectionGeometry {
+                root: to_client(root_rect),
+                hit: None,
+            };
+        }
+        let target_rect = union(&rects);
+        let mut remaining = Some(target_rect);
+        let mut current = target;
+        let mut found_root = root.is_none();
+        while let Some(container) = self.containing_block_element(doc, current) {
+            if Some(container) == root {
+                found_root = true;
+                break;
+            }
+            let (clip_x, clip_y) = clips(self, container);
+            if (clip_x || clip_y)
+                && let Some(inner) = self.shown_padding_box(container)
+            {
+                let inner = if self.scroller(container).is_some() { grow(inner, scroll_margin) } else { inner };
+                remaining = remaining.and_then(|r| {
+                    // A box that clips one axis only leaves the other alone.
+                    let clip = Rect::new(
+                        if clip_x { inner.x } else { r.x },
+                        if clip_y { inner.y } else { r.y },
+                        if clip_x { inner.width } else { r.width },
+                        if clip_y { inner.height } else { r.height },
+                    );
+                    intersect_inclusive(r, clip)
+                });
+            }
+            current = container;
+        }
+        if !found_root {
+            return IntersectionGeometry {
+                root: to_client(root_rect),
+                hit: None,
+            };
+        }
+        let intersection = remaining.and_then(|r| intersect_inclusive(r, root_rect));
+        IntersectionGeometry {
+            root: to_client(root_rect),
+            hit: Some((to_client(target_rect), intersection.map(to_client))),
+        }
+    }
+}
+
+/// A `DOMRectReadOnly` of a rectangle.
+pub(crate) fn new_rect_read_only(r: Rect, context: &mut Context) -> JsResult<JsObject> {
+    Ok(JsObject::from_proto_and_data(prototype_of::<DomRectReadOnlyClass>(context)?, RectData::from_rect(r)))
+}
+
+/// The rectangle a `DOMRectInit` value describes (`{x, y, width, height}`,
+/// each zero when absent).
+pub(crate) fn rect_of_value(value: &JsValue, context: &mut Context) -> JsResult<Rect> {
+    let data = RectData::from_init(value, context)?;
+    Ok(Rect::new(data.x as f32, data.y as f32, data.width as f32, data.height as f32))
 }
 
 // ----- the lent view in the Dom -----

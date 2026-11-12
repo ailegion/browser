@@ -20,6 +20,9 @@ impl Document {
     /// and in order. Scripts in the fragment are built, not run. The
     /// nodes live in this arena, so they can be inserted anywhere in it.
     pub fn parse_fragment(&mut self, context: NodeId, html: &str) -> Vec<NodeId> {
+        // The algorithm's scaffolding (its root under the document node)
+        // is no mutation of the document: nothing here is logged.
+        self.suppress_mutations();
         let doc = std::mem::take(self);
         let mut opts = ParseOpts::default();
         opts.tree_builder.quirks_mode = doc.quirks_mode;
@@ -40,6 +43,7 @@ impl Document {
             }
             _ => Vec::new(),
         };
+        doc.resume_mutations();
         *self = doc;
         nodes
     }

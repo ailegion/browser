@@ -678,6 +678,7 @@ dependencies = [
  "browser-dom",
  "browser-layout",
  "browser-style",
+ "encoding_rs",
  "html5ever",
  "url",
 ]
@@ -747,6 +748,7 @@ dependencies = [
  "fontique",
  "html5ever",
  "read-fonts",
+ "sha2",
  "tracing",
  "tracing-subscriber",
  "url",

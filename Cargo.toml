@@ -95,6 +95,10 @@ flate2 = "1"
 brotli = "9"
 cookie = "0.18"
 httpdate = "1"
+# Subresource integrity of `fetch()` ("Working sites first" line 7):
+# RustCrypto's SHA-2, the version already in the tree under the TLS
+# provider (plan/03-crates.md).
+sha2 = "0.10"
 
 # store (RustCrypto group)
 argon2 = "0.6"

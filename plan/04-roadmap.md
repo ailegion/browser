@@ -796,9 +796,104 @@ remaining lists as they stand.
       `elements_from_point_list_the_boxes_under_a_point`. Not verified: the
       right and bottom edges (a box's `contains` as hit testing has it;
       WPT's legacy `elementFromPosition.html` takes them as inside).
-      Still to build in this line: `fetch`/`XMLHttpRequest`, storage,
-      `history.pushState`/`popstate`, `MutationObserver`,
-      `IntersectionObserver`.
+      Built 2026-11-12, not ticked (SKIPPED and not-verified parts at
+      the end; the owner said to take the decisions, they are listed
+      there for a ruling). Net (`crates/net`): `Redirect::Manual` hands
+      a redirect response back (never cached); cache modes `no-store`,
+      `force-cache`, `only-if-cached`; the status line's reason phrase
+      (`NetToTab::ResponseStart::status_text`, empty over HTTP/2, kept
+      with a cached entry); header values up to U+00FF sent as bytes.
+      Script (`crates/script`): `fetch.rs` (`Headers` with its guards
+      and a live iterator, `Request`, `Response` with `error`/
+      `redirect`/`json`, `fetch`, bodies read as `text`/`json`/
+      `arrayBuffer`/`bytes`, `clone`, a body that goes on arriving
+      after the promise settled, `navigator.sendBeacon`), `xhr.rs`
+      (`XMLHttpRequest`, its upload object, `ProgressEvent`, the
+      standard's states and events, sync requests, `timeout`,
+      `overrideMimeType`, text by charset, `json`/`arraybuffer`
+      responses; an XHR keeps its listeners in its own object so the
+      collector frees it), `storage.rs` (`Storage` as a proxy with
+      named properties, `StorageEvent`, UTF-16 kept as written),
+      `history.rs` (`history`, `PopStateEvent`, `HashChangeEvent`,
+      states by structured serialization), `observers.rs`
+      (`MutationObserver`/`MutationRecord` with transient observers,
+      `IntersectionObserver`/`Entry`). DOM (`crates/dom`): a mutation
+      log on `Document` (`TreeMutation`), written by the insertion and
+      removal primitives (so the parser's work is seen) and by the
+      bindings, which log the one record the DOM standard gives each
+      operation. Tab (`crates/tab`): `scriptnet.rs`, Fetch's algorithm
+      per request (mode, tainting, CORS check, preflight with its
+      cache, redirects hop by hop, credentials per hop, filtered
+      responses, CORP, integrity by `sha2`, `03-crates.md`), the same
+      job driven blocking for a sync XHR; `storage.rs` (`WebStorage`
+      shared by the browser's tabs, a session storage per tab, changes
+      told to the other tabs); session history entries with a document
+      number, state and scroll position, traversal within a document
+      without a load, capped at 50; intersection observers updated
+      after layout in `flush`. This is Phase 3 item 4's CORS part for
+      script requests; its other parts stay there. Tests: script (six:
+      objects, fetch flow, XHR, storage, history, mutation records per
+      operation), tab (`script_requests_follow_the_fetch_algorithm`
+      over three loopback servers, `xml_http_request_times_out`,
+      `storage_is_by_origin_and_tells_other_tabs`,
+      `push_state_entries_traverse_without_loading`,
+      `intersection_observers_follow_scrolling_and_layout`,
+      `mutation_observers_see_the_parser_at_work`, unit tests of the
+      preflight names, integrity and storage areas).
+      Behaviour of existing features changed on the way: a fragment
+      navigation fires `popstate` and `hashchange` (neither fired
+      before); `document.title = ` changes the tree at once (was after
+      the script); `append`/`prepend`/`before`/`after`/`replaceWith`/
+      `replaceChildren` with several nodes gather them first as the
+      DOM standard does (all checked before any moves; `prepend` of
+      the first child among others now lands in argument order); the
+      script view's box index is rebuilt after the tab lays out or
+      scrolls a box (rectangles read then were stale); a traversal
+      restores the scroll position its entry was left at.
+      SKIPPED, for the owner to rule or place: no `Referer` header and
+      `referrer`/`referrerPolicy` without effect (3.1's open decision);
+      no `Sec-Fetch-*` headers; no HTTP authentication (`open()`'s user
+      and password go nowhere); response header values decoded as
+      UTF-8, not byte for byte; XHR `responseXML` and `responseType
+      'document'` are null (no second document exists); upload
+      `progress` fires once, at the end; `Cross-Origin-Resource-Policy:
+      same-site` compares the last two host labels (no public suffix
+      list, O16 b); scroll position is not restored on reload, and
+      after a cross-document traversal only once, when parsing ends;
+      no limit on `pushState` calls per interval; `IntersectionObserver`
+      `delay`/`trackVisibility` (Chrome only) absent, `clip-path` and
+      `contain: paint` do not clip (neither exists in the engine);
+      `location.hash = ` still takes effect after the script, so its
+      `popstate` is not synchronous (3.1's model). Owned elsewhere by
+      this section's rule (the rest of 3.3.5) or this line's "Later":
+      `Blob`, `FormData`, `URLSearchParams` (as bodies, `blob()`,
+      `formData()`, XHR `blob`), streams (`body`), `AbortController`
+      (`signal`); mixed content and CSP `connect-src` (Phase 3 item 4);
+      storage on disk (Phase 4 item 2).
+      Not verified against Chrome and Firefox: no record for text the
+      parser appends to an existing text node; `normalize()` records a
+      text node's data only when it merges; observers notified in the
+      order they were made; the implicit root's rectangle leaves the
+      page scrollbars out; a target without a box reports zero
+      rectangles; root margins take `px` and `%` only; the storage
+      quota (5 Mi UTF-16 units, Chrome's figure); the 50-entry cap;
+      the preflight cache's 7200 s ceiling (Chrome's; Firefox 86400).
+      Timing (release probe, live, two runs each, against the build
+      before): slower: Wikipedia Main Page full restyle 44.0–46.6 ms
+      (41.4–43.5), iana full restyle 392–402 ms (387–392), neither
+      attributed; Wikipedia load 607–670 ms (600–629), relayout
+      1.6–2.0 ms (3.3–3.6), heap 28.2 MiB (43.0); iana load 4.98 s and
+      one run of 7.21 s spent waiting on the network (4.95–5.13),
+      relayout 38.9–39.0 ms (38.0–38.9), heap 434.4 MiB (459.7). The
+      pages' scripts now find these APIs and take other paths, so heap,
+      node and layout counts are not of the same work.
+      Tests that fail now and then, before this line too (the build
+      before it failed the first two in 2 of 12 parallel runs): the
+      tab's `lifecycle_events_fire_in_order_and_load_waits_for_fetches`,
+      `responsive_images_select_load_and_react` and
+      `font_display_blocks_swaps_and_gives_up` (timers against the
+      loopback network), and the paint snapshots (one pixel of
+      `03-floats`, once; one crash inside the GPU driver, once).
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,

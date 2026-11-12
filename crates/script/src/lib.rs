@@ -35,11 +35,22 @@
 mod cssom;
 mod dom;
 mod events;
+mod fetch;
 mod fonts;
+mod history;
+mod observers;
+mod storage;
 mod view;
+mod xhr;
 
 pub use events::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
+pub use fetch::{
+    CredentialsMode, NetFailure, NetOp, NetRequest, NetResponseHead, RedirectMode, RequestCache, RequestMode, ResponseKind,
+    SyncNet, is_cors_safelisted_request_header,
+};
 pub use fonts::{FaceRef, FontLoadStatus, FontRequest, ScriptFace};
+pub use history::{MAX_HISTORY_ENTRIES, SerializedState};
+pub use storage::{StorageAccess, StorageArea};
 pub use dom::DomChange;
 pub use view::{FeatureDelta, ImageSizeMap, View, dom_box_changes, feature_changes};
 
@@ -476,8 +487,19 @@ pub enum HostRequest {
     Navigate { url: Url, replace: bool },
     /// `location.reload()`.
     Reload,
-    /// `document.title = `.
+    /// `document.title = `. The script has already changed the document
+    /// (so a `MutationObserver` sees it in the same task); the tab tells
+    /// the shell.
     SetTitle(String),
+    /// `history.pushState` (`replace` false) or `history.replaceState`:
+    /// the document's URL is now `url`, and its entry (a new one, or the
+    /// current one) carries `state`. Nothing loads and no event fires.
+    PushState { url: Url, state: SerializedState, replace: bool },
+    /// `history.go(delta)`, `back()` (-1) and `forward()` (1): traverse
+    /// the session history, if there is an entry that far.
+    Traverse { delta: i32 },
+    /// `history.scrollRestoration = `: the current entry's mode.
+    ScrollRestoration { manual: bool },
 }
 
 /// The browser's cookie jar as `document.cookie` sees it (HTML §7.9.2,
@@ -507,7 +529,7 @@ pub(crate) fn host_state(context: &mut Context) -> JsResult<SharedHost> {
         .ok_or_else(|| JsNativeError::error().with_message("no document").into())
 }
 
-fn current_url(info: &DocumentInfo) -> Url {
+pub(crate) fn current_url(info: &DocumentInfo) -> Url {
     info.url
         .clone()
         .unwrap_or_else(|| Url::parse("about:blank").expect("static url"))
@@ -664,9 +686,20 @@ fn string_list_contains(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult
 pub(crate) fn document_set_title(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let title = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
     let host = host_state(context)?;
-    let mut state = host.borrow_mut();
-    state.info.title = title.clone();
-    state.requests.push(HostRequest::SetTitle(title));
+    {
+        let mut state = host.borrow_mut();
+        state.info.title = title.clone();
+        state.requests.push(HostRequest::SetTitle(title.clone()));
+    }
+    // The `<title>` element's text is replaced here and now (HTML
+    // §3.1.5): a later read of the tree sees it, and so does a
+    // `MutationObserver`.
+    if let Ok(shared) = dom::dom(context) {
+        let mut dom = shared.borrow_mut();
+        dom.generation += 1;
+        dom.doc.set_title(&title);
+    }
+    observers::drain(context);
     Ok(JsValue::undefined())
 }
 
@@ -784,6 +817,11 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     // document properties of item 3.1 and reads `location` from the global.
     dom::register(context)?;
     fonts::register(context)?;
+    fetch::register(context)?;
+    xhr::register(context)?;
+    storage::register(context)?;
+    history::register(context)?;
+    observers::register(context)?;
     Ok(())
 }
 
@@ -885,6 +923,151 @@ impl ScriptHost {
     /// detached rather than freed when a script removes them.
     pub fn lend_document(&mut self, doc: Document, parsing: bool, states: browser_style::ElementStates) {
         self.dom.borrow_mut().lend(doc, parsing, states);
+        // What the parser (or the tab) changed while the document was
+        // away: records for the observers, delivered at this task's
+        // microtask checkpoint.
+        observers::drain(&mut self.context);
+    }
+
+    /// Deliver the mutation records of what changed outside script (the
+    /// parser's insertions, the tab's own changes): the observers'
+    /// callbacks run now, as at the microtask checkpoint that follows the
+    /// parser's work and precedes the next script. The document and the
+    /// view must be lent.
+    pub fn deliver_mutations(&mut self) {
+        observers::drain(&mut self.context);
+        let pending = self
+            .context
+            .get_data::<observers::SharedObservers>()
+            .is_some_and(|s| s.borrow().microtask_queued);
+        if pending {
+            self.microtask_checkpoint();
+        }
+    }
+
+    // ----- the network (fetch and XMLHttpRequest) -----
+
+    /// What scripts asked of the network since the last call.
+    pub fn take_net_ops(&mut self) -> Vec<NetOp> {
+        fetch::net(&mut self.context).map(|n| std::mem::take(&mut n.borrow_mut().ops)).unwrap_or_default()
+    }
+
+    /// Give synchronous `XMLHttpRequest`s the tab's blocking fetch.
+    pub fn set_sync_net(&mut self, sync: Rc<dyn SyncNet>) {
+        if let Ok(net) = fetch::net(&mut self.context) {
+            net.borrow_mut().sync = Some(sync);
+        }
+    }
+
+    fn net_event(&mut self, id: u64, event: fetch::NetEvent) {
+        if let Err(err) = fetch::deliver(id, event, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.microtask_checkpoint();
+    }
+
+    /// A request's response head arrived (a task). The document must be
+    /// lent, as for every call below that runs script.
+    pub fn net_response(&mut self, id: u64, head: NetResponseHead) {
+        self.net_event(id, fetch::NetEvent::Response(head));
+    }
+
+    /// More of a response's body arrived.
+    pub fn net_data(&mut self, id: u64, bytes: Vec<u8>) {
+        self.net_event(id, fetch::NetEvent::Data(bytes));
+    }
+
+    /// A response's body is complete.
+    pub fn net_done(&mut self, id: u64) {
+        self.net_event(id, fetch::NetEvent::Done);
+    }
+
+    /// A request failed: before its head (the fetch rejects) or in its
+    /// body (what waits for the body rejects).
+    pub fn net_failed(&mut self, id: u64, failure: NetFailure) {
+        self.net_event(id, fetch::NetEvent::Failed(failure));
+    }
+
+    // ----- storage -----
+
+    /// Give `localStorage` and `sessionStorage` the areas of the
+    /// document's origin; without them (an opaque origin) the two
+    /// attributes throw a `SecurityError`.
+    pub fn set_storage_access(&mut self, access: Rc<dyn StorageAccess>) {
+        if let Some(shared) = self.context.get_data::<storage::SharedStorage>().cloned() {
+            shared.borrow_mut().access = Some(access);
+        }
+    }
+
+    /// Another document of the origin changed a storage area: fire
+    /// `storage` at `window` as a task. `key` is none for `clear()`.
+    pub fn fire_storage_event(&mut self, area: StorageArea, key: Option<&[u16]>, old: Option<&[u16]>, new: Option<&[u16]>, url: &str) {
+        if let Err(err) = storage::fire_storage_event(area, key, old, new, url, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.microtask_checkpoint();
+    }
+
+    // ----- session history -----
+
+    /// Where the document stands in the tab's session history: its
+    /// entry's index, the number of entries, the entry's state and scroll
+    /// restoration mode.
+    pub fn set_history(&mut self, index: usize, length: usize, state: Option<SerializedState>, manual_scroll: bool) {
+        history::set_entry(index, length, state, manual_scroll, &mut self.context);
+    }
+
+    /// A traversal (or a fragment navigation) reached an entry of this
+    /// document: `history.state` becomes its state and `popstate` fires
+    /// at `window`, as a task.
+    pub fn fire_popstate(&mut self, state: Option<SerializedState>) {
+        if let Err(err) = history::fire_popstate(state, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.microtask_checkpoint();
+    }
+
+    /// The document's URL changed in its fragment: `hashchange` at
+    /// `window`, as a task.
+    pub fn fire_hashchange(&mut self, old: &Url, new: &Url) {
+        if let Err(err) = history::fire_hashchange(old, new, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.microtask_checkpoint();
+    }
+
+    // ----- intersection observers -----
+
+    /// Whether an `IntersectionObserver` has targets.
+    pub fn has_intersection_observers(&mut self) -> bool {
+        observers::has_intersection_observers(&mut self.context)
+    }
+
+    /// Whether a target was observed since the last update, so one is due
+    /// even when nothing was laid out.
+    pub fn intersection_observers_dirty(&mut self) -> bool {
+        self.context
+            .get_data::<observers::SharedObservers>()
+            .is_some_and(|s| s.borrow().intersection_dirty)
+    }
+
+    /// The "update intersection observations" step of updating the
+    /// rendering, then the observers' callbacks, each a task. `time_ms`
+    /// is the time since the document started. The document and the view
+    /// must be lent. Returns whether a callback ran.
+    pub fn update_intersection_observers(&mut self, time_ms: f64) -> bool {
+        if let Err(err) = observers::update_intersections(time_ms, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        let ids = observers::intersection_observers_to_notify(&mut self.context);
+        let ran = !ids.is_empty();
+        for id in ids {
+            if let Err(err) = observers::notify_intersection_observer(id, &mut self.context) {
+                self.report_uncaught(&err);
+            }
+            self.microtask_checkpoint();
+        }
+        ran
     }
 
     /// Take the lent document back; the bindings keep an empty one.
@@ -2183,5 +2366,441 @@ mod tests {
             Ok("\"color: red; width: 10px !important;|color: red; width: 10px !important;\"")
         );
         assert!(!h.take_dom_mutated(), "a detached element is not on screen");
+    }
+
+    // ----- "Working sites first" line 7 -----
+
+    fn eval(h: &mut ScriptHost, src: &str) -> String {
+        match h.eval_to_string(src) {
+            Ok(s) => s.trim_matches('"').to_owned(),
+            Err(e) => format!("threw {e}"),
+        }
+    }
+
+    #[test]
+    fn headers_request_and_response_objects() {
+        let mut h = host();
+        assert_eq!(
+            eval(&mut h, "var hd = new Headers({'Content-Type': 'text/plain', 'X-A': ' 1 '}); hd.append('x-a', '2'); hd.append('Set-Cookie', 'a=1'); hd.append('Set-Cookie', 'b=2'); \
+                          [hd.get('content-type'), hd.get('X-A'), hd.has('x-b'), String(hd.get('nope')), [...hd].map(p => p.join('=')).join('&'), [...hd.keys()].join(','), hd.getSetCookie().length, \
+                           Object.prototype.toString.call(hd.entries()), typeof hd[Symbol.iterator]].join('|')"),
+            "text/plain|1, 2|false|null|content-type=text/plain&set-cookie=a=1&set-cookie=b=2&x-a=1, 2|content-type,set-cookie,set-cookie,x-a|2|[object Headers Iterator]|function"
+        );
+        // set, delete, forEach, a sequence of pairs, another Headers; bad names and values throw.
+        assert_eq!(
+            eval(&mut h, "var h2 = new Headers([['a', '1'], ['B', '2']]); h2.set('A', '3'); h2.delete('b'); var seen = []; new Headers(h2).forEach((v, k, o) => seen.push(k + ':' + v + ':' + (o instanceof Headers))); \
+                          var errs = []; for (var f of [() => new Headers([['a']]), () => h2.append('a b', '1'), () => h2.set('a', 'x\\ny'), () => new Headers(null), () => h2.get('')]) { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } \
+                          [seen.join(','), errs.join(',')].join('|')"),
+            "a:3:true|TypeError,TypeError,TypeError,TypeError,TypeError"
+        );
+        assert_eq!(
+            eval(&mut h, "var r = new Request('/x?y#z', {method: 'post', body: 'hi', headers: [['A', 'b'], ['Cookie', 'c'], ['Sec-X', '1']], credentials: 'include', cache: 'no-store', redirect: 'manual'}); \
+                          [r.url, r.method, r.headers.get('content-type'), r.headers.get('a'), r.headers.has('cookie'), r.headers.has('sec-x'), r.mode, r.credentials, r.cache, r.redirect, r.bodyUsed, r.referrer, r.destination, r.duplex, r instanceof Request].join('|')"),
+            "https://example.test/x?y#z|POST|text/plain;charset=UTF-8|b|false|false|cors|include|no-store|manual|false|about:client||half|true"
+        );
+        assert_eq!(
+            eval(&mut h, "var errs = []; for (var f of [() => new Request('/x', {body: 'x'}), () => new Request('/x', {mode: 'navigate'}), () => new Request('https://u:p@h.test/'), () => new Request('/x', {method: 'TRACE'}), \
+                          () => new Request('/x', {method: 'a b'}), () => new Request('/x', {cache: 'only-if-cached'}), () => new Request('/x', {mode: 'no-cors', method: 'PUT'}), () => new Request('/x', {credentials: 'nope'}), () => new Request('http://[bad'), () => new Request('/x', {window: 1})]) \
+                          { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } errs.join(',')"),
+            "TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError"
+        );
+        // A request from a request takes its body; a clone shares it.
+        assert_eq!(
+            eval(&mut h, "var r2 = new Request(r, {headers: {'X': 'y'}}); var c = r2.clone(); \
+                          [r.bodyUsed, r2.bodyUsed, r2.method, r2.credentials, r2.headers.get('x'), r2.headers.has('a'), c.url === r2.url, c !== r2, new Request('/q', {mode: 'no-cors', headers: {'X-Custom': '1', 'Accept': 'a/b'}}).headers.has('x-custom')].join('|')"),
+            "true|false|POST|include|y|false|true|true|false"
+        );
+        assert_eq!(
+            eval(&mut h, "var s = new Response('body', {status: 201, statusText: 'Made', headers: {'X': 'y'}}); \
+                          [s.status, s.ok, s.statusText, s.headers.get('x'), s.headers.get('content-type'), s.type, JSON.stringify(s.url), s.redirected, s.bodyUsed, \
+                           Response.error().type, Response.error().status, Response.redirect('/to', 301).headers.get('location'), Response.redirect('/to').status, \
+                           Response.json({a: 1}).headers.get('content-type'), new Response().status, new Response(null, {status: 204}).ok].join('|')"),
+            "201|true|Made|y|text/plain;charset=UTF-8|default|\\\"\\\"|false|false|error|0|https://example.test/to|302|application/json|200|true"
+        );
+        assert_eq!(
+            eval(&mut h, "var errs = []; for (var f of [() => new Response('', {status: 99}), () => new Response('', {status: 600}), () => new Response('x', {status: 204}), () => new Response('', {statusText: 'a\\nb'}), () => Response.redirect('/x', 200), \
+                          () => Response.error().headers.set('a', 'b'), () => Response.json(1n)]) { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } errs.join(',')"),
+            "RangeError,RangeError,TypeError,TypeError,RangeError,TypeError,TypeError"
+        );
+        // Bodies: read once, in each form; a clone reads the same bytes.
+        h.run_script(
+            "var out = []; var s2 = s.clone(); \
+             s.text().then(t => { out.push(t + ':' + s.bodyUsed); return s.text(); }).catch(e => out.push(e.name)); \
+             s2.arrayBuffer().then(b => out.push('ab' + b.byteLength)); \
+             new Response(new Uint8Array([104, 105])).bytes().then(b => out.push(b instanceof Uint8Array ? 'u8:' + b[1] : 'no')); \
+             Response.json({a: [1, 'é']}).json().then(v => out.push(JSON.stringify(v))); \
+             new Response('{bad').json().catch(e => out.push(e.name)); \
+             new Response().text().then(t => out.push('empty' + t.length)); \
+             r2.text().then(t => out.push('req:' + t));",
+        );
+        assert_eq!(
+            eval(&mut h, "out.sort().join('|')"),
+            "SyntaxError|TypeError|ab4|body:true|empty0|req:hi|u8:105|{\\\"a\\\":[1,\\\"é\\\"]}"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    fn head(status: u16, headers: &[(&str, &str)], url_text: &str) -> NetResponseHead {
+        NetResponseHead {
+            status,
+            status_text: "OK".to_owned(),
+            headers: headers.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            url: url(url_text),
+            redirected: false,
+            kind: ResponseKind::Basic,
+        }
+    }
+
+    #[test]
+    fn fetch_settles_with_the_head_and_its_body_follows() {
+        let mut h = host();
+        h.run_script(
+            "var out = []; \
+             fetch('/data?q=1', {method: 'POST', body: 'q', headers: {'X-A': '1'}}).then(r => { out.push([r.status, r.statusText, r.ok, r.headers.get('x-y'), r.url, r.type, r.bodyUsed].join(' ')); return r.text(); }).then(t => out.push(t)).catch(e => out.push('failed ' + e.name)); \
+             fetch('/gone').then(r => out.push('no')).catch(e => out.push('failed ' + e.name + ' ' + (e instanceof TypeError))); \
+             fetch('/cut').then(r => r.json()).catch(e => out.push('cut ' + e.name)); \
+             fetch('http://[bad').catch(e => out.push('bad ' + e.name)); \
+             fetch(new Request('/again', {method: 'PUT', body: 'b'})).then(r => r.arrayBuffer()).then(b => out.push('again ' + b.byteLength));",
+        );
+        let ops = h.take_net_ops();
+        let requests: Vec<&NetRequest> = ops
+            .iter()
+            .map(|op| match op {
+                NetOp::Start(r) => r,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(requests.len(), 4, "the bad URL never reaches the network");
+        let first = requests[0];
+        assert_eq!(first.url.as_str(), "https://example.test/data?q=1");
+        assert_eq!((first.method.as_str(), first.body.as_deref()), ("POST", Some(&b"q"[..])));
+        assert_eq!((first.mode, first.credentials, first.cache, first.redirect), (RequestMode::Cors, CredentialsMode::SameOrigin, RequestCache::Default, RedirectMode::Follow));
+        assert!(first.headers.iter().any(|(k, v)| k == "X-A" && v == "1"));
+        assert!(first.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "text/plain;charset=UTF-8"));
+        assert_eq!(requests[3].method, "PUT");
+        assert_eq!(eval(&mut h, "out.join('|')"), "bad TypeError", "only the request that could not be made has settled");
+        let ids: Vec<u64> = requests.iter().map(|r| r.id).collect();
+        // The head settles the fetch; the text waits for the body's end.
+        h.net_response(ids[0], head(200, &[("x-y", "v")], "https://example.test/data?q=1"));
+        assert_eq!(eval(&mut h, "out.length + ':' + out[1]"), "2:200 OK true v https://example.test/data?q=1 basic false");
+        h.net_data(ids[0], b"hel".to_vec());
+        h.net_data(ids[0], b"lo".to_vec());
+        assert_eq!(eval(&mut h, "out.length"), "2");
+        h.net_done(ids[0]);
+        assert_eq!(eval(&mut h, "out[2]"), "hello");
+        // A failure before the head rejects the fetch; one in the body
+        // rejects the read.
+        h.net_failed(ids[1], NetFailure::Network("refused".to_owned()));
+        assert_eq!(eval(&mut h, "out[3]"), "failed TypeError true");
+        h.net_response(ids[2], head(200, &[], "https://example.test/cut"));
+        h.net_data(ids[2], b"{".to_vec());
+        h.net_failed(ids[2], NetFailure::Network("reset".to_owned()));
+        assert_eq!(eval(&mut h, "out[4]"), "cut TypeError");
+        h.net_response(ids[3], head(200, &[], "https://example.test/again"));
+        h.net_data(ids[3], vec![0; 7]);
+        h.net_done(ids[3]);
+        assert_eq!(eval(&mut h, "out[5]"), "again 7");
+        // An opaque response shows nothing.
+        h.run_script("fetch('https://other.test/x', {mode: 'no-cors'}).then(r => out.push([r.type, r.status, r.ok, JSON.stringify(r.url), [...r.headers].length, r.body === undefined].join(' ')));");
+        let ops = h.take_net_ops();
+        let NetOp::Start(request) = &ops[0] else { panic!("a request") };
+        assert_eq!(request.mode, RequestMode::NoCors);
+        let mut opaque = head(200, &[("x", "y")], "https://other.test/x");
+        opaque.kind = ResponseKind::Opaque;
+        h.net_response(request.id, opaque);
+        h.net_done(request.id);
+        assert_eq!(eval(&mut h, "out[6]"), "opaque 0 false \\\"\\\" 0 true");
+        // A beacon: a POST with credentials nobody waits for; too much data is refused.
+        assert_eq!(eval(&mut h, "[navigator.sendBeacon('/beacon', 'hi'), navigator.sendBeacon('/big', new Uint8Array(70000))].join(' ')"), "true false");
+        let ops = h.take_net_ops();
+        assert_eq!(ops.len(), 1);
+        let NetOp::Start(beacon) = &ops[0] else { panic!("a request") };
+        assert_eq!(
+            (beacon.url.path(), beacon.method.as_str(), beacon.mode, beacon.credentials, beacon.body.as_deref()),
+            ("/beacon", "POST", RequestMode::NoCors, CredentialsMode::Include, Some(&b"hi"[..]))
+        );
+        h.net_response(beacon.id, head(204, &[], "https://example.test/beacon"));
+        h.net_done(beacon.id);
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    struct FakeSync;
+
+    impl SyncNet for FakeSync {
+        fn fetch(&self, request: NetRequest) -> Result<(NetResponseHead, Vec<u8>), NetFailure> {
+            if request.url.path() == "/fail" {
+                return Err(NetFailure::Network("no".to_owned()));
+            }
+            let body = format!("{} {}", request.method, request.url.path()).into_bytes();
+            Ok((
+                NetResponseHead {
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                    url: request.url,
+                    redirected: false,
+                    kind: ResponseKind::Basic,
+                },
+                body,
+            ))
+        }
+    }
+
+    #[test]
+    fn xml_http_request_states_events_and_responses() {
+        let mut h = host();
+        h.set_sync_net(Rc::new(FakeSync));
+        h.run_script(
+            "var log = []; var x = new XMLHttpRequest(); \
+             x.onreadystatechange = function (e) { log.push('rs' + x.readyState + (this === x && e.target === x ? '' : '!')); }; \
+             ['loadstart', 'progress', 'load', 'loadend', 'error', 'abort', 'timeout'].forEach(k => x.addEventListener(k, e => log.push(k + ':' + e.loaded + '/' + e.total + (e.lengthComputable ? 'c' : '') + (e instanceof ProgressEvent ? '' : '!')))); \
+             x.onload = () => log.push('onload'); \
+             x.open('get', '/x?1'); x.setRequestHeader('X-A', '1'); x.setRequestHeader('x-a', '2'); x.setRequestHeader('Cookie', 'no'); x.send('ignored for GET');",
+        );
+        assert_eq!(
+            eval(&mut h, "[x instanceof XMLHttpRequestEventTarget, x instanceof EventTarget, x.upload instanceof XMLHttpRequestUpload, x.upload === x.upload, XMLHttpRequest.DONE, x.OPENED, x.readyState, x.status, JSON.stringify(x.responseText), String(x.responseXML), x.responseType, x.timeout, x.withCredentials].join('|')"),
+            "true|true|true|true|4|1|1|0|\\\"\\\"|null||0|false"
+        );
+        let ops = h.take_net_ops();
+        let NetOp::Start(request) = &ops[0] else { panic!("a request") };
+        assert_eq!((request.method.as_str(), request.url.as_str(), request.body.as_deref()), ("GET", "https://example.test/x?1", None));
+        assert_eq!(request.headers, vec![("X-A".to_owned(), "1, 2".to_owned())]);
+        assert_eq!((request.mode, request.credentials, request.force_preflight), (RequestMode::Cors, CredentialsMode::SameOrigin, false));
+        let id = request.id;
+        h.net_response(id, head(200, &[("Content-Length", "5"), ("Content-Type", "text/plain"), ("x-b", "1"), ("X-B", "2")], "https://example.test/x?1#f"));
+        assert_eq!(eval(&mut h, "[x.readyState, x.status, x.statusText, x.getResponseHeader('X-B'), String(x.getResponseHeader('nope')), x.responseURL].join('|')"), "2|200|OK|1, 2|null|https://example.test/x?1");
+        h.net_data(id, b"hel".to_vec());
+        assert_eq!(eval(&mut h, "x.readyState + x.responseText"), "3hel");
+        h.net_data(id, b"lo".to_vec());
+        h.net_done(id);
+        assert_eq!(
+            eval(&mut h, "log.join(' ')"),
+            "rs1 loadstart:0/0 rs2 rs3 progress:3/5c progress:5/5c rs4 load:5/5c onload loadend:5/5c"
+        );
+        assert_eq!(
+            eval(&mut h, "[x.readyState, x.response, x.responseText, JSON.stringify(x.getAllResponseHeaders()), 'end'].join('|')"),
+            "4|hello|hello|\\\"content-length: 5\\\\r\\\\ncontent-type: text/plain\\\\r\\\\nx-b: 1, 2\\\\r\\\\n\\\"|end"
+        );
+        // Wrong states throw; json and arraybuffer responses; the upload's events; abort and errors.
+        assert_eq!(
+            eval(&mut h, "var errs = []; var y = new XMLHttpRequest(); for (var f of [() => y.send(), () => y.setRequestHeader('a', 'b'), () => y.open('TRACE', '/'), () => y.open('a b', '/'), () => y.open('GET', 'http://[bad'), () => { y.open('GET', '/'); y.setRequestHeader('a b', 'c'); }, \
+                          () => { y.responseType = 'json'; y.responseText; }, () => { y.open('GET', '/', false); }, () => XMLHttpRequest()]) { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } errs.join(',')"),
+            "InvalidStateError,InvalidStateError,SecurityError,SyntaxError,SyntaxError,SyntaxError,InvalidStateError,InvalidAccessError,TypeError"
+        );
+        h.take_net_ops();
+        h.run_script(
+            "log = []; var j = new XMLHttpRequest(); j.responseType = 'json'; j.withCredentials = true; j.timeout = 500; \
+             j.upload.onprogress = e => log.push('up-progress:' + e.loaded + '/' + e.total); j.upload.addEventListener('loadend', e => log.push('up-loadend')); j.upload.onloadstart = e => log.push('up-loadstart:' + e.total); \
+             j.onloadend = () => log.push('loadend ' + JSON.stringify(j.response) + ' ' + (j.response === j.response)); \
+             j.open('POST', 'https://other.test/api'); j.setRequestHeader('Content-Type', 'application/json; charset=latin1'); j.send('{\"a\":1}');",
+        );
+        let ops = h.take_net_ops();
+        let NetOp::Start(request) = &ops[0] else { panic!("a request") };
+        assert_eq!((request.credentials, request.force_preflight, request.timeout), (CredentialsMode::Include, true, Some(Duration::from_millis(500))));
+        assert_eq!(request.headers, vec![("Content-Type".to_owned(), "application/json;charset=UTF-8".to_owned())]);
+        assert_eq!(request.body.as_deref(), Some(&b"{\"a\":1}"[..]));
+        let id = request.id;
+        assert_eq!(eval(&mut h, "String(j.response)"), "null");
+        h.net_response(id, head(200, &[], "https://other.test/api"));
+        h.net_data(id, b"{\"b\":[2]}".to_vec());
+        h.net_done(id);
+        assert_eq!(eval(&mut h, "log.join(' ')"), "up-loadstart:7 up-progress:7/7 up-loadend loadend {\\\"b\\\":[2]} true");
+        h.run_script(
+            "log = []; var a = new XMLHttpRequest(); a.onreadystatechange = () => log.push('rs' + a.readyState); a.onabort = () => log.push('abort'); a.onerror = () => log.push('error'); a.ontimeout = () => log.push('timeout'); a.onloadend = () => log.push('loadend'); \
+             a.open('GET', '/a'); a.send(); a.abort(); log.push('after ' + a.readyState + ' ' + a.status); \
+             var e = new XMLHttpRequest(); e.onerror = () => log.push('e-error ' + e.readyState + ' ' + e.status + JSON.stringify(e.responseText)); e.open('GET', '/e'); e.send(); \
+             var t = new XMLHttpRequest(); t.ontimeout = () => log.push('t-timeout'); t.onloadend = () => log.push('t-loadend'); t.timeout = 10; t.open('GET', '/t'); t.send();",
+        );
+        let ops = h.take_net_ops();
+        let started: Vec<u64> = ops.iter().filter_map(|op| if let NetOp::Start(r) = op { Some(r.id) } else { None }).collect();
+        assert!(ops.iter().any(|op| matches!(op, NetOp::Abort(id) if *id == started[0])), "the aborted request is cancelled");
+        h.net_response(started[0], head(200, &[], "https://example.test/a"));
+        h.net_failed(started[1], NetFailure::Network("down".to_owned()));
+        h.net_failed(started[2], NetFailure::Timeout);
+        assert_eq!(eval(&mut h, "log.join(' ')"), "rs1 rs4 abort loadend after 0 0 e-error 4 0\\\"\\\" t-timeout t-loadend");
+        // Synchronous: done inside send(); a failure throws.
+        assert_eq!(
+            eval(&mut h, "log = []; var sy = new XMLHttpRequest(); sy.onreadystatechange = () => log.push('rs' + sy.readyState); sy.onload = () => log.push('load'); sy.open('PUT', '/sync', false); sy.send('b'); \
+                          var threw = ''; var bad = new XMLHttpRequest(); bad.open('GET', '/fail', false); try { bad.send() } catch (err) { threw = err.name } \
+                          [log.join(' '), sy.status, sy.responseText, threw, bad.readyState].join('|')"),
+            "rs1 rs4 load|200|PUT /sync|NetworkError|4"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// Key/value pairs in insertion order.
+    type Pairs = Vec<(Vec<u16>, Vec<u16>)>;
+
+    #[derive(Default)]
+    struct FakeStorage {
+        areas: RefCell<HashMap<StorageArea, Pairs>>,
+    }
+
+    impl StorageAccess for FakeStorage {
+        fn keys(&self, area: StorageArea) -> Vec<Vec<u16>> {
+            self.areas.borrow().get(&area).map(|a| a.iter().map(|(k, _)| k.clone()).collect()).unwrap_or_default()
+        }
+        fn get(&self, area: StorageArea, key: &[u16]) -> Option<Vec<u16>> {
+            self.areas.borrow().get(&area).and_then(|a| a.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()))
+        }
+        fn set(&self, area: StorageArea, key: &[u16], value: &[u16]) -> bool {
+            if value.len() > 100 {
+                return false;
+            }
+            let mut areas = self.areas.borrow_mut();
+            let list = areas.entry(area).or_default();
+            match list.iter_mut().find(|(k, _)| k == key) {
+                Some(pair) => pair.1 = value.to_vec(),
+                None => list.push((key.to_vec(), value.to_vec())),
+            }
+            true
+        }
+        fn remove(&self, area: StorageArea, key: &[u16]) {
+            if let Some(list) = self.areas.borrow_mut().get_mut(&area) {
+                list.retain(|(k, _)| k != key);
+            }
+        }
+        fn clear(&self, area: StorageArea) {
+            self.areas.borrow_mut().remove(&area);
+        }
+    }
+
+    #[test]
+    fn storage_areas_read_write_and_list_their_keys() {
+        let mut h = host();
+        // No storage for the origin: both attributes throw.
+        assert_eq!(eval(&mut h, "var n = []; try { localStorage } catch (e) { n.push(e.name) } try { sessionStorage } catch (e) { n.push(e.name) } n.join(',')"), "SecurityError,SecurityError");
+        h.set_storage_access(Rc::new(FakeStorage::default()));
+        assert_eq!(
+            eval(&mut h, "localStorage.setItem('a', 1); localStorage.b = {toString() { return 'two' }}; localStorage['c d'] = null; \
+                          [localStorage.length, localStorage.a, localStorage.getItem('b'), localStorage['c d'], String(localStorage.getItem('zz')), String(localStorage.zz), 'a' in localStorage, 'zz' in localStorage, \
+                           Object.keys(localStorage).join(','), localStorage.key(1), String(localStorage.key(9)), JSON.stringify(localStorage), localStorage === localStorage, localStorage instanceof Storage, \
+                           sessionStorage.length, sessionStorage !== localStorage, Object.prototype.hasOwnProperty.call(localStorage, 'a')].join('|')"),
+            "3|1|two|null|null|undefined|true|false|a,b,c d|b|null|{\\\"a\\\":\\\"1\\\",\\\"b\\\":\\\"two\\\",\\\"c d\\\":\\\"null\\\"}|true|true|0|true|true"
+        );
+        // Deleting, clearing; a key named like a member is stored but the
+        // member still reads; the quota; text that is not well-formed.
+        assert_eq!(
+            eval(&mut h, "delete localStorage.a; localStorage.removeItem('b'); var after = localStorage.length; localStorage.length = 9; localStorage.setItem('getItem', 'x'); \
+                          var odd = '\\ud800x'; sessionStorage.setItem('odd', odd); var quota = ''; try { localStorage.big = 'x'.repeat(200) } catch (e) { quota = e.name } \
+                          var r = [after, localStorage.length, localStorage.getItem('length'), typeof localStorage.getItem, localStorage.getItem('getItem'), sessionStorage.getItem('odd') === odd, quota, String(localStorage.big)]; \
+                          localStorage.clear(); r.push(localStorage.length, sessionStorage.length); r.join('|')"),
+            "1|3|9|function|x|true|QuotaExceededError|undefined|0|1"
+        );
+        // Another document changed the area: the event.
+        h.run_script("var ev = []; window.onstorage = e => ev.push([String(e.key), String(e.oldValue), String(e.newValue), e.url, e.storageArea === localStorage, e instanceof StorageEvent, e.isTrusted].join(' ')); addEventListener('storage', e => ev.push(String(e.key)));");
+        let utf16 = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        h.fire_storage_event(StorageArea::Local, Some(&utf16("k")), None, Some(&utf16("v")), "https://example.test/other");
+        h.fire_storage_event(StorageArea::Local, None, None, None, "https://example.test/other");
+        assert_eq!(eval(&mut h, "ev.join('|')"), "k null v https://example.test/other true true true|k|null null null https://example.test/other true true true|null");
+        assert_eq!(eval(&mut h, "var se = new StorageEvent('storage', {key: 'a', newValue: 'b', storageArea: sessionStorage}); [se.key, String(se.oldValue), se.newValue, JSON.stringify(se.url), se.storageArea === sessionStorage].join('|')"), "a|null|b|\\\"\\\"|true");
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    #[test]
+    fn history_pushes_states_and_fires_its_events() {
+        let mut h = host();
+        h.set_history(0, 1, None, false);
+        assert_eq!(eval(&mut h, "[history.length, String(history.state), history.scrollRestoration, history instanceof History, history === history].join('|')"), "1|null|auto|true|true");
+        assert_eq!(
+            eval(&mut h, "var s = {a: [1, {b: new Date(5)}], m: new Map([[1, new Set([2])]]), n: -0, u: undefined, big: 10n, re: /x/gi, buf: new Uint8Array([1, 2, 3]), err: new RangeError('r'), box: new String('s'), sparse: [1, , 3], '__proto__x': 1}; s.self = s; \
+                          history.pushState(s, '', '/next?x#y'); var g = history.state; \
+                          [location.href, document.URL, history.length, g !== s, g.self === g, g.a[1].b.getTime(), g.a[1].b instanceof Date, g.m.get(1).has(2), Object.is(g.n, -0), 'u' in g, g.big === 10n, g.re.source + g.re.flags, \
+                           g.buf instanceof Uint8Array, g.buf[2], g.err instanceof RangeError, g.err.message, g.box instanceof String, 1 in g.sparse, g.sparse.length, history.state === g].join('|')"),
+            "https://example.test/next?x#y|https://example.test/next?x#y|2|true|true|5|true|true|true|true|true|xgi|true|3|true|r|true|false|3|true"
+        );
+        let requests = h.take_requests();
+        assert_eq!(requests.len(), 1);
+        let HostRequest::PushState { url: pushed, state, replace } = &requests[0] else { panic!("a push: {requests:?}") };
+        assert_eq!((pushed.as_str(), *replace), ("https://example.test/next?x#y", false));
+        let pushed_state = state.clone();
+        // replaceState keeps the length; what cannot be cloned or belongs
+        // to another origin throws and changes nothing.
+        assert_eq!(
+            eval(&mut h, "history.replaceState('str', '', '?z'); var errs = []; for (var f of [() => history.pushState(() => 1, ''), () => history.pushState({d: document}, ''), () => history.pushState(Symbol(), ''), () => history.pushState(1, '', 'https://other.test/'), () => history.pushState(1, '', 'http://example.test/'), () => history.pushState(1)]) \
+                          { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } [location.href, history.length, history.state, errs.join(',')].join('|')"),
+            "https://example.test/next?z|2|str|DataCloneError,DataCloneError,DataCloneError,SecurityError,SecurityError,TypeError"
+        );
+        let requests = h.take_requests();
+        assert!(matches!(&requests[..], [HostRequest::PushState { replace: true, .. }]), "{requests:?}");
+        // Traversals are requests; go(0) reloads; scroll restoration.
+        h.run_script("history.back(); history.forward(); history.go(-2); history.go(); history.scrollRestoration = 'manual'; history.scrollRestoration = 'nope';");
+        assert_eq!(
+            h.take_requests(),
+            vec![
+                HostRequest::Traverse { delta: -1 },
+                HostRequest::Traverse { delta: 1 },
+                HostRequest::Traverse { delta: -2 },
+                HostRequest::Reload,
+                HostRequest::ScrollRestoration { manual: true },
+            ]
+        );
+        assert_eq!(eval(&mut h, "history.scrollRestoration"), "manual");
+        // The tab's side: the entry's state, popstate and hashchange.
+        h.run_script("var ev = []; onpopstate = e => ev.push('pop ' + JSON.stringify(e.state && e.state.a) + ' ' + (e.state === history.state) + ' ' + (e instanceof PopStateEvent)); onhashchange = e => ev.push('hash ' + e.oldURL + ' ' + e.newURL + ' ' + (e instanceof HashChangeEvent));");
+        h.fire_popstate(Some(pushed_state.clone()));
+        h.fire_popstate(None);
+        h.fire_hashchange(&url("https://example.test/a#1"), &url("https://example.test/a#2"));
+        assert_eq!(
+            eval(&mut h, "ev.join('|')"),
+            "pop [1,{\\\"b\\\":\\\"1970-01-01T00:00:00.005Z\\\"}] true true|pop null true true|hash https://example.test/a#1 https://example.test/a#2 true"
+        );
+        h.set_history(3, 5, Some(pushed_state), true);
+        assert_eq!(eval(&mut h, "[history.length, history.state.a[0], history.scrollRestoration, new PopStateEvent('popstate', {state: 7}).state, new HashChangeEvent('hashchange', {newURL: 'n'}).newURL].join('|')"), "5|1|manual|7|n");
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mutation_observers_get_the_records_of_each_operation() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(b"<!DOCTYPE html><html><head><title>T</title></head><body><div id=a>old</div><p id=p><b>x</b></p></body></html>");
+        h.lend_document(doc, false, Default::default());
+        let show = "var show = r => [r.type, r.target.nodeName, [...r.addedNodes].map(n => n.nodeName).join('+'), [...r.removedNodes].map(n => n.nodeName).join('+'), r.previousSibling && r.previousSibling.nodeName, r.nextSibling && r.nextSibling.nodeName, r.attributeName, r.oldValue].join(':');";
+        h.run_script(&format!(
+            "{show} var calls = []; var mo = new MutationObserver(function (list, o) {{ calls.push(list.map(show).join(' ') + (o === mo && this === mo ? '' : '!')); }}); \
+             mo.observe(document.body, {{childList: true, subtree: true, attributes: true, attributeOldValue: true, characterData: true, characterDataOldValue: true}}); \
+             var d = document.getElementById('a'); var order = []; Promise.resolve().then(() => order.push('before')); \
+             d.setAttribute('x', '1'); d.setAttribute('x', '2'); d.removeAttribute('nope'); d.textContent = 'new'; d.firstChild.data = 'newer'; d.append(document.createElement('i'), 'txt'); \
+             Promise.resolve().then(() => order.push('after')); d.classList.add('k'); d.dataset.q = '1'; d.style.color = 'red'; d.id = 'a2';"
+        ));
+        assert_eq!(
+            eval(&mut h, "calls.join(' || ')"),
+            "attributes:DIV:::::x: attributes:DIV:::::x:1 childList:DIV:#text:#text:::: characterData:#text::::::new childList:DIV:I+#text::#text::: \
+             attributes:DIV:::::class: attributes:DIV:::::data-q: attributes:DIV:::::style: attributes:DIV:::::id:a"
+        );
+        // The callback is a microtask queued at the first record: after
+        // the promise job queued before it, before the one queued after.
+        h.run_script("order = []; Promise.resolve().then(() => order.push('p1')); var o2 = new MutationObserver(() => order.push('mo')); o2.observe(d, {attributes: true}); d.title = 't'; d.setAttribute('title', 't'); Promise.resolve().then(() => order.push('p2'));");
+        assert_eq!(eval(&mut h, "order.join(',')"), "p1,mo,p2");
+        // One record per operation: replaceChild, replaceChildren, insertBefore of a fragment, innerHTML, moves, removal.
+        h.run_script(
+            "calls = []; var p = document.getElementById('p'); var f = document.createDocumentFragment(); f.append(document.createElement('u'), document.createElement('s')); \
+             p.insertBefore(f, p.firstChild); p.replaceChild(document.createElement('em'), p.lastChild); p.replaceChildren(document.createElement('q')); p.innerHTML = '<a></a><b></b>'; \
+             d.appendChild(p.firstChild); p.firstChild.replaceWith('t1', document.createElement('hr')); p.before(d.lastChild); p.remove();",
+        );
+        assert_eq!(
+            eval(&mut h, "calls.join(' || ')"),
+            "childList:P:U+S:::B:: childList:P:EM:B:S::: childList:P:Q:U+S+EM:::: childList:P:A+B:Q:::: \
+             childList:P::A::B:: childList:DIV:A::#text::: childList:P:#text+HR:B:::: childList:DIV::A:#text::: childList:BODY:A::DIV:P:: childList:BODY::P:A:::"
+        );
+        // A removed subtree is still watched until the callback; takeRecords empties the queue; disconnect stops.
+        h.run_script(
+            "calls = []; var gone = d; gone.remove(); gone.setAttribute('late', '1'); var taken = mo.takeRecords().map(show).join(' '); gone.setAttribute('later', '1'); \
+             var filtered = []; var fo = new MutationObserver(l => filtered.push(l.map(show).join(' '))); fo.observe(document.documentElement, {attributeFilter: ['lang'], subtree: true}); \
+             document.body.setAttribute('lang', 'en'); document.body.setAttribute('dir', 'ltr'); document.title = 'New title';",
+        );
+        assert_eq!(eval(&mut h, "taken"), "childList:BODY::DIV::A:: attributes:DIV:::::late:");
+        assert_eq!(eval(&mut h, "calls.join(' || ')"), "attributes:DIV:::::later: attributes:BODY:::::lang: attributes:BODY:::::dir:");
+        assert_eq!(eval(&mut h, "filtered.join(' || ')"), "attributes:BODY:::::lang:");
+        h.run_script("calls = []; filtered = []; gone.setAttribute('after', '1'); mo.disconnect(); fo.disconnect(); document.body.setAttribute('z', '1'); var titles = []; new MutationObserver(l => titles.push(l.map(show).join(' '))).observe(document.head, {childList: true, subtree: true}); document.title = 'Again';");
+        assert_eq!(eval(&mut h, "calls.length + '|' + filtered.length + '|' + titles.join(' ')"), "0|0|childList:TITLE:#text:#text::::");
+        // Bad options and targets.
+        assert_eq!(
+            eval(&mut h, "var errs = []; var m = new MutationObserver(() => {}); for (var f of [() => m.observe(document.body, {}), () => m.observe(document.body), () => m.observe({}, {childList: true}), () => m.observe(document.body, {attributes: false, attributeOldValue: true}), \
+                          () => m.observe(document.body, {characterData: false, characterDataOldValue: true}), () => m.observe(document.body, {attributes: false, attributeFilter: ['a']}), () => new MutationObserver(1), () => MutationObserver(() => {})]) \
+                          { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } [errs.join(','), typeof WebKitMutationObserver, m.takeRecords().length].join('|')"),
+            "TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError|function|0"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
     }
 }
