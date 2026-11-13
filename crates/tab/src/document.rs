@@ -4539,11 +4539,11 @@ impl TabState {
     /// slots of a removed element go.
     fn sync_stylesheets(&mut self) {
         enum Source {
-            Inline(String),
+            /// The text, and the base URL it was set under.
+            Inline(String, Option<Url>),
             Link(Url),
         }
         let Some(doc) = &self.doc else { return };
-        let base = doc.base_url.clone();
         let mut found: Vec<(NodeId, MediaQueryList, Source)> = Vec::new();
         for id in doc.descendants(doc.root()) {
             let Some(e) = doc.element(id) else { continue };
@@ -4552,7 +4552,7 @@ impl TabState {
             }
             let media = parse_media_attr(e.attr("media"));
             if e.name.local == local_name!("style") {
-                found.push((id, media, Source::Inline(doc.text_content(id))));
+                found.push((id, media, Source::Inline(doc.text_content(id), doc.sheet_base(id).cloned())));
             } else if e.name.local == local_name!("link") {
                 let rel = e.attr("rel").unwrap_or("");
                 let is_sheet = rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet"));
@@ -4577,7 +4577,7 @@ impl TabState {
             let unchanged = same.last().is_some_and(|main| {
                 main.media == media
                     && match &source {
-                        Source::Inline(css) => main.url == base && main.text_hash == text_hash(css),
+                        Source::Inline(css, base) => main.url == *base && main.text_hash == text_hash(css),
                         Source::Link(url) => main.url.as_ref() == Some(url),
                     }
             });
@@ -4587,7 +4587,7 @@ impl TabState {
             }
             changed = true;
             match source {
-                Source::Inline(css) => {
+                Source::Inline(css, base) => {
                     tracing::debug!(tab = self.id.0, "inline stylesheet:\n{css}");
                     let sheet = Stylesheet::parse_with_base(&css, Origin::Author, base.as_ref());
                     let slot = self.sheets.len();
@@ -10645,11 +10645,12 @@ mod tests {
     fn a_base_href_moves_every_relative_url() {
         let page = "<!DOCTYPE html><title>Page</title><base href='/sub/'><link rel=stylesheet href=s.css>\
              <img src=i.png><script src=a.js></script><a id=l href=next>next</a>\
-             <form id=f><button id=b>go</button></form><div id=d style='background-image: url(bg.png)'>d</div>";
+             <form id=f><button id=b>go</button></form><div id=d style='background-image: url(bg.png)'>d</div>\
+             <style>#s { background-image: url(st.png) }</style><p id=s>s</p>";
         let server = Server::start(
             &[
                 ("/dir/page", "text/html", page),
-                ("/dir/page?", "text/html", "<title>Self</title>"),
+                ("/dir/page?", "text/html", "<title>Self</title><style>#s { background-image: url(st.png) }</style><p id=s>s</p>"),
                 ("/sub/s.css", "text/css", "p { color: red }"),
                 ("/sub/a.js", "text/javascript", "fetch('f');"),
                 ("/sub/f", "text/plain", "f"),
@@ -10660,16 +10661,26 @@ mod tests {
         );
         let mut h = Harness::load_url(server.url("/dir/page"));
         // The page's resources resolve against the base.
-        let paths = ["/sub/s.css", "/sub/i.png", "/sub/a.js", "/sub/f", "/sub/bg.png"];
+        let paths = ["/sub/s.css", "/sub/i.png", "/sub/a.js", "/sub/f", "/sub/bg.png", "/sub/st.png"];
         h.pump_until(|_| paths.iter().all(|p| !server.requests(p).is_empty()));
         h.pump_until(|h| !h.state.is_loading());
         let sub = server.url("/sub/").to_string();
         assert_eq!(run_js(&mut h, "document.baseURI"), format!("\"{sub}\""));
         assert_eq!(run_js(&mut h, "document.getElementById('l').baseURI"), format!("\"{sub}\""));
+        assert_eq!(
+            run_js(&mut h, "document.body.append(document.createElement('i')); getComputedStyle(document.getElementById('s')).backgroundImage"),
+            format!("\"url(\\\"{}\\\")\"", server.url("/sub/st.png"))
+        );
         // A form without an action submits to the document's own URL.
         h.click_id("b");
         h.pump_until(|h| h.title().as_deref() == Some("Self"));
         assert_eq!(server.requests("/dir/page?").len(), 1);
+        // The same `<style>` text in another document resolves against
+        // that document's base.
+        assert_eq!(
+            run_js(&mut h, "document.body.append(document.createElement('i')); getComputedStyle(document.getElementById('s')).backgroundImage"),
+            format!("\"url(\\\"{}\\\")\"", server.url("/dir/st.png"))
+        );
         h.send(ShellToTab::GoBack);
         h.pump_until(|h| h.title().as_deref() == Some("Page") && !h.state.is_loading());
         // A link, and `location`, resolve against the base.
@@ -10699,6 +10710,15 @@ mod tests {
         h.pump();
         assert!(server.requests("/other/s.css").is_empty(), "the loaded link is not fetched again");
         assert!(server.requests("/other/bg.png").is_empty(), "the style attribute keeps its base");
+        assert!(server.requests("/other/st.png").is_empty(), "the inline sheet keeps its base");
+        assert_eq!(
+            run_js(&mut h, "document.body.append(document.createElement('i')); getComputedStyle(document.getElementById('s')).backgroundImage"),
+            format!("\"url(\\\"{}\\\")\"", server.url("/sub/st.png")),
+            "getComputedStyle agrees"
+        );
+        // Its text changed: parsed again, with the base of now.
+        run_js(&mut h, "document.querySelector('style').textContent += ' '");
+        h.pump_until(|_| !server.requests("/other/st.png").is_empty());
         assert_eq!(server.requests("/sub/s.css").len(), sheet_loads, "nor from its old URL");
         assert_eq!(run_js(&mut h, "document.querySelector('base').remove(); document.baseURI"), format!("\"{}\"", server.url("/dir/page")));
     }

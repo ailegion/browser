@@ -291,6 +291,10 @@ pub struct Document {
     /// inserted, or an attribute that processes it again changed): its
     /// `href` resolves against it, so a base change fetches nothing again.
     link_bases: std::collections::HashMap<NodeId, Url>,
+    /// The document base URL each `<style>` element's sheet was parsed
+    /// with (when it was inserted or its text changed): its `url()`s are
+    /// not resolved again when the base changes.
+    sheet_bases: std::collections::HashMap<NodeId, Url>,
     /// The encoding the bytes were decoded with, set when the parser
     /// finishes; `None` for a document that was not parsed from bytes.
     pub encoding: Option<&'static encoding_rs::Encoding>,
@@ -386,6 +390,7 @@ impl Document {
             base_element: None,
             style_bases: Default::default(),
             link_bases: Default::default(),
+            sheet_bases: Default::default(),
             encoding: None,
             images: std::collections::HashMap::new(),
             created_images: Vec::new(),
@@ -482,6 +487,37 @@ impl Document {
         }
     }
 
+    /// The base URL a `<style>` element's sheet resolves against: the one
+    /// its text was parsed with, else the document base URL.
+    pub fn sheet_base(&self, style: NodeId) -> Option<&Url> {
+        self.sheet_bases.get(&style).or(self.base_url.as_ref())
+    }
+
+    /// A connected `<style>`'s text was set (it was inserted, a child came
+    /// or went, a text child's data changed): its sheet is parsed again,
+    /// with the document base URL of this moment.
+    fn sheet_text_changed(&mut self, style: NodeId) {
+        let is_style = self
+            .nodes
+            .get(style)
+            .and_then(Node::as_element)
+            .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("style"));
+        if is_style
+            && self.is_connected(style)
+            && let Some(base) = self.base_url.clone()
+        {
+            self.sheet_bases.insert(style, base);
+        }
+    }
+
+    /// The data of the text node `text` changed: a `<style>`'s text when
+    /// it is that element's child.
+    pub fn note_text_changed(&mut self, text: NodeId) {
+        if let Some(parent) = self.nodes.get(text).and_then(|n| n.parent) {
+            self.sheet_text_changed(parent);
+        }
+    }
+
     /// A `<link>`'s `href` resolved against the base URL it was processed
     /// with (else the document base URL).
     pub fn link_url(&self, link: NodeId, href: &str) -> Option<Url> {
@@ -573,15 +609,30 @@ impl Document {
             base |= self.descendants(child).any(|d| named(self, d, local_name!("base")));
             links.extend(self.descendants(child).filter(|&d| named(self, d, local_name!("link"))));
         }
-        if (base || !links.is_empty()) && self.is_connected(parent) {
+        let mut styles: Vec<NodeId> = Vec::new();
+        if named(self, child, local_name!("style")) {
+            styles.push(child);
+        }
+        if self.nodes[child].first_child.is_some() && self.is_connected(parent) {
+            styles.extend(self.descendants(child).filter(|&d| named(self, d, local_name!("style"))));
+        }
+        // A child given to a `<style>` changes its text.
+        if named(self, parent, local_name!("style")) {
+            styles.push(parent);
+        }
+        if (base || !links.is_empty() || !styles.is_empty()) && self.is_connected(parent) {
             if base {
                 self.update_base(None);
             }
             // A `<link>` that became connected is processed: its `href`
             // resolves against the base of this moment (after a `<base>`
-            // inserted with it).
+            // inserted with it); a `<style>` that did, or whose text
+            // changed, is parsed with it.
             for l in links {
                 self.link_processed(l);
+            }
+            for s in styles {
+                self.sheet_text_changed(s);
             }
         }
     }
@@ -1231,6 +1282,8 @@ impl Document {
         n.prev_sibling = None;
         n.next_sibling = None;
         self.forms_removed(id, parent);
+        // A child taken from a `<style>` changes its text.
+        self.sheet_text_changed(parent);
         // The first `<base>` went with it: another one, or none, is first.
         if let Some((base, _, _)) = &self.base_element
             && (*base == id || !self.is_connected(*base))
@@ -1312,6 +1365,7 @@ impl Document {
             self.parser_forms.remove(&n);
             self.style_bases.remove(&n);
             self.link_bases.remove(&n);
+            self.sheet_bases.remove(&n);
             self.nodes.remove(n);
         }
     }

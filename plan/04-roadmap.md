@@ -1310,11 +1310,20 @@ remaining lists as they stand.
       (`Document::link_url`: recorded when it becomes connected, after a
       `<base>` inserted with it, and when its `href`, `rel`, `type`,
       `crossorigin` or `referrerpolicy` changes), in the tab and in the
-      script's view. The tab test fails with either undone. Found, not
-      changed: the script's view (`getComputedStyle`) parses an inline
-      `<style>` against the base of the moment it builds (its cache key),
-      where the tab keeps the sheet it parsed until the text changes, as
-      browsers do; after a base change the two may differ. Timing
+      script's view. The tab test fails with either undone. Inline
+      `<style>` sheets too (owner's go, the same day; corrected: the
+      first record said the tab kept such a sheet until its text changed,
+      which was wrong: its sync compared each slot with the base of the
+      moment and parsed again when it moved): `Document::sheet_base`
+      records the base when a `<style>` becomes connected, a child comes
+      or goes, or a text child's data changes (`set_data`); the tab's
+      sync and the script's view both parse with it, and the view's
+      cache (it lives as long as the tab) is keyed by that base and the
+      text. The test fails without the recorded base. Not shown by a
+      test: the view's cache serving one document's sheet to another
+      with the same text (the view's own stylesheet path was not reached
+      by `getComputedStyle` after a DOM change in the test, cause not
+      found); the key holds the base now in any case. Timing
       (release probe, live, against the line's first build): slower:
       Wikipedia relayout 1.79–2.11 ms (1.67–1.95), iana full restyle
       391–404 ms (392–400), iana load 4.97–4.99 s (4.97–4.98), not
@@ -1322,7 +1331,14 @@ remaining lists as they stand.
       a cascade); Wikipedia full restyle 45.0–47.0 ms (47.3–50.6), load
       631–647 ms (623–650), iana relayout 37.2–38.8 ms (37.4–38.9), heaps
       30.3 and 435.7 MiB. Full run: the paint snapshots failed once
-      (passing alone). Ticked.
+      (passing alone). Ticked. Inline sheets' timing (same probe,
+      against the two fixes'): slower: iana load 4.98–5.04 s
+      (4.97–4.99), full restyle 393–411 ms (391–404), relayout 36.7–42.1
+      ms (37.2–38.8), Wikipedia load 631–651 ms (631–647), not attributed
+      (a map lookup per `<style>` in a sync); Wikipedia full restyle
+      43.6–47.6 ms (45.0–47.0), relayout 1.77–1.81 ms (1.79–2.11), heaps
+      30.3 and 435.7 MiB. Full run: the paint snapshots failed once
+      (passing alone).
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

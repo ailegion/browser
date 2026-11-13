@@ -397,7 +397,6 @@ impl View {
     fn stylist_for(&mut self, doc: &Document) -> Stylist {
         let mut stylist = Stylist::new();
         stylist.add_sheet(ua_stylesheet());
-        let base = doc.base_url.clone();
         for id in doc.descendants(doc.root()) {
             let Some(e) = doc.element(id) else { continue };
             if e.name.ns != ns!(html) {
@@ -405,8 +404,11 @@ impl View {
             }
             let media = e.attr("media").map_or_else(MediaQueryList::all, MediaQueryList::parse_str);
             let sheet = if e.name.local == local_name!("style") {
+                // Parsed with the base its text was set under; cached by
+                // that base and the text (the cache outlives documents).
                 let css = doc.text_content(id);
-                let key = hash_text(&css);
+                let base = doc.sheet_base(id).cloned();
+                let key = hash_text(&format!("{}\n{css}", base.as_ref().map_or("", Url::as_str)));
                 self.inline_cache
                     .entry(key)
                     .or_insert_with(|| Arc::new(Stylesheet::parse_with_base(&css, Origin::Author, base.as_ref())))

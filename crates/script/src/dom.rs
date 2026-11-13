@@ -1466,6 +1466,8 @@ fn set_data(doc: &mut Document, id: NodeId, text: String) {
         NodeKind::Text(t) | NodeKind::Comment(t) | NodeKind::ProcessingInstruction { data: t, .. } => *t = text,
         _ => {}
     }
+    // A `<style>`'s text changed: its sheet is parsed with the base of now.
+    doc.note_text_changed(id);
 }
 
 /// Replace every child of `id` with one text node (none for empty text).
