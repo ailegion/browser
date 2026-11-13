@@ -547,10 +547,13 @@ fn serve_cached(id: RequestId, url: &Url, cached: CachedResponse, referrer: Opti
     sink(NetToTab::ResponseEnd { id });
 }
 
+/// A header map as (name, value) strings, each value byte as the code
+/// point of that number (Fetch's isomorphic decode): nothing is lost, and
+/// `headers.get()` gives scripts the bytes as browsers do.
 fn header_list(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
-        .map(|(k, v)| (k.as_str().to_owned(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+        .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().iter().map(|&b| char::from(b)).collect()))
         .collect()
 }
 
@@ -801,6 +804,16 @@ mod tests {
         assert!(!heads[0].contains("cookie:"));
         assert!(heads[1].contains("cookie: sid=abc\r\n"), "{}", heads[1]);
         assert_eq!(svc.cookies().len(), 2);
+    }
+
+    #[test]
+    fn header_values_are_decoded_byte_for_byte() {
+        // "é" is sent as its two UTF-8 bytes: each becomes one code point.
+        let server = Server::start(vec![response("200 OK", &["X-Name: é"], "b")]);
+        let svc = NetService::new().unwrap();
+        let got = fetch(&svc, FetchRequest::get(server.url("/"))).unwrap();
+        let value = got.headers.iter().find(|(k, _)| k == "x-name").map(|(_, v)| v.clone());
+        assert_eq!(value.as_deref(), Some("\u{c3}\u{a9}"));
     }
 
     #[test]

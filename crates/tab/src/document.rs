@@ -720,9 +720,12 @@ pub(crate) struct TabState {
     /// The tab changed the layout tree (a layout, a scroll) since the
     /// script view last indexed its boxes.
     view_rects_stale: bool,
-    /// A traversal reached an entry with a scroll position to restore,
-    /// once the document is laid out.
+    /// A reload or a traversal reached an entry with a scroll position to
+    /// restore: tried at each layout until the page reaches it or has
+    /// loaded, given up once anything else scrolls the page
+    /// (`restore_applied`: where the last try left it).
     pending_scroll_restore: Option<(f32, f32)>,
+    restore_applied: Option<(f32, f32)>,
     /// The requests scripts have under way, by the script's id for each,
     /// and the network request each one's current hop is.
     script_fetches: HashMap<u64, ScriptFetch>,
@@ -892,6 +895,7 @@ impl TabState {
             fragment_scrolls: true,
             view_rects_stale: false,
             pending_scroll_restore: None,
+            restore_applied: None,
             script_fetches: HashMap::new(),
             net_to_script: HashMap::new(),
             next_detached: u64::MAX,
@@ -1049,6 +1053,10 @@ impl TabState {
                 self.navigate_with(url, NavKind::Push, Some(post), referrer);
             }
             ShellToTab::Reload => {
+                // The position to come back to after the reload.
+                if self.nav.is_none() {
+                    self.leave_entry();
+                }
                 // Reloading while a navigation is pending restarts that one,
                 // with its referrer; else the entry's request referrer and
                 // policy are used again (HTML §7.4.3 reload, §7.4.5).
@@ -2364,6 +2372,48 @@ impl TabState {
         self.same_document_navigated(old);
     }
 
+    /// One try at restoring the scroll position `to`: given up when the
+    /// page is no longer where the last try left it (the user or a script
+    /// scrolled); done when it is reached, or once the page has loaded (the
+    /// page cannot grow to it any more).
+    fn restore_scroll_step(&mut self, to: (f32, f32)) {
+        if self.restore_applied.is_some_and(|at| at != (self.scroll_x, self.scroll_y)) {
+            self.pending_scroll_restore = None;
+            self.restore_applied = None;
+            return;
+        }
+        self.programmatic_scroll(ScrollTarget::Page, to, false);
+        self.needs_paint = true;
+        let at = (self.scroll_x, self.scroll_y);
+        let reached = (at.0 - to.0).abs() < 0.5 && (at.1 - to.1).abs() < 0.5;
+        if reached || self.lifecycle == Lifecycle::Complete {
+            self.pending_scroll_restore = None;
+            self.restore_applied = None;
+        } else {
+            self.restore_applied = Some(at);
+        }
+    }
+
+    /// A script navigated to a fragment of the document (`location`): it
+    /// adopted the URL, moved its history and fired `popstate` itself; the
+    /// entry goes in the list (sharing the document's state) and the page
+    /// scrolls to the fragment, with no event from here.
+    fn script_fragment_navigated(&mut self, url: Url, replace: bool) {
+        self.cancel_pending_nav();
+        let kind = if replace { NavKind::Replace } else { NavKind::Push };
+        if kind == NavKind::Push {
+            self.leave_entry();
+        }
+        self.apply_history(url.clone(), kind, true);
+        self.pending_fragment = true;
+        self.state_dirty = true;
+        self.document_url_changed(&url);
+        let (index, length) = (self.history_index, self.history.len());
+        if let (Some(host), Some(entry)) = (&mut self.script, self.history.get(index)) {
+            host.set_history(index, length, None, entry.manual_scroll);
+        }
+    }
+
     /// The document's URL changed without a load (a fragment navigation
     /// or a traversal between its entries): the document and its scripts
     /// follow, `popstate` fires with the entry's state, and `hashchange`
@@ -2583,10 +2633,13 @@ impl TabState {
             self.leave_entry();
         }
         self.apply_history(final_url.clone(), kind, false);
+        // A reload and a traversal restore the entry's scroll position
+        // (`auto` scroll restoration).
         self.pending_scroll_restore = match kind {
-            NavKind::Traverse(_) => self.history.get(self.history_index).filter(|e| !e.manual_scroll).and_then(|e| e.scroll),
+            NavKind::Traverse(_) | NavKind::Reload => self.history.get(self.history_index).filter(|e| !e.manual_scroll).and_then(|e| e.scroll),
             _ => None,
         };
+        self.restore_applied = None;
         self.fragment_scrolls = true;
         self.doc_cache = if kind == NavKind::Reload {
             CacheMode::NoCache
@@ -4076,6 +4129,7 @@ impl TabState {
                 // of the new title.
                 HostRequest::SetTitle(_) => self.state_dirty = true,
                 HostRequest::PushState { url, state, replace } => self.push_state(url, state, replace),
+                HostRequest::FragmentNavigate { url, replace } => self.script_fragment_navigated(url, replace),
                 HostRequest::Traverse { delta } => {
                     let target = self.history_index as i64 + i64::from(delta);
                     if target >= 0 && (target as usize) < self.history.len() {
@@ -5515,12 +5569,10 @@ impl TabState {
             // The position a traversal's entry was left at, once its
             // document is the one laid out.
             if self.layout.is_some()
-                && self.parser.is_none()
                 && self.nav.is_none()
-                && let Some(to) = self.pending_scroll_restore.take()
+                && let Some(to) = self.pending_scroll_restore
             {
-                self.programmatic_scroll(ScrollTarget::Page, to, false);
-                self.needs_paint = true;
+                self.restore_scroll_step(to);
             }
             if !self.needs_style && !self.needs_layout {
                 break;
@@ -6031,6 +6083,21 @@ mod tests {
                     Ok(ev) => self.state.handle_net(ev),
                     Err(_) => panic!("timed out waiting for the tab"),
                 }
+            }
+        }
+
+        /// `pump_until` for a condition that sends the tab no event (a
+        /// request the server holds): checked every few milliseconds, the
+        /// network delivered in between. Panics after ten seconds.
+        fn pump_polling(&mut self, mut done: impl FnMut(&Self) -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                self.pump();
+                if done(self) {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for the tab");
+                self.pump_for(std::time::Duration::from_millis(5));
             }
         }
 
@@ -9158,7 +9225,8 @@ mod tests {
         let mut h = Harness::start(server.url("/page"));
         h.state.font_clock = FontClock::frozen();
         h.pump();
-        h.pump_until(|h| shown(h).len() == 5 && server.requests("/o.ttf").len() == 1);
+        // The held font's request sends the tab no event: polled.
+        h.pump_polling(|h| shown(h).len() == 5 && server.requests("/o.ttf").len() == 1);
         let s = shown(&h);
         assert_eq!(s["block"], (true, false), "block: invisible while loading");
         assert_eq!(s["swap"], (false, false), "swap: the fallback at once");
@@ -10639,6 +10707,71 @@ mod tests {
         h.send(ShellToTab::Navigate { url: server.url("/plain") });
         h.pump_until(|h| h.title().as_deref() == Some("Plain"));
         assert_eq!(referer(&server, "/plain", 0), None);
+    }
+
+    #[test]
+    fn a_reload_restores_the_scroll_position_as_the_page_grows() {
+        let server = Server::start(
+            &[
+                ("/tall", "text/html", "<!DOCTYPE html><title>T</title><body style='margin:0'><div style='height:1000px'></div><script async src=/grow.js></script>"),
+                ("/grow.js", "text/javascript", "var d = document.createElement('div'); d.style.height = '3000px'; document.body.append(d);"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/tall"));
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: 1500.0 });
+        assert_eq!(h.state.scroll_y, 1500.0);
+        // Reloaded with the script held: the page is short, so the restore
+        // waits; it lands once the script makes the page tall enough.
+        server.hold("/grow.js");
+        let before = server.requests("/grow.js").len();
+        h.send(ShellToTab::Reload);
+        h.pump_polling(|_| server.requests("/grow.js").len() > before);
+        h.pump();
+        assert!(h.state.scroll_y < 1500.0, "not reachable yet: {}", h.state.scroll_y);
+        server.release("/grow.js");
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.pump();
+        assert_eq!(h.state.scroll_y, 1500.0, "restored after the reload");
+        // The user scrolls while it waits: the restore gives up.
+        server.hold("/grow.js");
+        let before = server.requests("/grow.js").len();
+        h.send(ShellToTab::Reload);
+        h.pump_polling(|_| server.requests("/grow.js").len() > before);
+        h.pump();
+        h.send(ShellToTab::Scroll { dx: 0.0, dy: -100.0 });
+        let user = h.state.scroll_y;
+        assert!(user > 0.0 && user < 1500.0, "{user}");
+        server.release("/grow.js");
+        h.pump_until(|h| h.state.lifecycle == Lifecycle::Complete);
+        h.pump();
+        assert_eq!(h.state.scroll_y, user, "left where the user put it");
+    }
+
+    #[test]
+    fn location_fragment_changes_fire_popstate_at_once_and_hashchange_after() {
+        let server = Server::start(&[("/f", "text/html", "<!DOCTYPE html><title>F</title><p id=a>a</p>")], &[]);
+        let mut h = Harness::load_url(server.url("/f"));
+        h.pump_until(|h| !h.state.is_loading());
+        // `popstate` inside the setter, `hashchange` as a task after it.
+        assert_eq!(
+            run_js(
+                &mut h,
+                "var ev = []; onpopstate = e => ev.push('pop:' + location.hash + ':' + e.state); onhashchange = () => ev.push('hash'); \
+                 location.hash = 'a'; ev.push('after:' + history.length); ev.join(' ')"
+            ),
+            "\"pop:#a:null after:2\""
+        );
+        assert_eq!(run_js(&mut h, "ev.join(' ')"), "\"pop:#a:null after:2 hash\"");
+        assert_eq!(h.state.history.len(), 2, "the tab has the entry");
+        assert!(h.state.url.as_ref().is_some_and(|u| u.fragment() == Some("a")));
+        // The same fragment: nothing; one leading `#` goes.
+        assert_eq!(run_js(&mut h, "ev = []; location.hash = '#a'; [ev.length, history.length].join()"), "\"0,2\"");
+        assert_eq!(run_js(&mut h, "location.hash = '##b'; location.hash"), "\"##b\"");
+        // `location.replace` to a fragment replaces the entry.
+        assert_eq!(run_js(&mut h, "location.replace('#c'); [location.hash, history.length].join()"), "\"#c,3\"");
+        assert_eq!(h.state.history.len(), 3);
     }
 
     #[test]

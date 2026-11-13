@@ -916,6 +916,46 @@ remaining lists as they stand.
       (30.3, 435.7). Still open: the paint process ending without a
       failing test named and the one-pixel snapshot, and
       `declared_web_families_hide_installed_ones` (once).
+      Small fixes of this line's SKIPPED list, 2026-11-13 (owner's go):
+      CORP's `same-site` uses the public suffix list (done with O16 b,
+      see line 8's referrer record); response header values are decoded
+      byte for byte (Fetch's isomorphic decode; they were lossy UTF-8),
+      so `headers.get()`/`getResponseHeader()` give the bytes as
+      browsers do; a script's `location` change to a fragment of the
+      document is HTML's "navigate to a fragment" done at once
+      (`history::navigate_to_fragment`): the URL, a new entry (or the
+      current one for `replace`) with no state, `popstate` inside the
+      setter and `hashchange` as a task after (Chrome since 2022 and
+      Firefox order them so), the tab recording the entry and scrolling
+      (`HostRequest::FragmentNavigate`); `location.hash` drops one
+      leading `#` (it dropped all) and a fragment equal to the current
+      one navigates nowhere; a reload restores the entry's scroll
+      position like a traversal, and both try again at each layout until
+      the position is reached or the page has loaded, giving up once
+      anything else scrolls the page (they tried once, when parsing
+      ended). Tests: net `header_values_are_decoded_byte_for_byte`, tab
+      `location_fragment_changes_fire_popstate_at_once_and_hashchange_after`,
+      `a_reload_restores_the_scroll_position_as_the_page_grows`; the
+      script test of `location` expects the fragment request. Found on
+      the way: the tab harness's `pump_until` checks its condition only
+      after a network event, so a wait for a request the server holds
+      (which sends the tab none) could sleep its ten seconds and fail;
+      `pump_polling` checks every few milliseconds, used by the new test
+      and by `font_display_…`'s first wait (most likely the cause of its
+      rare timeouts, beside the clock). Six and four full tab runs after:
+      no failure. Not verified: whether a wheel on a page that cannot
+      scroll yet stops the restore in browsers (here only a change of
+      position does); whether `location` changes before the load should
+      replace the entry (HTML's rule for a document not completely
+      loaded; not done, as for other `location` navigations here).
+      Waiting for the owner: `pushState`'s limit (200 calls in 10 s in
+      both browsers; past it Firefox throws `SecurityError`, Chrome
+      ignores the call). Timing (release probe, live, against line 9's
+      inline sheets): slower: Wikipedia full restyle 45.3–47.7 ms
+      (43.6–47.6); Wikipedia load 623–647 ms (631–651), relayout
+      1.64–1.80 ms (1.77–1.81), iana load 4.94–5.00 s (4.98–5.04), full
+      restyle 389–407 ms (393–411), relayout 37.4–38.9 ms (36.7–42.1),
+      heaps 30.3 and 435.7 MiB.
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,

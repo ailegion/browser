@@ -261,6 +261,41 @@ fn history_push(this: &JsValue, args: &[JsValue], replace: &bool, context: &mut 
     Ok(JsValue::undefined())
 }
 
+/// HTML's "navigate to a fragment" for a script's `location` change: the
+/// document's URL is `url`, its history a new entry (or the current one,
+/// `replace`) with no state; `popstate` fires now and, when the fragment
+/// changed, `hashchange` as a task (as Chrome and Firefox order them);
+/// the tab records the entry and scrolls (`HostRequest::FragmentNavigate`).
+pub(crate) fn navigate_to_fragment(url: Url, replace: bool, context: &mut Context) -> JsResult<()> {
+    let host = host_state(context)?;
+    let old = crate::current_url(&host.borrow().info);
+    {
+        let shared_dom = dom(context)?;
+        shared_dom.borrow_mut().doc.set_document_url(Some(url.clone()));
+    }
+    host.borrow_mut().info.url = Some(url.clone());
+    {
+        let shared = history(context)?;
+        let mut state = shared.borrow_mut();
+        if !replace {
+            state.index = (state.index + 1).min(MAX_HISTORY_ENTRIES - 1);
+            state.length = (state.index + 1).min(MAX_HISTORY_ENTRIES);
+        }
+        state.serialized = None;
+        state.value = None;
+    }
+    host.borrow_mut().requests.push(HostRequest::FragmentNavigate { url: url.clone(), replace });
+    fire_popstate(None, context)?;
+    if old.fragment() != url.fragment() {
+        let hashchange = boa_engine::job::NativeJob::new(move |ctx| {
+            fire_hashchange(&old, &url, ctx)?;
+            Ok(JsValue::undefined())
+        });
+        context.enqueue_job(boa_engine::job::Job::TimeoutJob(boa_engine::job::TimeoutJob::new(hashchange, 0)));
+    }
+    Ok(())
+}
+
 /// Whether an object is an ordinary one for the serialization: no data of
 /// its own beyond its properties (not a node, an event, a promise, a
 /// proxy), and not callable.

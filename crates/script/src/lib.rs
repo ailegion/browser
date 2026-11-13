@@ -564,6 +564,12 @@ pub enum HostRequest {
     /// the document's URL is now `url`, and its entry (a new one, or the
     /// current one) carries `state`. Nothing loads and no event fires.
     PushState { url: Url, state: SerializedState, replace: bool },
+    /// A script's `location` change within the document (HTML's
+    /// "navigate to a fragment"): the script has adopted `url`, moved its
+    /// history to a new entry (or `replace`d the current one) with no
+    /// state and fired `popstate`; the tab records the entry and scrolls
+    /// to the fragment, firing nothing.
+    FragmentNavigate { url: Url, replace: bool },
     /// `history.go(delta)`, `back()` (-1) and `forward()` (1): traverse
     /// the session history, if there is an entry that far.
     Traverse { delta: i32 },
@@ -668,20 +674,33 @@ fn location_set(_: &JsValue, args: &[JsValue], what: &u8, context: &mut Context)
     // A URL resolves against the API base URL (the document base URL);
     // `hash` changes the document's own URL.
     let api_base = crate::fetch::api_base_url(context)?;
-    let mut state = host.borrow_mut();
+    let current = current_url(&host.borrow().info);
     let url = if *what == NAV_HASH {
-        let mut url = current_url(&state.info);
-        url.set_fragment(Some(target.trim_start_matches('#')));
+        // One leading `#` goes; the same fragment navigates nowhere.
+        let mut url = current.clone();
+        url.set_fragment(Some(target.strip_prefix('#').unwrap_or(&target)));
+        if url.fragment() == current.fragment() {
+            return Ok(JsValue::undefined());
+        }
         url
     } else {
-        api_base.unwrap_or_else(|| current_url(&state.info)).join(&target).map_err(|_| {
+        api_base.unwrap_or_else(|| current.clone()).join(&target).map_err(|_| {
             JsNativeError::syntax().with_message(format!("Failed to navigate: \"{target}\" is not a valid URL"))
         })?
     };
-    state.requests.push(HostRequest::Navigate {
-        url,
-        replace: *what == NAV_REPLACE,
-    });
+    let replace = *what == NAV_REPLACE;
+    // The document's own URL with a fragment: HTML's "navigate to a
+    // fragment", done now, `popstate` included.
+    let without = |u: &Url| {
+        let mut u = u.clone();
+        u.set_fragment(None);
+        u
+    };
+    if url.fragment().is_some() && without(&url) == without(&current) {
+        history::navigate_to_fragment(url, replace, context)?;
+        return Ok(JsValue::undefined());
+    }
+    host.borrow_mut().requests.push(HostRequest::Navigate { url, replace });
     Ok(JsValue::undefined())
 }
 
@@ -1707,7 +1726,8 @@ mod tests {
                 HostRequest::SetTitle("New".to_owned()),
                 HostRequest::Navigate { url: u("https://user@example.test:8443/c.html"), replace: false },
                 HostRequest::Navigate { url: u("https://other.test/"), replace: true },
-                HostRequest::Navigate { url: u("https://user@example.test:8443/a/b.html?q=1#x"), replace: false },
+                // `hash`: a fragment of the document, navigated to at once.
+                HostRequest::FragmentNavigate { url: u("https://user@example.test:8443/a/b.html?q=1#x"), replace: false },
                 HostRequest::Navigate { url: u("https://user@example.test:8443/root"), replace: false },
                 HostRequest::Reload,
             ]
