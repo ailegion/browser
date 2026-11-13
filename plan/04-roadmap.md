@@ -901,10 +901,20 @@ remaining lists as they stand.
       busy machine; it reads the log from the page now.
       `responsive_images_…` waited for one of the two images a scale
       change fetches; it waits for both. Eight full tab runs in parallel
-      after: no failure (before: 3 of 4 runs). Still open:
-      `font_display_…` (its periods are wall-clock; a clock the test can
-      move needs a product change, not made), the paint process ending
-      without a failing test named and the one-pixel snapshot, and
+      after: no failure (before: 3 of 4 runs). `font_display_…` (owner's
+      go, the same day): the `font-display` periods read the tab's
+      `FontClock` (the real time; outside tests a zero-sized wrapper of
+      `Instant::now`, so the browser is unchanged), which the test
+      freezes and moves on by 250 ms where it slept; it fails when the
+      clock is not moved, and eight full tab runs after had no failure.
+      Timing (release probe, live, against the referrer fixes'): slower:
+      Wikipedia full restyle 45.9–47.8 ms (43.6–46.3), relayout
+      1.63–2.13 ms (1.65–1.76), load 622–653 ms (621–644), iana relayout
+      36.7–47.1 ms (36.8–42.3), not attributed (the release build reads
+      the time as before); iana load 4.92–4.97 s (4.96–4.99), full
+      restyle 388–400 ms (395–405), heaps 30.3 and 435.7–435.8 MiB
+      (30.3, 435.7). Still open: the paint process ending without a
+      failing test named and the one-pixel snapshot, and
       `declared_web_families_hide_installed_ones` (once).
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;

@@ -262,6 +262,50 @@ fn display_periods(display: browser_style::fontface::FontDisplay) -> (std::time:
     }
 }
 
+/// The clock the `font-display` periods run on: the real time. A test
+/// may freeze it (`FontClock::frozen`) and move it by hand (`advance`),
+/// so a period ends exactly when the test says, however busy the machine.
+#[derive(Debug, Clone, Default)]
+struct FontClock {
+    #[cfg(test)]
+    frozen: Option<std::rc::Rc<std::cell::Cell<std::time::Instant>>>,
+}
+
+impl FontClock {
+    fn now(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(t) = &self.frozen {
+            return t.get();
+        }
+        std::time::Instant::now()
+    }
+
+    /// An instant of this clock as a real one, for the tab's wake-up.
+    fn to_real(&self, at: std::time::Instant) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(t) = &self.frozen {
+            return std::time::Instant::now() + at.saturating_duration_since(t.get());
+        }
+        at
+    }
+
+    /// A clock stopped at the real time now.
+    #[cfg(test)]
+    fn frozen() -> Self {
+        Self {
+            frozen: Some(std::rc::Rc::new(std::cell::Cell::new(std::time::Instant::now()))),
+        }
+    }
+
+    /// Move a frozen clock on by `by`.
+    #[cfg(test)]
+    fn advance(&self, by: std::time::Duration) {
+        if let Some(t) = &self.frozen {
+            t.set(t.get() + by);
+        }
+    }
+}
+
 /// One `src` entry of an `@font-face` rule, as loaded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Source {
@@ -535,6 +579,8 @@ pub(crate) struct TabState {
     /// The document's referrer for a synchronous `XMLHttpRequest`, kept
     /// current by `sync_document_info`.
     sync_referrer: std::rc::Rc<std::cell::RefCell<Option<RequestReferrer>>>,
+    /// What the `font-display` periods count on (`FontClock`).
+    font_clock: FontClock,
 
     /// Interaction state behind `:hover`, `:active` and `:focus`, and how
     /// far a change in it reaches under the current sheets.
@@ -891,6 +937,7 @@ impl TabState {
             doc_header_policy: ReferrerPolicy::Empty,
             document_referrer: None,
             sync_referrer: Default::default(),
+            font_clock: FontClock::default(),
             states: ElementStates::default(),
             deps: InteractionDeps::default(),
             hover: None,
@@ -2629,7 +2676,7 @@ impl TabState {
             self.scroll_animation_wake(),
             self.script.as_ref().and_then(ScriptHost::next_wake),
             self.frame_due,
-            self.web_fonts.next_wake(),
+            self.web_fonts.next_wake().map(|t| self.font_clock.to_real(t)),
             self.script_fetch_wake(),
             // A `document.fonts` task is due.
             (self.web_fonts.dirty && self.script.is_some()).then(std::time::Instant::now),
@@ -2656,7 +2703,7 @@ impl TabState {
         // No font changes with a period (the engine notes the families of
         // fonts that do change): the boxes stay; the layout is for the
         // walk after it, which decides the invisible text.
-        if self.web_fonts.tick(now) {
+        if self.web_fonts.tick(self.font_clock.now()) {
             self.want_layout_noted("web font period ended");
         }
         // `document.fonts`: its promises and events run as a task here,
@@ -3605,7 +3652,7 @@ impl TabState {
                     // Script faces out of the set are among them when a
                     // script loads them.
                     let source = Source::Url(url.clone());
-                    let now = std::time::Instant::now();
+                    let now = self.font_clock.now();
                     let font_data = LayoutEngine::is_font_data(&p.body);
                     let body: Arc<[u8]> = Arc::from(p.body.as_slice());
                     let outside: Vec<Arc<browser_style::fontface::FontFaceRule>> = self
@@ -5172,7 +5219,7 @@ impl TabState {
             families.entry(f.family.to_lowercase()).or_default().push((i as u32, f));
         }
         let state = &self.web_fonts;
-        let now = std::time::Instant::now();
+        let now = self.font_clock.now();
         // Each source URL with its rule's sheet (the `Referer` of the fetch).
         let mut fetch: Vec<(Url, Option<Arc<RequestReferrer>>)> = Vec::new();
         let mut locals: Vec<(u32, String)> = Vec::new();
@@ -9097,7 +9144,11 @@ mod tests {
             }
             out
         };
-        let mut h = Harness::load_url(server.url("/page"));
+        // The periods run on a clock the test moves: no period ends while
+        // a busy machine is slow to get here.
+        let mut h = Harness::start(server.url("/page"));
+        h.state.font_clock = FontClock::frozen();
+        h.pump();
         h.pump_until(|h| shown(h).len() == 5 && server.requests("/o.ttf").len() == 1);
         let s = shown(&h);
         assert_eq!(s["block"], (true, false), "block: invisible while loading");
@@ -9108,7 +9159,7 @@ mod tests {
         h.pump_until(|h| shown(h).get("soon") == Some(&(false, true)));
         // Past 100 ms: fallback and optional show their fallback; block
         // still waits.
-        h.pump_for(std::time::Duration::from_millis(250));
+        h.state.font_clock.advance(std::time::Duration::from_millis(250));
         h.pump();
         let s = shown(&h);
         assert_eq!(s["block"], (true, false));
