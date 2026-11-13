@@ -1861,7 +1861,8 @@ impl Document {
             .filter(|a| !trim_ascii_ws(a).is_empty());
         let mut url = match action {
             Some(a) => self.resolve_url(&a)?,
-            None => self.base_url.clone()?,
+            // No action: the form document's URL (not its base URL).
+            None => self.document_url().cloned()?,
         };
         let enctype = self.form_enctype(form, submitter);
         let target = self.form_target(form, submitter);

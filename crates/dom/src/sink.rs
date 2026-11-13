@@ -34,7 +34,7 @@ impl ElemName for OwnedElemName {
 impl Sink {
     fn new(base_url: Option<Url>) -> Self {
         let mut doc = Document::new();
-        doc.base_url = base_url;
+        doc.set_document_url(base_url);
         Self {
             doc: RefCell::new(doc),
         }

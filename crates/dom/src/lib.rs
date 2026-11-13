@@ -271,8 +271,17 @@ pub struct Document {
     nodes: SlotMap<NodeId, Node>,
     root: NodeId,
     pub quirks_mode: QuirksMode,
-    /// URL the document was loaded from; used to resolve relative URLs.
+    /// The document base URL (HTML §2.5.1): relative URLs resolve
+    /// against it. The frozen base URL of the first `<base>` with an
+    /// `href` in tree order, else the fallback base URL (the document's
+    /// URL, `set_document_url`). Kept current by the `<base>` hooks.
     pub base_url: Option<Url>,
+    /// The document's URL, which is its fallback base URL (no `srcdoc`
+    /// or `about:blank` creator here: no frames, no `window.open`).
+    document_url: Option<Url>,
+    /// The first `<base>` with an `href` in tree order, the `href` its
+    /// frozen base URL was set from, and that URL.
+    base_element: Option<(NodeId, String, Url)>,
     /// The encoding the bytes were decoded with, set when the parser
     /// finishes; `None` for a document that was not parsed from bytes.
     pub encoding: Option<&'static encoding_rs::Encoding>,
@@ -364,6 +373,8 @@ impl Document {
             root,
             quirks_mode: QuirksMode::NoQuirks,
             base_url: None,
+            document_url: None,
+            base_element: None,
             encoding: None,
             images: std::collections::HashMap::new(),
             created_images: Vec::new(),
@@ -380,6 +391,76 @@ impl Document {
             pending_radios: Vec::new(),
             controls_changed: Vec::new(),
             referrer_policy: browser_ipc_types::ReferrerPolicy::Empty,
+        }
+    }
+
+    // ----- the document base URL (HTML §2.5.1, §4.2.3) -----
+
+    /// The document's URL (its fallback base URL); a document made
+    /// without one answers with its base URL.
+    pub fn document_url(&self) -> Option<&Url> {
+        self.document_url.as_ref().or(self.base_url.as_ref())
+    }
+
+    /// The document's URL is `url` (a navigation set it, `pushState`
+    /// moved it): the fallback base URL, which is the document base URL
+    /// unless a `<base>` gives one (its frozen base URL stays).
+    pub fn set_document_url(&mut self, url: Option<Url>) {
+        self.document_url = url.clone();
+        if self.base_element.is_none() {
+            self.base_url = url;
+        }
+    }
+
+    /// Find the first `<base>` with an `href` in tree order again; when
+    /// another one is first, or `href_changed` (the `<base>` whose `href`
+    /// was set) is, set its frozen base URL: the `href` parsed against the
+    /// fallback base URL, or the fallback base URL itself when it does not
+    /// parse or is a `data:` or `javascript:` URL (HTML §4.2.3, as Chrome
+    /// and WebKit do). With none, the document base URL is the fallback.
+    fn update_base(&mut self, href_changed: Option<NodeId>) {
+        let is_base = |doc: &Self, n: NodeId| {
+            doc.nodes[n].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("base") && e.attr("href").is_some())
+        };
+        let first = self.descendants(self.root).find(|&n| is_base(self, n));
+        let Some(first) = first else {
+            if self.base_element.take().is_some() {
+                self.base_url = self.document_url.clone();
+            }
+            return;
+        };
+        let href = self.nodes[first].as_element().and_then(|e| e.attr("href")).unwrap_or("").to_owned();
+        if href_changed != Some(first) && matches!(&self.base_element, Some((n, h, _)) if *n == first && *h == href) {
+            return;
+        }
+        let fallback = self.document_url.clone().or_else(|| self.base_url.clone());
+        let parsed = match &fallback {
+            Some(f) => f.join(&href).ok(),
+            None => Url::parse(&href).ok(),
+        };
+        let frozen = match parsed {
+            Some(u) if !matches!(u.scheme(), "data" | "javascript") => Some(u),
+            _ => fallback,
+        };
+        match frozen {
+            Some(url) => {
+                self.base_url = Some(url.clone());
+                self.base_element = Some((first, href, url));
+            }
+            None => self.base_element = None,
+        }
+    }
+
+    /// An attribute of `element` was set, changed or removed: a `<base>`'s
+    /// `href` sets the document base URL again.
+    pub fn note_base_attribute(&mut self, element: NodeId, name: &str) {
+        let is_base = self
+            .nodes
+            .get(element)
+            .and_then(Node::as_element)
+            .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("base"));
+        if is_base && name == "href" && self.is_connected(element) {
+            self.update_base(Some(element));
         }
     }
 
@@ -410,18 +491,23 @@ impl Document {
     /// `child` (and its subtree) was inserted under `parent`: each
     /// `<meta>` that became connected, in tree order.
     fn meta_inserted(&mut self, child: NodeId, parent: NodeId) {
-        let is_meta = |doc: &Self, id: NodeId| {
-            doc.nodes[id].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("meta"))
+        let named = |doc: &Self, id: NodeId, local: LocalName| {
+            doc.nodes[id].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local)
         };
-        if is_meta(self, child) {
+        if named(self, child, local_name!("meta")) {
             self.meta_referrer(child);
         }
-        if self.nodes[child].first_child.is_none() || !self.is_connected(parent) {
-            return;
+        // A `<base>` that became connected may be the first now.
+        let mut base = named(self, child, local_name!("base"));
+        if self.nodes[child].first_child.is_some() && self.is_connected(parent) {
+            let metas: Vec<NodeId> = self.descendants(child).filter(|&d| named(self, d, local_name!("meta"))).collect();
+            for m in metas {
+                self.meta_referrer(m);
+            }
+            base |= self.descendants(child).any(|d| named(self, d, local_name!("base")));
         }
-        let metas: Vec<NodeId> = self.descendants(child).filter(|&d| is_meta(self, d)).collect();
-        for m in metas {
-            self.meta_referrer(m);
+        if base && self.is_connected(parent) {
+            self.update_base(None);
         }
     }
 
@@ -1059,6 +1145,12 @@ impl Document {
         n.prev_sibling = None;
         n.next_sibling = None;
         self.forms_removed(id, parent);
+        // The first `<base>` went with it: another one, or none, is first.
+        if let Some((base, _, _)) = &self.base_element
+            && (*base == id || !self.is_connected(*base))
+        {
+            self.update_base(None);
+        }
         // A removed `<img>` leaves its `<picture>` (a relevant mutation
         // for it), a removed `<source>` changes the picture's images.
         if self.nodes[parent].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("picture")) {
@@ -1294,6 +1386,40 @@ impl Iterator for Descendants<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_base_with_an_href_gives_the_document_base_url() {
+        let page = Url::parse("https://example.test/dir/page?q").expect("url");
+        let mut parser = HtmlParser::new(Some(page.clone()));
+        parser.feed(b"<head><base target=t><base href='/other/'><base href='https://ignored.test/'></head><body><a id=a href=x>");
+        let mut doc = parser.finish();
+        let u = |s: &str| Url::parse(s).expect("url");
+        assert_eq!(doc.base_url, Some(u("https://example.test/other/")), "the first with an href");
+        assert_eq!(doc.resolve_url("x"), Some(u("https://example.test/other/x")));
+        assert_eq!(doc.document_url(), Some(&page));
+        let bases: Vec<NodeId> = doc.descendants(doc.root()).filter(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "base")).collect();
+        // Its href changes: frozen again; removed: the next one.
+        doc.get_mut(bases[1]).as_element_mut().expect("base").set_attr("href", "sub/");
+        doc.note_base_attribute(bases[1], "href");
+        assert_eq!(doc.base_url, Some(u("https://example.test/dir/sub/")));
+        doc.detach(bases[1]);
+        assert_eq!(doc.base_url, Some(u("https://ignored.test/")));
+        // The document's URL moves (pushState): a frozen base URL stays.
+        doc.set_document_url(Some(u("https://example.test/moved/")));
+        assert_eq!(doc.base_url, Some(u("https://ignored.test/")));
+        // `data:` and `javascript:` give the fallback base URL.
+        doc.get_mut(bases[2]).as_element_mut().expect("base").set_attr("href", "javascript:void(0)");
+        doc.note_base_attribute(bases[2], "href");
+        assert_eq!(doc.base_url, Some(u("https://example.test/moved/")));
+        doc.get_mut(bases[2]).as_element_mut().expect("base").set_attr("href", "data:text/html,x");
+        doc.note_base_attribute(bases[2], "href");
+        assert_eq!(doc.base_url, Some(u("https://example.test/moved/")));
+        // No `<base>` with an href: the document's URL.
+        doc.detach(bases[2]);
+        assert_eq!(doc.base_url, Some(u("https://example.test/moved/")));
+        doc.set_document_url(Some(u("https://example.test/again")));
+        assert_eq!(doc.base_url, Some(u("https://example.test/again")));
+    }
 
     /// A `::before`/`::after` node hangs off its element but is in no
     /// child list: tree walks, text and serialization never meet it,

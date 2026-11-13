@@ -238,9 +238,8 @@ fn history_push(this: &JsValue, args: &[JsValue], replace: &bool, context: &mut 
     {
         let shared_dom = dom(context)?;
         let mut dom = shared_dom.borrow_mut();
-        if dom.doc.base_url.as_ref() == Some(&document_url) {
-            dom.doc.base_url = Some(new_url.clone());
-        }
+        // The fallback base URL; a `<base>`'s frozen base URL stays.
+        dom.doc.set_document_url(Some(new_url.clone()));
     }
     host.borrow_mut().info.url = Some(new_url.clone());
     let value = deserialize(Some(&serialized), context)?;

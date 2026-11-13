@@ -794,6 +794,7 @@ fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         ("nextSibling", Prop::NextSibling),
         ("ownerDocument", Prop::OwnerDocument),
         ("isConnected", Prop::IsConnected),
+        ("baseURI", Prop::BaseUri),
     ] {
         add_getter(class, name, prop);
     }
@@ -1137,6 +1138,7 @@ enum Prop {
     NextSibling,
     OwnerDocument,
     IsConnected,
+    BaseUri,
     TextContent,
     TagName,
     LocalName,
@@ -1205,6 +1207,11 @@ fn element_name(e: &browser_dom::Element) -> String {
     }
 }
 
+/// `Node.baseURI`: the node document's document base URL, serialized.
+fn base_uri(doc: &Document) -> String {
+    doc.base_url.as_ref().map_or_else(|| "about:blank".to_owned(), |u| u.to_string())
+}
+
 fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
     use Prop::*;
     let Some(id) = node.resolve(doc) else {
@@ -1213,6 +1220,7 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
             (ChildNodes, _) => Out::Live(CollectionKind::ChildNodes(node.clone())),
             (Children, _) => Out::Live(CollectionKind::Children(node.clone())),
             (IsConnected, _) => Out::Value(false.into()),
+            (BaseUri, _) => Out::Value(js_str(&base_uri(doc))),
             (ChildElementCount | Length | NodeType, _) => Out::Value(0.into()),
             (NodeName | TagName | LocalName | Id | ClassName | Data | TextContent | InnerHtml | OuterHtml, _) => {
                 Out::Value(js_str(""))
@@ -1282,6 +1290,7 @@ fn read(doc: &Document, node: &DomNode, prop: Prop) -> Out {
         NextSibling => Out::Node(node.next_sibling),
         OwnerDocument => Out::Node((id != doc.root()).then(|| doc.root())),
         IsConnected => Out::Value(doc.is_connected(id).into()),
+        BaseUri => Out::Value(js_str(&base_uri(doc))),
         TagName => Out::Value(element.map_or(JsValue::null(), |e| js_str(&element_name(e)))),
         LocalName => Out::Value(element.map_or(JsValue::null(), |e| js_str(&e.name.local))),
         NamespaceUri => Out::Value(element.map_or(JsValue::null(), |e| js_str(&e.name.ns))),
@@ -2429,6 +2438,8 @@ fn mutate(
         if matches!(name.as_str(), "name" | "content") {
             dom.doc.meta_referrer(id);
         }
+        // A `<base>`'s `href`: the document base URL.
+        dom.doc.note_base_attribute(id, name);
     }
     if let (Some((_, old)), Some((local, namespace))) = (&attr_change, &attr_record)
         && !attr_noop

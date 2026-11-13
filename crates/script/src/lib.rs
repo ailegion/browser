@@ -438,7 +438,11 @@ impl ModuleLoader for ModuleMap {
             }
             Referrer::Realm(_) => None,
         };
-        let base = importer.as_ref().map(|(u, _)| u.clone()).or_else(|| self.base.clone());
+        // No importing script (an event handler, a timer's string): the
+        // document base URL now.
+        let base = importer.as_ref().map(|(u, _)| u.clone()).or_else(|| {
+            crate::dom::dom(&mut context.borrow_mut()).ok().and_then(|d| d.borrow().doc.base_url.clone()).or_else(|| self.base.clone())
+        });
         let policy = importer.as_ref().map_or(browser_ipc_types::ReferrerPolicy::Empty, |(_, p)| *p);
         let referrer_url = importer.map(|(u, _)| u);
         let result = match resolve_module_specifier(&specifier, base.as_ref()) {
@@ -661,14 +665,16 @@ fn location_set(_: &JsValue, args: &[JsValue], what: &u8, context: &mut Context)
         return Ok(JsValue::undefined());
     }
     let target = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    // A URL resolves against the API base URL (the document base URL);
+    // `hash` changes the document's own URL.
+    let api_base = crate::fetch::api_base_url(context)?;
     let mut state = host.borrow_mut();
-    let base = current_url(&state.info);
     let url = if *what == NAV_HASH {
-        let mut url = base;
+        let mut url = current_url(&state.info);
         url.set_fragment(Some(target.trim_start_matches('#')));
         url
     } else {
-        base.join(&target).map_err(|_| {
+        api_base.unwrap_or_else(|| current_url(&state.info)).join(&target).map_err(|_| {
             JsNativeError::syntax().with_message(format!("Failed to navigate: \"{target}\" is not a valid URL"))
         })?
     };
@@ -1344,8 +1350,13 @@ impl ScriptHost {
     /// checkpoint. An uncaught error goes to the console. It counts as
     /// an inline script of the document, with no `referrerpolicy`.
     pub fn run_script(&mut self, source: &str) {
-        let base = self.modules.base.clone();
+        let base = self.document_base_url();
         self.eval_classic(source, None, base, browser_ipc_types::ReferrerPolicy::Empty);
+    }
+
+    /// The document base URL now (the document's URL before one exists).
+    fn document_base_url(&mut self) -> Option<Url> {
+        crate::dom::dom(&mut self.context).ok().and_then(|d| d.borrow().doc.base_url.clone()).or_else(|| self.modules.base.clone())
     }
 
     /// Run an inline classic script whose base URL is `base` (its
@@ -1360,7 +1371,7 @@ impl ScriptHost {
     /// and is its base URL; `policy` is the element's `referrerpolicy`,
     /// which a dynamic `import()` from the script inherits.
     pub fn run_script_from(&mut self, source: &str, url: Option<&Url>, policy: browser_ipc_types::ReferrerPolicy) {
-        let base = url.cloned().or_else(|| self.modules.base.clone());
+        let base = url.cloned().or_else(|| self.document_base_url());
         self.eval_classic(source, url, base, policy);
     }
 

@@ -2371,7 +2371,7 @@ impl TabState {
     /// history step application").
     fn same_document_navigated(&mut self, old: Option<Url>) {
         let Some(new) = self.url.clone() else { return };
-        self.document_url_changed(old.as_ref(), &new);
+        self.document_url_changed(&new);
         let Some(entry) = self.history.get(self.history_index).cloned() else { return };
         if self.script.is_none() {
             return;
@@ -2396,15 +2396,12 @@ impl TabState {
     /// The displayed document's URL is now `new`: what relative URLs
     /// resolve against (unless a `<base>` says otherwise) and what its
     /// storage events name follow.
-    fn document_url_changed(&mut self, old: Option<&Url>, new: &Url) {
+    fn document_url_changed(&mut self, new: &Url) {
         if self.parser.is_none() {
             self.doc_url = Some(new.clone());
         }
-        let rebase = |doc: &mut Document| {
-            if doc.base_url.as_ref() == old {
-                doc.base_url = Some(new.clone());
-            }
-        };
+        // The fallback base URL; a `<base>`'s frozen base URL stays.
+        let rebase = |doc: &mut Document| doc.set_document_url(Some(new.clone()));
         match (&mut self.parser, &mut self.doc) {
             (Some(parser), _) => rebase(&mut parser.document_mut()),
             (None, Some(doc)) => rebase(doc),
@@ -2419,7 +2416,6 @@ impl TabState {
     /// `replaceState` (the current one): the entry carries the state and
     /// the URL; the script has already adopted both.
     fn push_state(&mut self, url: Url, state: SerializedState, replace: bool) {
-        let old = self.url.clone();
         if replace {
             if let Some(entry) = self.history.get_mut(self.history_index) {
                 entry.url = url.clone();
@@ -2447,7 +2443,7 @@ impl TabState {
             self.cap_history();
         }
         self.url = Some(url.clone());
-        self.document_url_changed(old.as_ref(), &url);
+        self.document_url_changed(&url);
         self.state_dirty = true;
         let (index, length) = (self.history_index, self.history.len());
         if let (Some(host), Some(entry)) = (&mut self.script, self.history.get(index)) {
@@ -10643,6 +10639,54 @@ mod tests {
         h.send(ShellToTab::Navigate { url: server.url("/plain") });
         h.pump_until(|h| h.title().as_deref() == Some("Plain"));
         assert_eq!(referer(&server, "/plain", 0), None);
+    }
+
+    #[test]
+    fn a_base_href_moves_every_relative_url() {
+        let page = "<!DOCTYPE html><title>Page</title><base href='/sub/'><link rel=stylesheet href=s.css>\
+             <img src=i.png><script src=a.js></script><a id=l href=next>next</a>\
+             <form id=f><button id=b>go</button></form>";
+        let server = Server::start(
+            &[
+                ("/dir/page", "text/html", page),
+                ("/dir/page?", "text/html", "<title>Self</title>"),
+                ("/sub/s.css", "text/css", "p { color: red }"),
+                ("/sub/a.js", "text/javascript", "fetch('f');"),
+                ("/sub/f", "text/plain", "f"),
+                ("/sub/next", "text/html", "<title>Next</title>"),
+                ("/sub/loc", "text/html", "<title>Loc</title>"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/dir/page"));
+        // The page's resources resolve against the base.
+        let paths = ["/sub/s.css", "/sub/i.png", "/sub/a.js", "/sub/f"];
+        h.pump_until(|_| paths.iter().all(|p| !server.requests(p).is_empty()));
+        h.pump_until(|h| !h.state.is_loading());
+        let sub = server.url("/sub/").to_string();
+        assert_eq!(run_js(&mut h, "document.baseURI"), format!("\"{sub}\""));
+        assert_eq!(run_js(&mut h, "document.getElementById('l').baseURI"), format!("\"{sub}\""));
+        // A form without an action submits to the document's own URL.
+        h.click_id("b");
+        h.pump_until(|h| h.title().as_deref() == Some("Self"));
+        assert_eq!(server.requests("/dir/page?").len(), 1);
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Page") && !h.state.is_loading());
+        // A link, and `location`, resolve against the base.
+        h.click_id("l");
+        h.pump_until(|h| h.title().as_deref() == Some("Next"));
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Page") && !h.state.is_loading());
+        run_js(&mut h, "location.assign('loc')");
+        h.pump_until(|h| h.title().as_deref() == Some("Loc"));
+        // A script changing the base: what resolves later follows.
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Page") && !h.state.is_loading());
+        assert_eq!(
+            run_js(&mut h, "document.querySelector('base').setAttribute('href', '/other/'); document.baseURI"),
+            format!("\"{}\"", server.url("/other/"))
+        );
+        assert_eq!(run_js(&mut h, "document.querySelector('base').remove(); document.baseURI"), format!("\"{}\"", server.url("/dir/page")));
     }
 
     #[test]

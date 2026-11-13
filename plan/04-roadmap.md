@@ -1255,9 +1255,50 @@ remaining lists as they stand.
       line 8's referrer record), stylesheets and inline `style` URLs,
       `@import` from inline sheets, `fetch`/XHR and `history.pushState`
       URLs (the API base URL), `<meta http-equiv=refresh>`,
-      `document.baseURI` and `Node.baseURI`, and the `url()`s an inline
-      sheet resolved, which a change of base resolves again. `<base
-      target>` already works (line 8).
+      `document.baseURI` and `Node.baseURI`. `<base target>` already
+      works (line 8). (Corrected 2026-11-13: CSS `url()`s are not
+      resolved again when the base changes; Chrome and Firefox keep
+      them, per the 2016 www-style report by Tab Atkins.)
+      Built 2026-11-13, not ticked (two SKIPPED parts, for the owner).
+      DOM: `Document::base_url` is the document base URL (the frozen
+      base URL of the first `<base>` with an `href` in tree order, else
+      the fallback base URL), `document_url()`/`set_document_url` the
+      document's URL (the fallback; navigations, the parser and
+      `pushState` set it, a frozen base URL staying); a `<base>` inserted
+      (parser or script), removed, or its `href` set sets it again; an
+      `href` that does not parse or is `data:`/`javascript:` gives the
+      fallback (HTML §4.2.3; Chromium's and WebKit's behaviour, Firefox
+      not checked). What already resolved through the document's base
+      follows: links and areas, `<img>`/`srcset`, `<script src>`,
+      `<link>`, inline sheets when parsed, `style` attributes, refresh,
+      `fetch`/XHR/`pushState`/`Request` (the API base URL), inline
+      scripts' base URL (module specifiers, `import()` referrer); newly:
+      `location.assign`/`href`/`replace` (they resolved against the
+      document's URL), the module loader's base for an `import()` with
+      no importing script (it was the URL the context began with), and
+      `Node.baseURI`/`document.baseURI` (new). A form without an
+      `action` now submits to the document's URL (it used the base URL,
+      the same until now). Tests: dom
+      `the_first_base_with_an_href_gives_the_document_base_url`, tab
+      `a_base_href_moves_every_relative_url`. SKIPPED, for the owner: a
+      `style` attribute's `url()`s are resolved again at every restyle,
+      so after a base change (or `pushState`) they take the new base,
+      where Chrome and Firefox keep the base they were parsed with (the
+      2016 report; not re-checked); a `<link rel=stylesheet>` already
+      loaded is fetched again from its newly resolved URL after a base
+      change (`sync_stylesheets` resolves its `href` each time), where
+      browsers load a link only when it is inserted or its `href`
+      changes (WebKit bug 66474, the same report). Not verified: a
+      non-UTF-8 document's query encoding when parsing the `href` (URLs
+      resolve as UTF-8 here everywhere); `HTMLBaseElement.href` (the
+      reflected attributes, Phase 5 C). Timing (release probe, live,
+      against block B's): slower: Wikipedia full restyle 47.3–50.6 ms
+      (45.1–48.2), load 623–650 ms (620–638), not attributed (no
+      `<base>` on the page; the restyle numbers have climbed all day,
+      43–46 ms this morning); iana load 4.97–4.98 s (5.01–6.02), full
+      restyle 392–400 ms (393–408), relayouts 1.67–1.95 and 37.4–38.9 ms
+      (1.68–2.06, 37.8–40.7), heaps 30.3 and 435.7–435.8 MiB (unchanged).
+      Full test run: no failure.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 
