@@ -167,6 +167,12 @@ impl TabState {
         .unwrap_or((page_x, page_y))
     }
 
+    /// Where viewport point `(x, y)` is in `node`'s first box (an image
+    /// button's selected coordinate).
+    pub(super) fn click_offset(&self, node: NodeId, x: f32, y: f32) -> (f32, f32) {
+        self.box_offset(EventTargetRef::Node(node), x + self.scroll_x, y + self.scroll_y)
+    }
+
     /// A mouse or pointer event's fields at viewport point `(x, y)`:
     /// page coordinates add the scroll offset, offset coordinates are
     /// from the target's first box. `related` is dropped if it left the

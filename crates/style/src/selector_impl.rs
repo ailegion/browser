@@ -460,9 +460,15 @@ impl selectors::Element for ElementRef<'_> {
             // Visited needs history (Phase 4).
             PseudoClass::Visited => false,
             PseudoClass::Link | PseudoClass::AnyLink => self.is_link(),
-            PseudoClass::Checked => {
-                e.attr("checked").is_some() || e.attr("selected").is_some()
-            }
+            // Checkboxes and radios by their checkedness, options by their
+            // selectedness (HTML §4.16.3), not by the attributes.
+            PseudoClass::Checked => match self.doc.input_type(self.id) {
+                Some(browser_dom::forms::InputType::Checkbox | browser_dom::forms::InputType::Radio) => {
+                    self.doc.checkedness(self.id)
+                }
+                Some(_) => false,
+                None => e.is_html() && e.name.local == local_name!("option") && self.doc.option_selectedness(self.id),
+            },
             PseudoClass::Disabled => self.doc.disabled_state(self.id) == Some(true),
             PseudoClass::Enabled => self.doc.disabled_state(self.id) == Some(false),
             PseudoClass::Dir(dir) => dir.is_some_and(|d| self.doc.directionality(self.id) == d),

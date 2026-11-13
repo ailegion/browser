@@ -313,6 +313,22 @@ pub(crate) fn trusted_event_with_value(kind: &str, proto: JsObject, value: JsVal
     Ok(JsObject::from_proto_and_data(proto, data))
 }
 
+/// `trusted_event_with_value` that bubbles and may be cancelable (the
+/// forms' `submit` and `formdata`).
+pub(crate) fn trusted_event_with_value_flags(
+    kind: &str,
+    bubbles: bool,
+    cancelable: bool,
+    proto: JsObject,
+    value: JsValue,
+    context: &mut Context,
+) -> JsResult<JsObject> {
+    let now = now_ms(context)?;
+    let mut data = EventData::new(kind.to_owned(), bubbles, cancelable, false, true, now);
+    data.detail = value;
+    Ok(JsObject::from_proto_and_data(proto, data))
+}
+
 /// `new X(type, init)` for such a class: the `Event` part from the
 /// arguments, `value` in the value slot.
 pub(crate) fn constructed_event_with_value(args: &[JsValue], proto: JsObject, value: JsValue, context: &mut Context) -> JsResult<JsObject> {
@@ -1450,7 +1466,21 @@ fn dispatch_event(this: &JsValue, args: &[JsValue], context: &mut Context) -> Js
         }
         data.flags.is_trusted = false;
     }
+    // A `click` `MouseEvent` (or `PointerEvent`) has activation behavior:
+    // a checkbox flips before the listeners run and back when one
+    // cancels, a submit button submits after.
+    let click = event
+        .downcast_ref::<EventData>()
+        .filter(|d| d.kind == "click" && matches!(d.ui.class, UiClass::Mouse | UiClass::Pointer))
+        .map(|d| d.flags.bubbles);
+    let activation = match click {
+        Some(bubbles) => crate::forms::before_click(target, bubbles, context)?,
+        None => None,
+    };
     let not_cancelled = dispatch(&event, target, this.as_object().as_ref(), context)?;
+    if let Some((control, saved)) = activation {
+        crate::forms::after_click(control, saved, not_cancelled, context)?;
+    }
     Ok(not_cancelled.into())
 }
 

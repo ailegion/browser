@@ -1322,6 +1322,69 @@ impl UserSelect {
     }
 }
 
+/// `appearance` (CSS Basic UI 4 §7.2; "Working sites first" line 8):
+/// `none`, `auto`, `base-select`, and the compatibility keywords, kept as
+/// written (its computed value is the keyword). `none` drops a widget's
+/// native look; every other keyword keeps it, except that HTML lets
+/// `textfield` and `menulist-button` mean something on a search field
+/// and a select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Appearance {
+    #[default]
+    None,
+    Auto,
+    BaseSelect,
+    // <compat-auto>
+    Searchfield,
+    Textarea,
+    Checkbox,
+    Radio,
+    Menulist,
+    Listbox,
+    Meter,
+    ProgressBar,
+    Button,
+    // <compat-special>
+    Textfield,
+    MenulistButton,
+}
+
+impl Appearance {
+    pub const KEYWORDS: [(&'static str, Appearance); 14] = [
+        ("none", Appearance::None),
+        ("auto", Appearance::Auto),
+        ("base-select", Appearance::BaseSelect),
+        ("searchfield", Appearance::Searchfield),
+        ("textarea", Appearance::Textarea),
+        ("checkbox", Appearance::Checkbox),
+        ("radio", Appearance::Radio),
+        ("menulist", Appearance::Menulist),
+        ("listbox", Appearance::Listbox),
+        ("meter", Appearance::Meter),
+        ("progress-bar", Appearance::ProgressBar),
+        ("button", Appearance::Button),
+        ("textfield", Appearance::Textfield),
+        ("menulist-button", Appearance::MenulistButton),
+    ];
+
+    pub fn keyword(self) -> &'static str {
+        Self::KEYWORDS.iter().find(|(_, a)| *a == self).map_or("none", |(k, _)| k)
+    }
+
+    fn from_keyword(k: &str) -> Option<Self> {
+        Self::KEYWORDS.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, a)| *a)
+    }
+
+    /// Whether a widget keeps its native look: anything but `none`.
+    pub fn is_native(self) -> bool {
+        self != Appearance::None
+    }
+}
+
+fn parse_appearance<'i>(input: &mut Parser<'i, '_>) -> Result<Appearance, ParseErr<'i>> {
+    keyword(input, Appearance::from_keyword)
+}
+
 // ----- z-index, transforms, stacking (4a block 6) -----
 
 /// `z-index`: `auto` or an integer (CSS 2.1 §9.9.1).
@@ -2627,6 +2690,7 @@ longhands! {
     Cursor: "cursor" => CursorValue, true;
     PointerEvents: "pointer-events" => PointerEvents, true;
     UserSelect: "user-select" => UserSelect, false;
+    Appearance: "appearance" => Appearance, false;
     ZIndex: "z-index" => ZIndex, false;
     Isolation: "isolation" => Isolation, false;
     WillChange: "will-change" => WillChange, false;
@@ -2766,7 +2830,7 @@ pub fn is_shorthand(name: &str) -> bool {
 /// `overflow-wrap`, `box-decoration-break`, `background-clip`,
 /// `background-origin` and `background-size`, never written; so are the
 /// `-webkit-mask` names, the aliases of `mask` and its longhands).
-pub const SHORTHANDS: [&str; 51] = [
+pub const SHORTHANDS: [&str; 53] = [
     "grid",
     "grid-template",
     "grid-area",
@@ -2774,6 +2838,8 @@ pub const SHORTHANDS: [&str; 51] = [
     "grid-column",
     "outline",
     "-webkit-user-select",
+    "-webkit-appearance",
+    "-moz-appearance",
     "-webkit-transform",
     "-webkit-transform-origin",
     "-webkit-backface-visibility",
@@ -3053,6 +3119,7 @@ fn parse_longhand<'i>(id: PropertyId, input: &mut Parser<'i, '_>) -> Result<Prop
             "stroke" => PointerEvents::Stroke, "bounding-box" => PointerEvents::BoundingBox, "all" => PointerEvents::All,
             _ => return None }))?),
         PropertyId::UserSelect => P::UserSelect(parse_user_select(input)?),
+        PropertyId::Appearance => P::Appearance(parse_appearance(input)?),
         PropertyId::ZIndex => P::ZIndex(parse_z_index(input)?),
         PropertyId::Isolation => P::Isolation(keyword(input, |k| Some(match_ignore_ascii_case! { k,
             "auto" => Isolation::Auto, "isolate" => Isolation::Isolate, _ => return None }))?),
@@ -4132,6 +4199,7 @@ pub fn shorthand_longhands(name: &str) -> Option<&'static [PropertyId]> {
         "inset" => &[Top, Right, Bottom, Left],
         "outline" => &[OutlineWidth, OutlineStyle, OutlineColor],
         "-webkit-user-select" => &[UserSelect],
+        "-webkit-appearance" | "-moz-appearance" => &[Appearance],
         "-webkit-transform" => &[Transform],
         "-webkit-transform-origin" => &[TransformOrigin],
         "-webkit-backface-visibility" => &[BackfaceVisibility],
@@ -4374,6 +4442,7 @@ fn parse_shorthand<'i>(name: &str, input: &mut Parser<'i, '_>) -> Result<Vec<Pro
         "-webkit-mask-clip" => vec![P::MaskClip(input.parse_comma_separated(crate::mask::parse_clip)?)],
         "-webkit-mask-composite" => vec![P::MaskComposite(input.parse_comma_separated(crate::mask::parse_webkit_composite)?)],
         "-webkit-user-select" => vec![P::UserSelect(parse_user_select(input)?)],
+        "-webkit-appearance" | "-moz-appearance" => vec![P::Appearance(parse_appearance(input)?)],
         "-webkit-transform" => vec![P::Transform(parse_transform_list(input)?)],
         "-webkit-transform-origin" => vec![P::TransformOrigin(parse_transform_origin(input)?)],
         "-webkit-backface-visibility" => vec![P::BackfaceVisibility(parse_backface_visibility(input)?)],

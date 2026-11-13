@@ -361,6 +361,8 @@ pub struct ComputedStyle {
     /// `none` under a parent whose used value is that, else `text`; never
     /// `auto`.
     pub user_select_used: UserSelect,
+    /// `appearance`: whether a widget keeps its native look.
+    pub appearance: Appearance,
     /// 4a block 6: stacking and transforms.
     pub z_index: ZIndex,
     pub isolation: Isolation,
@@ -696,6 +698,7 @@ impl ComputedStyle {
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
             user_select_used: UserSelect::Text,
+            appearance: Appearance::None,
             z_index: ZIndex::Auto,
             isolation: Isolation::Auto,
             will_change: WillChange::default(),
@@ -857,6 +860,9 @@ impl ComputedStyle {
     /// (repaint without reflow).
     pub fn layout_differs(&self, other: &ComputedStyle) -> bool {
         self.display != other.display
+            // A control's native look takes room (a checkbox's box, a
+            // select's arrow).
+            || self.appearance != other.appearance
             || self.border_spacing != other.border_spacing
             || self.empty_cells != other.empty_cells
             || self.position != other.position
@@ -1470,6 +1476,7 @@ pub fn compute(
     pick!(cursor, Cursor, Cursor, |v| v.clone());
     pick!(pointer_events, PointerEvents, PointerEvents, |v| *v);
     pick!(user_select, UserSelect, UserSelect, |v| *v);
+    pick!(appearance, Appearance, Appearance, |v| *v);
     out.user_select_used = match out.user_select {
         UserSelect::Auto => match parent.user_select_used {
             UserSelect::All => UserSelect::All,

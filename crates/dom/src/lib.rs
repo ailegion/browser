@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod encoding;
+pub mod forms;
 mod fragment;
 pub mod image;
 mod sink;
@@ -300,6 +301,20 @@ pub struct Document {
     /// Above zero, the insertion and removal primitives do not log: a
     /// caller that logs the operation's own record is at work.
     mutations_suppressed: u32,
+    /// Form controls' state beyond their attributes (`forms.rs`).
+    controls: forms::Controls,
+    /// A form element was ever created: until then the form hooks of
+    /// the tree primitives do nothing.
+    forms_seen: bool,
+    /// Elements the parser associated with a form through its form
+    /// element pointer, while they stay where it put them.
+    parser_forms: std::collections::HashMap<NodeId, NodeId>,
+    /// Selects whose list of options changed and radios that became
+    /// connected, for `settle_forms`.
+    pending_selects: Vec<NodeId>,
+    pending_radios: Vec<NodeId>,
+    /// Controls whose shown state changed (`take_controls_changed`).
+    controls_changed: Vec<NodeId>,
 }
 
 /// One change to the tree, as a `MutationObserver` is told of it (DOM
@@ -352,6 +367,12 @@ impl Document {
             image_mutations: Vec::new(),
             mutation_log: None,
             mutations_suppressed: 0,
+            controls: Default::default(),
+            forms_seen: false,
+            parser_forms: Default::default(),
+            pending_selects: Vec::new(),
+            pending_radios: Vec::new(),
+            controls_changed: Vec::new(),
         }
     }
 
@@ -638,7 +659,7 @@ impl Document {
             if text_control {
                 // An R or AL before any L: rtl; any other non-empty value:
                 // ltr; empty: the parent's.
-                let value = if name == "textarea" { self.text_content(id) } else { e.attr("value").unwrap_or("").to_owned() };
+                let value = self.control_value(id);
                 if let Some(d) = value.chars().find_map(strong_direction) {
                     return d;
                 }
@@ -725,6 +746,12 @@ impl Document {
 
     pub fn create_node(&mut self, kind: NodeKind) -> NodeId {
         let img = matches!(&kind, NodeKind::Element(e) if e.name.ns == ns!(html) && e.name.local == local_name!("img"));
+        if let NodeKind::Element(e) = &kind
+            && e.name.ns == ns!(html)
+        {
+            let local = e.name.local.clone();
+            self.note_created_element(&local);
+        }
         let id = self.nodes.insert(Node::new(kind));
         if img {
             self.created_images.push(id);
@@ -783,6 +810,7 @@ impl Document {
             });
         }
         let copy = self.create_node(kind);
+        self.clone_control_state(id, copy);
         if deep {
             let mut child = self.nodes[id].first_child;
             while let Some(c) = child {
@@ -852,6 +880,7 @@ impl Document {
         }
         self.nodes[parent].last_child = Some(child);
         self.picture_child_moved(child, parent);
+        self.forms_inserted(child, parent);
         self.log_child_list(parent, Some(child), None, last, None);
     }
 
@@ -950,6 +979,7 @@ impl Document {
             None => self.nodes[parent].first_child = Some(new),
         }
         self.picture_child_moved(new, parent);
+        self.forms_inserted(new, parent);
         self.log_child_list(parent, Some(new), None, prev, Some(sibling));
     }
 
@@ -977,6 +1007,7 @@ impl Document {
         n.parent = None;
         n.prev_sibling = None;
         n.next_sibling = None;
+        self.forms_removed(id, parent);
         // A removed `<img>` leaves its `<picture>` (a relevant mutation
         // for it), a removed `<source>` changes the picture's images.
         if self.nodes[parent].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("picture")) {
@@ -1048,6 +1079,8 @@ impl Document {
                 self.nodes.remove(p);
             }
             self.images.remove(&n);
+            self.controls.remove(&n);
+            self.parser_forms.remove(&n);
             self.nodes.remove(n);
         }
     }

@@ -1103,7 +1103,42 @@ enum ControlKind {
     Text { password: bool },
     ButtonInput,
     Select,
+    /// A textarea: its value, not its children, is its content.
+    TextArea,
 }
+
+/// The size a native checkbox or radio takes when its width or height is
+/// `auto` (the platform look's; none without it).
+const NATIVE_CHECK_SIZE: f32 = 13.0;
+
+/// A native checkbox's or radio's style: an `auto` width or height is
+/// the native look's size, its border box (Chrome's).
+fn native_check_size(style: &Arc<ComputedStyle>) -> Arc<ComputedStyle> {
+    use browser_style::ComputedSize;
+    let (w, h) = (style.width == ComputedSize::Auto, style.height == ComputedSize::Auto);
+    if !w && !h {
+        return style.clone();
+    }
+    let mut s = (**style).clone();
+    s.box_sizing = browser_style::BoxSizing::BorderBox;
+    if w {
+        s.width = ComputedSize::Px(NATIVE_CHECK_SIZE);
+    }
+    if h {
+        s.height = ComputedSize::Px(NATIVE_CHECK_SIZE);
+    }
+    Arc::new(s)
+}
+
+/// A placeholder shows on one line: HTML strips its line breaks in an
+/// input.
+fn strip_newlines(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '\n' | '\r')).collect()
+}
+
+/// The room a native drop-down select keeps for its arrow at its end,
+/// inside its padding.
+const SELECT_ARROW_ROOM: f32 = 20.0;
 
 /// How an inline-level element joins its inline root.
 enum InlineKind {
@@ -1368,8 +1403,10 @@ impl BoxBuilder<'_> {
         }
         match e.name.local {
             local_name!("input") => {
-                let kind = e.attr("type").map(|t| t.trim().to_ascii_lowercase()).unwrap_or_default();
-                Some(match kind.as_str() {
+                // The type state as HTML's enumerated attribute gives it (no
+                // trimming; an unknown type is text).
+                let kind = browser_dom::forms::InputType::from_attr(e.attr("type")).as_str();
+                Some(match kind {
                     "checkbox" => ControlKind::Check { radio: false },
                     "radio" => ControlKind::Check { radio: true },
                     "submit" | "button" | "reset" | "image" | "file" => ControlKind::ButtonInput,
@@ -1379,6 +1416,7 @@ impl BoxBuilder<'_> {
                 })
             }
             local_name!("select") => Some(ControlKind::Select),
+            local_name!("textarea") => Some(ControlKind::TextArea),
             _ => None,
         }
     }
@@ -1388,14 +1426,27 @@ impl BoxBuilder<'_> {
     /// chosen option; checkboxes and radios are drawn by the painter.
     fn build_control(&self, id: NodeId, style: Arc<ComputedStyle>, kind: ControlKind) -> BoxNode {
         let attr = |name: &str| self.doc.element(id).and_then(|e| e.attr(name));
+        // `appearance: none` drops the native look: no check box, ring or
+        // arrow, and none of the room they take.
+        let native = style.appearance.is_native();
         match kind {
             ControlKind::Check { radio } => {
-                let checked = attr("checked").is_some();
-                let mut b = BoxNode::new(BoxKind::Block, Some(id), style.clone());
-                b.control = Some(if radio {
-                    Control::Radio { checked }
+                let checked = self.doc.checkedness(id);
+                let style = if native {
+                    native_check_size(&style)
                 } else {
-                    Control::Checkbox { checked }
+                    style
+                };
+                let mut b = BoxNode::new(BoxKind::Block, Some(id), style.clone());
+                b.control = native.then(|| {
+                    if radio {
+                        Control::Radio { checked }
+                    } else {
+                        Control::Checkbox {
+                            checked,
+                            indeterminate: self.doc.indeterminate(id),
+                        }
+                    }
                 });
                 // Its `::before`/`::after` boxes, inside it.
                 let kids = self.kids(id);
@@ -1405,64 +1456,90 @@ impl BoxBuilder<'_> {
                 b
             }
             ControlKind::Text { password } => {
-                let value = attr("value").unwrap_or("");
+                let value = self.doc.control_display_value(id);
                 let (text, dim) = if value.is_empty() {
-                    (attr("placeholder").unwrap_or("").to_owned(), true)
+                    (strip_newlines(attr("placeholder").unwrap_or("")), true)
                 } else if password {
                     ("\u{2022}".repeat(value.chars().count()), false)
                 } else {
-                    (value.to_owned(), false)
+                    (value, false)
                 };
-                self.control_box(id, style, &text, dim, None)
+                self.control_box(id, style, &text, dim, None, WhiteSpace::Pre)
+            }
+            ControlKind::TextArea => {
+                // Its API value, wrapped as its `white-space` says (pre-wrap
+                // in the UA sheet); the placeholder while it is empty.
+                let value = self.doc.control_display_value(id);
+                let (text, dim) = if value.is_empty() {
+                    (attr("placeholder").unwrap_or("").replace("\r\n", "\n").replace('\r', "\n"), true)
+                } else {
+                    (value, false)
+                };
+                let ws = style.white_space;
+                self.control_box(id, style, &text, dim, None, ws)
             }
             ControlKind::ButtonInput => {
-                let kind = attr("type").map(|t| t.trim().to_ascii_lowercase()).unwrap_or_default();
+                let kind = browser_dom::forms::InputType::from_attr(attr("type")).as_str();
                 let label = match attr("value") {
                     Some(v) => v.to_owned(),
-                    None => match kind.as_str() {
+                    None => match kind {
                         "submit" => "Submit".to_owned(),
                         "reset" => "Reset".to_owned(),
                         "file" => "Choose file".to_owned(),
                         _ => String::new(),
                     },
                 };
-                self.control_box(id, style, &label, false, None)
+                self.control_box(id, style, &label, false, None, WhiteSpace::Pre)
             }
             ControlKind::Select => {
-                let options: Vec<NodeId> = self
-                    .doc
-                    .descendants(id)
-                    .filter(|&n| {
-                        self.doc
-                            .element(n)
-                            .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("option"))
-                    })
-                    .collect();
+                // The selected option's label (the first option when none
+                // is selected, as a drop-down shows it).
+                let options = self.doc.list_of_options(id);
                 let chosen = options
                     .iter()
-                    .find(|&&o| self.doc.element(o).is_some_and(|e| e.attr("selected").is_some()))
+                    .find(|&&o| self.doc.option_selectedness(o))
                     .or(options.first());
-                let text = chosen.map(|&o| self.doc.text_content(o)).unwrap_or_default();
-                self.control_box(id, style, text.trim(), false, Some(Control::Select))
+                let text = chosen.map(|&o| self.doc.option_label(o)).unwrap_or_default();
+                let mut b = self.control_box(id, style.clone(), &text, false, native.then_some(Control::Select), WhiteSpace::Nowrap);
+                if native {
+                    // The arrow's room is the inner box's end padding, not
+                    // the select's own (so `padding` reads as written).
+                    let mut inner = ComputedStyle::anonymous_from(&style);
+                    let room = ComputedLp::Px(SELECT_ARROW_ROOM);
+                    if style.direction == Direction::Rtl {
+                        inner.padding.left = room;
+                    } else {
+                        inner.padding.right = room;
+                    }
+                    let mut wrapper = BoxNode::new(BoxKind::Block, None, Arc::new(inner));
+                    wrapper.anonymous = true;
+                    wrapper.children = std::mem::take(&mut b.children);
+                    b.children.push(wrapper);
+                }
+                b
             }
         }
     }
 
-    /// A block box for a control with one line of made-up text inside,
-    /// kept on one line with spaces intact so caret offsets match the
-    /// value. `dim` draws it as a placeholder.
-    fn control_box(&self, id: NodeId, style: Arc<ComputedStyle>, text: &str, dim: bool, control: Option<Control>) -> BoxNode {
+    /// A block box for a control with its made-up text inside, laid out
+    /// with `white_space` (one line with spaces kept for an input, so
+    /// caret offsets match the value). `dim` draws it as a placeholder.
+    fn control_box(
+        &self,
+        id: NodeId,
+        style: Arc<ComputedStyle>,
+        text: &str,
+        dim: bool,
+        control: Option<Control>,
+        white_space: WhiteSpace,
+    ) -> BoxNode {
         let mut b = BoxNode::new(BoxKind::Block, Some(id), style.clone());
         b.control = control;
         if text.is_empty() {
             return b;
         }
         let mut container = ComputedStyle::anonymous_from(&style);
-        container.white_space = if control == Some(Control::Select) {
-            WhiteSpace::Nowrap
-        } else {
-            WhiteSpace::Pre
-        };
+        container.white_space = white_space;
         let container = Arc::new(container);
         let mut text_style = (*container).clone();
         if dim {
@@ -1571,11 +1648,15 @@ impl BoxBuilder<'_> {
         if let Some(kind) = self.control_kind(id) {
             let mut b = self.build_control(id, style, kind);
             b.plan_scrolling();
-            if matches!(kind, ControlKind::Text { .. })
-                && let Some(plan) = b.scroll.as_mut()
-            {
-                plan.inner_editor = true;
-                plan.caret_room = true;
+            if let Some(plan) = b.scroll.as_mut() {
+                match kind {
+                    ControlKind::Text { .. } => {
+                        plan.inner_editor = true;
+                        plan.caret_room = true;
+                    }
+                    ControlKind::TextArea => plan.caret_room = true,
+                    _ => {}
+                }
             }
             return b;
         }
@@ -2765,7 +2846,7 @@ let img_index = 9;
         );
         assert_eq!(
             found,
-            vec![Control::Checkbox { checked: true }, Control::Radio { checked: false }, Control::Select]
+            vec![Control::Checkbox { checked: true, indeterminate: false }, Control::Radio { checked: false }, Control::Select]
         );
         let inputs: Vec<NodeId> = doc
             .descendants(doc.root())

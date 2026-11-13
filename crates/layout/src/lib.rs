@@ -578,7 +578,8 @@ impl ImageSource {
 /// its box: the check mark, the radio dot, the drop-down arrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
-    Checkbox { checked: bool },
+    /// An indeterminate checkbox shows a dash whatever its checkedness.
+    Checkbox { checked: bool, indeterminate: bool },
     Radio { checked: bool },
     Select,
 }

@@ -68,7 +68,9 @@ pub fn dom_box_changes(changes: &[DomChange], since: Option<u64>) -> Option<(Vec
         match change {
             DomChange::Tree { generation } if since.is_none_or(|s| *generation > s) => return None,
             DomChange::Tree { .. } => {}
-            DomChange::Attr { element, generation, .. } | DomChange::Image { element, generation }
+            DomChange::Attr { element, generation, .. }
+            | DomChange::Image { element, generation }
+            | DomChange::Control { element, generation }
                 if since.is_none_or(|s| *generation > s) =>
             {
                 elements.push(*element)
@@ -106,9 +108,23 @@ pub fn feature_changes(doc: &Document, changes: &[DomChange], since: Option<u64>
                 return None;
             }
             DomChange::Tree { .. } | DomChange::Sheets { .. } => continue,
-            DomChange::Children { generation, .. } | DomChange::Attr { generation, .. } | DomChange::Image { generation, .. }
+            DomChange::Children { generation, .. }
+            | DomChange::Attr { generation, .. }
+            | DomChange::Image { generation, .. }
+            | DomChange::Control { generation, .. }
                 if since.is_some_and(|s| *generation <= s) =>
             {
+                continue;
+            }
+            // A control's state: what `:checked` reads (the attribute
+            // features its invalidation records) and its box.
+            DomChange::Control { element, .. } => {
+                delta.layout = true;
+                let features = vec![Feature::Attr("checked".to_owned()), Feature::Attr("selected".to_owned())];
+                match delta.changes.iter_mut().find(|c| c.element == *element) {
+                    Some(c) => c.features.extend(features),
+                    None => delta.changes.push(FeatureChange { element: *element, features }),
+                }
                 continue;
             }
             // The `<img>` itself is restyled (its `width`/`height` hints

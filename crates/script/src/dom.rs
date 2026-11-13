@@ -105,6 +105,8 @@ pub(crate) struct Dom {
     /// removed nodes), then freed unless a wrapper holds them
     /// (`free_unreferenced`).
     pending_free: Vec<NodeId>,
+    /// The forms' submission and reset flags (`forms.rs`).
+    pub(crate) forms: crate::forms::FormFlags,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -135,6 +137,10 @@ pub enum DomChange {
     /// source changed ("Working sites first" 6m): its style (the
     /// `width`/`height` hints) and its box are computed again.
     Image { element: NodeId, generation: u64 },
+    /// A form control's value, checkedness or selectedness changed
+    /// ("Working sites first" line 8): `:checked` may match differently
+    /// and its box shows something else.
+    Control { element: NodeId, generation: u64 },
 }
 
 /// The parsed form of `text` from the cache, parsing it once. `None` if
@@ -160,6 +166,9 @@ impl Dom {
         self.doc = doc;
         self.parsing = parsing;
         self.states = states;
+        // What the parser's insertions queued for the controls is settled
+        // before a script reads them.
+        self.doc.settle_forms();
     }
 
 
@@ -242,6 +251,28 @@ impl Dom {
                 continue;
             }
             self.changes.push(DomChange::Image {
+                element,
+                generation: self.generation,
+            });
+        }
+    }
+
+    /// Settle what tree changes queued for the form controls, and turn the
+    /// controls whose state changed into changes for the tab.
+    pub(crate) fn note_controls_changed(&mut self) {
+        self.doc.settle_forms();
+        let changed = self.doc.take_controls_changed();
+        for element in changed {
+            if !self.doc.is_connected(element) {
+                continue;
+            }
+            self.mutated = true;
+            self.generation += 1;
+            if self.changes.len() >= CHANGE_LOG_LIMIT {
+                self.note_tree();
+                continue;
+            }
+            self.changes.push(DomChange::Control {
                 element,
                 generation: self.generation,
             });
@@ -404,6 +435,9 @@ pub(crate) fn flush_images(context: &mut Context) {
         let dom = &mut *guard;
         let jobs = with_image_env(dom, browser_style::responsive::run_image_mutations);
         dom.note_images_changed();
+        // The form controls' share of the same call: a select whose options
+        // changed, a radio group a checked radio joined.
+        dom.note_controls_changed();
         jobs
     };
     for (img, generation) in jobs {
@@ -525,7 +559,7 @@ dom_class!(TokenListClass, "DOMTokenList", init_token_list);
 dom_class!(NodeListClass, "NodeList", init_node_list);
 dom_class!(HtmlCollectionClass, "HTMLCollection", init_html_collection);
 
-fn prototype_of<C: Class>(context: &mut Context) -> JsResult<JsObject> {
+pub(crate) fn prototype_of<C: Class>(context: &mut Context) -> JsResult<JsObject> {
     context
         .get_global_class::<C>()
         .map(|c| c.prototype())
@@ -533,7 +567,7 @@ fn prototype_of<C: Class>(context: &mut Context) -> JsResult<JsObject> {
 }
 
 /// Make `Sub` inherit from `Base`: its prototype and its constructor.
-fn inherit<Sub: Class, Base: Class>(context: &mut Context) -> JsResult<()> {
+pub(crate) fn inherit<Sub: Class, Base: Class>(context: &mut Context) -> JsResult<()> {
     let sub = context.get_global_class::<Sub>();
     let base = context.get_global_class::<Base>();
     let (Some(sub), Some(base)) = (sub, base) else {
@@ -566,6 +600,7 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     inherit::<ElementClass, NodeClass>(context)?;
     inherit::<HtmlElementClass, ElementClass>(context)?;
     inherit::<HtmlImageElementClass, HtmlElementClass>(context)?;
+    crate::forms::register::<HtmlElementClass>(context)?;
     inherit::<CharacterDataClass, NodeClass>(context)?;
     inherit::<TextClass, CharacterDataClass>(context)?;
     inherit::<CommentClass, CharacterDataClass>(context)?;
@@ -895,6 +930,8 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     class.accessor(js_string!("domain"), Some(get_domain), Some(set_domain), ATTR);
     let get_fonts = getter(class.context(), "fonts", NativeFunction::from_fn_ptr(crate::fonts::document_fonts));
     class.accessor(js_string!("fonts"), Some(get_fonts), None, ATTR);
+    let get_forms = getter(class.context(), "forms", NativeFunction::from_fn_ptr(crate::forms::document_forms));
+    class.accessor(js_string!("forms"), Some(get_forms), None, ATTR);
     let get_cookie = getter(class.context(), "cookie", NativeFunction::from_fn_ptr(crate::document_get_cookie));
     let set_cookie = setter(class.context(), "cookie", NativeFunction::from_fn_ptr(crate::document_set_cookie));
     class.accessor(js_string!("cookie"), Some(get_cookie), Some(set_cookie), ATTR);
@@ -947,6 +984,8 @@ enum Proto {
     Element,
     HtmlElement,
     HtmlImage,
+    /// A form element's interface (`forms.rs`).
+    Form(crate::forms::FormInterface),
     Text,
     Comment,
     DocumentFragment,
@@ -968,7 +1007,10 @@ pub(crate) fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
         }
         match &dom.doc.get(id).kind {
             NodeKind::Element(e) if e.is_html() && &*e.name.local == "img" => Proto::HtmlImage,
-            NodeKind::Element(e) if e.is_html() => Proto::HtmlElement,
+            NodeKind::Element(e) if e.is_html() => match crate::forms::FormInterface::of(&e.name.local) {
+                Some(i) => Proto::Form(i),
+                None => Proto::HtmlElement,
+            },
             NodeKind::Element(_) => Proto::Element,
             NodeKind::Text(_) => Proto::Text,
             NodeKind::Comment(_) => Proto::Comment,
@@ -981,6 +1023,7 @@ pub(crate) fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
         Proto::Element => prototype_of::<ElementClass>(context)?,
         Proto::HtmlElement => prototype_of::<HtmlElementClass>(context)?,
         Proto::HtmlImage => prototype_of::<HtmlImageElementClass>(context)?,
+        Proto::Form(i) => crate::forms::prototype(i, context)?,
         Proto::Text => prototype_of::<TextClass>(context)?,
         Proto::Comment => prototype_of::<CommentClass>(context)?,
         Proto::DocumentFragment => prototype_of::<DocumentFragmentClass>(context)?,
@@ -2357,6 +2400,9 @@ fn mutate(
         && !attr_namespaced
     {
         dom.doc.note_image_attribute(id, name);
+        // And the form controls to theirs ("Working sites first" line 8).
+        let old = attr_change.as_ref().and_then(|(_, o)| o.clone());
+        dom.doc.note_form_attribute(id, name, old.as_deref());
     }
     if let (Some((_, old)), Some((local, namespace))) = (&attr_change, &attr_record)
         && !attr_noop
@@ -2472,7 +2518,13 @@ fn get_elements_by_tag_name_ns(this: &JsValue, args: &[JsValue], context: &mut C
 /// What a collection holds. The live kinds are recomputed whenever the
 /// arena changed since they were last read.
 #[derive(Debug, Clone)]
-enum CollectionKind {
+pub(crate) enum CollectionKind {
+    /// A form's `elements` (its listed elements but image buttons).
+    FormElements(DomNode),
+    /// A select's `options`: its list of options.
+    SelectOptions(DomNode),
+    /// `document.forms`.
+    Forms,
     ChildNodes(DomNode),
     Children(DomNode),
     ByClass(DomNode, String),
@@ -2499,6 +2551,12 @@ fn collection_members(dom: &Dom, kind: &CollectionKind) -> Vec<NodeId> {
     let doc = &dom.doc;
     let root = |n: &DomNode| n.resolve(doc);
     match kind {
+        CollectionKind::FormElements(n) => root(n).map(|id| doc.form_elements(id)).unwrap_or_default(),
+        CollectionKind::SelectOptions(n) => root(n).map(|id| doc.list_of_options(id)).unwrap_or_default(),
+        CollectionKind::Forms => doc
+            .descendants(doc.root())
+            .filter(|&d| doc.element(d).is_some_and(|e| e.is_html() && &*e.name.local == "form"))
+            .collect(),
         CollectionKind::Static(ids) => ids.iter().copied().filter(|&i| doc.contains(i)).collect(),
         CollectionKind::ChildNodes(n) => root(n).map(|id| doc.children(id).collect()).unwrap_or_default(),
         CollectionKind::Children(n) => root(n)
@@ -2607,11 +2665,11 @@ fn window_names(doc: &Document) -> Vec<String> {
 /// `Reflect`'s functions as the realm made them, for the window's named
 /// properties object to fall back on whatever a page does to `Reflect`.
 #[derive(Debug, Clone, Trace, Finalize)]
-struct ReflectFns {
-    get: JsObject,
-    has: JsObject,
-    descriptor: JsObject,
-    own_keys: JsObject,
+pub(crate) struct ReflectFns {
+    pub(crate) get: JsObject,
+    pub(crate) has: JsObject,
+    pub(crate) descriptor: JsObject,
+    pub(crate) own_keys: JsObject,
 }
 
 /// Put the window's named properties object (HTML §7.2.2.3) between the
@@ -2666,7 +2724,7 @@ fn named_value(args: &[JsValue], context: &mut Context) -> JsResult<Option<JsVal
     })
 }
 
-fn reflect_fns(context: &mut Context) -> JsResult<ReflectFns> {
+pub(crate) fn reflect_fns(context: &mut Context) -> JsResult<ReflectFns> {
     dom(context)?.borrow().reflect.clone().ok_or_else(|| JsNativeError::typ().with_message("no Reflect").into())
 }
 
@@ -2713,7 +2771,7 @@ fn named_keys(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<
 
 /// A `NodeList` or `HTMLCollection`: a `Proxy` whose indexed reads and
 /// `length` come from the document at the time of the read.
-fn collection_proxy(kind: CollectionKind, context: &mut Context) -> JsResult<JsValue> {
+pub(crate) fn collection_proxy(kind: CollectionKind, context: &mut Context) -> JsResult<JsValue> {
     let proto = match kind {
         CollectionKind::ChildNodes(_) | CollectionKind::Static(_) => prototype_of::<NodeListClass>(context)?,
         _ => prototype_of::<HtmlCollectionClass>(context)?,
@@ -2784,7 +2842,29 @@ fn collection_get(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
     if !key.is_symbol() && key.to_string(context)?.to_std_string_escaped() == "length" {
         return Ok((members.len() as i32).into());
     }
+    let name = (!key.is_symbol()).then(|| key.to_string(context).map(|s| s.to_std_string_escaped())).transpose()?;
     let key = key.to_property_key(context)?;
+    // An `HTMLCollection`'s named properties (DOM §4.2.10.2): a member
+    // whose `id`, or (an HTML element's) `name`, is the key, after the
+    // interface's own properties.
+    let html = target
+        .downcast_ref::<CollectionTarget>()
+        .is_some_and(|d| !matches!(d.kind, CollectionKind::ChildNodes(_) | CollectionKind::Static(_)));
+    if html
+        && let Some(name) = name.filter(|n| !n.is_empty())
+        && !target.has_property(key.clone(), context)?
+    {
+        let found = {
+            let shared = dom(context)?;
+            let dom = shared.borrow();
+            members.iter().copied().find(|&m| {
+                dom.doc.element(m).is_some_and(|e| e.id() == Some(&name) || (e.is_html() && e.attr("name") == Some(&name)))
+            })
+        };
+        if let Some(m) = found {
+            return wrap(m, context);
+        }
+    }
     target.get(key, context)
 }
 

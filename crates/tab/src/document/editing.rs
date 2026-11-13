@@ -226,6 +226,11 @@ impl TabState {
         data: Option<&str>,
         forced: bool,
     ) -> bool {
+        // A disabled or `readonly` control takes no edits, and fires
+        // nothing for them.
+        if !self.doc.as_ref().is_some_and(|d| d.control_is_mutable(control)) {
+            return false;
+        }
         let init = |cancelable: bool| UiEventInit {
             class: UiClass::Input,
             bubbles: true,

@@ -1175,13 +1175,23 @@ impl<'a> Painter<'a> {
         let r = krect(rect);
         let t = self.transform;
         match control {
-            Control::Checkbox { checked } => {
+            Control::Checkbox { checked, indeterminate } => {
                 let outer = RoundedRect::from_rect(r, 2.0);
-                let (fill, border) = if checked { (CONTROL_ON, CONTROL_ON) } else { (Color::WHITE, CONTROL_BORDER) };
+                let on = checked || indeterminate;
+                let (fill, border) = if on { (CONTROL_ON, CONTROL_ON) } else { (Color::WHITE, CONTROL_BORDER) };
                 self.scene.fill(Fill::NonZero, t, border, None, &outer);
                 self.scene
                     .fill(Fill::NonZero, t, fill, None, &RoundedRect::from_rect(r.inset(-1.0), 1.0));
-                if checked {
+                if indeterminate {
+                    // A dash across the middle.
+                    let (w, h) = (r.width(), r.height());
+                    let cy = r.y0 + h / 2.0;
+                    let mut path = BezPath::new();
+                    path.move_to((r.x0 + 0.25 * w, cy));
+                    path.line_to((r.x0 + 0.75 * w, cy));
+                    let stroke = Stroke::new((h * 0.14).max(1.0)).with_caps(vello::kurbo::Cap::Round);
+                    self.scene.stroke(&stroke, t, Color::WHITE, None, &path);
+                } else if checked {
                     let (w, h) = (r.width(), r.height());
                     let mut path = BezPath::new();
                     path.move_to((r.x0 + 0.22 * w, r.y0 + 0.52 * h));
@@ -3008,7 +3018,7 @@ mod tests {
             }
         });
         assert_eq!(boxes.len(), 2, "{boxes:?}");
-        assert_eq!(boxes[0].1, Control::Checkbox { checked: true });
+        assert_eq!(boxes[0].1, Control::Checkbox { checked: true, indeterminate: false });
         assert_eq!((boxes[0].0.width, boxes[0].0.height), (13.0, 13.0));
         let options = PaintOptions {
             viewport_width: 100.0,

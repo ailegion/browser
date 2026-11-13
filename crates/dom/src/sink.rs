@@ -201,6 +201,12 @@ impl TreeSink for Sink {
         }
     }
 
+    /// The form element pointer: a listed element the parser makes while
+    /// a form is open belongs to it, wherever it lands.
+    fn associate_with_form(&self, target: &NodeId, form: &NodeId, _nodes: (&NodeId, Option<&NodeId>)) {
+        self.doc.borrow_mut().associate_with_form(*target, *form);
+    }
+
     fn remove_from_parent(&self, target: &NodeId) {
         self.doc.borrow_mut().detach(*target);
     }

@@ -271,6 +271,10 @@ async fn run(
     let mut method = request.method.clone();
     let mut body = request.body.clone();
     let mut mode = request.cache;
+    // A redirect made the request a GET: its body's headers go (Fetch's
+    // HTTP-redirect fetch, the request-body-header names), and so does
+    // `Origin`, which a GET navigation does not send.
+    let mut made_get = false;
 
     for _ in 0..=MAX_REDIRECTS {
         match url.scheme() {
@@ -288,6 +292,14 @@ async fn run(
         headers.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
         headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate, br"));
         for (k, v) in &request.headers {
+            if made_get
+                && matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "content-encoding" | "content-language" | "content-location" | "content-type" | "origin"
+                )
+            {
+                continue;
+            }
             // A value is a byte string: a script's header may carry code
             // points up to U+00FF, one byte each (Fetch's isomorphic
             // encoding); anything else is sent as its UTF-8.
@@ -383,6 +395,7 @@ async fn run(
             if status == StatusCode::SEE_OTHER
                 || ((status == StatusCode::MOVED_PERMANENTLY || status == StatusCode::FOUND) && method == Method::POST)
             {
+                made_get |= method != Method::GET;
                 method = Method::GET;
                 body = None;
             }

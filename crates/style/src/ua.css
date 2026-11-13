@@ -111,16 +111,23 @@ button, input[type=button], input[type=submit], input[type=reset] {
 input, select { overflow: hidden; }
 textarea { overflow: auto; }
 input { width: 150px; height: 18px; line-height: 18px; }
-select { min-width: 60px; height: 20px; line-height: 20px; padding-right: 20px; white-space: nowrap; }
+/* The arrow's room is the layout's, with the native look only
+   (`appearance`). */
+select { min-width: 60px; height: 20px; line-height: 20px; white-space: nowrap; }
 textarea { width: 300px; height: 60px; }
 button { min-height: 20px; }
 input[type=hidden] { display: none !important; }
 input[type=submit], input[type=button], input[type=reset], input[type=file] {
   width: auto; height: auto; min-height: 20px;
 }
+/* Their 13px size is the native look's (layout gives it to an `auto`
+   width or height while `appearance` is not `none`). */
 input[type=checkbox], input[type=radio] {
-  width: 13px; height: 13px; padding: 0; border: none; margin: 3px 3px 3px 4px; background-color: transparent;
+  width: auto; height: auto; padding: 0; border: none; margin: 3px 3px 3px 4px; background-color: transparent;
 }
+/* Widgets have their native look (CSS Basic UI 4 §7.2; the initial
+   value is `none`). */
+input, textarea, select, button, meter, progress { appearance: auto; }
 input:disabled, button:disabled, select:disabled, textarea:disabled {
   color: #6d6d6d; background-color: #f0f0f0; border-color: #c0c0c0;
 }

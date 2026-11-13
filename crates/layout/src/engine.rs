@@ -2051,8 +2051,13 @@ fn taffy_style(node: &BoxNode) -> Style {
         }
         BoxKind::Block | BoxKind::Flex => {
             if node.anonymous {
+                // An anonymous block has no padding, except the inner box
+                // of a native select, whose end padding is the arrow's
+                // room ("Working sites first" line 8).
+                let padding = to_taffy(&node.style, false, false, None).padding;
                 Style {
                     display: taffy::Display::Block,
+                    padding,
                     ..Style::default()
                 }
             } else {

@@ -964,6 +964,10 @@ impl TabState {
         }
         match msg {
             ShellToTab::Navigate { url } => self.go(url, NavKind::Push),
+            ShellToTab::NavigateWithBody { url, post } => {
+                self.cancel_pending_nav();
+                self.navigate_with(url, NavKind::Push, Some(post));
+            }
             ShellToTab::Reload => {
                 // Reloading while a navigation is pending restarts that one.
                 let url = self.nav.as_ref().map(|n| n.url.clone()).or_else(|| self.url.clone());
@@ -1149,7 +1153,15 @@ impl TabState {
                 );
                 let proceed = match button {
                     MouseButton::Left if on_disabled => false,
-                    MouseButton::Left => self.fire_click("click", click_target, x, y, button, clicks),
+                    MouseButton::Left => {
+                        // An image button's selected coordinate: where in
+                        // it the click landed (whole CSS pixels).
+                        let coordinate = click_target.map(|t| {
+                            let (ox, oy) = self.click_offset(t, x, y);
+                            (ox.floor() as i32, oy.floor() as i32)
+                        });
+                        self.click_with_activation(click_target, coordinate, |s| s.fire_click("click", click_target, x, y, button, clicks))
+                    }
                     _ => self.fire_click("auxclick", click_target, x, y, button, clicks),
                 };
                 if button == MouseButton::Right {
@@ -1160,13 +1172,7 @@ impl TabState {
                 }
                 if button == MouseButton::Left {
                     self.set_active(None);
-                    let released_control = self.hover.and_then(|h| self.ancestor_or_self(h, is_toggle));
-                    if let Some(c) = self.press_control.take()
-                        && released_control == Some(c)
-                        && proceed
-                    {
-                        self.toggle_control(c);
-                    }
+                    self.press_control = None;
                 }
                 let released_on = self.hover.and_then(|h| self.ancestor_or_self(h, is_link));
                 if let (Some((pressed, pressed_button)), Some(released)) = (self.press.take(), released_on)
@@ -1232,10 +1238,8 @@ impl TabState {
                     && let Some(f) = self.space_armed.take()
                     && self.focus == Some(f)
                     && proceed
-                    && self.fire_synthetic_click(f)
-                    && self.doc.as_ref().and_then(|d| d.element(f)).is_some_and(is_toggle)
                 {
-                    self.toggle_control(f);
+                    self.click_with_activation(Some(f), Some((0, 0)), |s| s.fire_synthetic_click(f));
                 }
             }
             ShellToTab::Modifiers { shift, ctrl, alt, meta } => {
@@ -1291,9 +1295,14 @@ impl TabState {
         // focus never reaches a control.
         let f = focus.unwrap_or_default();
         if text {
-            // Enter in an input commits the value: `change` if edited.
+            // Enter in an input commits the value (`change` if edited),
+            // then submits its form implicitly, unless `keypress` was
+            // cancelled.
             if key == Key::Enter && !textarea && !ctrl && !alt {
                 self.fire_change_if_edited(f);
+                if keypress_ok {
+                    self.implicit_submission(f);
+                }
                 return;
             }
             if keypress_ok {
@@ -1301,10 +1310,26 @@ impl TabState {
             }
             return;
         }
+        // An input that is no button (a checkbox, a radio, ...) submits its
+        // form implicitly on Enter, as a text field does.
+        let other_input = focus
+            .and_then(|f| self.doc.as_ref()?.input_type(f))
+            .is_some_and(|t| !matches!(t, browser_dom::forms::InputType::Submit | browser_dom::forms::InputType::Image | browser_dom::forms::InputType::Reset | browser_dom::forms::InputType::Button));
         match key {
-            Key::Enter if (link || button) && !ctrl && !alt => {
-                if self.fire_synthetic_click(f) && link {
+            Key::Enter if link && !ctrl && !alt => {
+                if self.fire_synthetic_click(f) {
                     self.follow_link(f);
+                }
+            }
+            // Enter clicks a button (on `keypress`), with its activation.
+            Key::Enter if button && !ctrl && !alt => {
+                if keypress_ok {
+                    self.click_with_activation(Some(f), Some((0, 0)), |s| s.fire_synthetic_click(f));
+                }
+            }
+            Key::Enter if other_input && !ctrl && !alt => {
+                if keypress_ok {
+                    self.implicit_submission(f);
                 }
             }
             Key::Space if toggle || button => self.space_armed = Some(f),
@@ -1322,31 +1347,46 @@ impl TabState {
         }
     }
 
-    /// The live value of a text control: a textarea's text, an input's
-    /// `value` attribute (which editing updates, there being no script to
-    /// tell the difference yet).
+    /// The text a text control shows and the caret moves in: what the
+    /// user typed, else its value ("Working sites first" line 8: the value
+    /// is the control's state, never its `value` attribute or children).
     fn control_value(&self, id: NodeId) -> String {
         let Some(doc) = &self.doc else { return String::new() };
-        if doc.element(id).is_some_and(is_textarea) {
-            doc.text_content(id)
-        } else {
-            doc.element(id).and_then(|e| e.attr("value")).unwrap_or("").to_owned()
-        }
+        doc.control_display_value(id)
     }
 
+    /// The user edited a text control: its value is `value` (dirty).
     fn set_control_value(&mut self, id: NodeId, value: &str) {
         let Some(doc) = &mut self.doc else { return };
-        if doc.element(id).is_some_and(is_textarea) {
-            // The user's typing is the control's value, not a change to
-            // its children a `MutationObserver` hears of.
-            doc.suppress_mutations();
-            doc.set_text_content(id, value);
-            doc.resume_mutations();
-        } else if let Some(e) = doc.get_mut(id).as_element_mut() {
-            e.set_attr("value", value);
+        doc.set_value_by_user(id, value);
+        self.controls_changed();
+    }
+
+    /// Controls whose state changed (the user's edits, a toggle, a select
+    /// step, a reset, what a tree change settled): `:checked` restyles
+    /// what it reaches and their boxes are built again, through the same
+    /// path as a script's changes.
+    fn controls_changed(&mut self) {
+        let changed = match &mut self.doc {
+            Some(doc) => {
+                doc.settle_forms();
+                doc.take_controls_changed()
+            }
+            None => return,
+        };
+        if changed.is_empty() {
+            return;
         }
-        // The value is not a selector subject yet; layout is enough.
-        self.want_layout("text control value");
+        let changes: Vec<browser_script::DomChange> =
+            changed.iter().map(|&element| browser_script::DomChange::Control { element, generation: 0 }).collect();
+        if !self.restyle_changes(&changes) {
+            self.note_box_changes(&changed, &[]);
+            if self.layout.is_some() {
+                self.want_style("control state changed before styles were current");
+                self.want_layout_noted("control state changed before styles were current");
+            }
+        }
+        self.needs_paint = true;
     }
 
     /// Where the caret goes: after the value's character at `caret` in
@@ -1456,98 +1496,147 @@ impl TabState {
         self.caret_rect = Some(rect);
     }
 
-    /// Flip a checkbox, or check a radio and clear the rest of its group
-    /// (same `name`, same form or document).
-    fn toggle_control(&mut self, id: NodeId) {
-        let Some(doc) = &mut self.doc else { return };
-        if doc.disabled_state(id) == Some(true) {
-            return;
+    /// The form control a `click` at `target` activates (DOM dispatch's
+    /// activation target): the target or its nearest ancestor with
+    /// activation behavior, unless a link comes first (links keep their
+    /// own handling).
+    fn activation_control(&self, target: NodeId) -> Option<NodeId> {
+        let doc = self.doc.as_ref()?;
+        if !doc.contains(target) {
+            return None;
         }
-        let Some(e) = doc.element(id) else { return };
-        let radio = input_type(e).as_deref() == Some("radio");
-        let name = e.attr("name").map(str::to_owned);
-        // The controls whose `checked` changes: their boxes draw it.
-        let mut toggled = vec![id];
-        if radio {
-            let mut scope = doc.root();
-            let mut cur = doc.parent(id);
-            while let Some(n) = cur {
-                if doc.element(n).is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("form")) {
-                    scope = n;
-                    break;
-                }
-                cur = doc.parent(n);
-            }
-            let group: Vec<NodeId> = doc
-                .descendants(scope)
-                .filter(|&n| {
-                    n != id
-                        && doc.element(n).is_some_and(|o| {
-                            input_type(o).as_deref() == Some("radio") && o.attr("name").map(str::to_owned) == name
-                        })
-                })
-                .collect();
-            for n in group {
-                if let Some(o) = doc.get_mut(n).as_element_mut()
-                    && o.attr("checked").is_some()
-                {
-                    o.remove_attr("checked");
-                    toggled.push(n);
-                }
-            }
-            if let Some(e) = doc.get_mut(id).as_element_mut() {
-                e.set_attr("checked", "");
-            }
-        } else if let Some(e) = doc.get_mut(id).as_element_mut() {
-            if e.attr("checked").is_some() {
-                e.remove_attr("checked");
-            } else {
-                e.set_attr("checked", "");
-            }
-        }
-        // `:checked` can restyle anything; the cascade runs again.
-        self.note_box_changes(&toggled, &[]);
-        self.want_style("checked toggled");
-        self.fire_control_changed(id);
+        let first = std::iter::once(target)
+            .chain(doc.ancestors(target))
+            .find(|&n| doc.has_form_activation(n) || doc.element(n).is_some_and(is_link))?;
+        doc.has_form_activation(first).then_some(first)
     }
 
-    /// Arrow keys on a focused select move the chosen option.
-    fn step_select(&mut self, id: NodeId, down: bool) {
-        let Some(doc) = &mut self.doc else { return };
-        let options: Vec<NodeId> = doc
-            .descendants(id)
-            .filter(|&n| {
-                doc.element(n)
-                    .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("option"))
-            })
-            .collect();
-        if options.is_empty() {
-            return;
-        }
-        let current = options
-            .iter()
-            .position(|&o| doc.element(o).is_some_and(|e| e.attr("selected").is_some()))
-            .unwrap_or(0);
-        let next = if down {
-            (current + 1).min(options.len() - 1)
-        } else {
-            current.saturating_sub(1)
+    /// A `click` (`fire` dispatches it, returning whether it was not
+    /// cancelled) at `target`, with the form controls' activation around
+    /// it: a checkbox flips and a radio checks before the listeners run
+    /// (legacy-pre-activation), back when one cancels, and after it the
+    /// activation behavior runs: `input` and `change`, a submission (an
+    /// image button with `coordinate`), a reset.
+    fn click_with_activation(&mut self, target: Option<NodeId>, coordinate: Option<(i32, i32)>, fire: impl FnOnce(&mut Self) -> bool) -> bool {
+        let control = target.and_then(|t| self.activation_control(t));
+        let saved = match (control, &mut self.doc) {
+            (Some(c), Some(doc)) => Some(doc.pre_activate(c)),
+            _ => None,
         };
-        if next == current && doc.element(options[current]).is_some_and(|e| e.attr("selected").is_some()) {
+        if saved.is_some() {
+            self.controls_changed();
+        }
+        let proceed = fire(self);
+        if let (Some(c), Some(saved)) = (control, saved) {
+            if !self.doc.as_ref().is_some_and(|d| d.contains(c)) {
+                return proceed;
+            }
+            if proceed {
+                self.run_activation(c, coordinate);
+            } else {
+                if let Some(doc) = &mut self.doc {
+                    doc.cancel_activation(c, saved);
+                }
+                self.controls_changed();
+            }
+        }
+        proceed
+    }
+
+    /// A form control's activation behavior.
+    fn run_activation(&mut self, control: NodeId, coordinate: Option<(i32, i32)>) {
+        let Some(activation) = self.doc.as_ref().map(|d| d.activation(control)) else { return };
+        match activation {
+            browser_dom::forms::Activation::Changed => self.fire_control_changed(control),
+            browser_dom::forms::Activation::Submit { form } => {
+                let image = self.doc.as_ref().and_then(|d| d.input_type(control)) == Some(browser_dom::forms::InputType::Image);
+                self.submit_form(form, Some(control), image.then(|| coordinate.unwrap_or((0, 0))));
+            }
+            browser_dom::forms::Activation::Reset { form } => self.reset_form(form),
+            browser_dom::forms::Activation::Nothing => {}
+        }
+    }
+
+    /// Submit `form` from `submitter` (HTML §4.10.22.3): its events and
+    /// entry list in script, which plans the navigation
+    /// (`HostRequest::Submit`); with no script context, the same entry
+    /// list and navigation without the events.
+    fn submit_form(&mut self, form: NodeId, submitter: Option<NodeId>, coordinate: Option<(i32, i32)>) {
+        if self.script.is_some() && self.parser.is_none() {
+            self.sync_document_info();
+            self.with_script(|host| host.submit_form(form, submitter, coordinate));
+            self.after_script();
             return;
         }
-        for (i, &o) in options.iter().enumerate() {
-            if let Some(e) = doc.get_mut(o).as_element_mut() {
-                if i == next {
-                    e.set_attr("selected", "");
-                } else {
-                    e.remove_attr("selected");
+        let Some(doc) = &self.doc else { return };
+        if !doc.is_connected(form) {
+            return;
+        }
+        let encoding = doc.form_encoding(form);
+        let entries = doc.construct_entry_list(form, submitter, encoding, coordinate.unwrap_or((0, 0)));
+        let boundary = browser_dom::forms::new_boundary();
+        if let Some(browser_dom::forms::SubmitAction::Navigate { url, post, target, .. }) =
+            doc.submission_action(form, submitter, &entries, encoding, coordinate, &boundary)
+        {
+            self.navigate_submission(url, post, &target);
+        }
+    }
+
+    /// Reset `form` as the user asked: `reset` in script, then the reset
+    /// algorithms.
+    fn reset_form(&mut self, form: NodeId) {
+        if self.script.is_some() && self.parser.is_none() {
+            self.sync_document_info();
+            self.with_script(|host| host.reset_form(form));
+            self.after_script();
+            return;
+        }
+        if let Some(doc) = &mut self.doc {
+            for c in doc.form_resettable_elements(form) {
+                doc.reset_control(c);
+            }
+        }
+        self.controls_changed();
+    }
+
+    /// Implicit submission (HTML §4.10.22.2): Enter in a field of a form
+    /// clicks its default button, or with none submits the form when at
+    /// most one field blocks implicit submission.
+    fn implicit_submission(&mut self, field: NodeId) {
+        let Some(doc) = &self.doc else { return };
+        let Some(form) = doc.form_owner(field) else { return };
+        match doc.default_button(form) {
+            Some(button) => {
+                if doc.disabled_state(button) == Some(true) {
+                    return;
+                }
+                self.click_with_activation(Some(button), Some((0, 0)), |s| s.fire_synthetic_click(button));
+            }
+            None => {
+                if doc.implicit_submission_blockers(form) <= 1 {
+                    self.submit_form(form, None, None);
                 }
             }
         }
-        // The select's box shows the chosen option.
-        self.note_box_changes(&[id], &[]);
-        self.want_style("select option changed");
+    }
+
+    /// Arrow keys on a focused drop-down select pick the next (or
+    /// previous) option that is not disabled; `input` and `change` follow.
+    fn step_select(&mut self, id: NodeId, down: bool) {
+        let Some(doc) = &mut self.doc else { return };
+        if !doc.control_is_mutable(id) {
+            return;
+        }
+        let options = doc.list_of_options(id);
+        let current = options.iter().position(|&o| doc.option_selectedness(o));
+        let candidates: Box<dyn Iterator<Item = usize>> = match (current, down) {
+            (Some(c), true) => Box::new(c + 1..options.len()),
+            (Some(c), false) => Box::new((0..c).rev()),
+            (None, _) => Box::new(0..options.len()),
+        };
+        let Some(next) = candidates.into_iter().find(|&i| !doc.option_disabled(options[i])) else { return };
+        doc.pick_option(id, options[next]);
+        self.controls_changed();
         self.fire_control_changed(id);
     }
 
@@ -1947,6 +2036,41 @@ impl TabState {
     fn follow_link(&mut self, link: NodeId) {
         if let Some(url) = self.link_target(link) {
             self.go(url, NavKind::Push);
+        }
+    }
+
+    /// A form submission's navigation (HTML §4.10.22.3 steps 16 to 21):
+    /// to `url`, POSTing `post` when given, in the navigable `target`
+    /// names: this tab for none, `_self`, `_parent` and `_top` (there are
+    /// no frames), a new tab for `_blank` or any name. It replaces the
+    /// current entry while the document has not completely loaded. Only
+    /// http(s) and `about:` are navigated to: a top-level `data:` from a
+    /// page is blocked as in Chrome and Firefox; `javascript:` and
+    /// `mailto:` are not opened, as for links.
+    fn navigate_submission(&mut self, url: Url, post: Option<browser_dom::forms::PostResource>, target: &str) {
+        if !matches!(url.scheme(), "http" | "https" | "about") {
+            tracing::debug!(tab = self.id.0, "form submission to {url} not navigated");
+            return;
+        }
+        let origin = self.url.as_ref().map_or_else(|| "null".to_owned(), |u| u.origin().ascii_serialization());
+        let post = post.map(|p| browser_ipc_types::PostData {
+            content_type: p.content_type,
+            body: p.body,
+            origin: origin.clone(),
+        });
+        let t = target.trim().to_ascii_lowercase();
+        if !(t.is_empty() || t == "_self" || t == "_parent" || t == "_top") {
+            self.send(TabToShell::OpenFormSubmission { url, post });
+            return;
+        }
+        let kind = if self.lifecycle == Lifecycle::Complete { NavKind::Push } else { NavKind::Replace };
+        match post {
+            None => self.go(url, kind),
+            Some(post) => {
+                // A POST always loads, fragment or not.
+                self.cancel_pending_nav();
+                self.navigate_with(url, kind, Some(post));
+            }
         }
     }
 
@@ -2758,13 +2882,29 @@ impl TabState {
     /// Start loading `url`. Nothing about the current page changes until
     /// the response commits (`commit`).
     fn navigate(&mut self, url: Url, kind: NavKind) {
-        tracing::info!(tab = self.id.0, "navigate {url}");
+        self.navigate_with(url, kind, None);
+    }
+
+    /// `navigate`, POSTing `post` when given (a form submitted as an
+    /// entity body): its `Content-Type` and the submitting document's
+    /// `Origin` go with it; never from the cache.
+    fn navigate_with(&mut self, url: Url, kind: NavKind, post: Option<browser_ipc_types::PostData>) {
+        tracing::info!(tab = self.id.0, post = post.is_some(), "navigate {url}");
         self.refresh = None;
         self.refresh_header = None;
         self.press = None;
         let mut request = FetchRequest::get(url.clone());
         if kind == NavKind::Reload {
             request.cache = CacheMode::NoCache;
+        }
+        if let Some(post) = post {
+            if let Ok(method) = "POST".parse() {
+                request.method = method;
+            }
+            request.headers.push(("content-type".to_owned(), post.content_type));
+            request.headers.push(("origin".to_owned(), post.origin));
+            request.body = Some(post.body);
+            request.cache = CacheMode::NoStore;
         }
         let id = if url.scheme() == "about" {
             self.fetch_about(request.url)
@@ -3646,8 +3786,23 @@ impl TabState {
 
     /// Act on what a script asked of the document or the tab.
     fn apply_host_requests(&mut self, requests: Vec<HostRequest>) {
+        // A form's planned navigation is a task queued after the script:
+        // it runs after the script's own navigations, the last one
+        // winning.
+        let (submissions, requests): (Vec<HostRequest>, Vec<HostRequest>) =
+            requests.into_iter().partition(|r| matches!(r, HostRequest::Submit { .. }));
+        self.apply_script_requests(requests);
+        for s in submissions {
+            if let HostRequest::Submit { url, post, target, .. } = s {
+                self.navigate_submission(url, post, &target);
+            }
+        }
+    }
+
+    fn apply_script_requests(&mut self, requests: Vec<HostRequest>) {
         for request in requests {
             match request {
+                HostRequest::Submit { .. } => {}
                 // The script changed the document itself; the shell hears
                 // of the new title.
                 HostRequest::SetTitle(_) => self.state_dirty = true,
@@ -4005,6 +4160,17 @@ impl TabState {
         // A layout the script forced after its last change is current.
         let fresh = std::mem::take(&mut self.host_layout_fresh);
         self.state_dirty = true;
+        // A script changed the focused text control's value: the caret
+        // goes to its end and the selection is dropped (HTML's `value`
+        // setter).
+        if let Some(f) = self.text_focus()
+            && changes.iter().any(|c| matches!(c, browser_script::DomChange::Control { element, .. } if *element == f))
+        {
+            self.caret = self.control_value(f).len();
+            self.sel_anchor = None;
+            self.last_select = None;
+            self.needs_paint = true;
+        }
         // A `<style>` or `<link>` the script added, changed or removed.
         self.sync_stylesheets();
         if !fresh && !self.restyle_changes(changes) {
@@ -5064,6 +5230,18 @@ impl TabState {
     }
 
     fn restyle_all(&mut self) {
+        // The parser's (and any other) tree changes settled for the
+        // controls first: a select's chosen option, a radio group.
+        let settled = match &mut self.doc {
+            Some(doc) => {
+                doc.settle_forms();
+                doc.take_controls_changed()
+            }
+            None => Vec::new(),
+        };
+        if !settled.is_empty() {
+            self.note_box_changes(&settled, &[]);
+        }
         let Some(doc) = &self.doc else { return };
         let started = std::time::Instant::now();
         let stylist = self.stylist();
@@ -5342,11 +5520,12 @@ fn script_kind(e: &browser_dom::Element) -> Option<ScriptKind> {
     Some(kind)
 }
 
-/// An `<input>`'s type, lower-cased; `text` when absent. `None` for
-/// anything that is not an input.
+/// An `<input>`'s type state's keyword (`text` when absent or invalid,
+/// as HTML's enumerated attribute has it). `None` for anything that is
+/// not an input.
 fn input_type(e: &browser_dom::Element) -> Option<String> {
     (e.name.ns == ns!(html) && e.name.local == local_name!("input"))
-        .then(|| e.attr("type").map_or_else(|| "text".to_owned(), |t| t.trim().to_ascii_lowercase()))
+        .then(|| browser_dom::forms::InputType::from_attr(e.attr("type")).as_str().to_owned())
 }
 
 fn is_textarea(e: &browser_dom::Element) -> bool {
@@ -6342,14 +6521,14 @@ mod tests {
         <input id=d type=checkbox disabled></p>";
 
     impl Harness {
-        fn has_attr(&self, id: &str, attr: &str) -> bool {
-            let doc = self.state.doc.as_ref().expect("document");
-            doc.element(self.by_id(id)).is_some_and(|e| e.attr(attr).is_some())
+        /// A control's checkedness (its state, not its attribute).
+        fn checked(&self, id: &str) -> bool {
+            self.state.doc.as_ref().expect("document").checkedness(self.by_id(id))
         }
 
-        fn attr(&self, id: &str, attr: &str) -> Option<String> {
-            let doc = self.state.doc.as_ref().expect("document");
-            doc.element(self.by_id(id))?.attr(attr).map(str::to_owned)
+        /// A control's value as its alue IDL attribute reads it.
+        fn value(&self, id: &str) -> Option<String> {
+            Some(self.state.doc.as_ref().expect("document").control_value(self.by_id(id)))
         }
 
         /// Click near the right end of an element's first box.
@@ -6394,24 +6573,24 @@ mod tests {
         let mut h = Harness::load(FORM);
         // Checkbox: a click toggles, and `:checked` restyles the sibling.
         h.click_id("c");
-        assert!(h.has_attr("c", "checked"));
+        assert!(h.checked("c"));
         assert_eq!(h.color_of("cs"), [255, 0, 0, 255]);
         h.click_id("c");
-        assert!(!h.has_attr("c", "checked"));
+        assert!(!h.checked("c"));
         assert_eq!(h.color_of("cs"), [0, 0, 0, 255]);
         // Space on the focused checkbox toggles too, on release as in
         // browsers; a disabled one never.
         h.key(Key::Space, false);
-        assert!(!h.has_attr("c", "checked"), "not before the key goes up");
+        assert!(!h.checked("c"), "not before the key goes up");
         h.key_up(Key::Space, false);
-        assert!(h.has_attr("c", "checked"));
+        assert!(h.checked("c"));
         h.click_id("d");
-        assert!(!h.has_attr("d", "checked"));
+        assert!(!h.checked("d"));
         // Radios: one in the group at a time.
         h.click_id("r2");
-        assert!(h.has_attr("r2", "checked") && !h.has_attr("r1", "checked"));
+        assert!(h.checked("r2") && !h.checked("r1"));
         h.click_id("r1");
-        assert!(h.has_attr("r1", "checked") && !h.has_attr("r2", "checked"));
+        assert!(h.checked("r1") && !h.checked("r2"));
 
         // Text input: the click puts the caret at the end; keys edit.
         assert_eq!(h.control_text("t"), "ab");
@@ -6420,35 +6599,35 @@ mod tests {
         assert_eq!(h.state.caret, 2);
         let caret0 = h.state.caret_rect.expect("caret shown");
         h.typed("x");
-        assert_eq!(h.attr("t", "value").as_deref(), Some("abx"));
+        assert_eq!(h.value("t").as_deref(), Some("abx"));
         assert_eq!(h.control_text("t"), "abx");
         assert!(h.state.caret_rect.expect("caret").x > caret0.x, "the caret moved right");
         h.key(Key::Backspace, false);
         h.key(Key::Backspace, false);
         h.key(Key::ArrowLeft, false);
         h.typed("z");
-        assert_eq!(h.attr("t", "value").as_deref(), Some("za"));
+        assert_eq!(h.value("t").as_deref(), Some("za"));
         h.key(Key::Home, false);
         h.key(Key::Delete, false);
         h.key(Key::End, false);
         h.key(Key::Space, false);
-        assert_eq!(h.attr("t", "value").as_deref(), Some("a "));
+        assert_eq!(h.value("t").as_deref(), Some("a "));
         assert_eq!(h.control_text("t"), "a ", "spaces are kept");
         h.key(Key::Enter, false);
-        assert_eq!(h.attr("t", "value").as_deref(), Some("a "), "Enter does nothing in an input yet");
+        assert_eq!(h.value("t").as_deref(), Some("a "), "Enter in an input outside a form submits nothing");
         assert_eq!(h.state.history.len(), 1, "and does not navigate");
 
         // Password shows bullets; a textarea takes newlines.
         h.click_id("pw");
         h.typed("pq");
-        assert_eq!(h.attr("pw", "value").as_deref(), Some("pq"));
+        assert_eq!(h.value("pw").as_deref(), Some("pq"));
         assert_eq!(h.control_text("pw"), "\u{2022}\u{2022}");
         h.click_end_of("ta");
         h.key(Key::End, false);
         h.key(Key::Enter, false);
         h.typed("y");
-        let doc = h.state.doc.as_ref().expect("doc");
-        assert_eq!(doc.text_content(h.by_id("ta")), "hi\ny");
+        assert_eq!(h.value("ta").as_deref(), Some("hi\ny"), "the value; its children stay the default");
+        assert_eq!(h.state.doc.as_ref().expect("doc").text_content(h.by_id("ta")), "hi");
         assert!(h.state.caret_rect.is_some_and(|c| c.y > 0.0), "the caret is on the second line");
 
         // Select: arrows step the chosen option, and it shows.
@@ -6961,7 +7140,7 @@ mod tests {
                l.onmouseleave = ev => log.push('leave:' + ev.target.id); box.onmouseleave = ev => log.push('leave:' + ev.target.id); \
                l.addEventListener('mousemove', ev => log.push('move:' + Math.round(ev.clientX) + ':' + Math.round(ev.pageY) + ':' + Math.round(ev.offsetX) + ':' + ev.buttons + ':' + ev.ctrlKey + ':' + (ev instanceof MouseEvent))); \
                l.onfocus = () => log.push('focus:l'); \
-               c.oninput = ev => log.push('input:' + ev.target.hasAttribute('checked')); c.onchange = ev => log.push('change:' + ev.target.hasAttribute('checked')); \
+               c.oninput = ev => log.push('input:' + ev.target.checked); c.onchange = ev => log.push('change:' + ev.target.checked); \
                window.addEventListener('wheel', ev => {{ log.push('wheel:' + ev.deltaY + ':' + ev.target.id + ':' + (ev instanceof WheelEvent)); if (cancel.wheel) ev.preventDefault(); }}); \
                document.addEventListener('scroll', ev => log.push('scroll:' + (ev.target === document) + ':' + ev.bubbles)); \
                window.onresize = ev => log.push('resize:' + (ev.target === window) + ':' + (ev instanceof UIEvent)); \
@@ -7045,7 +7224,7 @@ mod tests {
             "\"mousedown:c:0:2:true mouseup:c:0:2:true click:c:0:2:true dblclick:c:0:2:true\""
         );
         let c = h.by_id("c");
-        assert!(h.state.doc.as_ref().and_then(|d| d.element(c)).is_some_and(|e| e.attr("checked").is_some()));
+        assert!(h.state.doc.as_ref().is_some_and(|d| d.checkedness(c)));
 
         // `wheel` before the scroll, `scroll` after it; a cancelled
         // `wheel` scrolls nothing. `resize` on the window.
@@ -7082,7 +7261,7 @@ mod tests {
                document.addEventListener('keypress', ev => log.push('kp:' + ev.key + ':' + ev.charCode + ':' + ev.which)); \
                document.addEventListener('keyup', ev => log.push('ku:' + ev.key)); \
                i.addEventListener('beforeinput', ev => { log.push('bi:' + ev.inputType + ':' + ev.data + ':' + ev.cancelable + ':' + (ev instanceof InputEvent)); if (ev.data === 'z') ev.preventDefault(); }); \
-               document.addEventListener('input', ev => log.push('in:' + ev.target.id + ':' + ev.inputType + ':' + ev.data + ':' + ev.target.getAttribute('value'))); \
+               document.addEventListener('input', ev => log.push('in:' + ev.target.id + ':' + ev.inputType + ':' + ev.data + ':' + ev.target.value)); \
                document.addEventListener('change', ev => log.push('ch:' + ev.target.id + ':' + ev.cancelable)); \
              </script>";
         let mut h = Harness::load(html);
@@ -7147,13 +7326,13 @@ mod tests {
         key(&mut h, Key::ArrowDown, false);
         assert_eq!(
             drain(&mut h),
-            "\"kd:ArrowDown:ArrowDown:40:false:select#s:true in:s::null:null ch:s:false\""
+            "\"kd:ArrowDown:ArrowDown:40:false:select#s:true in:s::null:b ch:s:false\""
         );
         key(&mut h, Key::Tab, false);
         drain(&mut h);
         key(&mut h, Key::Space, false);
         h.key_up(Key::Space, false);
-        assert_eq!(drain(&mut h), "\"kd: :Space:32:false:input#c:true kp: :32:32 ku:  in:c::null:null ch:c:false\"");
+        assert_eq!(drain(&mut h), "\"kd: :Space:32:false:input#c:true kp: :32:32 ku:  in:c::null:on ch:c:false\"");
         key(&mut h, Key::Tab, true);
         assert_eq!(
             drain(&mut h),
@@ -7248,7 +7427,7 @@ mod tests {
                document.addEventListener('click', ev => { log.push('click:' + ev.target.id + ':' + ev.pointerId + ':' + ev.pointerType + ':' + ev.detail + ':' + ev.clientX + ':' + (ev instanceof PointerEvent)); if (cancel[ev.target.id]) ev.preventDefault(); }); \
                document.addEventListener('keydown', ev => log.push('kd:' + ev.code + ':' + ev.repeat)); \
                document.addEventListener('keyup', ev => log.push('ku:' + ev.key + ':' + ev.code + ':' + ev.target.id)); \
-               document.addEventListener('change', ev => log.push('change:' + ev.target.id + ':' + ev.target.getAttribute('value'))); \
+               document.addEventListener('change', ev => log.push('change:' + ev.target.id + ':' + ev.target.value)); \
                document.addEventListener('contextmenu', ev => log.push('ctx:' + ev.target.id + ':' + ev.pointerId + ':' + ev.pointerType + ':' + Math.round(ev.clientX) + ':' + Math.round(ev.clientY))); \
              </script>";
         let mut h = Harness::load(html);
@@ -7294,12 +7473,12 @@ mod tests {
         drain(&mut h);
         h.key(Key::Space, false);
         h.key_up(Key::Space, false);
-        assert_eq!(drain(&mut h), "\"kd:Space:false ku: :Space:c click:c:-1::0:0:true change:c:null\"");
-        assert!(h.has_attr("c", "checked"));
+        assert_eq!(drain(&mut h), "\"kd:Space:false ku: :Space:c click:c:-1::0:0:true change:c:on\"");
+        assert!(h.checked("c"));
         js(&mut h, "cancel.c = true");
         h.key(Key::Space, false);
         h.key_up(Key::Space, false);
-        assert!(h.has_attr("c", "checked"), "a cancelled click toggles nothing");
+        assert!(h.checked("c"), "a cancelled click toggles nothing");
         drain(&mut h);
 
         // Enter in an input commits an edited value with `change`, once.
@@ -7385,7 +7564,7 @@ mod tests {
                var log = []; \
                document.addEventListener('select', ev => log.push('select:' + ev.target.id + ':' + ev.bubbles + ':' + ev.cancelable)); \
                document.addEventListener('beforeinput', ev => log.push('bi:' + ev.inputType + ':' + ev.data)); \
-               document.addEventListener('input', ev => log.push('in:' + ev.inputType + ':' + ev.target.getAttribute('value'))); \
+               document.addEventListener('input', ev => log.push('in:' + ev.inputType + ':' + ev.target.value)); \
              </script>";
         let mut h = Harness::load(html);
         let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
@@ -7418,7 +7597,7 @@ mod tests {
         assert_eq!(drain(&mut h), "\"bi:deleteByCut:null in:deleteByCut:\"");
         h.send(ShellToTab::Paste { text: "a\nb".into() });
         assert_eq!(drain(&mut h), "\"bi:insertFromPaste:ab in:insertFromPaste:ab\"");
-        assert_eq!(h.attr("t", "value").as_deref(), Some("ab"));
+        assert_eq!(h.value("t").as_deref(), Some("ab"));
 
         // A double click selects the word; Ctrl+A everything; Shift+click
         // and a drag extend from the caret.
@@ -7455,7 +7634,7 @@ mod tests {
         h.send(ShellToTab::Copy);
         h.send(ShellToTab::Cut);
         assert_eq!(h.copies().len(), 2);
-        assert_eq!(h.attr("pw", "value").as_deref(), Some("abc"));
+        assert_eq!(h.value("pw").as_deref(), Some("abc"));
         drain(&mut h);
 
         // A textarea: lines up and down keep the column.
@@ -7476,7 +7655,7 @@ mod tests {
         h.key(Key::ArrowUp, true);
         assert_eq!(h.state.control_selection(), Some((0, 3)));
         h.key(Key::Delete, false);
-        assert_eq!(h.state.doc.as_ref().expect("doc").text_content(h.by_id("ta")), "cd");
+        assert_eq!(h.value("ta").as_deref(), Some("cd"));
     }
 
     #[test]
@@ -7488,7 +7667,7 @@ mod tests {
                  log.push(t.replace('composition', 'c') + ':' + ev.data + ':' + (ev instanceof CompositionEvent) + ':' + ev.cancelable); \
                  if (refuse && t === 'compositionstart') ev.preventDefault(); })); \
                document.addEventListener('beforeinput', ev => log.push('bi:' + ev.inputType + ':' + ev.data + ':' + ev.cancelable)); \
-               document.addEventListener('input', ev => log.push('in:' + ev.target.getAttribute('value'))); \
+               document.addEventListener('input', ev => log.push('in:' + ev.target.value)); \
              </script>";
         let mut h = Harness::load(html);
         let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
@@ -7517,25 +7696,25 @@ mod tests {
         h.send(ShellToTab::ImeCommit { text: "你".into() });
         assert_eq!(drain(&mut h), "\"bi:insertCompositionText:你:false in:ab你 cend:你:true:false\"");
         assert!(h.state.composition.is_none());
-        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你"));
+        assert_eq!(h.value("t").as_deref(), Some("ab你"));
         // A clear with no commit: the IME cancelled.
         preedit(&mut h, "k", None);
         drain(&mut h);
         preedit(&mut h, "", None);
-        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你k"), "nothing decided yet");
+        assert_eq!(h.value("t").as_deref(), Some("ab你k"), "nothing decided yet");
         h.key(Key::ArrowLeft, false);
         assert_eq!(
             drain(&mut h),
             "\"cupdate::true:false bi:insertCompositionText::false in:ab你 cend::true:false\""
         );
-        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你"));
+        assert_eq!(h.value("t").as_deref(), Some("ab你"));
         // A refused start: nothing is inserted, the end still comes.
         js(&mut h, "refuse = true");
         preedit(&mut h, "z", None);
         assert_eq!(drain(&mut h), "\"cstart::true:true\"");
         h.send(ShellToTab::ImeCommit { text: "z".into() });
         assert_eq!(drain(&mut h), "\"cend:z:true:false\"");
-        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你"));
+        assert_eq!(h.value("t").as_deref(), Some("ab你"));
         js(&mut h, "refuse = false");
         // Focus leaving mid-composition commits what is there.
         h.key(Key::End, false);
@@ -7543,7 +7722,7 @@ mod tests {
         drain(&mut h);
         h.key(Key::Tab, false);
         assert_eq!(drain(&mut h), "\"cend:q:true:false\"");
-        assert_eq!(h.attr("t", "value").as_deref(), Some("ab你q"));
+        assert_eq!(h.value("t").as_deref(), Some("ab你q"));
         assert!(h.state.composition.is_none());
         assert_eq!(h.last_caret(), Some(None), "no text control has focus");
         // A commit with nothing composed (a dead key) is plain text.
@@ -7685,17 +7864,37 @@ mod tests {
                             }
                             head.extend_from_slice(&buf[..n]);
                         }
+                        // A body (a form's POST) is read to its
+                        // `Content-Length` and logged after the head.
+                        let split = head.windows(4).position(|w| w == b"\r\n\r\n").map_or(head.len(), |p| p + 4);
+                        let mut body = head.split_off(split);
                         let head = String::from_utf8_lossy(&head).into_owned();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
+                            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while body.len() < length {
+                            let Ok(n) = stream.read(&mut buf) else { return };
+                            if n == 0 {
+                                break;
+                            }
+                            body.extend_from_slice(&buf[..n]);
+                        }
                         let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                        heads.lock().expect("lock").push(head.clone());
+                        heads.lock().expect("lock").push(format!("{head}{}", String::from_utf8_lossy(&body)));
                         {
                             let (set, cv) = &*gate;
                             let mut set = set.lock().expect("lock");
-                            while set.contains(&path) {
+                            let bare = path.split('?').next().unwrap_or("/").to_owned();
+                            while set.contains(&path) || set.contains(&bare) {
                                 set = cv.wait(set).expect("wait");
                             }
                         }
-                        let response = match routes.get(&path) {
+                        // A route answers its path with any query (a GET
+                        // form's).
+                        let route = routes.get(&path).or_else(|| routes.get(path.split('?').next().unwrap_or("/")));
+                        let response = match route {
                             Some((headers, body)) => {
                                 // A `:status` pseudo-header gives a route
                                 // another status line than `200 OK`.
@@ -7722,13 +7921,24 @@ mod tests {
             }
         }
 
-        /// The heads of the requests received for `path`.
+        /// The heads (with any body) of the requests received for `path`.
         fn requests(&self, path: &str) -> Vec<String> {
             self.log
                 .lock()
                 .expect("lock")
                 .iter()
                 .filter(|h| h.split_whitespace().nth(1) == Some(path))
+                .cloned()
+                .collect()
+        }
+
+        /// The requests whose path (query included) starts with `prefix`.
+        fn requests_starting(&self, prefix: &str) -> Vec<String> {
+            self.log
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|h| h.split_whitespace().nth(1).is_some_and(|p| p.starts_with(prefix)))
                 .cloned()
                 .collect()
         }
@@ -10009,6 +10219,347 @@ mod tests {
             browser_platform::mib(browser_platform::heap_live()),
             browser_platform::mib(browser_platform::heap_peak())
         );
+    }
+
+    // ----- forms ("Working sites first" line 8) -----
+
+    /// The body of a logged request (after its head).
+    fn body_of(request: &str) -> &str {
+        request.split_once("\r\n\r\n").map_or("", |(_, b)| b)
+    }
+
+    /// A header of a logged request, lowercased name.
+    fn header_of(request: &str, name: &str) -> Option<String> {
+        request
+            .lines()
+            .take_while(|l| !l.is_empty())
+            .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_owned()))
+    }
+
+    #[test]
+    fn forms_submit_get_and_post_with_their_encodings() {
+        let form_page = "<!DOCTYPE html><title>Form</title>\
+             <form id=g action=/result><input name=q value='a b'><input type=checkbox name=c checked><input type=checkbox name=d>\
+             <select name=s><option>x<option selected value=yv>y</select><textarea name=t>l1\nl2</textarea>\
+             <button id=go name=go value=1>Go</button><button id=other name=other value=2>Other</button></form>\
+             <form id=p method=post action=/post><input id=pq name=q value=x><input id=pq2 name=r value=é><input type=submit id=ps></form>\
+             <form id=m method=post enctype=multipart/form-data action=/multi><input name=f value=v><input type=file name=up></form>\
+             <form id=tp method=post enctype=text/plain action=/plain><input name=a value=1><input name=b value=2></form>";
+        let server = Server::start(
+            &[
+                ("/form", "text/html; charset=utf-8", form_page),
+                ("/result", "text/html", "<title>Result</title>"),
+                ("/post", "text/html", "<title>Posted</title>"),
+                ("/multi", "text/html", "<title>Multi</title>"),
+                ("/plain", "text/html", "<title>Plain</title>"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/form"));
+        h.pump_until(|h| !h.state.is_loading());
+        // A click on the submit button: GET with the entries in the query,
+        // the button's own entry, unchecked boxes and other buttons left
+        // out, the textarea's newline as CRLF.
+        h.click_id("go");
+        h.pump_until(|h| h.title().as_deref() == Some("Result"));
+        let got = server.requests_starting("/result");
+        assert_eq!(got.len(), 1);
+        assert!(got[0].starts_with("GET /result?q=a+b&c=on&s=yv&t=l1%0D%0Al2&go=1 HTTP/1.1"), "{}", got[0]);
+        assert_eq!(h.state.history.len(), 2, "a new entry");
+
+        // Enter in a field: implicit submission through the default button,
+        // POSTed form-urlencoded with the document's origin.
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Form"));
+        h.click_end_of("pq");
+        h.typed("y");
+        h.key(Key::Enter, false);
+        h.pump_until(|h| h.title().as_deref() == Some("Posted"));
+        let post = server.requests("/post");
+        assert_eq!(post.len(), 1);
+        assert!(post[0].starts_with("POST /post HTTP/1.1"), "{}", post[0]);
+        assert_eq!(header_of(&post[0], "content-type").as_deref(), Some("application/x-www-form-urlencoded"));
+        let origin = server.base.origin().ascii_serialization();
+        assert_eq!(header_of(&post[0], "origin").as_deref(), Some(origin.as_str()));
+        assert_eq!(body_of(&post[0]), "q=xy&r=%C3%A9");
+
+        // multipart/form-data from `requestSubmit()`, an empty file input
+        // sending an empty file part.
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Form"));
+        run_js(&mut h, "document.getElementById('m').requestSubmit()");
+        h.pump_until(|h| h.title().as_deref() == Some("Multi"));
+        let multi = &server.requests("/multi")[0];
+        let ct = header_of(multi, "content-type").expect("content type");
+        let boundary = ct.strip_prefix("multipart/form-data; boundary=").expect("boundary").to_owned();
+        assert!(boundary.starts_with("----WebKitFormBoundary"), "{ct}");
+        assert_eq!(
+            body_of(multi),
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nv\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"up\"; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n\
+                 --{boundary}--\r\n"
+            )
+        );
+
+        // text/plain from `submit()`.
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Form"));
+        run_js(&mut h, "document.getElementById('tp').submit()");
+        h.pump_until(|h| h.title().as_deref() == Some("Plain"));
+        let plain = &server.requests("/plain")[0];
+        assert_eq!(header_of(plain, "content-type").as_deref(), Some("text/plain"));
+        assert_eq!(body_of(plain), "a=1\r\nb=2\r\n");
+    }
+
+    #[test]
+    fn form_events_cancel_change_and_replace_submissions() {
+        let page = "<!DOCTYPE html><title>Events</title>\
+             <form id=f action=/r><input id=q name=q value=1><button id=b>Go</button><input type=reset id=rs></form>\
+             <script>var log = []; var cancel = false; var f = document.getElementById('f'); \
+               f.addEventListener('submit', ev => { log.push('submit:' + (ev instanceof SubmitEvent) + ':' + (ev.submitter && ev.submitter.id) + ':' + ev.cancelable + ':' + ev.bubbles); if (cancel) ev.preventDefault(); }); \
+               f.addEventListener('formdata', ev => { log.push('formdata:' + (ev.formData instanceof FormData) + ':' + ev.formData.get('q')); ev.formData.append('extra', 'yes'); }); \
+               f.addEventListener('reset', ev => log.push('reset:' + ev.cancelable));</script>";
+        // /r is held so the log can be read before the new page lands.
+        let server = Server::start(&[("/page", "text/html", page), ("/r", "text/html", "<title>R</title>")], &["/r"]);
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| !h.state.is_loading());
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+        // A cancelled `submit` navigates nowhere; `formdata` does not fire.
+        js(&mut h, "cancel = true");
+        h.click_id("b");
+        assert_eq!(drain(&mut h), "\"submit:true:b:true:true\"");
+        assert!(h.state.nav.is_none());
+        // The user's edit, then a reset: `reset` fires and the value is
+        // the default again.
+        h.click_end_of("q");
+        h.typed("23");
+        assert_eq!(h.value("q").as_deref(), Some("123"));
+        h.click_id("rs");
+        assert_eq!(drain(&mut h), "\"reset:true\"");
+        assert_eq!(h.value("q").as_deref(), Some("1"));
+        // Not cancelled: `formdata` sees the entries and adds one, which is
+        // submitted.
+        js(&mut h, "cancel = false");
+        h.click_id("b");
+        assert_eq!(drain(&mut h), "\"submit:true:b:true:true formdata:true:1\"");
+        server.release("/r");
+        h.pump_until(|h| h.title().as_deref() == Some("R"));
+        assert!(server.requests_starting("/r")[0].starts_with("GET /r?q=1&extra=yes "), "{:?}", server.requests_starting("/r"));
+        // `submit()` fires no `submit` event; two submissions in one task:
+        // the later one is the planned navigation.
+        server.hold("/r");
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Events"));
+        run_js(
+            &mut h,
+            "f.querySelector('input').value = 'first'; f.submit(); f.querySelector('input').value = 'second'; f.submit()",
+        );
+        assert_eq!(drain(&mut h), "\"formdata:true:first formdata:true:second\"");
+        server.release("/r");
+        h.pump_until(|h| h.title().as_deref() == Some("R"));
+        let rs = server.requests_starting("/r");
+        assert_eq!(rs.len(), 2, "only the last submission went out: {rs:?}");
+        assert!(rs[1].starts_with("GET /r?q=second&extra=yes "), "{rs:?}");
+    }
+
+    #[test]
+    fn activation_checks_before_listeners_and_scripts_click_controls() {
+        let html = "<!DOCTYPE html><title>Act</title><form id=f action='data:text/html,x'>\
+             <input type=checkbox id=c><input type=radio name=g id=r1 checked><input type=radio name=g id=r2>\
+             <input id=t value=v></form>\
+             <script>var log = []; var cancel = false; \
+               document.getElementById('c').onclick = ev => { log.push('click:' + ev.target.checked); if (cancel) ev.preventDefault(); }; \
+               document.getElementById('r2').onclick = ev => { log.push('r:' + document.getElementById('r1').checked + ':' + ev.target.checked); if (cancel) ev.preventDefault(); }; \
+               document.addEventListener('change', ev => log.push('change:' + ev.target.id + ':' + ev.target.checked));</script>";
+        let mut h = Harness::load(html);
+        let drain = |h: &mut Harness| js(h, "log.splice(0).join(' ')");
+        // The listener sees the new checkedness; `change` follows.
+        h.click_id("c");
+        assert_eq!(drain(&mut h), "\"click:true change:c:true\"");
+        assert!(h.checked("c"));
+        // A cancelled click: checked while it runs, back after, no change.
+        js(&mut h, "cancel = true");
+        h.click_id("c");
+        assert_eq!(drain(&mut h), "\"click:false\"");
+        assert!(h.checked("c"), "restored");
+        h.click_id("r2");
+        assert_eq!(drain(&mut h), "\"r:false:true\"");
+        assert!(h.checked("r1") && !h.checked("r2"), "the group's checked radio is back");
+        js(&mut h, "cancel = false");
+        // A script's `click` MouseEvent activates as the user's does; a
+        // plain `Event` does not.
+        assert_eq!(
+            run_js(&mut h, "var c = document.getElementById('c'); c.dispatchEvent(new MouseEvent('click', {bubbles: true})); c.checked"),
+            "false"
+        );
+        assert_eq!(drain(&mut h), "\"click:false change:c:false\"");
+        assert_eq!(run_js(&mut h, "c.dispatchEvent(new Event('click')); c.checked"), "false");
+        // The `checked` IDL attribute is the state; the attribute stays the
+        // default, and a reset goes back to it.
+        assert_eq!(run_js(&mut h, "c.checked = true; [c.checked, c.hasAttribute('checked')].join()"), "\"true,false\"");
+        assert!(h.checked("c"));
+        // `:checked` follows the state.
+        assert_eq!(run_js(&mut h, "document.querySelectorAll(':checked').length"), "2");
+        assert_eq!(run_js(&mut h, "document.getElementById('f').reset(); c.checked"), "false");
+    }
+
+    #[test]
+    fn control_values_and_form_interfaces_in_script() {
+        let html = "<!DOCTYPE html><title>IDL</title>\
+             <form id=f name=login><input id=u name=user value=def><input id=n type=number name=num>\
+             <select id=s name=sel><option value=a>A<option value=b>B</select><textarea id=ta name=ta>x</textarea>\
+             <input type=image id=img name=im><button id=b name=btn>Go</button></form><input id=out form=f name=outside>";
+        let mut h = Harness::load(html);
+        let r = |h: &mut Harness, s: &str| run_js(h, s);
+        assert_eq!(r(&mut h, "var u = document.getElementById('u'); [u instanceof HTMLInputElement, u.value].join()"), "\"true,def\"");
+        assert_eq!(r(&mut h, "u.value = 'a\\nb'; [u.value, u.getAttribute('value')].join()"), "\"ab,def\"");
+        assert_eq!(h.control_text("u"), "ab", "the box shows the value");
+        assert_eq!(r(&mut h, "var n = document.getElementById('n'); n.value = 'abc'; n.value"), "\"\"");
+        assert_eq!(r(&mut h, "n.value = '1e3'; n.value"), "\"1e3\"");
+        assert_eq!(r(&mut h, "var s = document.getElementById('s'); [s.value, s.selectedIndex, s.length, s.options.length].join()"), "\"a,0,2,2\"");
+        assert_eq!(r(&mut h, "s.value = 'b'; [s.selectedIndex, s.options[1].selected].join()"), "\"1,true\"");
+        assert_eq!(h.control_text("s"), "B");
+        assert_eq!(r(&mut h, "s.selectedIndex = 5; [s.value, s.selectedIndex].join()"), "\",-1\"");
+        assert_eq!(r(&mut h, "s.options[0].selected = true; s.value"), "\"a\"");
+        assert_eq!(r(&mut h, "var ta = document.getElementById('ta'); ta.value = 'y\\r\\nz'; [JSON.stringify(ta.value), ta.textContent].join()"), "\"\\\"y\\\\nz\\\",x\"");
+        // The form's members and its named and indexed properties.
+        assert_eq!(r(&mut h, "var f = document.forms[0]; [f instanceof HTMLFormElement, f.elements.length, f.length, document.forms.length].join()"), "\"true,6,6,1\"");
+        assert_eq!(r(&mut h, "[f.user === u, f[0] === u, f.outside.id, f.elements.ta.id, 'im' in f, f.img].join()"), "\"true,true,out,ta,false,\"");
+        assert_eq!(r(&mut h, "[u.form === f, document.getElementById('out').form === f, s.options[0].form === f].join()"), "\"true,true,true\"");
+        // FormData from the form, and its API.
+        assert_eq!(
+            r(&mut h, "var d = new FormData(f); [...d.keys()].join()"),
+            "\"user,num,sel,ta,outside\""
+        );
+        assert_eq!(r(&mut h, "d.append('user', 'two'); d.set('ta', 'T'); [d.getAll('user').join('+'), d.get('ta'), d.has('nope'), d.get('nope')].join()"), "\"ab+two,T,false,\"");
+        assert_eq!(r(&mut h, "d.delete('user'); [...d].map(e => e.join('=')).join('&')"), "\"num=1e3&sel=a&ta=T&outside=\"");
+        assert_eq!(r(&mut h, "var e = new FormData(f, document.getElementById('b')); e.get('btn')"), "\"\"");
+        assert_eq!(r(&mut h, "try { new FormData(f, u); 'no' } catch (x) { x.name }"), "\"TypeError\"");
+        assert_eq!(r(&mut h, "try { f.requestSubmit(u); 'no' } catch (x) { x.name }"), "\"TypeError\"");
+        assert_eq!(r(&mut h, "var ev = new SubmitEvent('submit', {submitter: u}); [ev.submitter === u, new SubmitEvent('x').submitter].join()"), "\"true,\"");
+        assert_eq!(r(&mut h, "try { new FormDataEvent('x', {}); 'no' } catch (x) { x.name }"), "\"TypeError\"");
+    }
+
+    #[test]
+    fn implicit_submission_follows_the_default_button_rules() {
+        let page = "<!DOCTYPE html><title>Implicit</title>\
+             <form id=two action=/two><input id=a name=a><input id=b name=b></form>\
+             <form id=one action=/one><input id=c name=c><input type=checkbox id=cb name=cb></form>\
+             <form id=dis action=/dis><input id=d name=d><button disabled>x</button></form>\
+             <form id=blank action=/blank target=_blank method=post><input id=e name=e value=1></form>";
+        let server = Server::start(
+            &[("/page", "text/html", page), ("/one", "text/html", "<title>One</title>"), ("/two", "text/html", "<title>Two</title>")],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| !h.state.is_loading());
+        // Two fields that block implicit submission and no submit button:
+        // nothing.
+        h.click_id("a");
+        h.key(Key::Enter, false);
+        assert!(h.state.nav.is_none());
+        // A disabled default button: nothing.
+        h.click_id("d");
+        h.key(Key::Enter, false);
+        assert!(h.state.nav.is_none());
+        // A new tab for `target=_blank`, carrying its POST.
+        h.click_id("e");
+        h.key(Key::Enter, false);
+        let opened: Vec<(Url, Option<browser_ipc_types::PostData>)> = h
+            .messages
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|m| match m {
+                TabToShell::OpenFormSubmission { url, post } => Some((url.clone(), post.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].0, server.url("/blank"));
+        assert_eq!(opened[0].1.as_ref().map(|p| p.body.as_slice()), Some(&b"e=1"[..]));
+        assert!(h.state.nav.is_none(), "this tab stays");
+        // One blocking field (a checkbox does not block): Enter submits, also
+        // from the checkbox.
+        h.click_id("cb");
+        h.key(Key::Enter, false);
+        h.pump_until(|h| h.title().as_deref() == Some("One"));
+        assert!(server.requests_starting("/one")[0].starts_with("GET /one?c=&cb=on "), "{:?}", server.requests_starting("/one"));
+    }
+
+    #[test]
+    fn a_post_redirected_by_303_loads_the_target_with_get() {
+        let page = "<!DOCTYPE html><title>P</title><form id=f method=post action=/save><input name=q value=1><button id=b>Save</button></form>";
+        let server = Server::start_with(
+            vec![
+                ("/page".to_owned(), vec![("Content-Type".to_owned(), "text/html".to_owned())], page.as_bytes().to_vec()),
+                (
+                    "/save".to_owned(),
+                    vec![(":status".to_owned(), "303 See Other".to_owned()), ("Location".to_owned(), "/done".to_owned())],
+                    Vec::new(),
+                ),
+                ("/done".to_owned(), vec![("Content-Type".to_owned(), "text/html".to_owned())], b"<title>Done</title>".to_vec()),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_until(|h| !h.state.is_loading());
+        h.click_id("b");
+        h.pump_until(|h| h.title().as_deref() == Some("Done"));
+        assert!(server.requests("/save")[0].starts_with("POST /save "));
+        let done = &server.requests("/done")[0];
+        assert!(done.starts_with("GET /done "), "{done}");
+        assert_eq!(header_of(done, "content-type"), None, "the body's headers went with the body");
+        assert_eq!(header_of(done, "origin"), None);
+        assert_eq!(h.state.url, Some(server.url("/done")));
+    }
+
+    #[test]
+    fn appearance_none_drops_the_native_look() {
+        let html = "<!DOCTYPE html><body style='margin:0'>\
+             <input type=checkbox id=c1><input type=checkbox id=c2 style='appearance:none'>\
+             <input type=checkbox id=c3 style='-webkit-appearance:none; width:20px; height:20px'>\
+             <select id=s1><option>A rather long option label</option></select>\
+             <select id=s2 style='-moz-appearance:none'><option>A rather long option label</option></select>";
+        let mut h = Harness::load(html);
+        let w = |h: &Harness, id: &str| h.rect_of(h.by_id(id)).width;
+        assert_eq!(w(&h, "c1"), 13.0, "the native box");
+        assert_eq!(w(&h, "c2"), 0.0, "no look, no size of its own");
+        assert_eq!(w(&h, "c3"), 20.0);
+        let (w1, w2) = (w(&h, "s1"), w(&h, "s2"));
+        assert!(
+            w2 < w1,
+            "no arrow, no room for it: {w2} {w1} {}",
+            run_js(&mut h, "[getComputedStyle(s1).appearance, getComputedStyle(s2).appearance, s2.style.cssText].join('|')")
+        );
+        let controls: Vec<(String, browser_layout::Control)> = {
+            let doc = h.state.doc.as_ref().expect("doc");
+            let mut out = Vec::new();
+            h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+                if let browser_layout::FragmentContent::Control(c) = &f.content {
+                    let id = f.node.and_then(|n| doc.element(n)).and_then(|e| e.id()).unwrap_or("").to_owned();
+                    out.push((id, *c));
+                }
+            });
+            out
+        };
+        let ids: Vec<&str> = controls.iter().map(|(i, _)| i.as_str()).collect();
+        assert_eq!(ids, ["c1", "s1"], "only the native controls are drawn as controls");
+        assert_eq!(
+            run_js(&mut h, "[getComputedStyle(c1).appearance, getComputedStyle(c2).appearance, getComputedStyle(document.body).appearance, c3.style.cssText].join('|')"),
+            "\"auto|none|none|appearance: none; width: 20px; height: 20px;\""
+        );
+        // The indeterminate dash, and its control state.
+        run_js(&mut h, "c1.indeterminate = true");
+        h.pump();
+        let mut dash = None;
+        h.state.layout.as_ref().expect("layout").root.walk(&mut |f| {
+            if let browser_layout::FragmentContent::Control(browser_layout::Control::Checkbox { indeterminate, .. }) = &f.content {
+                dash = Some(*indeterminate);
+            }
+        });
+        assert_eq!(dash, Some(true));
     }
 }
 

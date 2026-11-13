@@ -112,11 +112,22 @@ pub enum Key {
     ContextMenu,
 }
 
+/// The body of a navigation that POSTs (a form submitted as an entity
+/// body), with the `Origin` of the document that submitted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostData {
+    pub content_type: String,
+    pub body: Vec<u8>,
+    pub origin: String,
+}
+
 /// Shell to tab. Mouse positions are logical pixels within the page's
 /// viewport (the tab adds its own scroll offset).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ShellToTab {
     Navigate { url: Url },
+    /// Navigate with a POST body (a form submitted into a new tab).
+    NavigateWithBody { url: Url, post: PostData },
     Reload,
     Stop,
     GoBack,
@@ -215,6 +226,10 @@ pub enum TabToShell {
     CursorImage(CursorImage),
     /// The user asked for a link in a new tab (middle click).
     OpenInNewTab { url: Url },
+    /// A form submitted into a new navigable (`target=_blank` or a name
+    /// no tab has): a new tab, shown, navigated to `url` (with `post` as
+    /// the body of a POST).
+    OpenFormSubmission { url: Url, post: Option<PostData> },
     /// Text the user copied; the shell owns the clipboard.
     CopyText { text: String },
     /// How many find matches there are and which is current (1-based).

@@ -357,7 +357,7 @@ impl App {
 
         if !self.options.smoke {
             let url = self.start_url();
-            self.open_tab(url, true)?;
+            self.open_tab(url, true, None)?;
             if self.options.screenshot.is_some() {
                 self.screenshot_deadline = Some(Instant::now() + SCREENSHOT_TIMEOUT);
             }
@@ -366,7 +366,7 @@ impl App {
     }
 
     /// Start a tab thread on `url`; show it if `activate`.
-    fn open_tab(&mut self, url: Url, activate: bool) -> Result<()> {
+    fn open_tab(&mut self, url: Url, activate: bool, post: Option<browser_ipc_types::PostData>) -> Result<()> {
         let net = match &self.net {
             Some(n) => n.clone(),
             None => {
@@ -383,7 +383,11 @@ impl App {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
         let handle = spawn_tab(id, net, self.storage.clone(), viewport, sink);
-        handle.send(ShellToTab::Navigate { url });
+        // A form submitted into a new tab POSTs there first thing.
+        match post {
+            Some(post) => handle.send(ShellToTab::NavigateWithBody { url, post }),
+            None => handle.send(ShellToTab::Navigate { url }),
+        }
         self.tabs.push(Tab {
             handle,
             page: None,
@@ -408,7 +412,7 @@ impl App {
     /// A fresh empty tab with the address bar ready for typing.
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("static url");
-        if let Err(e) = self.open_tab(url, true) {
+        if let Err(e) = self.open_tab(url, true, None) {
             tracing::error!("open tab: {e}");
             return;
         }
@@ -825,7 +829,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             TabOutput::Message(TabToShell::OpenInNewTab { url }) => {
-                if let Err(e) = self.open_tab(url, false) {
+                if let Err(e) = self.open_tab(url, false, None) {
+                    tracing::error!("open tab: {e}");
+                }
+            }
+            // A form's new navigable is shown, as browsers show it.
+            TabOutput::Message(TabToShell::OpenFormSubmission { url, post }) => {
+                if let Err(e) = self.open_tab(url, true, post) {
                     tracing::error!("open tab: {e}");
                 }
             }

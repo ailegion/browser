@@ -148,6 +148,7 @@ pub fn serialize_longhand(v: &PropertyDeclaration) -> String {
         P::Cursor(c) => c.to_css(),
         P::PointerEvents(p) => p.keyword().to_owned(),
         P::UserSelect(u) => u.keyword().to_owned(),
+        P::Appearance(a) => a.keyword().to_owned(),
         P::ZIndex(z) => z.to_css(),
         P::Isolation(i) => match i {
             Isolation::Auto => "auto".to_owned(),
@@ -659,7 +660,8 @@ pub fn serialize_shorthand(name: &str, values: &[String]) -> Option<String> {
             }
             parts.join(" ")
         }
-        "place-items" | "word-wrap" | "-webkit-box-decoration-break" | "-webkit-user-select" | "-webkit-transform"
+        "place-items" | "word-wrap" | "-webkit-box-decoration-break" | "-webkit-user-select" | "-webkit-appearance"
+        | "-moz-appearance" | "-webkit-transform"
         | "-webkit-transform-origin" | "-webkit-backface-visibility" => v(0).to_owned(),
         // A grid line part is left out when it is what the shorthand would
         // give it: a named start line repeated, else `auto`.
@@ -1245,6 +1247,7 @@ pub fn resolved_value(style: &ComputedStyle, id: PropertyId, used: Option<&UsedV
         Id::Cursor => style.cursor.to_css(),
         Id::PointerEvents => style.pointer_events.keyword().to_owned(),
         Id::UserSelect => style.user_select.keyword().to_owned(),
+        Id::Appearance => style.appearance.keyword().to_owned(),
         Id::ZIndex => style.z_index.to_css(),
         Id::Isolation => match style.isolation {
             Isolation::Auto => "auto".to_owned(),
@@ -1647,6 +1650,16 @@ mod tests {
             ("cursor: url(a.cur) 1 2, pointer", "cursor: url(\"a.cur\") 1 2, pointer;"),
             ("pointer-events: none", "pointer-events: none;"),
             ("-webkit-user-select: none", "user-select: none;"),
+            ("appearance: AUTO", "appearance: auto;"),
+            ("appearance: menulist-button", "appearance: menulist-button;"),
+            ("appearance: textfield", "appearance: textfield;"),
+            ("appearance: progress-bar", "appearance: progress-bar;"),
+            ("appearance: base-select", "appearance: base-select;"),
+            ("-webkit-appearance: none", "appearance: none;"),
+            ("-moz-appearance: checkbox", "appearance: checkbox;"),
+            ("appearance: push-button", ""),
+            ("appearance: slider-vertical", ""),
+            ("appearance: none auto", ""),
             ("z-index: 03", "z-index: 3;"),
             ("transform: translateX(10PX) rotate(45DEG) scale(2)", "transform: translateX(10px) rotate(45deg) scale(2, 2);"),
             ("transform: none", "transform: none;"),

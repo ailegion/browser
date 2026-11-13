@@ -37,6 +37,7 @@ mod dom;
 mod events;
 mod fetch;
 mod fonts;
+mod forms;
 mod history;
 mod observers;
 mod storage;
@@ -500,6 +501,18 @@ pub enum HostRequest {
     Traverse { delta: i32 },
     /// `history.scrollRestoration = `: the current entry's mode.
     ScrollRestoration { manual: bool },
+    /// A form's planned navigation (HTML §4.10.22.3, "Working sites
+    /// first" line 8): to `url`, with `post` as the body of a POST, in the
+    /// navigable `target` names (`_self` and the empty string: this tab).
+    /// A later submission of the same form in the task replaced any
+    /// earlier one; the tab navigates after the script's other requests.
+    Submit {
+        form: NodeId,
+        url: Url,
+        post: Option<browser_dom::forms::PostResource>,
+        target: String,
+        noreferrer: bool,
+    },
 }
 
 /// The browser's cookie jar as `document.cookie` sees it (HTML §7.9.2,
@@ -1152,6 +1165,29 @@ impl ScriptHost {
         };
         self.microtask_checkpoint();
         proceed
+    }
+
+    /// Submit `form` from `submitter` (a submit button the user activated,
+    /// or `None` for implicit submission with no default button) as a
+    /// task: its `submit` event, entry list and `formdata` event, and the
+    /// planned navigation (`HostRequest::Submit`). `coordinate` is an image
+    /// button's selected coordinate. The document must be lent.
+    pub fn submit_form(&mut self, form: NodeId, submitter: Option<NodeId>, coordinate: Option<(i32, i32)>) {
+        if let Err(err) = forms::submit_form(form, submitter, false, coordinate, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.dom.borrow_mut().note_controls_changed();
+        self.microtask_checkpoint();
+    }
+
+    /// Reset `form` as the user asked (a reset button): its `reset` event,
+    /// then the reset algorithms. The document must be lent.
+    pub fn reset_form(&mut self, form: NodeId) {
+        if let Err(err) = forms::reset_form(form, &mut self.context) {
+            self.report_uncaught(&err);
+        }
+        self.dom.borrow_mut().note_controls_changed();
+        self.microtask_checkpoint();
     }
 
     /// Whether any target has a listener or `on<type>` handler property

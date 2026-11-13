@@ -903,6 +903,175 @@ remaining lists as they stand.
       draws it, `auto` and the compat keywords keep it; parsed, inherited
       no, serialized, honoured in paint and in control sizing.
       Later: validation UI, file inputs, the owner's 2026-10-09 additions.
+      Built 2026-11-13 (owner: "make default decisions, finish it in one
+      go"), not ticked: the SKIPPED parts and the decisions taken are at
+      the end, for a ruling. DOM (`crates/dom/src/forms.rs`): control
+      state beside the tree, never in attributes (`Document::controls`:
+      an input's dirty value as typed, a textarea's raw value, checkedness
+      and dirty checkedness, indeterminateness, an option's selectedness
+      and dirtiness); every `<input type>` state with its value mode
+      (value, default, default/on, filename) and value sanitization (text,
+      search, tel, password, url, email with and without `multiple`,
+      number, range with its default value, clamping and step rounding
+      (ties up, step base from `min` then `value`), color, date, month,
+      week (53-week years), time, datetime-local normalized), HTML's
+      floating-point parsing and JavaScript's number serialization; the
+      `type` change steps (value mode moves, the value written to the
+      attribute, sanitization for good); radio button groups (same tree,
+      form owner and name; a checked radio inserted unchecks the earlier
+      ones); a select's list of options (the current definition: option
+      descendants, not inside a nested `select`, `hr`, `datalist`,
+      `option` or `optgroup` in an `optgroup`), the selectedness setting
+      algorithm and its triggers (option insertion and removal, `selected`,
+      `disabled`, `multiple`, `size`), `selectedIndex`, `value`, display
+      size, option value/text/label/disabled; the form owner (`form`
+      attribute, the parser's form element pointer through
+      `TreeSink::associate_with_form`, kept while the element stays put,
+      then the nearest ancestor form); listed, submittable, resettable;
+      every control's reset algorithm; cloning steps; legacy-pre-activation
+      and canceled-activation of checkboxes and radios, activation of
+      submit, image, reset and `<button>`s; default button and implicit
+      submission blockers; the entry list (datalist, disabled, buttons not
+      the submitter, unchecked boxes, image buttons' `name.x`/`name.y`,
+      selects, the empty file of a file input, `_charset_`, textareas,
+      `dirname`); the encoding (`accept-charset`, else the document's;
+      output encoding); `application/x-www-form-urlencoded` (numeric
+      character references for what the encoding lacks),
+      `multipart/form-data` (`----WebKitFormBoundary` boundary, names and
+      file names escaped, file parts typed) and `text/plain`; the scheme
+      and method table (http(s) GET mutates the query and keeps the
+      fragment, POST as an entity body; `data:` GET; `mailto:` with
+      headers or as body; the rest get the action URL); `method=dialog`
+      closing the dialog with its result. Tree and attribute hooks cost
+      nothing until a form element exists; select and radio work is queued
+      and done by `settle_forms` (the tab before a full restyle, the
+      bindings after each DOM call and when the document is lent). Style:
+      `:checked` from checkedness and selectedness; `appearance` (`none`,
+      `auto`, `base-select`, the nine compat-auto keywords, `textfield`,
+      `menulist-button`; initial `none`; not inherited; serialized as
+      written; `push-button`, `slider-vertical` and the other legacy names
+      refused, as WPT's `appearance-cssom-001` has it) with
+      `-webkit-appearance` and `-moz-appearance` as aliases serialized
+      under `appearance`; the UA sheet gives widgets `appearance: auto`; a
+      change of it lays out again. Layout: control boxes read the state; a
+      textarea is a control box showing its value (its placeholder when
+      empty, new) with its own `white-space`; a native checkbox or radio
+      takes 13×13 when its width or height is `auto` (the UA sheet's 13px
+      went), none without its look; a native drop-down select keeps its
+      arrow's room as its inner box's end padding (the UA sheet's
+      `padding-right: 20px` went; an anonymous block's own padding is now
+      passed to taffy, no other anonymous block has any); `appearance:
+      none` draws no check, ring or arrow; an indeterminate checkbox draws
+      a dash. Script (`crates/script/src/forms.rs`): `HTMLFormElement`
+      (`elements`, `length`, `submit()`, `requestSubmit()` with its
+      TypeError and NotFoundError, `reset()`, indexed and named
+      properties), `HTMLInputElement` (`value` per mode with the file
+      input's InvalidStateError, `checked`, `indeterminate`, `form`),
+      `HTMLTextAreaElement` (`value`, `form`), `HTMLSelectElement`
+      (`value`, `selectedIndex`, `options`, `length`, `form`),
+      `HTMLOptionElement` (`selected`, `form`), `HTMLButtonElement`
+      (`form`), `document.forms`, named properties on every
+      `HTMLCollection` (none had them), `FormData` (from a form and
+      submitter, firing `formdata`; `append`, `delete`, `get`, `getAll`,
+      `has`, `set`, iteration, `forEach`), `SubmitEvent`, `FormDataEvent`;
+      the submission algorithm (constructing and firing flags, `submit`
+      with its submitter, re-checks, the entry list and `formdata`, a later
+      submission of a form replacing its planned navigation,
+      `HostRequest::Submit`); reset with `reset`; a script's `click`
+      `MouseEvent` runs activation (pre-activation, undo when cancelled,
+      `input`/`change`, submit, reset); script value changes restyle
+      `:checked` and lay out through `DomChange::Control`, and move the
+      caret of the focused field to the end. Tab: the user's edits set the
+      value (dirty), not the attribute; disabled and `readonly` controls
+      take no edits; a click, Space and Enter on a control go through
+      pre-activation and activation; an image button's coordinate is
+      where the click landed; Enter in a field (and on a checkbox, radio
+      or other non-button input) submits implicitly (`keypress`
+      uncancelled; the default button clicked, or the form submitted with
+      at most one blocking field); arrow keys on a select skip disabled
+      options; a submission navigates after the script's other requests,
+      replaces the entry while the document is not completely loaded,
+      POSTs with `Content-Type` and `Origin`, opens a new tab for
+      `_blank` or a name (`TabToShell::OpenFormSubmission`; the shell opens
+      it shown and sends `ShellToTab::NavigateWithBody`, so no GET goes
+      first); a top-level `data:` submission is blocked. Net: a redirect
+      turning a POST into a GET drops `Content-Type`, the other body
+      headers and `Origin` (Fetch).
+      Behaviour of existing features changed on the way: typing no longer
+      writes the `value` attribute (or a textarea's children), toggling no
+      longer writes `checked`, stepping a select no longer writes
+      `selected` (`[value]`, `[checked]` and `textContent` keep the
+      defaults, as in browsers); a checkbox flips before the `click`
+      listeners run and back when one cancels (it flipped after); radio
+      groups are by form owner and tree; Space and Enter on a button now
+      submit or reset its form, and Enter on a button needs `keypress`
+      uncancelled; Enter in a text field of a form now submits it;
+      `type=" checkbox"` (with a space) is a text field (it was trimmed);
+      `getComputedStyle(select).paddingRight` reads the UA `2px` (was
+      `20px`); `dir=auto` on a text control reads its value state.
+      Tests: dom (`forms::tests`: microsyntaxes, sanitization and modes,
+      type changes, checkedness and radio groups, selectedness, entry
+      lists, encodings, submission actions, the parser's form pointer),
+      style (`appearance` serialization and refusals), tab
+      (`forms_submit_get_and_post_with_their_encodings` over a loopback
+      server: GET, implicit POST urlencoded with `Origin`, multipart from
+      `requestSubmit()`, text/plain from `submit()`;
+      `form_events_cancel_change_and_replace_submissions`;
+      `activation_checks_before_listeners_and_scripts_click_controls`;
+      `control_values_and_form_interfaces_in_script`;
+      `implicit_submission_follows_the_default_button_rules`;
+      `a_post_redirected_by_303_loads_the_target_with_get`;
+      `appearance_none_drops_the_native_look`); seven older tab tests moved
+      from reading attributes to reading the state; the test server reads
+      request bodies, answers a route with any query, and holds it too.
+      Timing (release probe, live, two runs each, against line 7's
+      recorded numbers: no build of the previous source was made): slower:
+      Wikipedia Main Page heap after load 29.9 MiB (28.2), not attributed
+      (live page); load 619–641 ms (607–670), full restyle 40.9–42.3 ms
+      (44.0–46.6), relayout 1.5–1.6 ms (1.6–2.0); iana load 4.75–4.76 s
+      (4.98), full restyle 372–379 ms (392–402), relayout 36.5–38.1 ms
+      (38.9–39.0), heap 434.4 MiB (434.4).
+      Tests that fail now and then: the three timer tests line 7 lists
+      failed in 6 of 8 full tab runs this session (4 of 6 with the new
+      tests skipped; line 7 saw 2 of 12), each passing alone; the failing
+      assert reads a 20 ms page timer that fires first on a slow pump; not
+      attributed. `declared_web_families_hide_installed_ones` (layout)
+      failed once, passing alone and in the suite after.
+      SKIPPED, for the owner to rule or place: interactive constraint
+      validation (a `required` or mismatched field does not block a
+      submission, no `invalid` events, no `:valid`/`:invalid`; taken as
+      part of this line's "Later: validation UI", where Chrome and Firefox
+      block); `FormData`'s file entries read as `null` and the
+      three-argument `append`/`set` throw (no `Blob`/`File`: 3.3.5), its
+      iterators walk a copy, it is not yet a `fetch`/XHR body (3.3.5);
+      `wrap=hard` inserts no line breaks; a named target opens a new tab
+      every time (no named navigables, no frames); `javascript:` and
+      `mailto:` actions navigate nowhere (as links do); reload and
+      back/forward of a POST's entry load it with GET, where browsers ask
+      to resubmit; no `Referer` (3.1's open decision); the form's named
+      properties sit in the prototype chain, so built-in members win over a
+      control named like them (HTML's `[LegacyOverrideBuiltIns]`: a field
+      named `submit` hides `form.submit`), they are not own or enumerable,
+      several matches give a static `NodeList` (not a live `RadioNodeList`)
+      and no past-names map is kept; `form.elements` with several matches
+      gives the first; `method=dialog` fires `close` as a microtask and
+      keeps no `returnValue` (no `HTMLDialogElement`); a `<select>` with
+      `size` or `multiple` still draws as a drop-down and opens no list on
+      click (the 2026-10-09 additions); colour sanitization is the
+      simple-colour rule (`#rrggbb`), where HTML now parses any CSS
+      colour; `output`'s default value override is not kept;
+      `base-select` draws as `auto`; user involvement is not passed.
+      Not verified against Chrome and Firefox (taken as written): a
+      checkbox or radio with `appearance: none` and an `auto` size is 0×0
+      (Chrome's, as recalled; Firefox may keep 13px); Enter on a checkbox
+      or radio submits; Enter on a button waits for `keypress`; a
+      drop-down with no selected option shows its first option; the
+      datetime-local fraction without trailing zeros; range step rounding
+      near ties (binary floats with a 1e-9 tolerance); the boundary's
+      format; a select's arrow room of 20px. ELSEWHERE (already placed):
+      the other reflected attributes and special getters of these elements
+      (`type`, `name`, `defaultValue`, `defaultChecked`, `action`,
+      `option.value`/`text`/`label`, ...) are Phase 5's DOM bindings (C).
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 
