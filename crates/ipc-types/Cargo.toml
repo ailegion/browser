@@ -10,5 +10,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+psl.workspace = true
 serde.workspace = true
 url = { workspace = true, features = ["serde"] }

@@ -69,6 +69,9 @@ selectors = "0.40.0"
 taffy = { version = "0.14.0", features = ["calc"] }
 slotmap = "1.1"
 url = "2"
+# The public suffix list, compiled in: registrable domains for "same site"
+# (referrer cap, cookies' Domain, CORP). Pure Rust, generated code.
+psl = "2"
 encoding_rs = "0.8"
 data-url = "0.3"
 mime = "0.3"

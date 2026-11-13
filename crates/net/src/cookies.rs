@@ -160,12 +160,19 @@ impl CookieJar {
             .map(|d| d.trim_start_matches('.').to_ascii_lowercase())
             .filter(|d| !d.is_empty());
         let (domain, host_only) = match domain_attr {
+            // A public suffix (by the public suffix list, O16 b) is no
+            // cookie's domain: it is the host's own cookie when it is the
+            // host, else the cookie is refused (RFC 6265bis §5.7 step 9).
+            Some(d) if browser_ipc_types::referrer::is_public_suffix(&d) => {
+                if d != host {
+                    return false;
+                }
+                (host.clone(), true)
+            }
             Some(d) => {
-                // The host must be inside the domain, an IP host can only set
-                // cookies for itself, and a domain without a dot is a public
-                // suffix we will not let anyone claim (a stand-in for the
-                // public suffix list; see O16).
-                if d != host && (host_is_ip(url) || !d.contains('.') || !domain_matches(&host, &d)) {
+                // The host must be inside the domain, and an IP host can
+                // only set cookies for itself.
+                if d != host && (host_is_ip(url) || !domain_matches(&host, &d)) {
                     return false;
                 }
                 (d, false)
@@ -446,6 +453,16 @@ mod tests {
         assert!(!jar.store(&url("http://10.0.0.1/"), "a=1; Domain=0.0.1", now()));
         assert!(jar.store(&url("http://10.0.0.1/"), "a=1; Domain=10.0.0.1", now()));
         assert_eq!(jar.len(), 1);
+        // The public suffix list: `co.uk` and `github.io` are no one's.
+        assert!(!jar.store(&url("http://www.example.co.uk/"), "b=1; Domain=co.uk", now()));
+        assert!(!jar.store(&url("https://me.github.io/"), "b=1; Domain=github.io", now()));
+        assert!(jar.store(&url("http://www.example.co.uk/"), "b=1; Domain=example.co.uk", now()));
+        assert_eq!(jar.cookie_header(&url("http://shop.example.co.uk/"), now()).as_deref(), Some("b=1"));
+        assert_eq!(jar.cookie_header(&url("http://other.co.uk/"), now()), None);
+        // A suffix that is the host itself: a cookie of that host only.
+        assert!(jar.store(&url("https://github.io/"), "c=1; Domain=github.io", now()));
+        assert_eq!(jar.cookie_header(&url("https://github.io/"), now()).as_deref(), Some("c=1"));
+        assert_eq!(jar.cookie_header(&url("https://me.github.io/"), now()), None);
     }
 
     #[test]

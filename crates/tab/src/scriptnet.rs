@@ -523,21 +523,13 @@ impl Job {
         vec![Action::Head(head)]
     }
 
-    /// Whether the current URL is of the document's site: the same host,
-    /// or hosts sharing their last two labels (the public suffix list is
-    /// a later item, O16).
+    /// Whether the current URL is of the document's site, schemelessly:
+    /// the same registrable domain by the public suffix list (or the same
+    /// host, for an IP address or a public suffix).
     fn same_site(&self) -> bool {
         let url::Origin::Tuple(_, host, _) = &self.origin else { return false };
-        let ours = host.to_string();
         let Some(theirs) = self.url.host_str() else { return false };
-        if ours == theirs {
-            return true;
-        }
-        let tail = |h: &str| {
-            let labels: Vec<&str> = h.rsplit('.').take(2).collect();
-            (labels.len() == 2).then(|| labels.join("."))
-        };
-        tail(&ours).is_some() && tail(&ours) == tail(theirs)
+        browser_ipc_types::referrer::same_site_hosts(&host.to_string(), theirs)
     }
 
     /// Fetch's CORS-preflight fetch, the response's side: the origin, the

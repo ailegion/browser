@@ -68,6 +68,9 @@ use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::builtins::{JsArray, JsFunction};
 use boa_engine::object::{FunctionObjectBuilder, ObjectInitializer};
 use boa_engine::property::Attribute;
+use boa_engine::vm::CodeBlock;
+use boa_engine::Script;
+use boa_gc::Gc;
 use boa_engine::{
     Context, JsArgs, JsError, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction, Source, js_string,
 };
@@ -360,13 +363,29 @@ struct ModuleMap {
     failed: RefCell<HashMap<Url, String>>,
     /// Modules asked for that are in neither map, since last taken.
     missing: RefCell<Vec<ModuleFetch>>,
-    /// Each module's (and classic script's) fetch options' referrer
-    /// policy, by URL: an import's fetch takes its importer's (HTML's
+    /// Each fetched module's fetch options' referrer policy, by URL (the
+    /// module map's key): an import's fetch takes its importer's (HTML's
     /// descendant script fetch options).
     policies: RefCell<HashMap<Url, browser_ipc_types::ReferrerPolicy>>,
-    /// The policy of the graph `poll_module` is loading, for imports from
-    /// its inline root (whose path is the document's URL).
-    graph_policy: std::cell::Cell<browser_ipc_types::ReferrerPolicy>,
+    /// Inline module scripts (which share the document's URL as path):
+    /// each one's base URL and its element's `referrerpolicy`.
+    inline_modules: RefCell<HashMap<Module, (Url, browser_ipc_types::ReferrerPolicy)>>,
+    /// Every classic script run, known by its code block (a script has
+    /// no other identity): its base URL (its own URL, or the document's
+    /// base URL for an inline one) and its element's `referrerpolicy`,
+    /// for a dynamic `import()` from it. The script is kept so its code
+    /// block is never freed and reused.
+    classic: RefCell<Vec<ClassicScript>>,
+}
+
+/// A classic script run (`ModuleMap::classic`).
+#[derive(Debug)]
+struct ClassicScript {
+    /// Kept so its code block stays its own.
+    _script: Script,
+    code: Gc<CodeBlock>,
+    base: Url,
+    policy: browser_ipc_types::ReferrerPolicy,
 }
 
 /// A module the map needs fetched: its URL, the `Referer` source (the
@@ -394,19 +413,34 @@ impl ModuleLoader for ModuleMap {
         self: Rc<Self>,
         referrer: Referrer,
         request: ModuleRequest,
-        _context: &RefCell<&mut Context>,
+        context: &RefCell<&mut Context>,
     ) -> impl Future<Output = JsResult<Module>> {
         let specifier = request.specifier().to_std_string_escaped();
-        // A module's path is its URL (see `ScriptHost::parse_module`).
-        let importer = referrer.path().and_then(|p| Url::parse(&p.to_string_lossy()).ok());
-        let base = importer.clone().or_else(|| self.base.clone());
-        // The import's fetch options: its importer's referrer policy (an
-        // inline root's is the graph's), and the importer as `Referer`.
-        let policy = importer
-            .as_ref()
-            .and_then(|u| self.policies.borrow().get(u).copied())
-            .unwrap_or(self.graph_policy.get());
-        let referrer_url = importer.filter(|u| Some(u) != self.base.as_ref());
+        // The importing script: its base URL (the specifier's base and the
+        // fetch's `Referer`, HTML's "referencing script's base URL") and
+        // its fetch options' referrer policy, which the import's inherit.
+        let importer: Option<(Url, browser_ipc_types::ReferrerPolicy)> = match &referrer {
+            Referrer::Module(m) => self.inline_modules.borrow().get(m).cloned().or_else(|| {
+                // A fetched module's path is its URL (`parse_module`).
+                let url = Url::parse(&m.path()?.to_string_lossy()).ok()?;
+                let policy = self.policies.borrow().get(&url).copied().unwrap_or_default();
+                Some((url, policy))
+            }),
+            Referrer::Script(s) => {
+                let code = s.codeblock(&mut context.borrow_mut()).ok();
+                code.and_then(|code| {
+                    self.classic
+                        .borrow()
+                        .iter()
+                        .find(|c| Gc::ptr_eq(&c.code, &code))
+                        .map(|c| (c.base.clone(), c.policy))
+                })
+            }
+            Referrer::Realm(_) => None,
+        };
+        let base = importer.as_ref().map(|(u, _)| u.clone()).or_else(|| self.base.clone());
+        let policy = importer.as_ref().map_or(browser_ipc_types::ReferrerPolicy::Empty, |(_, p)| *p);
+        let referrer_url = importer.map(|(u, _)| u);
         let result = match resolve_module_specifier(&specifier, base.as_ref()) {
             None => Err(JsNativeError::typ()
                 .with_message(format!(
@@ -454,8 +488,6 @@ pub struct ModuleScript {
     module: Module,
     url: Url,
     ready: bool,
-    /// Its element's `referrerpolicy`.
-    policy: browser_ipc_types::ReferrerPolicy,
 }
 
 impl std::fmt::Debug for ModuleScript {
@@ -1309,31 +1341,65 @@ impl ScriptHost {
     }
 
     /// Run a classic script as a task: evaluate it, then a microtask
-    /// checkpoint. An uncaught error goes to the console.
+    /// checkpoint. An uncaught error goes to the console. It counts as
+    /// an inline script of the document, with no `referrerpolicy`.
     pub fn run_script(&mut self, source: &str) {
-        self.run_script_from(source, None, browser_ipc_types::ReferrerPolicy::Empty);
+        let base = self.modules.base.clone();
+        self.eval_classic(source, None, base, browser_ipc_types::ReferrerPolicy::Empty);
+    }
+
+    /// Run an inline classic script whose base URL is `base` (its
+    /// document's base URL when it was prepared) and whose element's
+    /// `referrerpolicy` is `policy`, which a dynamic `import()` from it
+    /// inherits.
+    pub fn run_inline_script(&mut self, source: &str, base: &Url, policy: browser_ipc_types::ReferrerPolicy) {
+        self.eval_classic(source, None, Some(base.clone()), policy);
     }
 
     /// `run_script` for an external script: its URL names it in errors
-    /// and is the base for dynamic imports from it.
-    /// `policy`: the element's `referrerpolicy`, which a dynamic
-    /// `import()` from the script inherits.
+    /// and is its base URL; `policy` is the element's `referrerpolicy`,
+    /// which a dynamic `import()` from the script inherits.
     pub fn run_script_from(&mut self, source: &str, url: Option<&Url>, policy: browser_ipc_types::ReferrerPolicy) {
-        if let Some(url) = url {
-            self.modules.policies.borrow_mut().insert(url.clone(), policy);
-        }
-        let result = match url {
-            Some(url) => self
-                .context
-                .eval(Source::from_bytes(source.as_bytes()).with_path(Path::new(url.as_str()))),
-            None => self.context.eval(Source::from_bytes(source.as_bytes())),
+        let base = url.cloned().or_else(|| self.modules.base.clone());
+        self.eval_classic(source, url, base, policy);
+    }
+
+    /// Parse and run a classic script, keeping its base URL and policy by
+    /// its code block for the imports it may make later
+    /// (`ModuleMap::classic`).
+    fn eval_classic(&mut self, source: &str, path: Option<&Url>, base: Option<Url>, policy: browser_ipc_types::ReferrerPolicy) {
+        let src = Source::from_bytes(source.as_bytes());
+        let src = match path {
+            Some(url) => src.with_path(Path::new(url.as_str())),
+            None => src,
         };
+        let result = Script::parse(src, None, &mut self.context).and_then(|script| {
+            if let Some(base) = base {
+                let code = script.codeblock(&mut self.context)?;
+                self.modules.classic.borrow_mut().push(ClassicScript {
+                    _script: script.clone(),
+                    code,
+                    base,
+                    policy,
+                });
+            }
+            script.evaluate(&mut self.context)
+        });
         if let Err(err) = result {
             self.report_uncaught(&err);
         }
         self.microtask_checkpoint();
     }
 
+    /// Parse an inline module script whose base URL is `base` and whose
+    /// element's `referrerpolicy` is `policy`: its imports, at load and
+    /// later (`import()`), inherit the policy and have `base` as
+    /// referrer.
+    pub fn parse_inline_module(&mut self, source: &str, base: &Url, policy: browser_ipc_types::ReferrerPolicy) -> Result<ModuleScript, String> {
+        let script = self.parse_module(source, base, false, policy)?;
+        self.modules.inline_modules.borrow_mut().insert(script.module.clone(), (base.clone(), policy));
+        Ok(script)
+    }
     // ----- modules -----
 
     /// Parse a module script. `url` is the module's own URL, which its
@@ -1354,7 +1420,6 @@ impl ScriptHost {
             module,
             url: url.clone(),
             ready: false,
-            policy,
         })
     }
 
@@ -1403,11 +1468,8 @@ impl ScriptHost {
         if script.ready {
             return ModuleProgress::Ready;
         }
-        // Imports from the graph's inline root take the root's policy.
-        self.modules.graph_policy.set(script.policy);
         let promise = script.module.load(&mut self.context);
         self.microtask_checkpoint();
-        self.modules.graph_policy.set(browser_ipc_types::ReferrerPolicy::Empty);
         match promise.state() {
             PromiseState::Fulfilled(_) => {
                 script.ready = true;
@@ -1540,6 +1602,33 @@ mod tests {
 
     fn host() -> ScriptHost {
         ScriptHost::new(Some(Url::parse("https://example.test/app/").expect("url")), "browser/test").expect("script host")
+    }
+
+    #[test]
+    fn inline_scripts_keep_their_policy_for_dynamic_imports() {
+        use browser_ipc_types::ReferrerPolicy as P;
+        let mut h = host();
+        let base = url("https://example.test/app/page");
+        h.run_inline_script("import('./x.js').catch(() => {});", &base, P::Origin);
+        h.run_inline_script("import('./y.js').catch(() => {});", &base, P::NoReferrer);
+        // Two external scripts of one URL, each with its element's policy.
+        let ext = url("https://cdn.test/lib.js");
+        h.run_script_from("import('./e1.js').catch(() => {});", Some(&ext), P::SameOrigin);
+        h.run_script_from("import('./e2.js').catch(() => {});", Some(&ext), P::UnsafeUrl);
+        let got = h.take_module_requests();
+        let find = |u: &str| got.iter().find(|m| m.url.as_str() == u).cloned().expect(u);
+        // Each with its own element's policy, and its base URL as the
+        // referrer (an inline script's is the document's base URL).
+        let x = find("https://example.test/app/x.js");
+        assert_eq!((x.policy, x.referrer), (P::Origin, Some(base.clone())));
+        assert_eq!(find("https://example.test/app/y.js").policy, P::NoReferrer);
+        let e1 = find("https://cdn.test/e1.js");
+        assert_eq!((e1.policy, e1.referrer), (P::SameOrigin, Some(ext.clone())));
+        assert_eq!(find("https://cdn.test/e2.js").policy, P::UnsafeUrl);
+        // An inline script's error names no path of its own.
+        h.run_inline_script("null.y;", &base, P::Empty);
+        let out: Vec<String> = h.take_console().into_iter().map(|l| l.text).collect();
+        assert!(out.iter().any(|l| l.contains("TypeError")) && !out.iter().any(|l| l.contains('#')), "{out:?}");
     }
 
     #[test]

@@ -170,8 +170,10 @@ impl Scripts {
 
 /// What "prepare the script element" decided for a parser-inserted script.
 enum Prepared {
-    /// An inline classic script: run it now, then parse on.
-    Run(String),
+    /// An inline classic script: run it now, then parse on; with its
+    /// base URL (the document's when prepared) and its element's
+    /// `referrerpolicy`.
+    Run(String, Option<Url>, ReferrerPolicy),
     /// An external script the parser must wait for.
     Blocking,
     /// Queued, skipped, or already handled: parse on.
@@ -4090,9 +4092,12 @@ impl TabState {
                 return;
             }
             match self.prepare_script(node) {
-                Prepared::Run(source) => {
+                Prepared::Run(source, base, policy) => {
                     self.sync_document_info();
-                    self.with_script(|host| host.run_script(&source));
+                    self.with_script(|host| match &base {
+                        Some(base) => host.run_inline_script(&source, base, policy),
+                        None => host.run_script(&source),
+                    });
                     self.after_script();
                 }
                 Prepared::Blocking => return,
@@ -4179,7 +4184,7 @@ impl TabState {
                     if text.trim().is_empty() {
                         Prepared::Done
                     } else {
-                        Prepared::Run(text)
+                        Prepared::Run(text, doc_url, policy)
                     }
                 }
                 ScriptKind::Module => {
@@ -4187,7 +4192,7 @@ impl TabState {
                     let url = doc_url
                         .or_else(|| self.url.clone())
                         .unwrap_or_else(|| Url::parse("about:blank").expect("static url"));
-                    match host.parse_module(&text, &url, false, policy) {
+                    match host.parse_inline_module(&text, &url, policy) {
                         Ok(m) => {
                             let load = ScriptLoad {
                                 id: self.scripts.next_id(),

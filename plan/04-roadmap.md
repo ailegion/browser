@@ -1150,15 +1150,23 @@ remaining lists as they stand.
       `requests_carry_the_referrer_their_policy_gives` (every kind of
       subresource, a link, `noreferrer`, back, meta, reload, the address
       bar; it fails when a sheet's fetches take the document's referrer)
-      and `forms_scripts_and_new_tabs_carry_the_referrer`. Changed from
-      the plan shown to the owner: a reload the user starts sends the
-      entry's stored referrer, not none (HTML's reload reuses the entry's
-      document state; the spec text came after the plan). SKIPPED: a
-      dynamic `import()` from an inline classic script whose element has
-      a `referrerpolicy` takes the document's policy (Boa gives an inline
-      script no identity to keep its policy by), and its `Referer` is the
-      document's URL where HTML says the script's base URL (the
-      document's base URL, which `<base href>` changes). Not verified
+      and `forms_scripts_and_new_tabs_carry_the_referrer`. A reload the
+      user starts sends the entry's stored referrer (owner, 2026-11-13:
+      keep it, as browsers do: HTML's reload reuses the entry's document
+      state; Firefox's bug 968861 and WebKit's 138462 report the old
+      referrer resent, Chromium sets one on reloads). The two SKIPPED
+      parts, fixed the same day (owner's go): "same site" is by the
+      public suffix list (`psl`, O16 b; cookies' `Domain` and CORP's
+      `same-site` use it too, see 05); a classic script is known by its
+      code block (`ModuleMap::classic`: base URL and element's
+      `referrerpolicy`, inline ones with the document's base URL) and an
+      inline module by its `Module` (`inline_modules`), so a dynamic
+      `import()` from any script, inline or not, takes that script's
+      policy and its base URL as `Referer` (two scripts of one `src`
+      with different policies too); Boa 0.22 lets no data be set on a
+      script, so identity is the way. Found on the way, not part of
+      this: `<base href>` is not implemented (a document's base URL is
+      its URL, moved only by `pushState`). Not verified
       against Chrome and Firefox: `Referrer-Policy` tokens matched as
       written (the spec's reading); a `url()` that a `var()` substitution
       parses takes the referrer of the declaration holding the `var()`;
@@ -1173,7 +1181,18 @@ remaining lists as they stand.
       1.7–1.8 ms (1.6–2.0); iana load 4.94–4.98 s (4.85–5.52). Tests that
       failed now and then: the tab's two timer tests line 7 lists
       (`lifecycle_events_…` 3 of 4 full runs, `responsive_images_…` 1 of
-      4), each passing alone.
+      4), each passing alone. The fixes' timing (same probe, against
+      block A's): slower: iana full restyle 395–405 ms (381–402), not
+      attributed (nothing the fixes changed runs in a restyle);
+      Wikipedia heap 30.3 MiB (30.2), likely the classic scripts now
+      kept for the document's life; iana load 4.96–4.99 s (4.94–4.98);
+      Wikipedia load 621–644 ms (629–647), full restyle 43.6–46.3 ms
+      (44.2–46.5), relayout 1.65–1.76 ms (1.7–1.8); iana relayout
+      36.8–42.3 ms (38.6–46.7), heap 435.7 MiB (435.7). Tests: script
+      `inline_scripts_keep_their_policy_for_dynamic_imports`, the
+      referrer module's public-suffix cases, net's public-suffix
+      cookies; in the full run the paint snapshots failed once (passing
+      alone, line 7 lists them) and `lifecycle_events_…` once.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

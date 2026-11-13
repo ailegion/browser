@@ -52,6 +52,7 @@ Re-resolve the whole set at the start of every phase and update this table.
 | `usvg` | 0.48.1 | SVG parse to a tree we paint with vello | Added 2026-10-18 for "Working sites first" line 6b (SVG images; moved up from Phase 5 by the owner). Default features: `text` (through `fontdb`, which reads the installed fonts once, memory-mapped, on the first SVG with text), `system-fonts`, `memmap-fonts`. `resvg`'s raster path is not pulled. Brings `roxmltree`, `simplecss`, `svgtypes`, `tiny-skia-path` (paths only, no rasterizer), `fontdb`, `strict-num`, `imagesize`, `data-url`, `flate2` (SVGZ, already in the tree) |
 | `vello_svg` | 0.11.0 | A `usvg` tree as vello drawing | Added 2026-10-18 with `usvg`: Linebender's own adapter, on our vello 0.10 / peniko 0.6.1 / kurbo 0.13.1. An SVG image is turned into a vello scene once and appended, scaled, wherever it is drawn (`<img>`, background and mask layers) |
 | `url` | 2.5.8 | URL parsing (with `idna`) | `serde` feature on in `ipc-types` |
+| `psl` | 2.1.253 | The public suffix list, compiled in (with `psl-types` 2.0.11): registrable domains for "same site" (the referrer cap, cookies' `Domain`, CORP) | Added 2026-11-13 (O16 b, O23). Pure Rust generated code, no build script or native code; `cargo deny check bans` passes. Unsafe count not taken; take it at the next phase boundary (`06-unsafe-baseline.md`). The list is as of the crate's release: bump with releases |
 | `encoding_rs` | 0.8.42 | Legacy encodings | |
 | `data-url` | 0.3.2 | `data:` URLs | |
 | `mime` | 0.3.17 | Content-type parsing | |

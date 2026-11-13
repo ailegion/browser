@@ -189,26 +189,51 @@ pub fn potentially_trustworthy(url: &Url) -> bool {
     }
 }
 
-/// Whether two URLs are same site (HTML's schemeful "same site"): same
-/// scheme and the same registrable domain. Without the public suffix
-/// list (O16 b) a domain's registrable domain is taken as its last two
-/// labels, as the CORP check does; an IP address is its own site.
+/// A domain's registrable domain by the public suffix list (the `psl`
+/// crate's compiled-in copy): the public suffix and one label more;
+/// `None` when the domain is itself a public suffix (or has no label
+/// beyond one). Lowercased, a trailing dot ignored.
+pub fn registrable_domain(domain: &str) -> Option<String> {
+    let d = domain.trim_end_matches('.').to_ascii_lowercase();
+    psl::domain_str(&d).map(str::to_owned)
+}
+
+/// Whether a domain is a public suffix (`com`, `co.uk`, `github.io`).
+pub fn is_public_suffix(domain: &str) -> bool {
+    let d = domain.trim_end_matches('.').to_ascii_lowercase();
+    !d.is_empty() && psl::suffix_str(&d) == Some(d.as_str())
+}
+
+/// HTML's "obtain a site" for a host: its registrable domain, else the
+/// host itself (an IP address, a public suffix, a single label).
+fn site_host(host: &url::Host<&str>) -> String {
+    match host {
+        url::Host::Domain(d) => registrable_domain(d).unwrap_or_else(|| d.trim_end_matches('.').to_ascii_lowercase()),
+        other => other.to_string(),
+    }
+}
+
+/// Whether two URLs are same site (HTML's schemeful "same site"): the
+/// same scheme and the same site of their hosts.
 pub fn same_site(a: &Url, b: &Url) -> bool {
     if a.scheme() != b.scheme() {
         return false;
     }
     match (a.host(), b.host()) {
-        (Some(url::Host::Domain(x)), Some(url::Host::Domain(y))) => {
-            let tail = |h: &str| {
-                let h = h.trim_end_matches('.').to_ascii_lowercase();
-                let labels: Vec<&str> = h.rsplit('.').take(2).collect();
-                labels.into_iter().rev().collect::<Vec<_>>().join(".")
-            };
-            tail(x) == tail(y)
-        }
-        (Some(x), Some(y)) => x == y,
+        (Some(x), Some(y)) => site_host(&x) == site_host(&y),
         _ => false,
     }
+}
+
+/// `same_site` for hosts alone (CORP's `same-site` compares the
+/// request's and the response's hosts this way).
+pub fn same_site_hosts(a: &str, b: &str) -> bool {
+    let site = |h: &str| match url::Host::parse(h) {
+        Ok(url::Host::Domain(d)) => Some(site_host(&url::Host::Domain(d.as_str()))),
+        Ok(other) => Some(other.to_string()),
+        Err(_) => None,
+    };
+    matches!((site(a), site(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Fetch's "determine request's referrer" (Referrer Policy §8.3) from
@@ -316,6 +341,16 @@ mod tests {
         assert_eq!(d("about:blank", P::UnsafeUrl, "https://a.example/"), None);
         assert_eq!(d("https://a.example/", P::Empty, "http://127.0.0.1:8080/").as_deref(), Some("https://a.example/"));
         assert_eq!(d("https://a.example/", P::Empty, "http://localhost/").as_deref(), Some("https://a.example/"));
+        // Sites by the public suffix list: `co.uk` and `github.io` are
+        // suffixes, so their subdomains are sites of their own.
+        assert_eq!(d(page, P::UnsafeUrl, "https://x.a.example/").as_deref(), Some("https://a.example/p/q?x=1"));
+        assert_eq!(d("https://a.co.uk/p", P::UnsafeUrl, "https://b.co.uk/").as_deref(), Some("https://a.co.uk/"), "another site");
+        assert_eq!(d("https://w.a.co.uk/p", P::UnsafeUrl, "https://a.co.uk/").as_deref(), Some("https://w.a.co.uk/p"), "the same site");
+        assert_eq!(d("https://me.github.io/p", P::UnsafeUrl, "https://you.github.io/").as_deref(), Some("https://me.github.io/"));
+        assert!(is_public_suffix("co.uk") && is_public_suffix("COM.") && !is_public_suffix("example.com"));
+        assert_eq!(registrable_domain("www.Example.co.uk").as_deref(), Some("example.co.uk"));
+        assert!(same_site_hosts("a.example.com", "b.example.com") && !same_site_hosts("a.co.uk", "b.co.uk"));
+        assert!(same_site_hosts("127.0.0.1", "127.0.0.1") && !same_site_hosts("127.0.0.1", "127.0.0.2"));
         // Over 4096 bytes: the origin.
         let long = format!("https://a.example/{}", "x".repeat(4100));
         assert_eq!(d(&long, P::UnsafeUrl, "https://a.example/").as_deref(), Some("https://a.example/"));
