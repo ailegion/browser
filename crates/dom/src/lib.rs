@@ -282,6 +282,15 @@ pub struct Document {
     /// The first `<base>` with an `href` in tree order, the `href` its
     /// frozen base URL was set from, and that URL.
     base_element: Option<(NodeId, String, Url)>,
+    /// The document base URL each element's `style` attribute was parsed
+    /// with (when it was set; a clone keeps its original's): its `url()`s
+    /// are not resolved again when the base changes (HTML, since 2009;
+    /// Chrome and Firefox).
+    style_bases: std::collections::HashMap<NodeId, Url>,
+    /// The document base URL each `<link>` was processed with (when it was
+    /// inserted, or an attribute that processes it again changed): its
+    /// `href` resolves against it, so a base change fetches nothing again.
+    link_bases: std::collections::HashMap<NodeId, Url>,
     /// The encoding the bytes were decoded with, set when the parser
     /// finishes; `None` for a document that was not parsed from bytes.
     pub encoding: Option<&'static encoding_rs::Encoding>,
@@ -375,6 +384,8 @@ impl Document {
             base_url: None,
             document_url: None,
             base_element: None,
+            style_bases: Default::default(),
+            link_bases: Default::default(),
             encoding: None,
             images: std::collections::HashMap::new(),
             created_images: Vec::new(),
@@ -451,6 +462,57 @@ impl Document {
         }
     }
 
+    /// The base URL `element`'s `style` attribute resolves against: the
+    /// one it was parsed with, else the document base URL.
+    pub fn style_base(&self, element: NodeId) -> Option<&Url> {
+        self.style_bases.get(&element).or(self.base_url.as_ref())
+    }
+
+    /// `element`'s `style` attribute was set or removed (a script, the
+    /// CSSOM): it is parsed with the document base URL now.
+    pub fn note_style_attribute(&mut self, element: NodeId) {
+        let has = self.nodes.get(element).and_then(Node::as_element).is_some_and(|e| e.attr("style").is_some());
+        match (has, self.base_url.clone()) {
+            (true, Some(base)) => {
+                self.style_bases.insert(element, base);
+            }
+            _ => {
+                self.style_bases.remove(&element);
+            }
+        }
+    }
+
+    /// A `<link>`'s `href` resolved against the base URL it was processed
+    /// with (else the document base URL).
+    pub fn link_url(&self, link: NodeId, href: &str) -> Option<Url> {
+        match self.link_bases.get(&link).or(self.base_url.as_ref()) {
+            Some(base) => base.join(href.trim()).ok(),
+            None => Url::parse(href.trim()).ok(),
+        }
+    }
+
+    /// A connected `<link>` is processed (HTML §4.2.4: inserted, or one
+    /// of the attributes that fetch it again changed): its `href` now
+    /// resolves against the document base URL of this moment.
+    fn link_processed(&mut self, link: NodeId) {
+        if let Some(base) = self.base_url.clone() {
+            self.link_bases.insert(link, base);
+        }
+    }
+
+    /// An attribute of a connected `<link>` changed: `href`, `rel`, `type`,
+    /// `crossorigin`, `referrerpolicy` process it again.
+    pub fn note_link_attribute(&mut self, element: NodeId, name: &str) {
+        let is_link = self
+            .nodes
+            .get(element)
+            .and_then(Node::as_element)
+            .is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("link"));
+        if is_link && matches!(name, "href" | "rel" | "type" | "crossorigin" | "referrerpolicy") && self.is_connected(element) {
+            self.link_processed(element);
+        }
+    }
+
     /// An attribute of `element` was set, changed or removed: a `<base>`'s
     /// `href` sets the document base URL again.
     pub fn note_base_attribute(&mut self, element: NodeId, name: &str) {
@@ -499,15 +561,28 @@ impl Document {
         }
         // A `<base>` that became connected may be the first now.
         let mut base = named(self, child, local_name!("base"));
+        let mut links: Vec<NodeId> = Vec::new();
+        if named(self, child, local_name!("link")) {
+            links.push(child);
+        }
         if self.nodes[child].first_child.is_some() && self.is_connected(parent) {
             let metas: Vec<NodeId> = self.descendants(child).filter(|&d| named(self, d, local_name!("meta"))).collect();
             for m in metas {
                 self.meta_referrer(m);
             }
             base |= self.descendants(child).any(|d| named(self, d, local_name!("base")));
+            links.extend(self.descendants(child).filter(|&d| named(self, d, local_name!("link"))));
         }
-        if base && self.is_connected(parent) {
-            self.update_base(None);
+        if (base || !links.is_empty()) && self.is_connected(parent) {
+            if base {
+                self.update_base(None);
+            }
+            // A `<link>` that became connected is processed: its `href`
+            // resolves against the base of this moment (after a `<base>`
+            // inserted with it).
+            for l in links {
+                self.link_processed(l);
+            }
         }
     }
 
@@ -887,9 +962,15 @@ impl Document {
             let local = e.name.local.clone();
             self.note_created_element(&local);
         }
+        let has_style = matches!(&kind, NodeKind::Element(e) if e.attr("style").is_some());
         let id = self.nodes.insert(Node::new(kind));
         if img {
             self.created_images.push(id);
+        }
+        // Made with a `style` attribute (the parser, a fragment, a clone):
+        // parsed with the base URL now.
+        if has_style && let Some(base) = self.base_url.clone() {
+            self.style_bases.insert(id, base);
         }
         id
     }
@@ -946,6 +1027,11 @@ impl Document {
         }
         let copy = self.create_node(kind);
         self.clone_control_state(id, copy);
+        // A clone's `style` keeps the base its original was parsed with.
+        match self.style_bases.get(&id).cloned() {
+            Some(base) => self.style_bases.insert(copy, base),
+            None => self.style_bases.remove(&copy),
+        };
         if deep {
             let mut child = self.nodes[id].first_child;
             while let Some(c) = child {
@@ -1224,6 +1310,8 @@ impl Document {
             self.images.remove(&n);
             self.controls.remove(&n);
             self.parser_forms.remove(&n);
+            self.style_bases.remove(&n);
+            self.link_bases.remove(&n);
             self.nodes.remove(n);
         }
     }

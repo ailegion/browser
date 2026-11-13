@@ -285,6 +285,9 @@ fn write_inline(target: &JsObject, dom: &mut Dom, decls: Vec<Declaration>) {
     let Some(e) = dom.doc.get_mut(id).as_element_mut() else { return };
     let old = e.attr("style").map(str::to_owned);
     e.set_attr("style", &text);
+    // The declarations set now resolve their `url()`s against the base
+    // of now.
+    dom.doc.note_style_attribute(id);
     *data.cache.borrow_mut() = Some((text, decls));
     dom.generation += 1;
     dom.record_attr(id, "style", None, old.clone());

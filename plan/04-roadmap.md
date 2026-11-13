@@ -1239,7 +1239,7 @@ remaining lists as they stand.
       `NetOp`'s variant sizes (232 bytes with the referrer's URL boxed;
       the fields add 17), likely there before. Full run: the paint
       snapshots failed once (passing alone).
-- [ ] 9. `<base href>` (new, owner 2026-11-13; found while fixing line
+- [x] 9. `<base href>` (new, owner 2026-11-13; found while fixing line
       8's referrer parts: a document's base URL is its own URL, moved
       only by `pushState`, so a page relying on `<base>` resolves its
       relative URLs wrong). HTML §2.5.1 and §4.2.3: the document base
@@ -1299,6 +1299,30 @@ remaining lists as they stand.
       restyle 392–400 ms (393–408), relayouts 1.67–1.95 and 37.4–38.9 ms
       (1.68–2.06, 37.8–40.7), heaps 30.3 and 435.7–435.8 MiB (unchanged).
       Full test run: no failure.
+      The two SKIPPED parts, fixed the same day (owner's go; HTML has said
+      since 2009 that CSS URLs are not resolved again when the base
+      changes, as the 2016 report found browsers doing): an element's
+      `style` attribute resolves against the base it was parsed with
+      (`Document::style_base`: recorded when the element is made with
+      one, by the parser, a fragment or a clone, which keeps its
+      original's, and when a script or the CSSOM sets it); a `<link>`'s
+      `href` against the base it was processed with
+      (`Document::link_url`: recorded when it becomes connected, after a
+      `<base>` inserted with it, and when its `href`, `rel`, `type`,
+      `crossorigin` or `referrerpolicy` changes), in the tab and in the
+      script's view. The tab test fails with either undone. Found, not
+      changed: the script's view (`getComputedStyle`) parses an inline
+      `<style>` against the base of the moment it builds (its cache key),
+      where the tab keeps the sheet it parsed until the text changes, as
+      browsers do; after a base change the two may differ. Timing
+      (release probe, live, against the line's first build): slower:
+      Wikipedia relayout 1.79–2.11 ms (1.67–1.95), iana full restyle
+      391–404 ms (392–400), iana load 4.97–4.99 s (4.97–4.98), not
+      attributed (the change adds a map lookup per `style` attribute in
+      a cascade); Wikipedia full restyle 45.0–47.0 ms (47.3–50.6), load
+      631–647 ms (623–650), iana relayout 37.2–38.8 ms (37.4–38.9), heaps
+      30.3 and 435.7 MiB. Full run: the paint snapshots failed once
+      (passing alone). Ticked.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

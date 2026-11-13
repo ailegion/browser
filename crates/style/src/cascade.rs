@@ -668,12 +668,12 @@ impl<'a> Restyler<'a> {
         let mut matched: Vec<(u8, u32, u32, &Declaration)> = self.match_rules(id, element, None);
 
         // Style attribute: author origin, beats any selector specificity.
-        // Its `url()`s are relative to the document's base URL.
+        // Its `url()`s are relative to the base URL it was parsed with.
         let inline_decls: Vec<Declaration> = element
             .attr("style")
             .map(|css| {
                 let mut decls = parse_declaration_block(css);
-                if let Some(base) = &doc.base_url {
+                if let Some(base) = doc.style_base(id) {
                     crate::stylesheet::resolve_declaration_urls(&mut decls, base);
                 }
                 decls

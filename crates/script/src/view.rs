@@ -415,7 +415,7 @@ impl View {
                 let rel = e.attr("rel").unwrap_or("");
                 let is_sheet = rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("stylesheet"));
                 let alternate = rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("alternate"));
-                let url = e.attr("href").and_then(|h| doc.resolve_url(h));
+                let url = e.attr("href").and_then(|h| doc.link_url(id, h));
                 match (is_sheet && !alternate, url) {
                     (true, Some(url)) => match self.loaded_sheets.get(&url) {
                         Some(s) => s.clone(),

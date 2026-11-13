@@ -2440,6 +2440,11 @@ fn mutate(
         }
         // A `<base>`'s `href`: the document base URL.
         dom.doc.note_base_attribute(id, name);
+        // A `style` is parsed with the base of now; a `<link>` processed.
+        if name == "style" {
+            dom.doc.note_style_attribute(id);
+        }
+        dom.doc.note_link_attribute(id, name);
     }
     if let (Some((_, old)), Some((local, namespace))) = (&attr_change, &attr_record)
         && !attr_noop

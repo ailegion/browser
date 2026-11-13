@@ -4559,7 +4559,7 @@ impl TabState {
                 let alternate = rel.split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("alternate"));
                 if is_sheet && !alternate
                     && let Some(href) = e.attr("href")
-                    && let Some(url) = doc.resolve_url(href)
+                    && let Some(url) = doc.link_url(id, href)
                 {
                     found.push((id, media, Source::Link(url)));
                 }
@@ -10645,7 +10645,7 @@ mod tests {
     fn a_base_href_moves_every_relative_url() {
         let page = "<!DOCTYPE html><title>Page</title><base href='/sub/'><link rel=stylesheet href=s.css>\
              <img src=i.png><script src=a.js></script><a id=l href=next>next</a>\
-             <form id=f><button id=b>go</button></form>";
+             <form id=f><button id=b>go</button></form><div id=d style='background-image: url(bg.png)'>d</div>";
         let server = Server::start(
             &[
                 ("/dir/page", "text/html", page),
@@ -10660,7 +10660,7 @@ mod tests {
         );
         let mut h = Harness::load_url(server.url("/dir/page"));
         // The page's resources resolve against the base.
-        let paths = ["/sub/s.css", "/sub/i.png", "/sub/a.js", "/sub/f"];
+        let paths = ["/sub/s.css", "/sub/i.png", "/sub/a.js", "/sub/f", "/sub/bg.png"];
         h.pump_until(|_| paths.iter().all(|p| !server.requests(p).is_empty()));
         h.pump_until(|h| !h.state.is_loading());
         let sub = server.url("/sub/").to_string();
@@ -10682,10 +10682,24 @@ mod tests {
         // A script changing the base: what resolves later follows.
         h.send(ShellToTab::GoBack);
         h.pump_until(|h| h.title().as_deref() == Some("Page") && !h.state.is_loading());
+        let sheet_loads = server.requests("/sub/s.css").len();
         assert_eq!(
             run_js(&mut h, "document.querySelector('base').setAttribute('href', '/other/'); document.baseURI"),
             format!("\"{}\"", server.url("/other/"))
         );
+        // What was parsed or processed keeps its base (no fetch again, even
+        // after a restyle); what is set or inserted now takes the new one.
+        run_js(&mut h, "document.getElementById('d').className = 'x'; document.body.offsetWidth");
+        run_js(
+            &mut h,
+            "var d2 = document.createElement('div'); d2.textContent = 'e'; document.body.append(d2); d2.setAttribute('style', 'background-image: url(bg2.png)'); \
+             var l2 = document.createElement('link'); l2.rel = 'stylesheet'; l2.setAttribute('rel', 'stylesheet'); l2.setAttribute('href', 's2.css'); document.head.append(l2);",
+        );
+        h.pump_until(|_| !server.requests("/other/bg2.png").is_empty() && !server.requests("/other/s2.css").is_empty());
+        h.pump();
+        assert!(server.requests("/other/s.css").is_empty(), "the loaded link is not fetched again");
+        assert!(server.requests("/other/bg.png").is_empty(), "the style attribute keeps its base");
+        assert_eq!(server.requests("/sub/s.css").len(), sheet_loads, "nor from its old URL");
         assert_eq!(run_js(&mut h, "document.querySelector('base').remove(); document.baseURI"), format!("\"{}\"", server.url("/dir/page")));
     }
 
