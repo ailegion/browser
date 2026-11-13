@@ -104,6 +104,20 @@ pub struct NetRequest {
     /// The request outlives the document that made it (`keepalive`, a
     /// beacon): it is carried to its end with nobody to tell.
     pub keepalive: bool,
+    /// Fetch's request referrer and referrer policy (`Empty`: the
+    /// document's).
+    pub referrer: ScriptReferrer,
+    pub referrer_policy: browser_ipc_types::ReferrerPolicy,
+}
+
+/// A script request's referrer (Fetch's request referrer): the
+/// document's (`client`), none, or a URL of the document's origin (the
+/// `Request` constructor's `referrer`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptReferrer {
+    Client,
+    NoReferrer,
+    Url(Box<Url>),
 }
 
 /// What a script asked of the network since the tab last took them.
@@ -983,6 +997,41 @@ fn redirect_keyword(mode: RedirectMode) -> &'static str {
     }
 }
 
+/// `RequestInit`'s members in lexicographic order (WebIDL converts a
+/// dictionary's members in that order).
+const REQUEST_INIT_MEMBERS: [&str; 15] = [
+    "body",
+    "cache",
+    "credentials",
+    "duplex",
+    "headers",
+    "integrity",
+    "keepalive",
+    "method",
+    "mode",
+    "priority",
+    "redirect",
+    "referrer",
+    "referrerPolicy",
+    "signal",
+    "window",
+];
+
+/// A copy of a `RequestInit` with its present members (read once each,
+/// in order), and whether any was present.
+fn snapshot_request_init(init: &JsObject, context: &mut Context) -> JsResult<(JsObject, bool)> {
+    let copy = JsObject::with_null_proto();
+    let mut any = false;
+    for name in REQUEST_INIT_MEMBERS {
+        let value = init.get(JsString::from(name), context)?;
+        if !value.is_undefined() {
+            copy.set(JsString::from(name), value, false, context)?;
+            any = true;
+        }
+    }
+    Ok((copy, any))
+}
+
 /// The `Request` constructor's steps (Fetch §5.4): the request `input`
 /// and `init` describe.
 fn make_request(input: &JsValue, init: &JsValue, context: &mut Context) -> JsResult<RequestData> {
@@ -991,7 +1040,14 @@ fn make_request(input: &JsValue, init: &JsValue, context: &mut Context) -> JsRes
         v if v.is_null_or_undefined() => None,
         v => Some(v.as_object().ok_or_else(|| type_error("Failed to construct 'Request': The provided value is not of type 'RequestInit'."))?),
     };
-    let init = init.as_ref();
+    // WebIDL's dictionary conversion: every member read once, in
+    // lexicographic order, before the steps; the steps read the copy.
+    let snapshot = match init.as_ref() {
+        Some(o) => Some(snapshot_request_init(o, context)?),
+        None => None,
+    };
+    let init_is_empty = snapshot.as_ref().is_none_or(|(_, any)| !any);
+    let init = snapshot.as_ref().map(|(o, _)| o);
     let input_request = input.as_object().filter(|o| o.is::<RequestData>());
     // The request to start from: the input's, or a new one for its URL.
     let (mut request, input_headers, input_body) = match &input_request {
@@ -1048,6 +1104,12 @@ fn make_request(input: &JsValue, init: &JsValue, context: &mut Context) -> JsRes
         && !window.is_null()
     {
         return Err(type_error("Failed to construct 'Request': 'window' can only be null."));
+    }
+    // Step 13: a non-empty init makes the input request's referrer the
+    // client's again and its policy empty (the init's own, below, win).
+    if input_request.is_some() && !init_is_empty {
+        request.referrer = "about:client".to_owned();
+        request.referrer_policy = String::new();
     }
     if let Some(referrer) = member(init, "referrer", context)? {
         let text = referrer.to_string(context)?.to_std_string_escaped();
@@ -1659,6 +1721,12 @@ fn fetch(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsVal
         force_preflight: false,
         timeout: None,
         keepalive: request.keepalive,
+        referrer: match request.referrer.as_str() {
+            "" => ScriptReferrer::NoReferrer,
+            "about:client" => ScriptReferrer::Client,
+            url => Url::parse(url).map_or(ScriptReferrer::Client, |u| ScriptReferrer::Url(Box::new(u))),
+        },
+        referrer_policy: browser_ipc_types::ReferrerPolicy::from_token(&request.referrer_policy).unwrap_or_default(),
     }));
     state.consumers.insert(
         id,
@@ -1725,6 +1793,8 @@ fn send_beacon(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
         force_preflight: false,
         timeout: None,
         keepalive: true,
+        referrer: ScriptReferrer::Client,
+        referrer_policy: browser_ipc_types::ReferrerPolicy::Empty,
     }));
     Ok(true.into())
 }

@@ -2209,6 +2209,21 @@ impl TabState {
         self.client_referrer(policy)
     }
 
+    /// The referrer of a script's request (`fetch`, XHR, a beacon): the
+    /// `Request`'s own `referrer` (a URL of the document's origin) or the
+    /// document's, under the `Request`'s `referrerPolicy`, else the
+    /// document's policy; none for `referrer: ''`.
+    fn script_request_referrer(&self, request: &browser_script::NetRequest) -> Option<RequestReferrer> {
+        match &request.referrer {
+            browser_script::ScriptReferrer::NoReferrer => None,
+            browser_script::ScriptReferrer::Client => self.client_referrer(request.referrer_policy),
+            browser_script::ScriptReferrer::Url(source) => Some(RequestReferrer {
+                source: (**source).clone(),
+                policy: request.referrer_policy.or(self.document_policy()),
+            }),
+        }
+    }
+
     /// The referrer of a fetch a stylesheet makes: its URL under its
     /// response's policy (else the document's) for an external sheet, the
     /// document's for an inline one or a `style` attribute.
@@ -3324,11 +3339,9 @@ impl TabState {
                 NetOp::Start(request) => {
                     let Some(document_url) = self.url.clone() else { continue };
                     let (id, timeout, keepalive) = (request.id, request.timeout, request.keepalive);
-                    let referrer = self.client_referrer(ReferrerPolicy::Empty);
+                    let referrer = self.script_request_referrer(&request);
                     let (job, actions) = {
                         let mut preflights = self.preflights.lock().unwrap_or_else(|e| e.into_inner());
-                        // The document's referrer (`fetch`'s own `referrer`
-                        // and `referrerPolicy` are block B).
                         Job::start(request, &document_url, referrer, &mut preflights)
                     };
                     self.script_fetches.insert(
@@ -10630,6 +10643,37 @@ mod tests {
         h.send(ShellToTab::Navigate { url: server.url("/plain") });
         h.pump_until(|h| h.title().as_deref() == Some("Plain"));
         assert_eq!(referer(&server, "/plain", 0), None);
+    }
+
+    #[test]
+    fn fetch_sends_the_referrer_and_policy_it_was_given() {
+        let server = Server::start(
+            &[
+                ("/p", "text/html", "<title>P</title>"),
+                ("/n1", "text/plain", "1"),
+                ("/n2", "text/plain", "2"),
+                ("/n3", "text/plain", "3"),
+                ("/n4", "text/plain", "4"),
+                ("/n5", "text/plain", "5"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/p?q"));
+        h.pump_until(|h| !h.state.is_loading());
+        run_js(
+            &mut h,
+            "fetch('/n1', {referrerPolicy: 'no-referrer'}); fetch('/n2', {referrerPolicy: 'origin'}); \
+             fetch('/n3', {referrer: '/from?x#f'}); fetch('/n4', {referrer: 'https://other.test/'}); \
+             fetch(new Request('/n5', {referrer: ''}));",
+        );
+        let paths = ["/n1", "/n2", "/n3", "/n4", "/n5"];
+        h.pump_until(|_| paths.iter().all(|p| !server.requests(p).is_empty()));
+        let referer = |p: &str| header_of(&server.requests(p)[0], "referer");
+        assert_eq!(referer("/n1"), None, "referrerPolicy: no-referrer");
+        assert_eq!(referer("/n2").as_deref(), Some(&*server.url("/").to_string()), "referrerPolicy: origin");
+        assert_eq!(referer("/n3").as_deref(), Some(&*server.url("/from?x").to_string()), "its own referrer, stripped");
+        assert_eq!(referer("/n4").as_deref(), Some(&*server.url("/p?q").to_string()), "cross-origin: the document's");
+        assert_eq!(referer("/n5"), None, "referrer: ''");
     }
 
     #[test]

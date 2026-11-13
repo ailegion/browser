@@ -880,6 +880,8 @@ fn xhr_send(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
             force_preflight: upload_listener,
             timeout: (s.timeout_ms != 0).then(|| Duration::from_millis(s.timeout_ms.into())),
             keepalive: false,
+            referrer: crate::fetch::ScriptReferrer::Client,
+            referrer_policy: browser_ipc_types::ReferrerPolicy::Empty,
         }
     })?;
     let synchronous = with(&xhr, |x| x.state.synchronous)?;

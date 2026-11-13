@@ -1214,6 +1214,31 @@ remaining lists as they stand.
       referrer module's public-suffix cases, net's public-suffix
       cookies; in the full run the paint snapshots failed once (passing
       alone, line 7 lists them) and `lifecycle_events_…` once.
+      Referrer, block B (O23), 2026-11-13, owner's go: `fetch()` and
+      `Request` send the referrer and policy they were given:
+      `NetRequest::referrer` (`ScriptReferrer`: the client's, none for
+      `referrer: ''`, or the constructor's same-origin URL) and
+      `referrer_policy` (`Empty`: the document's), determined per hop as
+      the rest (`script_request_referrer`); XHR and `sendBeacon` keep the
+      client's. The `Request` constructor now reads its init once, every
+      member in lexicographic order (WebIDL's dictionary conversion;
+      before, each step read its member when it came to it), and a
+      non-empty init resets an input `Request`'s referrer to the
+      client's and its policy to empty (Fetch §5.4 step 13; before, they
+      were copied). `Request.referrer`/`referrerPolicy` read as before.
+      Tests: script `request_referrer_and_policy_follow_the_constructor`
+      (the parsing, the cross-origin fallback, the reset, the read
+      order), tab `fetch_sends_the_referrer_and_policy_it_was_given`.
+      Timing (release probe, live, against the font clock's): slower:
+      iana load 5.01–6.02 s (4.92–4.97; the 6.02 s run took 431 rounds,
+      the network), full restyle 393–408 ms (388–400), Wikipedia full
+      restyle 45.1–48.2 ms (45.9–47.8), not attributed (neither page's
+      load runs a `fetch` with a referrer of its own); Wikipedia load
+      620–638 ms (622–653), relayout 1.68–2.06 ms (1.63–2.13), iana
+      relayout 37.8–40.7 ms (36.7–47.1), heaps 30.3 and 435.8 MiB. Clippy:
+      `NetOp`'s variant sizes (232 bytes with the referrer's URL boxed;
+      the fields add 17), likely there before. Full run: the paint
+      snapshots failed once (passing alone).
 - [ ] 9. `<base href>` (new, owner 2026-11-13; found while fixing line
       8's referrer parts: a document's base URL is its own URL, moved
       only by `pushState`, so a page relying on `<base>` resolves its

@@ -47,7 +47,7 @@ mod xhr;
 pub use events::{EventTargetRef, MOUSE_POINTER_ID, UiClass, UiEventInit, forwarded_to_window};
 pub use fetch::{
     CredentialsMode, NetFailure, NetOp, NetRequest, NetResponseHead, RedirectMode, RequestCache, RequestMode, ResponseKind,
-    SyncNet, is_cors_safelisted_request_header,
+    ScriptReferrer, SyncNet, is_cors_safelisted_request_header,
 };
 pub use fonts::{FaceRef, FontLoadStatus, FontRequest, ScriptFace};
 pub use history::{MAX_HISTORY_ENTRIES, SerializedState};
@@ -1602,6 +1602,31 @@ mod tests {
 
     fn host() -> ScriptHost {
         ScriptHost::new(Some(Url::parse("https://example.test/app/").expect("url")), "browser/test").expect("script host")
+    }
+
+    #[test]
+    fn request_referrer_and_policy_follow_the_constructor() {
+        let mut h = host();
+        let e = |h: &mut ScriptHost, s: &str| h.eval_to_string(s).expect("eval");
+        assert_eq!(e(&mut h, "var r0 = new Request('/a'); [r0.referrer, JSON.stringify(r0.referrerPolicy)].join()"), "\"about:client,\\\"\\\"\"");
+        assert_eq!(e(&mut h, "JSON.stringify(new Request('/a', {referrer: ''}).referrer)"), "\"\\\"\\\"\"");
+        assert_eq!(e(&mut h, "new Request('/a', {referrer: '/x?q#f'}).referrer"), "\"https://example.test/x?q#f\"");
+        assert_eq!(e(&mut h, "new Request('/a', {referrer: 'https://other.test/'}).referrer"), "\"about:client\"", "cross-origin: the client's");
+        assert_eq!(e(&mut h, "new Request('/a', {referrer: 'about:client'}).referrer"), "\"about:client\"");
+        assert_eq!(e(&mut h, "try { new Request('/a', {referrer: 'http://[bad'}); 'no' } catch (x) { x.name }"), "\"TypeError\"");
+        assert_eq!(e(&mut h, "try { new Request('/a', {referrerPolicy: 'bogus'}); 'no' } catch (x) { x.name }"), "\"TypeError\"");
+        // From a Request: kept with an empty init, reset by a non-empty
+        // one (the init's own members win).
+        e(&mut h, "var r = new Request('/a', {referrer: '/x', referrerPolicy: 'origin'})");
+        assert_eq!(e(&mut h, "var c = new Request(r); [c.referrer, c.referrerPolicy].join()"), "\"https://example.test/x,origin\"");
+        assert_eq!(e(&mut h, "var c = new Request(r, {method: undefined}); [c.referrer, c.referrerPolicy].join()"), "\"https://example.test/x,origin\"");
+        assert_eq!(e(&mut h, "var c = new Request(r, {method: 'POST'}); [c.referrer, JSON.stringify(c.referrerPolicy)].join()"), "\"about:client,\\\"\\\"\"");
+        assert_eq!(e(&mut h, "var c = new Request(r, {referrerPolicy: 'same-origin'}); [c.referrer, c.referrerPolicy].join()"), "\"about:client,same-origin\"");
+        // The init's members are read once each, in lexicographic order.
+        assert_eq!(
+            e(&mut h, "var seen = []; new Request('/a', new Proxy({}, { get(t, k) { seen.push(String(k)); } })); seen.join()"),
+            "\"body,cache,credentials,duplex,headers,integrity,keepalive,method,mode,priority,redirect,referrer,referrerPolicy,signal,window\""
+        );
     }
 
     #[test]
