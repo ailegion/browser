@@ -357,7 +357,7 @@ impl App {
 
         if !self.options.smoke {
             let url = self.start_url();
-            self.open_tab(url, true, None)?;
+            self.open_tab(url, true, None, None)?;
             if self.options.screenshot.is_some() {
                 self.screenshot_deadline = Some(Instant::now() + SCREENSHOT_TIMEOUT);
             }
@@ -366,7 +366,10 @@ impl App {
     }
 
     /// Start a tab thread on `url`; show it if `activate`.
-    fn open_tab(&mut self, url: Url, activate: bool, post: Option<browser_ipc_types::PostData>) -> Result<()> {
+    /// Open a tab on `url`: the user's own navigation when `referrer` is
+    /// none (no `Referer`), else one a page started (a link opened in a
+    /// new tab, a form submitted into one), with the page's referrer.
+    fn open_tab(&mut self, url: Url, activate: bool, post: Option<browser_ipc_types::PostData>, referrer: Option<browser_ipc_types::NavigationReferrer>) -> Result<()> {
         let net = match &self.net {
             Some(n) => n.clone(),
             None => {
@@ -385,8 +388,11 @@ impl App {
         let handle = spawn_tab(id, net, self.storage.clone(), viewport, sink);
         // A form submitted into a new tab POSTs there first thing.
         match post {
-            Some(post) => handle.send(ShellToTab::NavigateWithBody { url, post }),
-            None => handle.send(ShellToTab::Navigate { url }),
+            Some(post) => handle.send(ShellToTab::NavigateWithBody { url, post, referrer: referrer.unwrap_or_default() }),
+            None => match referrer {
+                Some(referrer) => handle.send(ShellToTab::NavigateFrom { url, referrer }),
+                None => handle.send(ShellToTab::Navigate { url }),
+            },
         }
         self.tabs.push(Tab {
             handle,
@@ -412,7 +418,7 @@ impl App {
     /// A fresh empty tab with the address bar ready for typing.
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("static url");
-        if let Err(e) = self.open_tab(url, true, None) {
+        if let Err(e) = self.open_tab(url, true, None, None) {
             tracing::error!("open tab: {e}");
             return;
         }
@@ -828,14 +834,14 @@ impl ApplicationHandler<UserEvent> for App {
                     active.window.set_cursor(cursor);
                 }
             }
-            TabOutput::Message(TabToShell::OpenInNewTab { url }) => {
-                if let Err(e) = self.open_tab(url, false, None) {
+            TabOutput::Message(TabToShell::OpenInNewTab { url, referrer }) => {
+                if let Err(e) = self.open_tab(url, false, None, Some(referrer)) {
                     tracing::error!("open tab: {e}");
                 }
             }
             // A form's new navigable is shown, as browsers show it.
-            TabOutput::Message(TabToShell::OpenFormSubmission { url, post }) => {
-                if let Err(e) = self.open_tab(url, true, post) {
+            TabOutput::Message(TabToShell::OpenFormSubmission { url, post, referrer }) => {
+                if let Err(e) = self.open_tab(url, true, post, Some(referrer)) {
                     tracing::error!("open tab: {e}");
                 }
             }

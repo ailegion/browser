@@ -358,8 +358,26 @@ struct ModuleMap {
     base: Option<Url>,
     modules: RefCell<HashMap<Url, Module>>,
     failed: RefCell<HashMap<Url, String>>,
-    /// URLs asked for that are in neither map, since last taken.
-    missing: RefCell<Vec<Url>>,
+    /// Modules asked for that are in neither map, since last taken.
+    missing: RefCell<Vec<ModuleFetch>>,
+    /// Each module's (and classic script's) fetch options' referrer
+    /// policy, by URL: an import's fetch takes its importer's (HTML's
+    /// descendant script fetch options).
+    policies: RefCell<HashMap<Url, browser_ipc_types::ReferrerPolicy>>,
+    /// The policy of the graph `poll_module` is loading, for imports from
+    /// its inline root (whose path is the document's URL).
+    graph_policy: std::cell::Cell<browser_ipc_types::ReferrerPolicy>,
+}
+
+/// A module the map needs fetched: its URL, the `Referer` source (the
+/// importing module's or classic script's URL; none for the document's,
+/// an inline script) and the referrer policy of its fetch options
+/// (`Empty`: the document's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleFetch {
+    pub url: Url,
+    pub referrer: Option<Url>,
+    pub policy: browser_ipc_types::ReferrerPolicy,
 }
 
 impl std::fmt::Debug for ModuleMap {
@@ -380,10 +398,15 @@ impl ModuleLoader for ModuleMap {
     ) -> impl Future<Output = JsResult<Module>> {
         let specifier = request.specifier().to_std_string_escaped();
         // A module's path is its URL (see `ScriptHost::parse_module`).
-        let base = referrer
-            .path()
-            .and_then(|p| Url::parse(&p.to_string_lossy()).ok())
-            .or_else(|| self.base.clone());
+        let importer = referrer.path().and_then(|p| Url::parse(&p.to_string_lossy()).ok());
+        let base = importer.clone().or_else(|| self.base.clone());
+        // The import's fetch options: its importer's referrer policy (an
+        // inline root's is the graph's), and the importer as `Referer`.
+        let policy = importer
+            .as_ref()
+            .and_then(|u| self.policies.borrow().get(u).copied())
+            .unwrap_or(self.graph_policy.get());
+        let referrer_url = importer.filter(|u| Some(u) != self.base.as_ref());
         let result = match resolve_module_specifier(&specifier, base.as_ref()) {
             None => Err(JsNativeError::typ()
                 .with_message(format!(
@@ -396,7 +419,12 @@ impl ModuleLoader for ModuleMap {
                 } else if let Some(why) = self.failed.borrow().get(&url) {
                     Err(JsNativeError::typ().with_message(why.clone()).into())
                 } else {
-                    self.missing.borrow_mut().push(url.clone());
+                    self.policies.borrow_mut().entry(url.clone()).or_insert(policy);
+                    self.missing.borrow_mut().push(ModuleFetch {
+                        url: url.clone(),
+                        referrer: referrer_url,
+                        policy,
+                    });
                     Err(JsNativeError::typ()
                         .with_message(format!("module {url} is not loaded yet"))
                         .into())
@@ -426,6 +454,8 @@ pub struct ModuleScript {
     module: Module,
     url: Url,
     ready: bool,
+    /// Its element's `referrerpolicy`.
+    policy: browser_ipc_types::ReferrerPolicy,
 }
 
 impl std::fmt::Debug for ModuleScript {
@@ -455,7 +485,7 @@ pub enum ModuleProgress {
     Ready,
     /// These modules are not in the map; fetch them and poll again once
     /// they have been passed to `module_fetched`.
-    Fetch(Vec<Url>),
+    Fetch(Vec<ModuleFetch>),
     /// The graph cannot load: a specifier that does not resolve, a fetch
     /// that failed, or a dependency that does not parse.
     Failed(String),
@@ -477,6 +507,8 @@ pub struct DocumentInfo {
     pub charset: String,
     /// Whether the parser put the document in quirks mode.
     pub quirks: bool,
+    /// The referrer the document's load determined (`document.referrer`).
+    pub referrer: Option<Url>,
 }
 
 /// Something a script asked of the document or the tab, collected for
@@ -622,6 +654,7 @@ pub(crate) const DOC_TITLE: u8 = 2;
 pub(crate) const DOC_CHARSET: u8 = 3;
 pub(crate) const DOC_COMPAT_MODE: u8 = 4;
 pub(crate) const DOC_DOMAIN: u8 = 5;
+pub(crate) const DOC_REFERRER: u8 = 6;
 
 pub(crate) fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut Context) -> JsResult<JsValue> {
     let host = host_state(context)?;
@@ -639,6 +672,9 @@ pub(crate) fn document_get(_: &JsValue, _: &[JsValue], part: &u8, context: &mut 
                 _ => "",
             })
         }
+        // The serialization of the referrer the document's load
+        // determined; empty for none (DOM §3.1.4, HTML §7.5.1 step 14).
+        DOC_REFERRER => js_str(info.referrer.as_ref().map_or("", |u| u.as_str())),
         _ => js_str(&info.title),
     })
 }
@@ -878,6 +914,7 @@ impl ScriptHost {
                 user_agent: user_agent.to_owned(),
                 charset: "UTF-8".to_owned(),
                 quirks: false,
+                referrer: None,
             },
             requests: Vec::new(),
             cookies: None,
@@ -1223,6 +1260,12 @@ impl ScriptHost {
         self.host.borrow_mut().cookies = Some(access);
     }
 
+    /// The document's referrer (`document.referrer`), set once its load
+    /// committed.
+    pub fn set_document_referrer(&mut self, referrer: Option<Url>) {
+        self.host.borrow_mut().info.referrer = referrer;
+    }
+
     pub fn set_document_info(&mut self, url: Option<Url>, title: String, ready_state: &str, charset: &str, quirks: bool) {
         let mut state = self.host.borrow_mut();
         state.info.url = url;
@@ -1268,12 +1311,17 @@ impl ScriptHost {
     /// Run a classic script as a task: evaluate it, then a microtask
     /// checkpoint. An uncaught error goes to the console.
     pub fn run_script(&mut self, source: &str) {
-        self.run_script_from(source, None);
+        self.run_script_from(source, None, browser_ipc_types::ReferrerPolicy::Empty);
     }
 
     /// `run_script` for an external script: its URL names it in errors
     /// and is the base for dynamic imports from it.
-    pub fn run_script_from(&mut self, source: &str, url: Option<&Url>) {
+    /// `policy`: the element's `referrerpolicy`, which a dynamic
+    /// `import()` from the script inherits.
+    pub fn run_script_from(&mut self, source: &str, url: Option<&Url>, policy: browser_ipc_types::ReferrerPolicy) {
+        if let Some(url) = url {
+            self.modules.policies.borrow_mut().insert(url.clone(), policy);
+        }
         let result = match url {
             Some(url) => self
                 .context
@@ -1293,16 +1341,20 @@ impl ScriptHost {
     /// `register`ed in the map under it so other modules can import it,
     /// an inline one (whose URL is the document's) is not. A syntax error
     /// is returned as its message.
-    pub fn parse_module(&mut self, source: &str, url: &Url, register: bool) -> Result<ModuleScript, String> {
+    /// `policy` is the script element's `referrerpolicy` (its fetch
+    /// options'), which the graph's imports inherit.
+    pub fn parse_module(&mut self, source: &str, url: &Url, register: bool, policy: browser_ipc_types::ReferrerPolicy) -> Result<ModuleScript, String> {
         let src = Source::from_bytes(source.as_bytes()).with_path(Path::new(url.as_str()));
         let module = Module::parse(src, None, &mut self.context).map_err(|e| e.to_string())?;
         if register {
             self.modules.modules.borrow_mut().insert(url.clone(), module.clone());
+            self.modules.policies.borrow_mut().insert(url.clone(), policy);
         }
         Ok(ModuleScript {
             module,
             url: url.clone(),
             ready: false,
+            policy,
         })
     }
 
@@ -1336,11 +1388,11 @@ impl ScriptHost {
     /// the last call: the tab fetches them and answers with
     /// `module_fetched`. `poll_module` takes its own; this catches the
     /// rest, such as a dynamic `import()` from a running script.
-    pub fn take_module_requests(&mut self) -> Vec<Url> {
+    pub fn take_module_requests(&mut self) -> Vec<ModuleFetch> {
         let mut seen = HashSet::new();
         std::mem::take(&mut *self.modules.missing.borrow_mut())
             .into_iter()
-            .filter(|u| seen.insert(u.clone()))
+            .filter(|m| seen.insert(m.url.clone()))
             .collect()
     }
 
@@ -1351,8 +1403,11 @@ impl ScriptHost {
         if script.ready {
             return ModuleProgress::Ready;
         }
+        // Imports from the graph's inline root take the root's policy.
+        self.modules.graph_policy.set(script.policy);
         let promise = script.module.load(&mut self.context);
         self.microtask_checkpoint();
+        self.modules.graph_policy.set(browser_ipc_types::ReferrerPolicy::Empty);
         match promise.state() {
             PromiseState::Fulfilled(_) => {
                 script.ready = true;
@@ -2221,6 +2276,7 @@ mod tests {
                 "import { a } from './a.js'; import b from 'https://cdn.test/b.js'; console.log('root', a, b); export const done = true;",
                 &main,
                 true,
+                browser_ipc_types::ReferrerPolicy::Origin,
             )
             .expect("parses");
         assert!(!root.is_ready());
@@ -2229,12 +2285,19 @@ mod tests {
             panic!("expected a fetch round")
         };
         assert_eq!(urls.len(), 2, "{urls:?}");
+        // Each with its importer as referrer and the root's policy.
+        let fetch = |u: &Url, from: &Url| ModuleFetch { url: u.clone(), referrer: Some(from.clone()), policy: browser_ipc_types::ReferrerPolicy::Origin };
+        assert!(urls.contains(&fetch(&a, &main)) && urls.contains(&fetch(&b, &main)), "{urls:?}");
+        let urls: Vec<Url> = urls.into_iter().map(|m| m.url).collect();
         assert!(urls.contains(&a) && urls.contains(&b), "{urls:?}");
         // Round two: `a` is in and wants `c`; `b` is still missing.
         h.module_fetched(a.clone(), Ok("import { c } from '../c.js'; export const a = c + 1;".to_owned()));
         let ModuleProgress::Fetch(urls) = h.poll_module(&mut root) else {
             panic!("expected a second fetch round")
         };
+        // `c` is `a`'s import: `a` is its referrer, the policy inherited.
+        assert!(urls.contains(&fetch(&c, &a)), "{urls:?}");
+        let urls: Vec<Url> = urls.into_iter().map(|m| m.url).collect();
         assert!(urls.contains(&c) && urls.contains(&b), "{urls:?}");
         assert!(!urls.contains(&a), "{urls:?}");
         h.module_fetched(b.clone(), Ok("export default 'B';".to_owned()));
@@ -2253,7 +2316,7 @@ mod tests {
 
         // A bare specifier does not resolve.
         let mut bare = h
-            .parse_module("import x from 'lodash';", &url("https://example.test/app/bare.js"), false)
+            .parse_module("import x from 'lodash';", &url("https://example.test/app/bare.js"), false, browser_ipc_types::ReferrerPolicy::Empty)
             .expect("parses");
         let ModuleProgress::Failed(why) = h.poll_module(&mut bare) else {
             panic!("bare specifier must fail")
@@ -2263,9 +2326,16 @@ mod tests {
         // A fetch that failed fails the importer with the reason.
         let gone = url("https://example.test/app/gone.js");
         let mut importer = h
-            .parse_module("import './gone.js';", &url("https://example.test/app/i.js"), false)
+            .parse_module("import './gone.js';", &url("https://example.test/app/i.js"), false, browser_ipc_types::ReferrerPolicy::Empty)
             .expect("parses");
-        assert_eq!(h.poll_module(&mut importer), ModuleProgress::Fetch(vec![gone.clone()]));
+        assert_eq!(
+            h.poll_module(&mut importer),
+            ModuleProgress::Fetch(vec![ModuleFetch {
+                url: gone.clone(),
+                referrer: Some(url("https://example.test/app/i.js")),
+                policy: browser_ipc_types::ReferrerPolicy::Empty,
+            }])
+        );
         h.module_fetched(gone, Err("HTTP 404".to_owned()));
         let ModuleProgress::Failed(why) = h.poll_module(&mut importer) else {
             panic!("failed fetch must fail the graph")
@@ -2276,7 +2346,7 @@ mod tests {
         // syntax error; a root that does not parse fails at once.
         let broken = url("https://example.test/app/broken.js");
         let mut importer = h
-            .parse_module("import './broken.js';", &url("https://example.test/app/j.js"), false)
+            .parse_module("import './broken.js';", &url("https://example.test/app/j.js"), false, browser_ipc_types::ReferrerPolicy::Empty)
             .expect("parses");
         assert!(matches!(h.poll_module(&mut importer), ModuleProgress::Fetch(_)));
         h.module_fetched(broken, Ok("export {".to_owned()));
@@ -2285,14 +2355,14 @@ mod tests {
         };
         assert!(why.contains("SyntaxError") && why.contains("broken.js"), "{why}");
         let err = h
-            .parse_module("import {", &url("https://example.test/app/k.js"), false)
+            .parse_module("import {", &url("https://example.test/app/k.js"), false, browser_ipc_types::ReferrerPolicy::Empty)
             .map(|_| ())
             .expect_err("syntax error");
         assert!(err.contains("SyntaxError"), "{err}");
 
         // A throw at the top level of a module is reported.
         let mut thrower = h
-            .parse_module("throw new RangeError('boom')", &url("https://example.test/app/t.js"), false)
+            .parse_module("throw new RangeError('boom')", &url("https://example.test/app/t.js"), false, browser_ipc_types::ReferrerPolicy::Empty)
             .expect("parses");
         assert_eq!(h.poll_module(&mut thrower), ModuleProgress::Ready);
         h.run_module(thrower);

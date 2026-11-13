@@ -292,7 +292,7 @@ pub struct ComputedStyle {
     pub box_decoration_break: BoxDecorationBreak,
     pub list_style_type: ListStyleType,
     pub list_style_position: ListStylePosition,
-    pub list_style_image: Option<Arc<str>>,
+    pub list_style_image: Option<crate::properties::CssUrl>,
     /// Generated content ("Working sites first" 6e): `content` (its
     /// `attr()`s resolved against the element by the cascade), `quotes`
     /// (inherited) and the counter properties.

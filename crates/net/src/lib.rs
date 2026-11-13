@@ -17,7 +17,7 @@ mod decode;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use browser_ipc_types::{NetToTab, RequestId};
+use browser_ipc_types::{NetToTab, ReferrerPolicy, RequestId};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Full};
@@ -69,6 +69,11 @@ pub struct FetchRequest {
     pub credentials: Credentials,
     /// Whether redirects are followed here or handed back.
     pub redirect: Redirect,
+    /// Where the `Referer` comes from, and the policy (Fetch's request
+    /// referrer and referrer policy); none for no referrer. Each hop
+    /// determines it again from what the last one determined, under the
+    /// policy a redirect may change (`Referrer-Policy` on the redirect).
+    pub referrer: Option<browser_ipc_types::RequestReferrer>,
 }
 
 /// What a redirect response does: followed (up to the limit), or
@@ -113,6 +118,27 @@ impl FetchRequest {
             cache: CacheMode::Default,
             credentials: Credentials::Include,
             redirect: Redirect::Follow,
+            referrer: None,
+        }
+    }
+}
+
+/// Fetch's main fetch, step 9: the request's referrer determined for
+/// the hop to `url`, which becomes the request's referrer from then on
+/// (a later hop starts from it, not from the page).
+fn determine_referrer(
+    referrer: &mut Option<browser_ipc_types::RequestReferrer>,
+    url: &Url,
+) -> Option<Url> {
+    let r = referrer.as_mut()?;
+    match browser_ipc_types::referrer::determine(&r.source, r.policy, url) {
+        Some(u) => {
+            r.source = u.clone();
+            Some(u)
+        }
+        None => {
+            *referrer = None;
+            None
         }
     }
 }
@@ -209,7 +235,9 @@ impl NetService {
     /// `ResponseEnd` or `Failed`.
     pub fn fetch(&self, id: RequestId, request: FetchRequest, sink: Sink) {
         if request.url.scheme() == "data" {
-            fetch_data_url(id, &request.url, &sink);
+            let mut referrer = request.referrer.clone();
+            let referrer = determine_referrer(&mut referrer, &request.url);
+            fetch_data_url(id, &request.url, referrer, &sink);
             return;
         }
         let client = self.client.clone();
@@ -275,6 +303,7 @@ async fn run(
     // HTTP-redirect fetch, the request-body-header names), and so does
     // `Origin`, which a GET navigation does not send.
     let mut made_get = false;
+    let mut referrer = request.referrer.clone();
 
     for _ in 0..=MAX_REDIRECTS {
         match url.scheme() {
@@ -282,6 +311,7 @@ async fn run(
             other => return Err(FetchError::Scheme(other.to_owned())),
         }
         let uri: Uri = url.as_str().parse().map_err(|_| FetchError::Url)?;
+        let hop_referrer = determine_referrer(&mut referrer, &url);
 
         let mut headers = HeaderMap::new();
         headers.insert(header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
@@ -312,6 +342,13 @@ async fn run(
                 headers.insert(name, value);
             }
         }
+        // Fetch's HTTP-network-or-cache fetch, step 11: a referrer that is
+        // a URL goes as `Referer`, serialized.
+        if let Some(r) = &hop_referrer
+            && let Ok(value) = HeaderValue::from_str(r.as_str())
+        {
+            headers.insert(header::REFERER, value);
+        }
         let credentials = request.credentials.allows(&url);
         if credentials
             && let Some(cookie) = shared.cookies().cookie_header(&url, SystemTime::now())
@@ -327,7 +364,7 @@ async fn run(
         if method == Method::GET {
             match shared.cache().lookup(&key, &request_headers, mode, Instant::now()) {
                 Lookup::Fresh(cached) => {
-                    serve_cached(id, &url, cached, sink);
+                    serve_cached(id, &url, cached, hop_referrer.clone(), sink);
                     return Ok(());
                 }
                 Lookup::Stale { etag, last_modified } => {
@@ -377,7 +414,7 @@ async fn run(
         if status == StatusCode::NOT_MODIFIED && conditional {
             let head = header_list(response.headers());
             if let Some(cached) = shared.cache().revalidated(&key, &head, timing) {
-                serve_cached(id, &url, cached, sink);
+                serve_cached(id, &url, cached, hop_referrer.clone(), sink);
                 return Ok(());
             }
             // The entry went away between lookup and answer: fetch it plain.
@@ -398,6 +435,16 @@ async fn run(
                 made_get |= method != Method::GET;
                 method = Method::GET;
                 body = None;
+            }
+            // Fetch's HTTP-redirect fetch, step 19: the redirect's own
+            // `Referrer-Policy` becomes the request's policy.
+            let policy = ReferrerPolicy::from_headers(
+                response.headers().iter().filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?))),
+            );
+            if policy != ReferrerPolicy::Empty
+                && let Some(r) = &mut referrer
+            {
+                r.policy = policy;
             }
             url = next;
             continue;
@@ -428,6 +475,7 @@ async fn run(
             status_text: status_text.clone(),
             headers: headers.clone(),
             final_url: url.clone(),
+            referrer: hop_referrer.clone().map(Box::new),
         });
 
         // A copy of the decoded body is kept for the cache while it stays
@@ -479,7 +527,7 @@ fn keep_copy(copy: &mut Option<Vec<u8>>, out: &[u8], max_entry: usize) {
 }
 
 /// Deliver a cached response as if it had just arrived.
-fn serve_cached(id: RequestId, url: &Url, cached: CachedResponse, sink: &Sink) {
+fn serve_cached(id: RequestId, url: &Url, cached: CachedResponse, referrer: Option<Url>, sink: &Sink) {
     let mut headers = cached.headers;
     headers.push(("age".to_owned(), cached.age.to_string()));
     sink(NetToTab::ResponseStart {
@@ -488,6 +536,7 @@ fn serve_cached(id: RequestId, url: &Url, cached: CachedResponse, sink: &Sink) {
         status_text: cached.status_text,
         headers,
         final_url: url.clone(),
+        referrer: referrer.map(Box::new),
     });
     if !cached.body.is_empty() {
         sink(NetToTab::ResponseChunk {
@@ -506,7 +555,7 @@ fn header_list(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 /// `data:` URLs are answered synchronously from the caller's thread.
-fn fetch_data_url(id: RequestId, url: &Url, sink: &Sink) {
+fn fetch_data_url(id: RequestId, url: &Url, referrer: Option<Url>, sink: &Sink) {
     let parsed = data_url::DataUrl::process(url.as_str());
     let (bytes, mime) = match parsed.and_then(|d| {
         let mime = d.mime_type().to_string();
@@ -527,6 +576,7 @@ fn fetch_data_url(id: RequestId, url: &Url, sink: &Sink) {
         status_text: "OK".to_owned(),
         headers: vec![("content-type".to_owned(), mime)],
         final_url: url.clone(),
+        referrer: referrer.map(Box::new),
     });
     sink(NetToTab::ResponseChunk { id, bytes });
     sink(NetToTab::ResponseEnd { id });
@@ -554,7 +604,7 @@ mod tests {
         let e2 = events.clone();
         let sink: Sink = Arc::new(move |ev| e2.lock().unwrap().push(ev));
         let url = Url::parse("data:text/plain;base64,aGVsbG8=").unwrap();
-        fetch_data_url(RequestId(1), &url, &sink);
+        fetch_data_url(RequestId(1), &url, None, &sink);
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 3);
         match &events[1] {
@@ -751,6 +801,27 @@ mod tests {
         assert!(!heads[0].contains("cookie:"));
         assert!(heads[1].contains("cookie: sid=abc\r\n"), "{}", heads[1]);
         assert_eq!(svc.cookies().len(), 2);
+    }
+
+    #[test]
+    fn the_referer_is_determined_per_hop_and_a_redirect_sets_the_policy() {
+        let b = Server::start(vec![response("200 OK", &[], "b"), response("200 OK", &[], "c")]);
+        let location = format!("Location: {}", b.url("/next"));
+        let a = Server::start(vec![response("302 Found", &[&location, "Referrer-Policy: bogus, origin"], "")]);
+        let svc = NetService::new().unwrap();
+        let mut request = FetchRequest::get(a.url("/start"));
+        request.referrer = Some(browser_ipc_types::RequestReferrer {
+            source: Url::parse("http://u:p@127.0.0.1:9/page?q=1#frag").unwrap(),
+            policy: ReferrerPolicy::UnsafeUrl,
+        });
+        assert_eq!(fetch(&svc, request).unwrap().body, b"b");
+        // The first hop: the whole URL, stripped; the second, under the
+        // redirect's `origin`.
+        assert!(a.heads()[0].contains("referer: http://127.0.0.1:9/page?q=1\r\n"), "{}", a.heads()[0]);
+        assert!(b.heads()[0].contains("referer: http://127.0.0.1:9/\r\n"), "{}", b.heads()[0]);
+        // No referrer, no header.
+        assert_eq!(fetch(&svc, FetchRequest::get(b.url("/plain"))).unwrap().body, b"c");
+        assert!(!b.heads()[1].contains("referer:"), "{}", b.heads()[1]);
     }
 
     #[test]

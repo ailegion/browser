@@ -40,6 +40,11 @@ pub struct Stylesheet {
     /// `@import` URLs found at the top of the sheet, in order. The loader
     /// fetches them and inserts the resulting sheets before this one.
     pub imports: Vec<(String, MediaQueryList)>,
+    /// An external sheet's URL and its response's referrer policy: the
+    /// `Referer` of what it fetches (its `url()`s, `@font-face` sources
+    /// and `@import`s); none for an inline sheet, whose fetches are the
+    /// document's.
+    pub referrer: Option<Arc<browser_ipc_types::RequestReferrer>>,
 }
 
 impl Stylesheet {
@@ -47,9 +52,27 @@ impl Stylesheet {
         Self::parse_with_base(css, origin, None)
     }
 
+    /// Parse an external sheet fetched from `url`: URLs resolve against
+    /// `url`, and its fetches carry `referrer` (the sheet's response URL
+    /// and the policy its response gave, `Empty` without one).
+    pub fn parse_external(css: &str, origin: Origin, url: &url::Url, referrer: browser_ipc_types::RequestReferrer) -> Self {
+        let mut sheet = Self::parse_unresolved(css, origin);
+        sheet.referrer = Some(Arc::new(referrer));
+        sheet.resolve_urls(url);
+        sheet
+    }
+
     /// Parse, resolving `url()` values and `@import` targets against the
     /// sheet's own URL so they are absolute from here on.
     pub fn parse_with_base(css: &str, origin: Origin, base: Option<&url::Url>) -> Self {
+        let mut sheet = Self::parse_unresolved(css, origin);
+        if let Some(base) = base {
+            sheet.resolve_urls(base);
+        }
+        sheet
+    }
+
+    fn parse_unresolved(css: &str, origin: Origin) -> Self {
         let mut input = ParserInput::new(css);
         let mut parser = Parser::new(&mut input);
         let mut rule_parser = TopLevel {
@@ -63,25 +86,23 @@ impl Stylesheet {
                 Err(_) => {} // invalid rule: skipped, as the spec requires
             }
         }
-        let mut sheet = Self {
+        Self {
             origin,
             rules,
             imports: rule_parser.imports,
-        };
-        if let Some(base) = base {
-            sheet.resolve_urls(base);
+            referrer: None,
         }
-        sheet
     }
 
     fn resolve_urls(&mut self, base: &url::Url) {
-        fn walk(rules: &mut [Rule], base: &url::Url) {
+        fn walk(rules: &mut [Rule], base: &url::Url, referrer: Option<&Arc<browser_ipc_types::RequestReferrer>>) {
             for r in rules {
                 match r {
-                    Rule::Style(s) => resolve_declaration_urls(&mut s.declarations, base),
-                    Rule::Media(_, inner) => walk(inner, base),
+                    Rule::Style(s) => resolve_declaration_urls_from(&mut s.declarations, base, referrer),
+                    Rule::Media(_, inner) => walk(inner, base, referrer),
                     Rule::FontFace(face) => {
                         let face = Arc::make_mut(face);
+                        face.referrer = referrer.cloned();
                         for s in &mut face.sources {
                             if let crate::fontface::FontSource::Url { url, .. } = s
                                 && let Ok(abs) = base.join(url)
@@ -93,7 +114,8 @@ impl Stylesheet {
                 }
             }
         }
-        walk(&mut self.rules, base);
+        let referrer = self.referrer.clone();
+        walk(&mut self.rules, base, referrer.as_ref());
         for (u, _) in &mut self.imports {
             if let Ok(abs) = base.join(u) {
                 *u = abs.to_string();
@@ -123,59 +145,94 @@ impl Stylesheet {
 /// the text of custom properties and `var()` values, which is parsed
 /// later per element.
 pub fn resolve_declaration_urls(decls: &mut [Declaration], base: &url::Url) {
-    use crate::properties::{ImageValue, PropertyDeclaration as P};
-    let join = |u: &mut Arc<str>| {
+    resolve_declaration_urls_from(decls, base, None);
+}
+
+/// `resolve_declaration_urls` for an external sheet's declarations: each
+/// `url()` also takes the sheet's `referrer`, and so does a `var()`
+/// value, for the URLs its substitution parses later.
+pub fn resolve_declaration_urls_from(
+    decls: &mut [Declaration],
+    base: &url::Url,
+    referrer: Option<&Arc<browser_ipc_types::RequestReferrer>>,
+) {
+    let mut values: Vec<&mut DeclaredValue> = decls.iter_mut().map(|d| &mut d.value).collect();
+    visit_values(&mut values, &mut |u| {
         if let Ok(abs) = base.join(u) {
-            *u = Arc::from(abs.as_str());
+            u.url = Arc::from(abs.as_str());
         }
-    };
-    fn image(img: &mut ImageValue, join: &dyn Fn(&mut Arc<str>), base: &url::Url) {
+        u.referrer = referrer.cloned();
+    }, &mut |text| {
+        if let Some(resolved) = crate::custom::resolve_urls(text, base) {
+            *text = Arc::from(resolved);
+        }
+    });
+    for v in values {
+        if let DeclaredValue::Pending { referrer: r, .. } = v {
+            *r = referrer.cloned();
+        }
+    }
+}
+
+/// Give the `url()`s a `var()` substitution parsed (`values`) the
+/// referrer of the declaration that held the `var()`; none leaves them
+/// to the document's.
+pub fn stamp_referrer(values: &mut [DeclaredValue], referrer: Option<&Arc<browser_ipc_types::RequestReferrer>>) {
+    let Some(referrer) = referrer else { return };
+    let mut refs: Vec<&mut DeclaredValue> = values.iter_mut().collect();
+    visit_values(&mut refs, &mut |u| u.referrer = Some(referrer.clone()), &mut |_| {});
+}
+
+/// Every `url()` of the values (background and mask images,
+/// `image-set()` candidates, `list-style-image`, `content` images,
+/// `cursor` images) to `url`, and every text that may hold URLs (image
+/// functions kept as written, custom properties, `var()` values) to
+/// `text`.
+fn visit_values(
+    values: &mut [&mut DeclaredValue],
+    url: &mut dyn FnMut(&mut crate::properties::CssUrl),
+    text: &mut dyn FnMut(&mut Arc<str>),
+) {
+    use crate::properties::{ImageValue, PropertyDeclaration as P};
+    fn image(img: &mut ImageValue, url: &mut dyn FnMut(&mut crate::properties::CssUrl), text: &mut dyn FnMut(&mut Arc<str>)) {
         match img {
-            ImageValue::Url(u) => join(u),
+            ImageValue::Url(u) => url(u),
             ImageValue::ImageSet(set) => {
                 for c in Arc::make_mut(set) {
-                    image(&mut c.image, join, base);
+                    image(&mut c.image, url, text);
                 }
             }
-            ImageValue::Function(text) => {
-                if let Some(resolved) = crate::custom::resolve_urls(text, base) {
-                    *text = Arc::from(resolved);
-                }
-            }
+            ImageValue::Function(t) => text(t),
             ImageValue::None | ImageValue::Gradient(_) => {}
         }
     }
-    for d in decls {
-        match &mut d.value {
+    for v in values.iter_mut() {
+        match &mut **v {
             DeclaredValue::Value(P::BackgroundImage(images) | P::MaskImage(images)) => {
                 for img in images {
-                    image(img, &join, base);
+                    image(img, url, text);
                 }
             }
-            DeclaredValue::Value(P::ListStyleImage(img)) => image(img, &join, base),
+            DeclaredValue::Value(P::ListStyleImage(img)) => image(img, url, text),
             DeclaredValue::Value(P::Content(crate::content::ContentValue::List(items, _))) => {
                 if items.iter().any(|i| matches!(i, crate::content::ContentItem::Image(_))) {
                     for item in Arc::make_mut(items) {
                         if let crate::content::ContentItem::Image(img) = item {
-                            image(img, &join, base);
+                            image(img, url, text);
                         }
                     }
                 }
             }
             DeclaredValue::Value(P::Cursor(c)) => {
                 for i in &mut c.images {
-                    join(&mut i.url);
+                    url(&mut i.url);
                 }
             }
             DeclaredValue::Custom {
                 value: CustomValue::Raw(raw),
                 ..
             }
-            | DeclaredValue::Pending { raw, .. } => {
-                if let Some(resolved) = crate::custom::resolve_urls(raw, base) {
-                    *raw = Arc::from(resolved);
-                }
-            }
+            | DeclaredValue::Pending { raw, .. } => text(raw),
             _ => {}
         }
     }
@@ -211,6 +268,7 @@ pub fn parse_declaration_value(name: &str, value: &str) -> Option<Vec<DeclaredVa
         return Some(vec![DeclaredValue::Pending {
             name: Arc::from(name),
             raw: Arc::from(raw),
+            referrer: None,
         }]);
     }
     let mut input = ParserInput::new(raw);
@@ -543,6 +601,7 @@ impl<'i> DeclarationParser<'i> for Body {
             vec![DeclaredValue::Pending {
                 name: Arc::from(&*name),
                 raw: Arc::from(raw),
+                referrer: None,
             }]
         } else {
             input.reset(&start);

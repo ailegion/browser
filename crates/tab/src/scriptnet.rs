@@ -192,11 +192,15 @@ pub(crate) struct Job {
     /// With integrity metadata: the head and the body so far, held until
     /// the body is whole and checked.
     held: Option<(NetResponseHead, Vec<u8>)>,
+    /// The request's referrer and policy (none: no referrer): each hop
+    /// determines it again from what the last one determined, under the
+    /// policy a redirect's `Referrer-Policy` may have set.
+    referrer: Option<browser_ipc_types::RequestReferrer>,
 }
 
 impl Job {
     /// Start `request` for a document at `document_url`.
-    pub(crate) fn start(request: NetRequest, document_url: &Url, preflights: &mut PreflightCache) -> (Self, Vec<Action>) {
+    pub(crate) fn start(request: NetRequest, document_url: &Url, referrer: Option<browser_ipc_types::RequestReferrer>, preflights: &mut PreflightCache) -> (Self, Vec<Action>) {
         let mut job = Self {
             origin: document_url.origin(),
             url: request.url.clone(),
@@ -210,6 +214,7 @@ impl Job {
             streaming: false,
             discard_body: false,
             held: None,
+            referrer,
             request,
         };
         let actions = job.main_fetch(preflights);
@@ -243,7 +248,9 @@ impl Job {
             // A `data:` URL is its own response, whatever the mode.
             "data" => {
                 self.phase = Phase::Main;
-                return vec![Action::Send(FetchRequest::get(self.url.clone()))];
+                let mut request = FetchRequest::get(self.url.clone());
+                request.referrer = self.referrer.clone();
+                return vec![Action::Send(request)];
             }
             "about" if self.url.path() == "blank" && self.request.mode == RequestMode::NoCors => {
                 self.tainting = Tainting::Opaque;
@@ -303,6 +310,9 @@ impl Job {
         request.credentials = Credentials::Omit;
         request.cache = CacheMode::NoStore;
         request.redirect = Redirect::Manual;
+        // The preflight's referrer and policy are the request's (Fetch's
+        // CORS-preflight fetch).
+        request.referrer = self.referrer.clone();
         request
     }
 
@@ -316,6 +326,7 @@ impl Job {
         request.body = self.body.clone();
         request.redirect = Redirect::Manual;
         request.headers = self.headers.clone();
+        request.referrer = self.referrer.clone();
         let has = |headers: &[(String, String)], name: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
         if !has(&request.headers, "accept") {
             request.headers.push(("accept".to_owned(), "*/*".to_owned()));
@@ -423,10 +434,16 @@ impl Job {
         status: u16,
         status_text: String,
         headers: Vec<(String, String)>,
+        hop_referrer: Option<Url>,
         preflights: &mut PreflightCache,
     ) -> Vec<Action> {
         if self.phase == Phase::Preflight {
             return self.on_preflight(status, &headers, preflights);
+        }
+        // The hop determined the request's referrer (main fetch, step 9).
+        match (hop_referrer, &mut self.referrer) {
+            (Some(u), Some(r)) => r.source = u,
+            _ => self.referrer = None,
         }
         if self.url.scheme() == "data" {
             let head = NetResponseHead {
@@ -464,6 +481,14 @@ impl Job {
                 }
                 RedirectMode::Follow => {
                     if let Some(location) = location {
+                        // HTTP-redirect fetch, step 19: the redirect's own
+                        // `Referrer-Policy` becomes the request's.
+                        let policy = browser_ipc_types::ReferrerPolicy::from_headers(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                        if policy != browser_ipc_types::ReferrerPolicy::Empty
+                            && let Some(r) = &mut self.referrer
+                        {
+                            r.policy = policy;
+                        }
                         return self.redirect(status, &location, preflights);
                     }
                 }
@@ -689,6 +714,9 @@ pub(crate) struct BlockingNet {
     pub(crate) net: Arc<NetService>,
     pub(crate) document_url: Url,
     pub(crate) preflights: SharedPreflights,
+    /// The document's referrer for a request now (its URL and policy as
+    /// the tab last synced them, before each script runs).
+    pub(crate) referrer: std::rc::Rc<std::cell::RefCell<Option<browser_ipc_types::RequestReferrer>>>,
 }
 
 /// Request ids of blocking fetches; their answers never reach a tab's
@@ -702,7 +730,8 @@ impl SyncNet for BlockingNet {
             let _ = tx.send(event);
         });
         let lock = || self.preflights.lock().unwrap_or_else(|e| e.into_inner());
-        let (mut job, mut actions) = Job::start(request, &self.document_url, &mut lock());
+        let referrer = self.referrer.borrow().clone();
+        let (mut job, mut actions) = Job::start(request, &self.document_url, referrer, &mut lock());
         let mut current: Option<RequestId> = None;
         let mut head: Option<NetResponseHead> = None;
         let mut body = Vec::new();
@@ -727,8 +756,13 @@ impl SyncNet for BlockingNet {
             };
             actions = match event {
                 NetToTab::ResponseStart {
-                    id, status, status_text, headers, ..
-                } if Some(id) == current => job.on_start(status, status_text, headers, &mut lock()),
+                    id,
+                    status,
+                    status_text,
+                    headers,
+                    referrer,
+                    ..
+                } if Some(id) == current => job.on_start(status, status_text, headers, referrer.map(|r| *r), &mut lock()),
                 NetToTab::ResponseChunk { id, bytes } if Some(id) == current => job.on_chunk(bytes),
                 NetToTab::ResponseEnd { id } if Some(id) == current => job.on_end(),
                 NetToTab::Failed { id, error } if Some(id) == current => job.on_failed(error),

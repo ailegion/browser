@@ -452,6 +452,7 @@ impl View {
                 origin: Origin::Author,
                 rules: vec![Rule::Media(media.clone(), sheet.rules.clone())],
                 imports: Vec::new(),
+                referrer: sheet.referrer.clone(),
             }));
         }
     }

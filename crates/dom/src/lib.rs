@@ -285,8 +285,9 @@ pub struct Document {
     /// Tasks the image algorithms queued, for the tab to run.
     pub image_tasks: Vec<image::ImageTask>,
     /// URLs the image algorithms want fetched, with whether the fetch
-    /// waits for rendering and does not delay the load event.
-    pub image_fetches: Vec<(Url, bool)>,
+    /// waits for rendering and does not delay the load event, and the
+    /// `<img>`'s referrer policy then.
+    pub image_fetches: Vec<(Url, bool, browser_ipc_types::ReferrerPolicy)>,
     /// `<img>` elements whose current request or dimension attribute
     /// source changed: their boxes (and styles) are built again.
     pub images_changed: Vec<NodeId>,
@@ -315,6 +316,11 @@ pub struct Document {
     pending_radios: Vec<NodeId>,
     /// Controls whose shown state changed (`take_controls_changed`).
     controls_changed: Vec<NodeId>,
+    /// The referrer policy of the document's policy container: the tab
+    /// sets it from the response's `Referrer-Policy` before parsing; a
+    /// `<meta name=referrer>` inserted or changed later replaces it
+    /// (`meta_referrer`). `Empty` means the default.
+    pub referrer_policy: browser_ipc_types::ReferrerPolicy,
 }
 
 /// One change to the tree, as a `MutationObserver` is told of it (DOM
@@ -373,6 +379,49 @@ impl Document {
             pending_selects: Vec::new(),
             pending_radios: Vec::new(),
             controls_changed: Vec::new(),
+            referrer_policy: browser_ipc_types::ReferrerPolicy::Empty,
+        }
+    }
+
+    // ----- `<meta name=referrer>` (HTML §4.2.5.1) -----
+
+    /// A `<meta name=referrer>` was inserted into the document or had its
+    /// `name` or `content` changed: an element in the document tree whose
+    /// name matches (ASCII case-insensitively) and whose content is not
+    /// empty and names a policy (legacy keywords mapped) sets the
+    /// document's policy. The most recent one wins; a removal changes
+    /// nothing.
+    pub fn meta_referrer(&mut self, element: NodeId) {
+        let Some(e) = self.nodes.get(element).and_then(Node::as_element) else { return };
+        if e.name.ns != ns!(html) || e.name.local != local_name!("meta") {
+            return;
+        }
+        if !e.attr("name").is_some_and(|n| n.eq_ignore_ascii_case("referrer")) {
+            return;
+        }
+        let Some(content) = e.attr("content").filter(|c| !c.is_empty()) else { return };
+        let Some(policy) = browser_ipc_types::ReferrerPolicy::from_meta(content) else { return };
+        if !self.is_connected(element) {
+            return;
+        }
+        self.referrer_policy = policy;
+    }
+
+    /// `child` (and its subtree) was inserted under `parent`: each
+    /// `<meta>` that became connected, in tree order.
+    fn meta_inserted(&mut self, child: NodeId, parent: NodeId) {
+        let is_meta = |doc: &Self, id: NodeId| {
+            doc.nodes[id].as_element().is_some_and(|e| e.name.ns == ns!(html) && e.name.local == local_name!("meta"))
+        };
+        if is_meta(self, child) {
+            self.meta_referrer(child);
+        }
+        if self.nodes[child].first_child.is_none() || !self.is_connected(parent) {
+            return;
+        }
+        let metas: Vec<NodeId> = self.descendants(child).filter(|&d| is_meta(self, d)).collect();
+        for m in metas {
+            self.meta_referrer(m);
         }
     }
 
@@ -881,6 +930,7 @@ impl Document {
         self.nodes[parent].last_child = Some(child);
         self.picture_child_moved(child, parent);
         self.forms_inserted(child, parent);
+        self.meta_inserted(child, parent);
         self.log_child_list(parent, Some(child), None, last, None);
     }
 
@@ -980,6 +1030,7 @@ impl Document {
         }
         self.picture_child_moved(new, parent);
         self.forms_inserted(new, parent);
+        self.meta_inserted(new, parent);
         self.log_child_list(parent, Some(new), None, prev, Some(sibling));
     }
 

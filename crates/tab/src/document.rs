@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use browser_dom::{Document, HtmlParser, NodeId};
-use browser_ipc_types::{Cursor, Key, MouseButton, NetToTab, RequestId, ShellToTab, TabId, TabToShell, Viewport};
+use browser_ipc_types::{
+    Cursor, Key, MouseButton, NetToTab, ReferrerPolicy, RequestId, RequestReferrer, ShellToTab, TabId, TabToShell, Viewport,
+};
 use browser_layout::selection::{self, TextPos};
 use browser_layout::{LayoutEngine, LayoutTree, Rect, ScrollbarPart, SelectionRanges};
 use browser_net::{CacheMode, FetchRequest, NetService, Sink};
@@ -109,6 +111,8 @@ struct ScriptLoad {
     /// The `src`, for external scripts.
     url: Option<Url>,
     state: LoadState,
+    /// The element's `referrerpolicy` (its fetch options').
+    policy: ReferrerPolicy,
 }
 
 impl ScriptLoad {
@@ -380,6 +384,13 @@ struct HistoryEntry {
     scroll: Option<(f32, f32)>,
     /// `history.scrollRestoration` is `manual` for the entry.
     manual_scroll: bool,
+    /// Its document state's request referrer, as the load determined it
+    /// (none: no referrer), and the request referrer policy the
+    /// navigation was given (`Empty`: the source document's then). A
+    /// reload or a traversal that loads requests with them again (HTML
+    /// §7.4.5); entries of one document share them.
+    referrer: Option<Url>,
+    referrer_policy: ReferrerPolicy,
 }
 
 /// A request a script made (`fetch`, `XMLHttpRequest`) on its way through
@@ -408,7 +419,13 @@ struct PendingNav {
     request: RequestId,
     kind: NavKind,
     committed: bool,
+    /// Where its request's `Referer` came from, and the policy it was
+    /// given (for its history entry; a restarted load uses them again).
+    referrer: NavReferrer,
 }
+
+/// A navigation's referrer (`browser_ipc_types::NavigationReferrer`).
+type NavReferrer = browser_ipc_types::NavigationReferrer;
 
 /// Find in page: the query, its matches in tree order, and what to
 /// highlight, kept ready for every repaint.
@@ -473,7 +490,7 @@ pub(crate) struct TabState {
     failed_images: std::collections::HashSet<Url>,
     /// Image fetches that wait for their `<img>` to be rendered (one that
     /// allows auto-sizes, lazily loaded), with the URL they fetch.
-    deferred_images: Vec<(NodeId, Url)>,
+    deferred_images: Vec<(NodeId, Url, ReferrerPolicy)>,
     /// External sheets already parsed, by URL, so a script that adds a
     /// `<link>` or `<style>` again does not fetch again.
     loaded_sheets: std::collections::HashMap<Url, Arc<Stylesheet>>,
@@ -508,6 +525,14 @@ pub(crate) struct TabState {
     /// A script forced a layout that is still current: `dom_changed`
     /// need not schedule another.
     host_layout_fresh: bool,
+    /// The main response's `Referrer-Policy` (the document's policy
+    /// container's, until a `<meta name=referrer>` replaces it).
+    doc_header_policy: ReferrerPolicy,
+    /// The referrer the document's load determined: `document.referrer`.
+    document_referrer: Option<Url>,
+    /// The document's referrer for a synchronous `XMLHttpRequest`, kept
+    /// current by `sync_document_info`.
+    sync_referrer: std::rc::Rc<std::cell::RefCell<Option<RequestReferrer>>>,
 
     /// Interaction state behind `:hover`, `:active` and `:focus`, and how
     /// far a change in it reaches under the current sheets.
@@ -861,6 +886,9 @@ impl TabState {
             screen_size: (viewport.width, viewport.height),
             image_sizes: ImageSizeMap::default(),
             host_layout_fresh: false,
+            doc_header_policy: ReferrerPolicy::Empty,
+            document_referrer: None,
+            sync_referrer: Default::default(),
             states: ElementStates::default(),
             deps: InteractionDeps::default(),
             hover: None,
@@ -963,16 +991,22 @@ impl TabState {
             self.settle_composition();
         }
         match msg {
-            ShellToTab::Navigate { url } => self.go(url, NavKind::Push),
-            ShellToTab::NavigateWithBody { url, post } => {
+            // The user's own navigation: no referrer (HTML §7.4.5, a
+            // request with no client).
+            ShellToTab::Navigate { url } => self.go(url, NavKind::Push, NavReferrer::default()),
+            ShellToTab::NavigateFrom { url, referrer } => self.go(url, NavKind::Push, referrer),
+            ShellToTab::NavigateWithBody { url, post, referrer } => {
                 self.cancel_pending_nav();
-                self.navigate_with(url, NavKind::Push, Some(post));
+                self.navigate_with(url, NavKind::Push, Some(post), referrer);
             }
             ShellToTab::Reload => {
-                // Reloading while a navigation is pending restarts that one.
-                let url = self.nav.as_ref().map(|n| n.url.clone()).or_else(|| self.url.clone());
-                if let Some(url) = url {
-                    self.go(url, NavKind::Reload);
+                // Reloading while a navigation is pending restarts that one,
+                // with its referrer; else the entry's request referrer and
+                // policy are used again (HTML §7.4.3 reload, §7.4.5).
+                let pending = self.nav.as_ref().map(|n| (n.url.clone(), n.referrer.clone()));
+                let target = pending.or_else(|| self.url.clone().map(|u| (u, self.entry_referrer(self.history_index))));
+                if let Some((url, referrer)) = target {
+                    self.go(url, NavKind::Reload, referrer);
                 }
             }
             ShellToTab::Stop => self.stop(),
@@ -1575,10 +1609,10 @@ impl TabState {
         let encoding = doc.form_encoding(form);
         let entries = doc.construct_entry_list(form, submitter, encoding, coordinate.unwrap_or((0, 0)));
         let boundary = browser_dom::forms::new_boundary();
-        if let Some(browser_dom::forms::SubmitAction::Navigate { url, post, target, .. }) =
+        if let Some(browser_dom::forms::SubmitAction::Navigate { url, post, target, noreferrer }) =
             doc.submission_action(form, submitter, &entries, encoding, coordinate, &boundary)
         {
-            self.navigate_submission(url, post, &target);
+            self.navigate_submission(url, post, &target, noreferrer);
         }
     }
 
@@ -2064,7 +2098,92 @@ impl TabState {
     /// Follow a link the user clicked.
     fn follow_link(&mut self, link: NodeId) {
         if let Some(url) = self.link_target(link) {
-            self.go(url, NavKind::Push);
+            let referrer = self.link_referrer(link);
+            self.go(url, NavKind::Push, referrer);
+        }
+    }
+
+    // ----- referrers (plan O23) -----
+
+    /// The document's referrer policy now (its policy container's).
+    fn document_policy(&self) -> ReferrerPolicy {
+        match (&self.parser, &self.doc) {
+            (Some(parser), _) => parser.document().referrer_policy,
+            (None, Some(doc)) => doc.referrer_policy,
+            (None, None) => ReferrerPolicy::Empty,
+        }
+    }
+
+    /// Fetch's "client" referrer of a request the document makes: its
+    /// URL (none for an opaque origin), under `policy`, else the
+    /// document's own.
+    fn client_referrer(&self, policy: ReferrerPolicy) -> Option<RequestReferrer> {
+        let url = self.url.clone()?;
+        if !url.origin().is_tuple() {
+            return None;
+        }
+        Some(RequestReferrer {
+            source: url,
+            policy: policy.or(self.document_policy()),
+        })
+    }
+
+    /// A navigation the document starts with `policy` (an element's,
+    /// `Empty` for none).
+    fn page_referrer(&self, policy: ReferrerPolicy) -> NavReferrer {
+        NavReferrer {
+            request: if policy == ReferrerPolicy::NoReferrer { None } else { self.client_referrer(policy) },
+            policy,
+        }
+    }
+
+    /// The referrer of an `<a>` or `<area>`'s navigation: none for
+    /// `rel=noreferrer` (HTML §4.6.6.13: the policy `no-referrer`), else
+    /// its `referrerpolicy` (HTML §4.6.4 "follow the hyperlink").
+    fn link_referrer(&self, link: NodeId) -> NavReferrer {
+        let Some(e) = self.doc.as_ref().and_then(|d| d.element(link)) else { return self.page_referrer(ReferrerPolicy::Empty) };
+        let noreferrer = e.attr("rel").is_some_and(|r| r.split_ascii_whitespace().any(|t| t.eq_ignore_ascii_case("noreferrer")));
+        let policy = if noreferrer { ReferrerPolicy::NoReferrer } else { ReferrerPolicy::from_attribute(e.attr("referrerpolicy")) };
+        self.page_referrer(policy)
+    }
+
+    /// The referrer of a request for an element's resource (`<img>`,
+    /// `<script>`, `<link>`): its `referrerpolicy`, else the document's.
+    fn element_referrer(&self, element: Option<NodeId>) -> Option<RequestReferrer> {
+        let policy = element
+            .and_then(|el| match (&self.parser, &self.doc) {
+                (Some(parser), _) => parser.document().element(el).map(|e| ReferrerPolicy::from_attribute(e.attr("referrerpolicy"))),
+                (None, Some(doc)) => doc.element(el).map(|e| ReferrerPolicy::from_attribute(e.attr("referrerpolicy"))),
+                (None, None) => None,
+            })
+            .unwrap_or(ReferrerPolicy::Empty);
+        self.client_referrer(policy)
+    }
+
+    /// The referrer of a fetch a stylesheet makes: its URL under its
+    /// response's policy (else the document's) for an external sheet, the
+    /// document's for an inline one or a `style` attribute.
+    fn css_referrer(&self, sheet: Option<&RequestReferrer>) -> Option<RequestReferrer> {
+        match sheet {
+            Some(r) => Some(RequestReferrer {
+                source: r.source.clone(),
+                policy: r.policy.or(self.document_policy()),
+            }),
+            None => self.client_referrer(ReferrerPolicy::Empty),
+        }
+    }
+
+    /// A reload or a traversal that loads the entry at `index`: its
+    /// stored referrer again, under its stored policy, else the current
+    /// document's (the navigation's source snapshot, HTML §7.4.5).
+    fn entry_referrer(&self, index: usize) -> NavReferrer {
+        let Some(entry) = self.history.get(index) else { return NavReferrer::default() };
+        NavReferrer {
+            request: entry.referrer.clone().map(|source| RequestReferrer {
+                source,
+                policy: entry.referrer_policy.or(self.document_policy()),
+            }),
+            policy: entry.referrer_policy,
         }
     }
 
@@ -2076,11 +2195,15 @@ impl TabState {
     /// http(s) and `about:` are navigated to: a top-level `data:` from a
     /// page is blocked as in Chrome and Firefox; `javascript:` and
     /// `mailto:` are not opened, as for links.
-    fn navigate_submission(&mut self, url: Url, post: Option<browser_dom::forms::PostResource>, target: &str) {
+    fn navigate_submission(&mut self, url: Url, post: Option<browser_dom::forms::PostResource>, target: &str, noreferrer: bool) {
         if !matches!(url.scheme(), "http" | "https" | "about") {
             tracing::debug!(tab = self.id.0, "form submission to {url} not navigated");
             return;
         }
+        // The form's `rel=noreferrer` navigates with the policy
+        // `no-referrer` (HTML §4.10.22.3, "plan to navigate"); forms have
+        // no `referrerpolicy` of their own.
+        let referrer = self.page_referrer(if noreferrer { ReferrerPolicy::NoReferrer } else { ReferrerPolicy::Empty });
         let origin = self.url.as_ref().map_or_else(|| "null".to_owned(), |u| u.origin().ascii_serialization());
         let post = post.map(|p| browser_ipc_types::PostData {
             content_type: p.content_type,
@@ -2089,31 +2212,33 @@ impl TabState {
         });
         let t = target.trim().to_ascii_lowercase();
         if !(t.is_empty() || t == "_self" || t == "_parent" || t == "_top") {
-            self.send(TabToShell::OpenFormSubmission { url, post });
+            self.send(TabToShell::OpenFormSubmission { url, post, referrer });
             return;
         }
         let kind = if self.lifecycle == Lifecycle::Complete { NavKind::Push } else { NavKind::Replace };
         match post {
-            None => self.go(url, kind),
+            None => self.go(url, kind, referrer),
             Some(post) => {
                 // A POST always loads, fragment or not.
                 self.cancel_pending_nav();
-                self.navigate_with(url, kind, Some(post));
+                self.navigate_with(url, kind, Some(post), referrer);
             }
         }
     }
 
-    /// Ask the shell for a new tab on the link (middle click).
+    /// Ask the shell for a new tab on the link (middle click), with the
+    /// link's referrer.
     fn open_link_in_new_tab(&mut self, link: NodeId) {
         if let Some(url) = self.link_target(link) {
-            self.send(TabToShell::OpenInNewTab { url });
+            let referrer = self.link_referrer(link);
+            self.send(TabToShell::OpenInNewTab { url, referrer });
         }
     }
 
-    /// Go to `url`. A change of fragment within the displayed document
-    /// takes effect at once and only scrolls; anything else starts a load
-    /// that commits when its first bytes arrive.
-    fn go(&mut self, url: Url, kind: NavKind) {
+    /// Go to `url` with `referrer`. A change of fragment within the
+    /// displayed document takes effect at once and only scrolls; anything
+    /// else starts a load that commits when its first bytes arrive.
+    fn go(&mut self, url: Url, kind: NavKind, referrer: NavReferrer) {
         self.cancel_pending_nav();
         if kind != NavKind::Reload && self.is_same_document(&url) {
             tracing::info!(tab = self.id.0, "fragment navigation {url}");
@@ -2126,7 +2251,7 @@ impl TabState {
             self.state_dirty = true;
             self.same_document_navigated(old);
         } else {
-            self.navigate(url, kind);
+            self.navigate(url, kind, referrer);
         }
     }
 
@@ -2154,7 +2279,8 @@ impl TabState {
             && self.nav.is_none()
             && (self.doc.is_some() || self.parser.is_some());
         if !same_document {
-            self.go(target.url, NavKind::Traverse(index));
+            let referrer = self.entry_referrer(index);
+            self.go(target.url, NavKind::Traverse(index), referrer);
             return;
         }
         if index == self.history_index {
@@ -2237,9 +2363,10 @@ impl TabState {
             }
         } else {
             self.leave_entry();
-            let (document, manual_scroll) = match self.history.get(self.history_index) {
-                Some(entry) => (entry.document, entry.manual_scroll),
-                None => (self.fresh_document(), false),
+            // The new entry shares the document's state (its referrer too).
+            let (document, manual_scroll, referrer, referrer_policy) = match self.history.get(self.history_index) {
+                Some(entry) => (entry.document, entry.manual_scroll, entry.referrer.clone(), entry.referrer_policy),
+                None => (self.fresh_document(), false, self.document_referrer.clone(), ReferrerPolicy::Empty),
             };
             if !self.history.is_empty() {
                 self.history.truncate(self.history_index + 1);
@@ -2250,6 +2377,8 @@ impl TabState {
                 state: Some(state),
                 scroll: None,
                 manual_scroll,
+                referrer,
+                referrer_policy,
             });
             self.cap_history();
         }
@@ -2290,10 +2419,18 @@ impl TabState {
         let current = self.history.get(self.history_index).cloned();
         let has_entry = current.is_some();
         // A new entry: the current document's, or a new document's.
+        // A new document's entry keeps the referrer its load determined
+        // (`commit` set it) and the policy its navigation was given; one of
+        // the current document shares that document's.
         let new_entry = |state: &mut Self| {
-            let (document, manual_scroll) = match (&current, same_document) {
-                (Some(c), true) => (c.document, c.manual_scroll),
-                _ => (state.fresh_document(), false),
+            let (document, manual_scroll, referrer, referrer_policy) = match (&current, same_document) {
+                (Some(c), true) => (c.document, c.manual_scroll, c.referrer.clone(), c.referrer_policy),
+                _ => (
+                    state.fresh_document(),
+                    false,
+                    state.document_referrer.clone(),
+                    state.nav.as_ref().map_or(ReferrerPolicy::Empty, |n| n.referrer.policy),
+                ),
             };
             HistoryEntry {
                 url: url.clone(),
@@ -2301,6 +2438,8 @@ impl TabState {
                 state: None,
                 scroll: None,
                 manual_scroll,
+                referrer,
+                referrer_policy,
             }
         };
         match kind {
@@ -2367,12 +2506,15 @@ impl TabState {
     }
 
     /// The first bytes of the main response: the navigation is now real.
-    fn commit(&mut self, id: RequestId, final_url: Url) {
+    fn commit(&mut self, id: RequestId, final_url: Url, referrer: Option<Url>) {
         let Some(nav) = self.nav.as_mut() else { return };
         if nav.request != id {
             return;
         }
         nav.committed = true;
+        // The referrer the load determined: `document.referrer`, and the
+        // new entry's request referrer (`apply_history`).
+        self.document_referrer = referrer;
         let kind = nav.kind;
         tracing::info!(tab = self.id.0, "committed {final_url}");
         // The entry being left keeps where it was scrolled; one reached
@@ -2420,6 +2562,9 @@ impl TabState {
         // The new document's scripts run while it parses, so its context
         // starts here; the old document's timers stop with its context.
         self.new_script_host();
+        if let Some(host) = &mut self.script {
+            host.set_document_referrer(self.document_referrer.clone());
+        }
         self.start_main_document(id, final_url);
         self.state_dirty = true;
     }
@@ -2549,7 +2694,10 @@ impl TabState {
             // Refreshing to the same URL replaces the entry; to another
             // adds one, as browsers do.
             let same = self.url.as_ref() == Some(&url);
-            self.go(url, if same { NavKind::Reload } else { NavKind::Push });
+            // The document navigates (HTML's shared declarative refresh
+            // steps): its referrer, as a link's.
+            let referrer = self.page_referrer(ReferrerPolicy::Empty);
+            self.go(url, if same { NavKind::Reload } else { NavKind::Push }, referrer);
         }
     }
 
@@ -2699,7 +2847,7 @@ impl TabState {
         match image.filter(|_| self.pan.is_none() && !over_bar) {
             Some((url, hotspot, img)) => {
                 if self.cursor_image_sent.as_deref() != Some(&*url) {
-                    self.cursor_image_sent = Some(url);
+                    self.cursor_image_sent = Some(url.url.clone());
                     self.cursor = cursor;
                     let (w, h) = (img.width as u16, img.height as u16);
                     let (hx, hy) = hotspot.map_or((0, 0), |(x, y)| (x.round().clamp(0.0, f32::from(w)) as u16, y.round().clamp(0.0, f32::from(h)) as u16));
@@ -2910,19 +3058,20 @@ impl TabState {
 
     /// Start loading `url`. Nothing about the current page changes until
     /// the response commits (`commit`).
-    fn navigate(&mut self, url: Url, kind: NavKind) {
-        self.navigate_with(url, kind, None);
+    fn navigate(&mut self, url: Url, kind: NavKind, referrer: NavReferrer) {
+        self.navigate_with(url, kind, None, referrer);
     }
 
     /// `navigate`, POSTing `post` when given (a form submitted as an
     /// entity body): its `Content-Type` and the submitting document's
     /// `Origin` go with it; never from the cache.
-    fn navigate_with(&mut self, url: Url, kind: NavKind, post: Option<browser_ipc_types::PostData>) {
+    fn navigate_with(&mut self, url: Url, kind: NavKind, post: Option<browser_ipc_types::PostData>, referrer: NavReferrer) {
         tracing::info!(tab = self.id.0, post = post.is_some(), "navigate {url}");
         self.refresh = None;
         self.refresh_header = None;
         self.press = None;
         let mut request = FetchRequest::get(url.clone());
+        request.referrer = referrer.request.clone();
         if kind == NavKind::Reload {
             request.cache = CacheMode::NoCache;
         }
@@ -2936,7 +3085,12 @@ impl TabState {
             request.cache = CacheMode::NoStore;
         }
         let id = if url.scheme() == "about" {
-            self.fetch_about(request.url)
+            // Main fetch determines the referrer before the scheme fetch.
+            let referrer = request
+                .referrer
+                .as_ref()
+                .and_then(|r| browser_ipc_types::referrer::determine(&r.source, r.policy, &request.url));
+            self.fetch_about(request.url, referrer)
         } else {
             self.fetch(request, PendingKind::Main)
         };
@@ -2945,6 +3099,7 @@ impl TabState {
             request: id,
             kind,
             committed: false,
+            referrer,
         });
         self.state_dirty = true;
     }
@@ -2971,7 +3126,7 @@ impl TabState {
     /// panics the tab thread on purpose, to exercise crash recovery.
     /// Answered through the net sink like a `data:` URL, so the load goes
     /// through the same commit path as any other.
-    fn fetch_about(&mut self, url: Url) -> RequestId {
+    fn fetch_about(&mut self, url: Url, referrer: Option<Url>) -> RequestId {
         let id = RequestId(self.next_request);
         self.next_request += 1;
         self.pending.insert(
@@ -2993,6 +3148,7 @@ impl TabState {
                     status_text: "OK".to_owned(),
                     headers: vec![("content-type".to_owned(), "text/html".to_owned())],
                     final_url: url,
+                    referrer: referrer.map(Box::new),
                 });
                 (self.net_sink)(NetToTab::ResponseEnd { id });
             }
@@ -3005,10 +3161,12 @@ impl TabState {
         id
     }
 
-    /// A `GET` for a sub-resource of the current document.
-    fn subresource(&self, url: Url) -> FetchRequest {
+    /// A `GET` for a sub-resource of the current document, with its
+    /// referrer (an element's, a stylesheet's, a module's, the document's).
+    fn subresource(&self, url: Url, referrer: Option<RequestReferrer>) -> FetchRequest {
         let mut request = FetchRequest::get(url);
         request.cache = self.doc_cache;
+        request.referrer = referrer;
         request
     }
 
@@ -3033,6 +3191,7 @@ impl TabState {
                 status_text,
                 headers,
                 final_url,
+                referrer,
             } => {
                 let Some(p) = self.pending.get_mut(&id) else { return };
                 p.status = status;
@@ -3045,7 +3204,7 @@ impl TabState {
                         .iter()
                         .find(|(k, _)| k.eq_ignore_ascii_case("refresh"))
                         .map(|(_, v)| v.clone());
-                    self.commit(id, final_url);
+                    self.commit(id, final_url, referrer.map(|r| *r));
                 }
             }
             NetToTab::ResponseChunk { id, bytes } => {
@@ -3116,9 +3275,12 @@ impl TabState {
                 NetOp::Start(request) => {
                     let Some(document_url) = self.url.clone() else { continue };
                     let (id, timeout, keepalive) = (request.id, request.timeout, request.keepalive);
+                    let referrer = self.client_referrer(ReferrerPolicy::Empty);
                     let (job, actions) = {
                         let mut preflights = self.preflights.lock().unwrap_or_else(|e| e.into_inner());
-                        Job::start(request, &document_url, &mut preflights)
+                        // The document's referrer (`fetch`'s own `referrer`
+                        // and `referrerPolicy` are block B).
+                        Job::start(request, &document_url, referrer, &mut preflights)
                     };
                     self.script_fetches.insert(
                         id,
@@ -3161,8 +3323,9 @@ impl TabState {
                     status,
                     status_text,
                     headers,
+                    referrer,
                     ..
-                } => fetch.job.on_start(status, status_text, headers, &mut preflights),
+                } => fetch.job.on_start(status, status_text, headers, referrer.map(|r| *r), &mut preflights),
                 NetToTab::ResponseChunk { bytes, .. } => fetch.job.on_chunk(bytes),
                 NetToTab::ResponseEnd { .. } => fetch.job.on_end(),
                 NetToTab::Failed { error, .. } => fetch.job.on_failed(error),
@@ -3326,8 +3489,14 @@ impl TabState {
             || ct == "application/xhtml+xml"
             || ct == "application/xml"
             || ct == "text/xml";
+        // The document's policy container takes the response's
+        // `Referrer-Policy` (HTML's "create a policy container from a
+        // fetch response"); a `<meta name=referrer>` may replace it.
+        self.doc_header_policy = ReferrerPolicy::from_headers(p.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if html_like {
-            self.parser = Some(HtmlParser::with_charset(Some(final_url), charset.as_deref()));
+            let parser = HtmlParser::with_charset(Some(final_url), charset.as_deref());
+            parser.document_mut().referrer_policy = self.doc_header_policy;
+            self.parser = Some(parser);
         }
         // Other types are wrapped when the body completes.
     }
@@ -3369,6 +3538,7 @@ impl TabState {
                         )
                     };
                     let mut parser = HtmlParser::new(self.url.clone());
+                    parser.document_mut().referrer_policy = self.doc_header_policy;
                     parser.feed(html.as_bytes());
                     parser.finish()
                 };
@@ -3379,7 +3549,14 @@ impl TabState {
                     let (_, charset) = Self::content_type_of(&p.headers);
                     let css = browser_dom::encoding::decode_stylesheet(&p.body, charset.as_deref());
                     tracing::debug!(tab = self.id.0, bytes = css.len(), url = url.as_str(), "external stylesheet loaded");
-                    let sheet = Arc::new(Stylesheet::parse_with_base(&css, Origin::Author, Some(&url)));
+                    // What the sheet fetches has the sheet's own URL as
+                    // referrer, under its response's policy (WPT
+                    // `referrer-policy/css-integration`).
+                    let referrer = RequestReferrer {
+                        source: p.final_url.clone().unwrap_or_else(|| url.clone()),
+                        policy: ReferrerPolicy::from_headers(p.headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
+                    };
+                    let sheet = Arc::new(Stylesheet::parse_external(&css, Origin::Author, &url, referrer));
                     self.loaded_sheets.insert(url.clone(), sheet.clone());
                     // Every slot waiting for this URL (a script may have
                     // added the same link twice). Imports are inserted
@@ -3497,7 +3674,7 @@ impl TabState {
                             ScriptKind::Module => {
                                 // Modules are always UTF-8.
                                 let text = browser_dom::encoding::decode_script(&p.body, None);
-                                match host.parse_module(&text, &url, true) {
+                                match host.parse_module(&text, &url, true, load.policy) {
                                     Ok(m) => LoadState::Module(m),
                                     Err(e) => LoadState::Failed(format!("{e} (in {url})")),
                                 }
@@ -3668,6 +3845,7 @@ impl TabState {
                         net: self.net.clone(),
                         document_url: url.clone(),
                         preflights: self.preflights.clone(),
+                        referrer: self.sync_referrer.clone(),
                     }));
                 }
                 if let Some(entry) = self.history.get(self.history_index) {
@@ -3791,6 +3969,10 @@ impl TabState {
     /// its URL, its title so far, and its readiness (`loading` while it
     /// parses, `interactive` while deferred scripts remain, `complete`).
     fn sync_document_info(&mut self) {
+        // A synchronous `XMLHttpRequest` sends the document's referrer as
+        // it is now.
+        let referrer = self.client_referrer(ReferrerPolicy::Empty);
+        *self.sync_referrer.borrow_mut() = referrer;
         let Some(host) = &mut self.script else { return };
         let title = match (&self.parser, &self.doc) {
             (Some(parser), _) => parser.document().title(),
@@ -3822,8 +4004,8 @@ impl TabState {
             requests.into_iter().partition(|r| matches!(r, HostRequest::Submit { .. }));
         self.apply_script_requests(requests);
         for s in submissions {
-            if let HostRequest::Submit { url, post, target, .. } = s {
-                self.navigate_submission(url, post, &target);
+            if let HostRequest::Submit { url, post, target, noreferrer, .. } = s {
+                self.navigate_submission(url, post, &target, noreferrer);
             }
         }
     }
@@ -3856,7 +4038,9 @@ impl TabState {
                     if !matches!(url.scheme(), "http" | "https" | "data" | "about") {
                         continue;
                     }
-                    self.go(url, if replace { NavKind::Replace } else { NavKind::Push });
+                    // `location`'s navigations: the document's referrer.
+                    let referrer = self.page_referrer(ReferrerPolicy::Empty);
+                    self.go(url, if replace { NavKind::Replace } else { NavKind::Push }, referrer);
                     // Later requests belong to a document that is going away.
                     break;
                 }
@@ -3942,10 +4126,11 @@ impl TabState {
     /// skipped.
     fn prepare_script(&mut self, node: NodeId) -> Prepared {
         let Some(parser) = &self.parser else { return Prepared::Done };
-        let (kind, src, is_async, defer, text, doc_url) = {
+        let (kind, src, is_async, defer, text, doc_url, policy) = {
             let doc = parser.document();
             let Some(e) = doc.element(node) else { return Prepared::Done };
             let Some(kind) = script_kind(e) else { return Prepared::Done };
+            let policy = ReferrerPolicy::from_attribute(e.attr("referrerpolicy"));
             let src = e.attr("src").map(|s| (s.to_owned(), doc.resolve_url(s)));
             let text = if src.is_none() { doc.text_content(node) } else { String::new() };
             (
@@ -3955,6 +4140,7 @@ impl TabState {
                 e.attr("defer").is_some(),
                 text,
                 doc.base_url.clone(),
+                policy,
             )
         };
         match src {
@@ -3972,6 +4158,7 @@ impl TabState {
                     kind,
                     url: Some(url.clone()),
                     state: LoadState::Fetching,
+                    policy,
                 };
                 let blocking = !is_async && !defer && kind == ScriptKind::Classic;
                 if is_async {
@@ -3981,7 +4168,8 @@ impl TabState {
                 } else {
                     self.scripts.deferred.push_back(load);
                 }
-                let mut request = self.subresource(url);
+                // The element's `referrerpolicy` (HTML's script fetch options).
+                let mut request = self.subresource(url, self.element_referrer(Some(node)));
                 request.headers.push(("accept".to_owned(), "*/*".to_owned()));
                 self.fetch(request, PendingKind::Script { id });
                 if blocking { Prepared::Blocking } else { Prepared::Done }
@@ -3999,13 +4187,14 @@ impl TabState {
                     let url = doc_url
                         .or_else(|| self.url.clone())
                         .unwrap_or_else(|| Url::parse("about:blank").expect("static url"));
-                    match host.parse_module(&text, &url, false) {
+                    match host.parse_module(&text, &url, false, policy) {
                         Ok(m) => {
                             let load = ScriptLoad {
                                 id: self.scripts.next_id(),
                                 kind,
                                 url: None,
                                 state: LoadState::Module(m),
+                                policy,
                             };
                             if is_async {
                                 self.scripts.asap.push(load);
@@ -4087,15 +4276,16 @@ impl TabState {
             }
         }
         let mut settled = false;
-        for url in to_fetch {
-            settled |= self.fetch_module_source(url);
+        for m in to_fetch {
+            settled |= self.fetch_module_source(m);
         }
         settled
     }
 
     /// Fetch a module for the module map, once per URL. Returns true when
     /// the answer was given on the spot (an unsupported scheme).
-    fn fetch_module_source(&mut self, url: Url) -> bool {
+    fn fetch_module_source(&mut self, module: browser_script::ModuleFetch) -> bool {
+        let browser_script::ModuleFetch { url, referrer, policy } = module;
         if !self.scripts.module_urls.insert(url.clone()) {
             return false;
         }
@@ -4108,7 +4298,16 @@ impl TabState {
             }
             return true;
         }
-        let mut request = self.subresource(url.clone());
+        // An import's `Referer` is its importer's URL, under the policy
+        // its fetch options inherited; the document's for an inline script.
+        let referrer = match referrer {
+            Some(source) => Some(RequestReferrer {
+                source,
+                policy: policy.or(self.document_policy()),
+            }),
+            None => self.client_referrer(policy),
+        };
+        let mut request = self.subresource(url.clone(), referrer);
         request.headers.push(("accept".to_owned(), "*/*".to_owned()));
         self.fetch(request, PendingKind::ModuleSource { url });
         false
@@ -4118,7 +4317,7 @@ impl TabState {
     fn execute_script(&mut self, load: ScriptLoad) {
         self.sync_document_info();
         self.with_script(|host| match load.state {
-            LoadState::Classic(source) => host.run_script_from(&source, load.url.as_ref()),
+            LoadState::Classic(source) => host.run_script_from(&source, load.url.as_ref(), load.policy),
             LoadState::Module(m) => host.run_module(m),
             LoadState::Failed(why) => host.report_error(why),
             LoadState::Fetching => {}
@@ -4164,8 +4363,8 @@ impl TabState {
         // A dynamic `import()` of a module not in the map rejects for now
         // and is fetched here, so the map has it the next time (known
         // limitation until fetch, Phase 3 item 3.5, makes imports wait).
-        for url in requests {
-            self.fetch_module_source(url);
+        for m in requests {
+            self.fetch_module_source(m);
         }
         if mutated {
             self.dom_changed(&changes);
@@ -4350,7 +4549,9 @@ impl TabState {
                         text_hash: 0,
                         sheet: None,
                     });
-                    self.load_external_sheet(slot, url, 0);
+                    // The `<link>`'s `referrerpolicy`.
+                    let referrer = self.element_referrer(Some(node));
+                    self.load_external_sheet(slot, url, 0, referrer);
                 }
             }
         }
@@ -4368,14 +4569,14 @@ impl TabState {
     /// Fill `slot` with the sheet at `url`: from the loaded sheets if it
     /// came before, else by fetching it (once; a second slot with the
     /// same URL is filled when the response comes).
-    fn load_external_sheet(&mut self, slot: usize, url: Url, depth: u8) {
+    fn load_external_sheet(&mut self, slot: usize, url: Url, depth: u8, referrer: Option<RequestReferrer>) {
         if let Some(sheet) = self.loaded_sheets.get(&url).cloned() {
             let slot = slot + self.queue_imports(slot, &sheet, depth);
             self.sheets[slot].sheet = Some(sheet);
             return;
         }
         if self.fetched_urls.insert(url.clone()) {
-            let request = self.subresource(url.clone());
+            let request = self.subresource(url.clone(), referrer);
             self.fetch(request, PendingKind::Stylesheet { url, depth });
         }
     }
@@ -4401,7 +4602,10 @@ impl TabState {
                 },
             );
             let before = self.sheets.len();
-            self.load_external_sheet(insert_at, url, depth + 1);
+            // An `@import`'s `Referer` is its importing sheet's (the
+            // document's for an inline one).
+            let referrer = self.css_referrer(sheet.referrer.as_deref());
+            self.load_external_sheet(insert_at, url, depth + 1, referrer);
             // A loaded import may have inserted its own imports before it.
             insert_at += 1 + (self.sheets.len() - before);
         }
@@ -4482,8 +4686,8 @@ impl TabState {
             if fetches.is_empty() && changed.is_empty() && tasks.is_empty() {
                 return;
             }
-            for (url, deferred) in fetches {
-                self.request_image(url, deferred);
+            for (url, deferred, policy) in fetches {
+                self.request_image(url, deferred, policy);
             }
             self.images_changed(changed);
             for task in tasks {
@@ -4495,7 +4699,9 @@ impl TabState {
     /// A request wants `url`: done at once when it is decoded already or
     /// failed before, else fetched (once per URL; requests share it). A
     /// deferred one waits until its `<img>` is rendered (`after_layout_images`).
-    fn request_image(&mut self, url: Url, deferred: bool) {
+    /// `policy`: the `<img>`'s `referrerpolicy` when the request was
+    /// made.
+    fn request_image(&mut self, url: Url, deferred: bool, policy: ReferrerPolicy) {
         self.wanted_images.insert(url.clone());
         if self.images.contains(&url) {
             self.with_image_doc(|doc, _| browser_style::responsive::image_fetch_done(doc, &url, true));
@@ -4519,16 +4725,19 @@ impl TabState {
                 })
                 .unwrap_or_default();
             for img in imgs {
-                if !self.deferred_images.contains(&(img, url.clone())) {
-                    self.deferred_images.push((img, url.clone()));
+                if !self.deferred_images.iter().any(|(i, u, _)| *i == img && *u == url) {
+                    self.deferred_images.push((img, url.clone(), policy));
                 }
             }
             return;
         }
-        self.fetch_image(url, true);
+        let referrer = self.client_referrer(policy);
+        self.fetch_image(url, true, referrer);
     }
 
-    fn fetch_image(&mut self, url: Url, delays_load: bool) {
+    /// Fetch an image once per URL (a later request for it shares the
+    /// first, whose `referrer` went).
+    fn fetch_image(&mut self, url: Url, delays_load: bool, referrer: Option<RequestReferrer>) {
         self.wanted_images.insert(url.clone());
         if self.fetched_images.contains(&url) || self.images.contains(&url) {
             return;
@@ -4537,7 +4746,7 @@ impl TabState {
             return;
         }
         self.fetched_images.insert(url.clone());
-        let request = self.subresource(url.clone());
+        let request = self.subresource(url.clone(), referrer);
         self.fetch(request, PendingKind::Image { url, delays_load });
     }
 
@@ -4635,7 +4844,7 @@ impl TabState {
         // The deferred fetches whose `<img>` is rendered and still wants
         // that URL.
         let pending = std::mem::take(&mut self.deferred_images);
-        for (img, url) in pending {
+        for (img, url, policy) in pending {
             let state = self.with_image_doc(|doc, _| {
                 doc.image_data(img).map(|d| {
                     d.current.url.as_ref() == Some(&url) && d.current.state == browser_dom::image::RequestState::Unavailable
@@ -4643,8 +4852,11 @@ impl TabState {
                 })
             });
             match state.flatten() {
-                Some(true) if widths.contains_key(&img) => self.fetch_image(url, false),
-                Some(true) => self.deferred_images.push((img, url)),
+                Some(true) if widths.contains_key(&img) => {
+                    let referrer = self.client_referrer(policy);
+                    self.fetch_image(url, false, referrer);
+                }
+                Some(true) => self.deferred_images.push((img, url, policy)),
                 _ => {}
             }
         }
@@ -4723,26 +4935,28 @@ impl TabState {
     fn fetch_background_images(&mut self) {
         let scale = self.viewport.scale_factor;
         let mut urls = Vec::new();
+        // Each URL with the sheet its declaration came from (the
+        // `Referer` of its fetch).
         let mut collect = |style: &browser_style::ComputedStyle| {
             // Every layer's image; an `image-set()` the candidate this
             // device's scale chooses.
-            let mut names: Vec<String> =
-                style.background_images.iter().filter_map(|i| i.url_to_fetch(scale)).map(|u| u.to_string()).collect();
-            names.extend(style.list_style_image.iter().map(|s| s.to_string()));
+            let mut names: Vec<browser_style::CssUrl> =
+                style.background_images.iter().filter_map(|i| i.url_to_fetch(scale)).cloned().collect();
+            names.extend(style.list_style_image.iter().cloned());
             // Mask layers' images.
-            names.extend(style.mask_images.iter().filter_map(|i| i.url_to_fetch(scale)).map(|u| u.to_string()));
+            names.extend(style.mask_images.iter().filter_map(|i| i.url_to_fetch(scale)).cloned());
             // `cursor: url()` images too.
-            names.extend(style.cursor.images.iter().map(|i| i.url.to_string()));
+            names.extend(style.cursor.images.iter().map(|i| i.url.clone()));
             // A pseudo-element's or marker's `content` images.
             if let Some(items) = style.content.items() {
                 names.extend(items.iter().filter_map(|i| match i {
-                    browser_style::GeneratedItem::Image(img) => img.url_to_fetch(scale).map(|u| u.to_string()),
+                    browser_style::GeneratedItem::Image(img) => img.url_to_fetch(scale).cloned(),
                     _ => None,
                 }));
             }
             for u in names {
                 if let Ok(url) = Url::parse(&u) {
-                    urls.push(url);
+                    urls.push((url, u.referrer));
                 }
             }
         };
@@ -4755,8 +4969,9 @@ impl TabState {
                 }
             }
         }
-        for url in urls {
-            self.fetch_image(url, true);
+        for (url, sheet) in urls {
+            let referrer = self.css_referrer(sheet.as_deref());
+            self.fetch_image(url, true, referrer);
         }
     }
 
@@ -4953,7 +5168,8 @@ impl TabState {
         }
         let state = &self.web_fonts;
         let now = std::time::Instant::now();
-        let mut fetch: Vec<Url> = Vec::new();
+        // Each source URL with its rule's sheet (the `Referer` of the fetch).
+        let mut fetch: Vec<(Url, Option<Arc<RequestReferrer>>)> = Vec::new();
         let mut locals: Vec<(u32, String)> = Vec::new();
         // The faces that begin loading now, and the characters of each run
         // that wait for a face in its block period (drawn invisibly).
@@ -5000,8 +5216,8 @@ impl TabState {
                             }
                             match source {
                                 Some(Source::Url(url)) => {
-                                    if !state.requested.contains(url) && !fetch.contains(url) {
-                                        fetch.push(url.clone());
+                                    if !state.requested.contains(url) && !fetch.iter().any(|(u, _)| u == url) {
+                                        fetch.push((url.clone(), face.referrer.clone()));
                                     }
                                     if !state.started.contains_key(&fk) && !starting.iter().any(|(k, _)| *k == fk) {
                                         starting.push((fk, face.display));
@@ -5052,8 +5268,8 @@ impl TabState {
             }
             match state.source_of(face) {
                 Some(Source::Url(url)) => {
-                    if !state.requested.contains(&url) && !fetch.contains(&url) {
-                        fetch.push(url);
+                    if !state.requested.contains(&url) && !fetch.iter().any(|(u, _)| *u == url) {
+                        fetch.push((url, face.referrer.clone()));
                     }
                     if !state.started.contains_key(&fk) && !starting.iter().any(|(k, _)| *k == fk) {
                         starting.push((fk, face.display));
@@ -5108,7 +5324,7 @@ impl TabState {
                 local_changed = true;
             }
         }
-        for url in fetch {
+        for (url, sheet) in fetch {
             if !matches!(url.scheme(), "http" | "https" | "data") {
                 self.web_fonts.failed.insert(Source::Url(url));
                 local_changed = true;
@@ -5117,7 +5333,8 @@ impl TabState {
             if !self.web_fonts.requested.insert(url.clone()) {
                 continue;
             }
-            let mut request = self.subresource(url.clone());
+            let referrer = self.css_referrer(sheet.as_deref());
+            let mut request = self.subresource(url.clone(), referrer);
             request.headers.push(("Accept".to_owned(), "*/*".to_owned()));
             // CORS mode, credentials only to the document's own origin.
             if let Some(origin) = self.doc_url.as_ref().map(Url::origin) {
@@ -5171,6 +5388,7 @@ impl TabState {
                     origin: Origin::Author,
                     rules: vec![Rule::Media(slot.media.clone(), sheet.rules.clone())],
                     imports: Vec::new(),
+                    referrer: sheet.referrer.clone(),
                 })
             };
             stylist.add_sheet(sheet);
@@ -6061,7 +6279,7 @@ mod tests {
             .expect("lock")
             .iter()
             .filter_map(|m| match m {
-                TabToShell::OpenInNewTab { url } => Some(url.clone()),
+                TabToShell::OpenInNewTab { url, .. } => Some(url.clone()),
                 _ => None,
             })
             .collect();
@@ -10266,6 +10484,158 @@ mod tests {
     }
 
     #[test]
+    fn requests_carry_the_referrer_their_policy_gives() {
+        let html = |h: &str| ("Content-Type".to_owned(), h.to_owned());
+        let page = "<!DOCTYPE html><title>Page</title><link rel=stylesheet href=/s.css>\
+             <style>@font-face { font-family: F; src: url(/inline.ttf) } p { font-family: F }</style>\
+             <img src=/i.png referrerpolicy=origin><script src=/a.js></script>\
+             <script type=module src=/m.js referrerpolicy=no-referrer-when-downgrade></script>\
+             <p>text</p><h1>head</h1><a id=l href='/next#top'>next</a>";
+        let next = "<!DOCTYPE html><title>Next</title><meta name=referrer content=origin>\
+             <a id=n href=/last rel=noreferrer>last</a><a id=o href=/other>other</a>";
+        let server = Server::start_with(
+            vec![
+                ("/page".to_owned(), vec![html("text/html")], page.as_bytes().to_vec()),
+                (
+                    "/s.css".to_owned(),
+                    vec![html("text/css"), ("Referrer-Policy".to_owned(), "unsafe-url".to_owned())],
+                    b"@import url(/imp.css); @font-face { font-family: G; src: url(/g.ttf) } body { background: url(/bg.png) } h1 { font-family: G }".to_vec(),
+                ),
+                ("/imp.css".to_owned(), vec![html("text/css")], b"p { color: red }".to_vec()),
+                ("/a.js".to_owned(), vec![html("text/javascript")], b"fetch('/f');".to_vec()),
+                ("/m.js".to_owned(), vec![html("text/javascript")], b"import './dep.js';".to_vec()),
+                ("/dep.js".to_owned(), vec![html("text/javascript")], b"".to_vec()),
+                ("/f".to_owned(), vec![html("text/plain")], b"ok".to_vec()),
+                ("/next".to_owned(), vec![html("text/html")], next.as_bytes().to_vec()),
+                ("/last".to_owned(), vec![html("text/html")], b"<title>Last</title>".to_vec()),
+                ("/other".to_owned(), vec![html("text/html")], b"<title>Other</title>".to_vec()),
+                ("/plain".to_owned(), vec![html("text/html")], b"<title>Plain</title>".to_vec()),
+            ],
+            &[],
+        );
+        let referer = |s: &Server, path: &str, n: usize| {
+            let got = s.requests(path);
+            assert!(got.len() > n, "{path} requested {} times", got.len());
+            header_of(&got[n], "referer")
+        };
+        let page_url = server.url("/page").to_string();
+        let origin = server.url("/").to_string();
+        let sheet = server.url("/s.css").to_string();
+        let mut h = Harness::load_url(server.url("/page"));
+        // Every request the page makes has gone out.
+        let paths = ["/s.css", "/a.js", "/m.js", "/f", "/i.png", "/inline.ttf", "/dep.js", "/imp.css", "/bg.png", "/g.ttf"];
+        h.pump_until(|_| paths.iter().all(|p| !server.requests(p).is_empty()));
+        // The page's own resources: its URL by the default policy, an
+        // element's `referrerpolicy` when it has one.
+        assert_eq!(referer(&server, "/s.css", 0).as_deref(), Some(&*page_url));
+        assert_eq!(referer(&server, "/a.js", 0).as_deref(), Some(&*page_url));
+        assert_eq!(referer(&server, "/m.js", 0).as_deref(), Some(&*page_url));
+        assert_eq!(referer(&server, "/f", 0).as_deref(), Some(&*page_url), "a script's fetch");
+        assert_eq!(referer(&server, "/i.png", 0).as_deref(), Some(&*origin), "the img's referrerpolicy");
+        assert_eq!(referer(&server, "/inline.ttf", 0).as_deref(), Some(&*page_url), "an inline sheet's font");
+        // A module's import: the importer, under the root's policy.
+        assert_eq!(referer(&server, "/dep.js", 0).as_deref(), Some(&*server.url("/m.js").to_string()));
+        // What the external sheet fetches: the sheet, under its response's
+        // `unsafe-url`.
+        assert_eq!(referer(&server, "/imp.css", 0).as_deref(), Some(&*sheet), "an @import");
+        assert_eq!(referer(&server, "/bg.png", 0).as_deref(), Some(&*sheet), "a url() image");
+        assert_eq!(referer(&server, "/g.ttf", 0).as_deref(), Some(&*sheet), "a font");
+        assert_eq!(js_text(&mut h, "document.referrer"), "", "typed into the address bar: none");
+        // A link: the page's URL, without the fragment; the new document's
+        // `document.referrer`.
+        h.click_id("l");
+        h.pump_until(|h| h.title().as_deref() == Some("Next"));
+        assert_eq!(referer(&server, "/next", 0).as_deref(), Some(&*page_url));
+        assert_eq!(js_text(&mut h, "document.referrer"), page_url);
+        // `rel=noreferrer`: none.
+        h.click_id("n");
+        h.pump_until(|h| h.title().as_deref() == Some("Last"));
+        assert_eq!(referer(&server, "/last", 0), None);
+        assert_eq!(js_text(&mut h, "document.referrer"), "");
+        // Back loads the entry with its stored referrer again.
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("Next"));
+        assert_eq!(referer(&server, "/next", 1).as_deref(), Some(&*page_url));
+        assert_eq!(js_text(&mut h, "document.referrer"), page_url);
+        // The `<meta name=referrer content=origin>` sets the document's
+        // policy: the origin only.
+        h.click_id("o");
+        h.pump_until(|h| h.title().as_deref() == Some("Other"));
+        let next_origin = origin.clone();
+        assert_eq!(referer(&server, "/other", 0).as_deref(), Some(&*next_origin));
+        // A reload sends the entry's referrer again.
+        h.send(ShellToTab::Reload);
+        h.pump_until(|_| server.requests("/other").len() == 2);
+        assert_eq!(referer(&server, "/other", 1).as_deref(), Some(&*next_origin));
+        // The user's own navigation: none.
+        h.send(ShellToTab::Navigate { url: server.url("/plain") });
+        h.pump_until(|h| h.title().as_deref() == Some("Plain"));
+        assert_eq!(referer(&server, "/plain", 0), None);
+    }
+
+    #[test]
+    fn forms_scripts_and_new_tabs_carry_the_referrer() {
+        let page = "<!DOCTYPE html><title>P</title><form id=f action=/r><button id=b>go</button></form>\
+             <form id=fn action=/r2 rel=noreferrer><button id=bn>go</button></form>\
+             <a id=nt href='/x?q' referrerpolicy=origin>x</a>";
+        let server = Server::start(
+            &[
+                ("/p", "text/html", page),
+                ("/r", "text/html", "<title>R</title>"),
+                ("/r2", "text/html", "<title>R2</title>"),
+                ("/after", "text/html", "<title>After</title>"),
+            ],
+            &[],
+        );
+        let referer = |s: &Server, prefix: &str| {
+            let got = s.requests_starting(prefix);
+            assert_eq!(got.len(), 1, "{prefix}");
+            header_of(&got[0], "referer")
+        };
+        let page_url = server.url("/p").to_string();
+        let mut h = Harness::load_url(server.url("/p"));
+        h.pump_until(|h| !h.state.is_loading());
+        // A form's submission: the page; with `rel=noreferrer`, none.
+        h.click_id("b");
+        h.pump_until(|h| h.title().as_deref() == Some("R"));
+        assert_eq!(referer(&server, "/r?").as_deref(), Some(&*page_url));
+        assert_eq!(js_text(&mut h, "document.referrer"), page_url);
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("P") && !h.state.is_loading());
+        h.click_id("bn");
+        h.pump_until(|h| h.title().as_deref() == Some("R2"));
+        assert_eq!(referer(&server, "/r2"), None);
+        h.send(ShellToTab::GoBack);
+        h.pump_until(|h| h.title().as_deref() == Some("P") && !h.state.is_loading());
+        // A link opened in a new tab hands the shell its referrer.
+        let link = h.by_id("nt");
+        h.state.open_link_in_new_tab(link);
+        let sent = h.messages.lock().expect("lock").iter().rev().find_map(|m| match m {
+            TabToShell::OpenInNewTab { referrer, .. } => Some(referrer.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            sent,
+            Some(NavReferrer {
+                request: Some(RequestReferrer {
+                    source: server.url("/p"),
+                    policy: ReferrerPolicy::Origin
+                }),
+                policy: ReferrerPolicy::Origin,
+            })
+        );
+        // A `<meta name=referrer>` a script inserts sets the policy for
+        // what follows, `location` included.
+        run_js(
+            &mut h,
+            "var m = document.createElement('meta'); m.setAttribute('name', 'Referrer'); m.setAttribute('content', 'NEVER'); \
+             document.head.append(m); location.assign('/after');",
+        );
+        h.pump_until(|h| h.title().as_deref() == Some("After"));
+        assert_eq!(referer(&server, "/after"), None);
+    }
+
+    #[test]
     fn forms_submit_get_and_post_with_their_encodings() {
         let form_page = "<!DOCTYPE html><title>Form</title>\
              <form id=g action=/result><input name=q value='a b'><input type=checkbox name=c checked><input type=checkbox name=d>\
@@ -10564,7 +10934,7 @@ mod tests {
             .expect("lock")
             .iter()
             .filter_map(|m| match m {
-                TabToShell::OpenFormSubmission { url, post } => Some((url.clone(), post.clone())),
+                TabToShell::OpenFormSubmission { url, post, .. } => Some((url.clone(), post.clone())),
                 _ => None,
             })
             .collect();

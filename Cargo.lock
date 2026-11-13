@@ -587,6 +587,7 @@ dependencies = [
 name = "browser-dom"
 version = "0.0.1"
 dependencies = [
+ "browser-ipc-types",
  "encoding_rs",
  "html5ever",
  "icu_properties",
@@ -676,6 +677,7 @@ dependencies = [
  "boa_gc",
  "boa_runtime",
  "browser-dom",
+ "browser-ipc-types",
  "browser-layout",
  "browser-style",
  "encoding_rs",
@@ -724,6 +726,7 @@ name = "browser-style"
 version = "0.0.1"
 dependencies = [
  "browser-dom",
+ "browser-ipc-types",
  "cssparser",
  "html5ever",
  "precomputed-hash",

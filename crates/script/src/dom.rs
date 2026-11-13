@@ -928,6 +928,12 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     );
     let set_domain = setter(class.context(), "domain", NativeFunction::from_fn_ptr(document_set_domain));
     class.accessor(js_string!("domain"), Some(get_domain), Some(set_domain), ATTR);
+    let get_referrer = getter(
+        class.context(),
+        "referrer",
+        NativeFunction::from_copy_closure_with_captures(document_get, crate::DOC_REFERRER),
+    );
+    class.accessor(js_string!("referrer"), Some(get_referrer), None, ATTR);
     let get_fonts = getter(class.context(), "fonts", NativeFunction::from_fn_ptr(crate::fonts::document_fonts));
     class.accessor(js_string!("fonts"), Some(get_fonts), None, ATTR);
     let get_forms = getter(class.context(), "forms", NativeFunction::from_fn_ptr(crate::forms::document_forms));
@@ -942,9 +948,7 @@ fn init_document(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     class
         .property(js_string!("location"), location, Attribute::ENUMERABLE)
         .property(js_string!("defaultView"), global, Attribute::ENUMERABLE)
-        .property(js_string!("contentType"), js_str("text/html"), Attribute::ENUMERABLE)
-        // Nothing sends a `Referer` header yet, so no document has one.
-        .property(js_string!("referrer"), js_str(""), Attribute::ENUMERABLE);
+        .property(js_string!("contentType"), js_str("text/html"), Attribute::ENUMERABLE);
     Ok(())
 }
 
@@ -2421,6 +2425,10 @@ fn mutate(
         // And the form controls to theirs ("Working sites first" line 8).
         let old = attr_change.as_ref().and_then(|(_, o)| o.clone());
         dom.doc.note_form_attribute(id, name, old.as_deref());
+        // A `<meta name=referrer>`'s `name` or `content` changed.
+        if matches!(name.as_str(), "name" | "content") {
+            dom.doc.meta_referrer(id);
+        }
     }
     if let (Some((_, old)), Some((local, namespace))) = (&attr_change, &attr_record)
         && !attr_noop

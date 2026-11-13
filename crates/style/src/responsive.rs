@@ -653,7 +653,14 @@ pub fn update_image_data_rest(doc: &mut Document, img: NodeId, generation: u64, 
     } else {
         data.pending = Some((request, PendingKind::Update));
     }
-    doc.image_fetches.push((url, deferred));
+    let policy = img_referrer_policy(doc, img);
+    doc.image_fetches.push((url, deferred, policy));
+}
+
+/// The `<img>`'s `referrerpolicy` when its request is made (HTML
+/// §4.8.4.3.5: the image request's fetch takes the attribute's state).
+fn img_referrer_policy(doc: &Document, img: NodeId) -> browser_ipc_types::ReferrerPolicy {
+    browser_ipc_types::ReferrerPolicy::from_attribute(doc.element(img).and_then(|e| e.attr("referrerpolicy")))
 }
 
 /// What happened to the document's images since the last call: each
@@ -699,7 +706,8 @@ pub fn react_to_environment_changes(doc: &mut Document, img: NodeId, env: &Image
         },
         PendingKind::Environment { selected: source, density },
     ));
-    doc.image_fetches.push((url, false));
+    let policy = img_referrer_policy(doc, img);
+    doc.image_fetches.push((url, false, policy));
 }
 
 /// A fetch of `url` ended: decoded (`ok`) or not (a network error, an

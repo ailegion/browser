@@ -263,7 +263,7 @@ pub struct ImageSetCandidate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComputedImage {
     None,
-    Url(Arc<str>),
+    Url(crate::properties::CssUrl),
     Gradient(Arc<ComputedGradient>),
     ImageSet(Arc<[ComputedCandidate]>),
     /// An image function this engine does not paint (`cross-fade()`,
@@ -353,7 +353,7 @@ impl ComputedImage {
     }
 
     /// The URL to fetch for this layer on a device of `scale`, if any.
-    pub fn url_to_fetch(&self, scale: f32) -> Option<&Arc<str>> {
+    pub fn url_to_fetch(&self, scale: f32) -> Option<&crate::properties::CssUrl> {
         match self.chosen(scale) {
             ComputedImage::Url(u) => Some(u),
             _ => None,
@@ -1067,7 +1067,7 @@ fn parse_color_stops<'i>(input: &mut Parser<'i, '_>, angular: bool) -> Result<Ve
 fn parse_image_set<'i>(input: &mut Parser<'i, '_>) -> Result<ImageValue, ParseErr<'i>> {
     let candidates = input.parse_comma_separated(|i| {
         let image = if let Ok(s) = i.try_parse(|i| i.expect_string().map(|s| s.to_string())) {
-            ImageValue::Url(Arc::from(s.as_str()))
+            ImageValue::Url(crate::properties::CssUrl::new(s.as_str()))
         } else {
             let img = parse_image(i)?;
             if matches!(img, ImageValue::None | ImageValue::ImageSet(_)) {
@@ -1142,11 +1142,11 @@ pub(crate) fn parse_image<'i>(input: &mut Parser<'i, '_>) -> Result<ImageValue, 
     let location = input.current_source_location();
     let start = input.position();
     match input.next()?.clone() {
-        Token::UnquotedUrl(u) => Ok(ImageValue::Url(Arc::from(&*u))),
+        Token::UnquotedUrl(u) => Ok(ImageValue::Url(crate::properties::CssUrl::new(&u))),
         Token::Function(name) => {
             if name.eq_ignore_ascii_case("url") {
                 let url = input.parse_nested_block(|i| Ok(i.expect_string()?.to_string()))?;
-                return Ok(ImageValue::Url(Arc::from(url.as_str())));
+                return Ok(ImageValue::Url(crate::properties::CssUrl::new(url.as_str())));
             }
             if let Some(image) = parse_image_function(&name, input)? {
                 return Ok(image);

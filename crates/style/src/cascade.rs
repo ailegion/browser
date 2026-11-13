@@ -772,7 +772,11 @@ impl<'a> Restyler<'a> {
             matched
                 .iter()
                 .filter_map(|(_, _, _, d)| match &d.value {
-                    DeclaredValue::Pending { name, raw } => Some(expand_pending(name, raw, &custom)),
+                    DeclaredValue::Pending { name, raw, referrer } => {
+                        let mut values = expand_pending(name, raw, &custom);
+                        crate::stylesheet::stamp_referrer(&mut values, referrer.as_ref());
+                        Some(values)
+                    }
                     _ => None,
                 })
                 .collect()

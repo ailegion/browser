@@ -851,7 +851,8 @@ remaining lists as they stand.
       scrolls a box (rectangles read then were stale); a traversal
       restores the scroll position its entry was left at.
       SKIPPED, for the owner to rule or place: no `Referer` header and
-      `referrer`/`referrerPolicy` without effect (3.1's open decision);
+      `referrer`/`referrerPolicy` without effect (O23: block A built
+      2026-11-13, recorded under line 8; block B owns the options);
       no `Sec-Fetch-*` headers; no HTTP authentication (`open()`'s user
       and password go nowhere); response header values decoded as
       UTF-8, not byte for byte; XHR `responseXML` and `responseType
@@ -1048,7 +1049,7 @@ remaining lists as they stand.
       every time (no named navigables, no frames); `javascript:` and
       `mailto:` actions navigate nowhere (as links do); reload and
       back/forward of a POST's entry load it with GET, where browsers ask
-      to resubmit; no `Referer` (3.1's open decision); the form's named
+      to resubmit; no `Referer` (O23: block A built 2026-11-13, recorded below); the form's named
       properties sit in the prototype chain, so built-in members win over a
       control named like them (HTML's `[LegacyOverrideBuiltIns]`: a field
       named `submit` hides `form.submit`), they are not own or enumerable,
@@ -1107,6 +1108,72 @@ remaining lists as they stand.
       paint unit tests twice in four runs with no failing test named
       (the process ended, cause not found), the tab's two timer tests
       line 7 lists once (each passing alone).
+      Referrer, block A (O23), 2026-11-13, owner's go on the plan (parts
+      1 to 7; block B, `fetch`'s `referrer`/`referrerPolicy` options and
+      `Request.referrer`, follows). Built: `browser_ipc_types::referrer`
+      (the policies; header tokens as written, attributes and meta ASCII
+      case-insensitively, the meta's legacy keywords; Fetch's split of
+      `Referrer-Policy` values; strip, potentially trustworthy, same site
+      (no public suffix list, O16 b: the last two labels), "determine
+      request's referrer" with the 4096-byte cut and O23's cross-site
+      cap). Net: `FetchRequest::referrer`, determined on every hop, the
+      result the next hop's source, a redirect's `Referrer-Policy`
+      setting the policy, `Referer` added before the cache's Vary check,
+      `NetToTab::ResponseStart::referrer` reporting it. DOM:
+      `Document::referrer_policy` (the response's header, set before
+      parsing; a `<meta name=referrer>` inserted by the parser or a
+      script, or a connected one's `name`/`content` changed, replaces
+      it, the most recent winning). Tab: navigations from the page (links
+      and areas with `referrerpolicy` and `rel=noreferrer`, forms with
+      `rel=noreferrer`, `location`, `<meta http-equiv=refresh>` and the
+      `Refresh` header) carry the document's URL; the address bar none;
+      a history entry keeps the referrer its load determined and the
+      policy its navigation was given, and a reload or a loading
+      traversal requests with them again (HTML §7.4.3, §7.4.5); entries
+      of one document share them; a new tab from a link or a form gets
+      them through `TabToShell::OpenInNewTab`/`OpenFormSubmission` and
+      `ShellToTab::NavigateFrom`/`NavigateWithBody`
+      (`NavigationReferrer`); `document.referrer` is the serialization of
+      the determined referrer. Subresources: `<script>` (classic and
+      module) and `<link rel=stylesheet>` with their `referrerpolicy`,
+      `<img>` with the attribute's state when its request is made
+      (`Document::image_fetches`), module imports with the importer's URL
+      under the inherited policy (`ModuleFetch`), what an external sheet
+      fetches (`url()` images of every kind, `@font-face` sources,
+      `@import`s) with the sheet's response URL under its response's
+      policy (`CssUrl`, `Stylesheet::referrer`, `FontFaceRule::referrer`;
+      WPT `referrer-policy/css-integration`), an inline sheet's and a
+      `style` attribute's with the document's; `fetch`/XHR (sync too) and
+      their preflights with the document's, per hop. Tests: ipc-types
+      (parsing, determination, the cap), net (per hop, a redirect's
+      policy), script (imports' referrer and inherited policy), tab
+      `requests_carry_the_referrer_their_policy_gives` (every kind of
+      subresource, a link, `noreferrer`, back, meta, reload, the address
+      bar; it fails when a sheet's fetches take the document's referrer)
+      and `forms_scripts_and_new_tabs_carry_the_referrer`. Changed from
+      the plan shown to the owner: a reload the user starts sends the
+      entry's stored referrer, not none (HTML's reload reuses the entry's
+      document state; the spec text came after the plan). SKIPPED: a
+      dynamic `import()` from an inline classic script whose element has
+      a `referrerpolicy` takes the document's policy (Boa gives an inline
+      script no identity to keep its policy by), and its `Referer` is the
+      document's URL where HTML says the script's base URL (the
+      document's base URL, which `<base href>` changes). Not verified
+      against Chrome and Firefox: `Referrer-Policy` tokens matched as
+      written (the spec's reading); a `url()` that a `var()` substitution
+      parses takes the referrer of the declaration holding the `var()`;
+      one fetch per image URL, the first request's referrer going.
+      Timing (release probe, live, two runs each, against this morning's
+      follow-up): slower: iana heap 435.7 MiB (434.4–434.5), likely
+      `CssUrl` (24 bytes where `Arc<str>` was 16, in every computed
+      style's `list-style-image` and image layers), not measured apart;
+      Wikipedia full restyle 44.2–46.5 ms (43.4–45.3), heap 30.2 MiB
+      (30.1); iana relayout 38.6–46.7 ms (37.5–39.9), full restyle
+      381–402 ms (383–394); Wikipedia load 629–647 ms (627–679), relayout
+      1.7–1.8 ms (1.6–2.0); iana load 4.94–4.98 s (4.85–5.52). Tests that
+      failed now and then: the tab's two timer tests line 7 lists
+      (`lifecycle_events_…` 3 of 4 full runs, `responsive_images_…` 1 of
+      4), each passing alone.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

@@ -9,6 +9,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod referrer;
+
+pub use referrer::{NavigationReferrer, ReferrerPolicy, RequestReferrer};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -125,9 +128,16 @@ pub struct PostData {
 /// viewport (the tab adds its own scroll offset).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ShellToTab {
+    /// Navigate as the user asked (the address bar, a bookmark): no
+    /// referrer.
     Navigate { url: Url },
-    /// Navigate with a POST body (a form submitted into a new tab).
-    NavigateWithBody { url: Url, post: PostData },
+    /// Navigate for a page that opened this tab (a link opened in a new
+    /// tab): `referrer` is where its `Referer` comes from, none for a
+    /// `noreferrer` link.
+    NavigateFrom { url: Url, referrer: NavigationReferrer },
+    /// Navigate with a POST body (a form submitted into a new tab), with
+    /// the submitting page's referrer.
+    NavigateWithBody { url: Url, post: PostData, referrer: NavigationReferrer },
     Reload,
     Stop,
     GoBack,
@@ -224,12 +234,13 @@ pub enum TabToShell {
     Cursor(Cursor),
     /// What the pointer is over has a `cursor: url()` image.
     CursorImage(CursorImage),
-    /// The user asked for a link in a new tab (middle click).
-    OpenInNewTab { url: Url },
+    /// The user asked for a link in a new tab (middle click), with the
+    /// page's referrer for it (none for `noreferrer`).
+    OpenInNewTab { url: Url, referrer: NavigationReferrer },
     /// A form submitted into a new navigable (`target=_blank` or a name
     /// no tab has): a new tab, shown, navigated to `url` (with `post` as
-    /// the body of a POST).
-    OpenFormSubmission { url: Url, post: Option<PostData> },
+    /// the body of a POST) and the page's referrer.
+    OpenFormSubmission { url: Url, post: Option<PostData>, referrer: NavigationReferrer },
     /// Text the user copied; the shell owns the clipboard.
     CopyText { text: String },
     /// How many find matches there are and which is current (1-based).
@@ -272,6 +283,10 @@ pub enum NetToTab {
         status_text: String,
         headers: Vec<(String, String)>,
         final_url: Url,
+        /// The referrer the last hop determined (Fetch's request
+        /// referrer once fetched): a document's `document.referrer`.
+        /// Boxed: chunks, the common message, stay small.
+        referrer: Option<Box<Url>>,
     },
     ResponseChunk { id: RequestId, bytes: Vec<u8> },
     ResponseEnd { id: RequestId },

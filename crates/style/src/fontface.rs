@@ -54,6 +54,10 @@ pub struct FontFaceRule {
     pub ascent_override: Option<f32>,
     pub descent_override: Option<f32>,
     pub line_gap_override: Option<f32>,
+    /// The external sheet the rule is in, as the `Referer` of its
+    /// sources' fetches; none for an inline sheet or a script's face (the
+    /// document's).
+    pub referrer: Option<Arc<browser_ipc_types::RequestReferrer>>,
 }
 
 /// `font-display` (CSS Fonts 4 §4.9): how long text waits, invisible,
@@ -257,6 +261,8 @@ pub fn parse_font_face_block(input: &mut Parser<'_, '_>) -> Option<FontFaceRule>
         ascent_override: parser.ascent_override,
         descent_override: parser.descent_override,
         line_gap_override: parser.line_gap_override,
+        // Its sheet's, once the sheet resolves its URLs.
+        referrer: None,
     })
 }
 

@@ -1242,7 +1242,7 @@ pub struct CursorValue {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CursorImage {
-    pub url: Arc<str>,
+    pub url: CssUrl,
     pub hotspot: Option<(f32, f32)>,
 }
 
@@ -1980,15 +1980,53 @@ impl ListStylePosition {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImageValue {
     None,
-    Url(Arc<str>),
+    Url(CssUrl),
     Gradient(Arc<Gradient>),
     ImageSet(Arc<Vec<ImageSetCandidate>>),
     Function(Arc<str>),
 }
 
+/// A `url()` value (absolute once its sheet resolved it) with where the
+/// `Referer` of its fetch comes from: the external stylesheet's URL and
+/// its response's policy (WPT `referrer-policy/css-integration`); none
+/// for an inline sheet or a `style` attribute, whose fetches use the
+/// document's. It reads as its URL.
+#[derive(Debug, Clone)]
+pub struct CssUrl {
+    pub url: Arc<str>,
+    pub referrer: Option<Arc<browser_ipc_types::RequestReferrer>>,
+}
+
+impl CssUrl {
+    pub fn new(url: &str) -> Self {
+        Self {
+            url: Arc::from(url),
+            referrer: None,
+        }
+    }
+}
+
+impl PartialEq for CssUrl {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+            && match (&self.referrer, &other.referrer) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+                _ => false,
+            }
+    }
+}
+
+impl std::ops::Deref for CssUrl {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.url
+    }
+}
+
 impl ImageValue {
     /// The URL, when the value is a plain `url()`.
-    pub fn url(&self) -> Option<Arc<str>> {
+    pub fn url(&self) -> Option<CssUrl> {
         match self {
             ImageValue::Url(u) => Some(u.clone()),
             _ => None,
@@ -2776,7 +2814,9 @@ pub enum DeclaredValue {
     Custom { name: Arc<str>, value: CustomValue },
     /// A known property whose value contains `var()`; substituted and
     /// parsed per element by `crate::custom::expand_pending`.
-    Pending { name: Arc<str>, raw: Arc<str> },
+    /// `referrer`: the external sheet's, for the URLs the substitution
+    /// parses (`stylesheet::stamp_referrer`).
+    Pending { name: Arc<str>, raw: Arc<str>, referrer: Option<Arc<browser_ipc_types::RequestReferrer>> },
 }
 
 impl DeclaredValue {
@@ -3467,7 +3507,7 @@ fn parse_cursor<'i>(input: &mut Parser<'i, '_>) -> Result<CursorValue, ParseErr<
             Err(_) => None,
         };
         images.push(CursorImage {
-            url: Arc::from(url.as_str()),
+            url: CssUrl::new(url.as_str()),
             hotspot,
         });
         input.expect_comma()?;
