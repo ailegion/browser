@@ -1591,12 +1591,41 @@ impl TabState {
             self.after_script();
             return;
         }
+        // The `<output>`s reset, whose children were replaced.
+        let mut changes = Vec::new();
         if let Some(doc) = &mut self.doc {
             for c in doc.form_resettable_elements(form) {
                 doc.reset_control(c);
+                // An `<output>`'s reset: string replace all with its
+                // default value.
+                if let Some(text) = doc.output_default_value(c) {
+                    let held = doc.children(c).any(|n| {
+                        std::iter::once(n).chain(doc.descendants(n)).any(|d| {
+                            doc.element(d).is_some_and(|e| e.is_html() && matches!(&*e.name.local, "style" | "link" | "base"))
+                        })
+                    });
+                    doc.set_text_content(c, &text);
+                    if doc.is_connected(c) {
+                        changes.push(if held {
+                            browser_script::DomChange::Sheets { parent: c, generation: 0 }
+                        } else {
+                            browser_script::DomChange::Children {
+                                parent: c,
+                                inserted: doc.children(c).collect(),
+                                generation: 0,
+                            }
+                        });
+                    }
+                }
             }
         }
         self.controls_changed();
+        if !changes.is_empty() {
+            // As after a script's tree change: restyle, lay out, drop the
+            // references to removed nodes, run the image algorithms.
+            self.dom_changed(&changes);
+            self.drive_images();
+        }
     }
 
     /// Implicit submission (HTML §4.10.22.2): Enter in a field of a form
@@ -10402,6 +10431,69 @@ mod tests {
         // `:checked` follows the state.
         assert_eq!(run_js(&mut h, "document.querySelectorAll(':checked').length"), "2");
         assert_eq!(run_js(&mut h, "document.getElementById('f').reset(); c.checked"), "false");
+    }
+
+    #[test]
+    fn output_reset_replaces_its_children_with_its_text() {
+        let html = "<!DOCTYPE html><title>Out</title>\
+             <style>output { display: inline-block } #wide { display: inline-block; width: 100px }</style>\
+             <form id=f><output id=o><span id=wide>5</span>6<!--c--></output><output id=e></output><output id=t>x</output>\
+             <input type=reset id=r></form>\
+             <script>var recs = []; \
+               new MutationObserver(l => l.forEach(m => recs.push(m.target.id + ':' + m.addedNodes.length + ':' + m.removedNodes.length))) \
+                 .observe(document.getElementById('f'), {childList: true, subtree: true});</script>";
+        let mut h = Harness::load(html);
+        let o = h.by_id("o");
+        assert!(h.rect_of(o).width >= 100.0, "the span's width at first");
+        // Its children become one text node of its descendant text (the
+        // comment's data is not text); an empty one stays empty and no
+        // record is queued for it; a text-only one gets a new text node.
+        assert_eq!(
+            run_js(
+                &mut h,
+                "var o = document.getElementById('o'), w = document.getElementById('wide'), t = document.getElementById('t'), t0 = t.firstChild; \
+                 document.getElementById('f').reset(); \
+                 [o.childNodes.length, o.firstChild.nodeType, o.textContent, w.parentNode === null, \
+                  document.getElementById('e').childNodes.length, t.textContent, t.firstChild !== t0].join()"
+            ),
+            "\"1,3,56,true,0,x,true\""
+        );
+        assert_eq!(js(&mut h, "recs.splice(0).join(' ')"), "\"o:1:3 t:1:1\"");
+        assert!(h.rect_of(o).width < 100.0, "laid out again with the text alone: {:?}", h.rect_of(o));
+        // The user's reset button runs the same reset.
+        run_js(&mut h, "o.innerHTML = '<b>7</b>'");
+        js(&mut h, "recs.length = 0");
+        h.click_id("r");
+        assert_eq!(run_js(&mut h, "[o.childNodes.length, o.firstChild.nodeType, o.textContent].join()"), "\"1,3,7\"");
+        assert_eq!(js(&mut h, "recs.splice(0).join(' ')"), "\"o:1:1 t:1:1\"");
+    }
+
+    #[test]
+    fn method_dialog_fires_close_as_a_task() {
+        let html = "<!DOCTYPE html><title>Dlg</title>\
+             <dialog id=d open><form id=f method=dialog><button id=b value=ok>OK</button></form></dialog>\
+             <script>var log = []; document.getElementById('d').onclose = ev => log.push('close:' + ev.isTrusted + ':' + ev.bubbles);</script>";
+        let mut h = Harness::load(html);
+        // `open` goes at once; `close` waits for a task of its own, after
+        // every microtask of this one (those they queue included).
+        assert_eq!(
+            run_js(
+                &mut h,
+                "document.getElementById('f').requestSubmit(); \
+                 Promise.resolve().then(() => { log.push('micro'); Promise.resolve().then(() => log.push('micro2')); }); \
+                 [document.getElementById('d').hasAttribute('open'), log.length].join()"
+            ),
+            "\"false,0\""
+        );
+        assert_eq!(js(&mut h, "log.splice(0).join(' ')"), "\"micro micro2 close:true:false\"");
+        // A closed dialog: no second `close`.
+        run_js(&mut h, "document.getElementById('f').requestSubmit()");
+        assert_eq!(js(&mut h, "log.length"), "0");
+        // The user's click closes it the same way.
+        run_js(&mut h, "document.getElementById('d').setAttribute('open', '')");
+        h.click_id("b");
+        h.pump();
+        assert_eq!(js(&mut h, "log.splice(0).join(' ')"), "\"close:true:false\"");
     }
 
     #[test]

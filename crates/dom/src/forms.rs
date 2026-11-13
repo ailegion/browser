@@ -1439,11 +1439,21 @@ impl Document {
                 self.controls_changed.push(id);
             }
             local_name!("output") => {
-                // The default value override is not kept (no `output.value`
-                // setter yet): its text is its default.
+                // Its reset is a tree change ("string replace all" with its
+                // default value, `output_default_value`), which the caller
+                // makes: the bindings and the tab each note it their way.
             }
             _ => {}
         }
+    }
+
+    /// An `<output>`'s default value (HTML §4.10.12), the text its reset
+    /// puts in it; `None` for any other element. Its default value
+    /// override is only ever set by the `value` and `defaultValue`
+    /// setters (not bound yet), so it is null and the default value is
+    /// the descendant text content.
+    pub fn output_default_value(&self, id: NodeId) -> Option<String> {
+        self.is_html_named(id, local_name!("output")).then(|| self.text_content(id))
     }
 
     // ----- tree and attribute hooks -----

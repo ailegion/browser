@@ -1473,6 +1473,24 @@ fn replace_children_with_text(dom: &mut Dom, id: NodeId, text: &str) {
     log_replace_all(&mut dom.doc, id, added, children);
 }
 
+/// The DOM's "string replace all" made by the engine itself (an
+/// `<output>`'s reset): what the `textContent` setter does to the element
+/// `id`, with the change noted for the restyle when it is connected.
+pub(crate) fn string_replace_all(dom: &mut Dom, id: NodeId, text: &str) {
+    dom.generation += 1;
+    let connected = dom.doc.is_connected(id);
+    let held = holds_sheet(&dom.doc, &dom.doc.children(id).collect::<Vec<_>>());
+    replace_children_with_text(dom, id, text);
+    if connected {
+        if held {
+            dom.note_sheet_children(id);
+        } else {
+            let inserted = dom.doc.children(id).collect();
+            dom.note_children(id, inserted);
+        }
+    }
+}
+
 /// The record of a "replace all": every old child removed, the new ones
 /// added; none when both lists are empty.
 fn log_replace_all(doc: &mut Document, parent: NodeId, added: Vec<NodeId>, removed: Vec<NodeId>) {

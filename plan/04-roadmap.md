@@ -1054,16 +1054,14 @@ remaining lists as they stand.
       named `submit` hides `form.submit`), they are not own or enumerable,
       several matches give a static `NodeList` (not a live `RadioNodeList`)
       and no past-names map is kept; `form.elements` with several matches
-      gives the first; `method=dialog` fires `close` as a microtask and
-      keeps no `returnValue` (no `HTMLDialogElement`); a `<select>` with
+      gives the first; `method=dialog` keeps no `returnValue` (no
+      `HTMLDialogElement`) and fires no `beforetoggle`/`toggle` (no
+      `ToggleEvent`; found 2026-11-13, Chrome and Firefox firing them is
+      as recalled, not checked); a `<select>` with
       `size` or `multiple` still draws as a drop-down and opens no list on
-      click (the 2026-10-09 additions); colour sanitization is the
-      simple-colour rule (`#rrggbb`), where HTML now parses any CSS
-      colour; `output`'s default value override is not kept;
+      click (the 2026-10-09 additions);
       `base-select` draws as `auto`; user involvement is not passed.
-      Not verified against Chrome and Firefox (taken as written): a
-      checkbox or radio with `appearance: none` and an `auto` size is 0×0
-      (Chrome's, as recalled; Firefox may keep 13px); Enter on a checkbox
+      Not verified against Chrome and Firefox (taken as written): Enter on a checkbox
       or radio submits; Enter on a button waits for `keypress`; a
       drop-down with no selected option shows its first option; the
       datetime-local fraction without trailing zeros; range step rounding
@@ -1072,6 +1070,43 @@ remaining lists as they stand.
       the other reflected attributes and special getters of these elements
       (`type`, `name`, `defaultValue`, `defaultChecked`, `action`,
       `option.value`/`text`/`label`, ...) are Phase 5's DOM bindings (C).
+      Follow-up 2026-11-13 (owner: "do what you think is small"), still
+      not ticked. Built: an `<output>`'s reset is HTML's: string replace
+      all with its default value (`Document::output_default_value`: the
+      override is only set by the `value`/`defaultValue` setters, Phase
+      5's bindings (C), so it is null and the default is the descendant
+      text content), one `childList` record, the children's boxes built
+      again; in script (`dom::string_replace_all`, the `textContent`
+      setter's path) and in the tab without script (`dom_changed`).
+      `method=dialog`'s `close` is a task of its own (a zero-delay timer
+      job, which the tab runs as a task with its checkpoint), no longer a
+      microtask. Tests: tab `output_reset_replaces_its_children_with_its_text`
+      (children, records, relayout, the reset button),
+      `method_dialog_fires_close_as_a_task` (after the microtasks the
+      submission's task queued, none for a closed dialog, the user's
+      click). Not covered by a test: the tab's reset without script (the
+      harness always has one). Owner's rulings: colour sanitization stays
+      the simple-colour rule, not a skip: Chrome and Firefox keep
+      `#rrggbb` (caniuse and web-features: `alpha`/`colorspace` and CSS
+      colour values unsupported in Chrome through 149, behind a
+      preference in Firefox; only Safari 18.4 shipped them); a checkbox
+      or radio with `appearance: none` and an `auto` size stays 0×0, as
+      Firefox does (its bug 1435658: 18×18 back and forth to 0×0 as
+      `appearance` toggles; Chrome as recalled, not checked), done for
+      now. Not verified: Chrome and Firefox giving one `childList`
+      record and a new text node on an output's reset (the spec's steps,
+      taken as written). Timing (release probe, live, two runs each,
+      against the line 8 build's numbers above), slower: Wikipedia load
+      627–679 ms (619–641), full restyle 43.4–45.3 ms (40.9–42.3),
+      relayout 1.6–2.0 ms (1.5–1.6), heap after load 30.1 MiB (29.9);
+      iana load 4.85–5.52 s (4.75–4.76), full restyle 383–394 ms
+      (372–379), relayout 37.5–39.9 ms (36.5–38.1), heap 434.4–434.5 MiB
+      (434.4). Not attributed: the changed code runs only on a form
+      reset and a `method=dialog` submission, which neither page does
+      before these are measured. Tests that failed now and then: the
+      paint unit tests twice in four runs with no failing test named
+      (the process ended, cause not found), the tab's two timer tests
+      line 7 lists once (each passing alone).
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

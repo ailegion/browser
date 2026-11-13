@@ -578,12 +578,17 @@ fn close_dialog(dialog: NodeId, _result: Option<String>, context: &mut Context) 
             d.note_attr(dialog, "open", Some(was));
         }
     }
-    context.enqueue_job(boa_engine::job::Job::PromiseJob(boa_engine::job::PromiseJob::new(move |ctx| {
+    // "Queue an element task on the user interaction task source": a task
+    // of its own after this one (the executor's zero-delay timer queue,
+    // which the tab runs as tasks, each with its microtask checkpoint),
+    // never a microtask of the current one.
+    let fire = boa_engine::job::NativeJob::new(move |ctx| {
         if let Ok(event) = crate::events::new_event("close", crate::UiEventInit::default(), ctx) {
             let _ = dispatch(&event, EventTargetRef::Node(dialog), None, ctx);
         }
         Ok(JsValue::undefined())
-    })));
+    });
+    context.enqueue_job(boa_engine::job::Job::TimeoutJob(boa_engine::job::TimeoutJob::new(fire, 0)));
     Ok(())
 }
 
@@ -632,9 +637,18 @@ pub(crate) fn reset_form(form: NodeId, context: &mut Context) -> JsResult<()> {
             let mut d = shared.borrow_mut();
             for c in d.doc.form_resettable_elements(form) {
                 d.doc.reset_control(c);
+                // An `<output>`'s reset: string replace all with its
+                // default value.
+                if let Some(text) = d.doc.output_default_value(c) {
+                    crate::dom::string_replace_all(&mut d, c, &text);
+                }
             }
             drop(d);
             changed(context)?;
+            // As after `textContent`: a `<picture>` may have lost an
+            // `<img>`, and the observers hear of the replaced children.
+            crate::dom::flush_images(context);
+            crate::observers::drain(context);
         }
         Ok(())
     })();
