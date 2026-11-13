@@ -11,7 +11,7 @@ Start here, in order, one line per turn, before anything else in this
 file. Each line names the plan entry it comes from and the part to
 build now; the rest of that entry stays there for later. The usual flow
 holds per line: build, test, report with the per-item lines, stop. Tick
-a line when done. After line 8, continue at 4a block 7 and the
+a line when done. After line 9, continue at 4a block 7 and the
 remaining lists as they stand.
 
 - [ ] 1. From Phase 1 item 1 (net), O2 and O16: TLS checked and fixed on
@@ -895,6 +895,17 @@ remaining lists as they stand.
       `font_display_blocks_swaps_and_gives_up` (timers against the
       loopback network), and the paint snapshots (one pixel of
       `03-floats`, once; one crash inside the GPU driver, once).
+      Fixed 2026-11-13 (owner's go), test changes only, what each
+      checks unchanged: `lifecycle_events_…` printed its event log from a
+      20 ms page timer that fired among the lines the test asserted on a
+      busy machine; it reads the log from the page now.
+      `responsive_images_…` waited for one of the two images a scale
+      change fetches; it waits for both. Eight full tab runs in parallel
+      after: no failure (before: 3 of 4 runs). Still open:
+      `font_display_…` (its periods are wall-clock; a clock the test can
+      move needs a product change, not made), the paint process ending
+      without a failing test named and the one-pixel snapshot, and
+      `declared_web_families_hide_installed_ones` (once).
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,
@@ -1193,6 +1204,25 @@ remaining lists as they stand.
       referrer module's public-suffix cases, net's public-suffix
       cookies; in the full run the paint snapshots failed once (passing
       alone, line 7 lists them) and `lifecycle_events_…` once.
+- [ ] 9. `<base href>` (new, owner 2026-11-13; found while fixing line
+      8's referrer parts: a document's base URL is its own URL, moved
+      only by `pushState`, so a page relying on `<base>` resolves its
+      relative URLs wrong). HTML §2.5.1 and §4.2.3: the document base
+      URL from the first `<base>` with an `href` in tree order, its
+      frozen base URL (resolved against the fallback base URL when the
+      element is inserted, removed, or its `href` changes; a `data:` or
+      `javascript:` URL, or one the document's CSP refuses, falls back),
+      the fallback base URL (`about:blank` and `srcdoc` documents
+      included). Every resolution that uses the base URL follows it:
+      links and areas (`href` reflected), forms (`action`), images and
+      `srcset`, scripts and module specifiers (an inline script's base
+      URL is the document's when prepared: the `import()` referrer of
+      line 8's referrer record), stylesheets and inline `style` URLs,
+      `@import` from inline sheets, `fetch`/XHR and `history.pushState`
+      URLs (the API base URL), `<meta http-equiv=refresh>`,
+      `document.baseURI` and `Node.baseURI`, and the `url()`s an inline
+      sheet resolved, which a change of base resolves again. `<base
+      target>` already works (line 8).
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

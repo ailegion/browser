@@ -7106,8 +7106,7 @@ mod tests {
               document.addEventListener('readystatechange', note('rsc')); document.addEventListener('DOMContentLoaded', note('dcl')); \
               window.addEventListener('DOMContentLoaded', note('dcl@window')); window.addEventListener('load', ev => log.push('load:' + document.readyState + ':' + (ev.target === window) + ':' + ev.bubbles)); \
               document.onreadystatechange = note('onrsc'); console.log('inline:' + document.readyState)</script>\
-            <script defer src='/d.js'></script><body><img src='/img.png'>\
-            <script>setTimeout(() => console.log(log.join(' ')), 20)</script>";
+            <script defer src='/d.js'></script><body><img src='/img.png'>";
         let server = Server::start(
             &[
                 ("/page", "text/html; charset=utf-8", page),
@@ -7120,11 +7119,12 @@ mod tests {
         h.pump_until(|h| h.state.doc.is_some() && h.state.scripts.deferred.is_empty());
         assert_eq!(console_texts(&h), ["inline:loading", "defer:interactive"]);
         assert_eq!(h.state.lifecycle, Lifecycle::ContentLoaded);
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        // The events so far, read from the page (a page timer printing
+        // them raced the test's own pace on a busy machine).
         h.pump();
         assert_eq!(
-            console_texts(&h).last().map(String::as_str),
-            Some("rsc:interactive onrsc:interactive dcl:interactive dcl@window:interactive"),
+            h.state.script.as_mut().and_then(|s| s.eval_to_string("log.join(' ')").ok()).as_deref(),
+            Some("\"rsc:interactive onrsc:interactive dcl:interactive dcl@window:interactive\""),
             "no load while the image is held"
         );
         server.release("/img.png");
@@ -9703,7 +9703,10 @@ mod tests {
 
         // Twice the pixels: the 2x candidate, drawn at half its size.
         h.send(ShellToTab::Resize(Viewport { width: 400.0, height: 600.0, scale_factor: 2.0 }));
-        h.pump_until(|h| h.state.images.get_svg(&server.url("/a2.svg")).is_some());
+        // Both new candidates are fetched; each may arrive last.
+        h.pump_until(|h| {
+            h.state.images.get_svg(&server.url("/a2.svg")).is_some() && h.state.images.get_svg(&server.url("/w800.svg")).is_some()
+        });
         h.pump();
         assert_eq!(current(&mut h), "\"/a2.svg /w800.svg /narrow.svg \"");
         assert_eq!(size_of(&h, "x"), Some((40.0, 10.0)));
