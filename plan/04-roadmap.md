@@ -1533,13 +1533,17 @@ remaining lists as they stand.
       test now expects the rejection it says was silent only for want
       of a tracker. Not built: the `unhandledrejection` and
       `rejectionhandled` events (not part of this item); CSP and mixed
-      content messages (nothing here blocks on them). Found, not
-      fixed (owner to decide): a `<script src>`, module import,
-      stylesheet or font whose request fails on the network (not an
-      HTTP error) is never marked failed: the `Failed` handler only
-      handles images and the main document, so a parser-blocking
-      script that fails this way stops the page's parsing for good.
-      Full runs: the paint snapshots failed once (passing alone).
+      content messages (nothing here blocks on them). Full runs: the
+      paint snapshots failed once (passing alone). Found while doing
+      it, fixed with the owner's go the same day: a `<script src>`,
+      module import or font whose request failed on the network (not
+      an HTTP error) was never marked failed (the `Failed` handler only
+      handled images and the main document), so a parser-blocking
+      script failing that way stopped parsing for good. Now it ends as
+      an error status does: the script fails and the parser goes on,
+      the module graph fails, the font's next source is fetched (a
+      stylesheet was already skipped either way). Test: the three from
+      a refused port, the page completing. Full run clean.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

@@ -3376,9 +3376,35 @@ impl TabState {
             NetToTab::Failed { id, error } => {
                 let Some(p) = self.pending.remove(&id) else { return };
                 tracing::warn!(tab = self.id.0, "request {} failed: {error}", id.0);
-                if !matches!(p.kind, PendingKind::Main) {
+                // Scripts and modules report their own failure lines.
+                if !matches!(p.kind, PendingKind::Main | PendingKind::Script { .. } | PendingKind::ModuleSource { .. }) {
                     let url = self.pending_url(&p);
                     self.resource_failed(url.as_ref(), error.clone());
+                }
+                // A failure on the network ends a load as an error status
+                // does: the script fails (the parser goes on), the module
+                // graph hears of it, the font's next source is tried. (A
+                // stylesheet is skipped either way.)
+                match &p.kind {
+                    PendingKind::Script { id } => {
+                        if let Some(load) = self.scripts.get_mut(*id) {
+                            let url = load.url.as_ref().map(Url::to_string).unwrap_or_default();
+                            load.state = LoadState::Failed(format!("Failed to load script {url}: {error}"));
+                        }
+                        self.run_ready_scripts();
+                    }
+                    PendingKind::ModuleSource { url } => {
+                        let url = url.clone();
+                        if let Some(host) = &mut self.script {
+                            host.module_fetched(url.clone(), Err(format!("Failed to load module script {url}: {error}")));
+                        }
+                        self.run_ready_scripts();
+                    }
+                    PendingKind::Font { url } => {
+                        self.web_fonts.failed.insert(Source::Url(url.clone()));
+                        self.fetch_web_fonts();
+                    }
+                    _ => {}
                 }
                 if let PendingKind::Image { url, .. } = &p.kind {
                     let url = url.clone();
@@ -8387,6 +8413,28 @@ mod tests {
         // A new document: the console is cleared.
         h.send(ShellToTab::Navigate { url: page_url("Next") });
         assert!(h.messages.lock().expect("lock").iter().any(|m| matches!(m, TabToShell::ConsoleCleared)));
+    }
+
+    #[test]
+    fn scripts_modules_and_fonts_that_fail_on_the_network_fail_and_the_page_goes_on() {
+        let page = "<style>@font-face { font-family: F; src: url(http://127.0.0.1:1/f.ttf), url(/next.ttf) } p { font-family: F }</style>\
+            <script src='http://127.0.0.1:1/blocking.js'></script><script>console.log('after the blocking script')</script>\
+            <script type=module>import 'http://127.0.0.1:1/m.js'; console.log('module ran')</script><p>text";
+        let server = Server::start(&[("/page", "text/html; charset=utf-8", page)], &[]);
+        let mut h = Harness::load_url(server.url("/page"));
+        h.pump_polling(|h| h.state.lifecycle == Lifecycle::Complete && server.requests("/next.ttf").len() == 1);
+        let t = console_texts(&h);
+        let at = |prefix: &str| t.iter().position(|l| l.starts_with(prefix)).unwrap_or_else(|| panic!("no {prefix:?} in {t:?}"));
+        // The parser went past the failed blocking script.
+        assert!(at("Failed to load script http://127.0.0.1:1/blocking.js") < at("after the blocking script"), "{t:?}");
+        // The module's graph failed: reported, the module never ran.
+        assert!(t.iter().any(|l| l.contains("http://127.0.0.1:1/m.js")), "{t:?}");
+        assert!(!t.iter().any(|l| l == "module ran"), "{t:?}");
+        // The font's next source was fetched (the test server answers it
+        // 404); each reported once.
+        let failed: Vec<&String> = t.iter().filter(|l| l.starts_with("Failed to load resource")).collect();
+        assert_eq!(failed.len(), 2, "{t:?}");
+        assert!(failed[1].contains("status of 404"), "{t:?}");
     }
 
     fn page_url(title: &str) -> Url {
