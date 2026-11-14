@@ -41,6 +41,7 @@ mod fonts;
 mod forms;
 mod history;
 mod observers;
+mod perf;
 mod storage;
 mod urlapi;
 mod view;
@@ -1056,6 +1057,7 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     dom::register(context)?;
     fonts::register(context)?;
     urlapi::register(context)?;
+    perf::register(context)?;
     fetch::register(context)?;
     xhr::register(context)?;
     storage::register(context)?;
@@ -1479,6 +1481,12 @@ impl ScriptHost {
     /// Give `document.cookie` the browser's jar.
     pub fn set_cookie_access(&mut self, access: Rc<dyn CookieAccess>) {
         self.host.borrow_mut().cookies = Some(access);
+    }
+
+    /// The document's time origin: `performance.now()` counts from it, as
+    /// the animation frame timestamps the tab passes do.
+    pub fn set_time_origin(&mut self, origin: std::time::Instant) {
+        perf::set_time_origin(origin, &mut self.context);
     }
 
     /// The tab's History and Location rate limit, shared by its documents.
@@ -3153,6 +3161,58 @@ mod tests {
         assert_eq!(eval(&mut h, "ev.join('|')"), "k null v https://example.test/other true true true|k|null null null https://example.test/other true true true|null");
         assert_eq!(eval(&mut h, "var se = new StorageEvent('storage', {key: 'a', newValue: 'b', storageArea: sessionStorage}); [se.key, String(se.oldValue), se.newValue, JSON.stringify(se.url), se.storageArea === sessionStorage].join('|')"), "a|null|b|\\\"\\\"|true");
         assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    #[test]
+    fn performance_times_marks_measures_and_observes() {
+        let mut h = host();
+        // now() counts up from the origin, in 100 µs steps; timeOrigin is
+        // a wall clock time.
+        assert_eq!(
+            eval(&mut h, "var a = performance.now(), b = performance.now(); [typeof a, a >= 0, b >= a, Math.abs(a * 10 - Math.round(a * 10)) < 1e-6, performance.timeOrigin > 1.7e12, performance instanceof Performance, Object.prototype.toString.call(performance)].join()"),
+            "number,true,true,true,true,true,[object Performance]"
+        );
+        // Marks: a start given or now, a copied detail; timing names and
+        // negative starts throw.
+        assert_eq!(
+            eval(&mut h, "var d = { k: 1 }; var m = performance.mark('a', { startTime: 5, detail: d }); \
+                          [m instanceof PerformanceMark, m instanceof PerformanceEntry, m.name, m.entryType, m.startTime, m.duration, m.detail.k, m.detail !== d, \
+                           (() => { try { performance.mark('navigationStart'); return 'no' } catch (e) { return e.name } })(), \
+                           (() => { try { performance.mark('x', { startTime: -1 }); return 'no' } catch (e) { return e instanceof TypeError } })(), \
+                           new PerformanceMark('loose').name, performance.getEntriesByName('loose').length].join()"),
+            "true,true,a,mark,5,0,1,true,SyntaxError,true,loose,0"
+        );
+        // Measures: between marks, from options, to now; a missing mark throws.
+        assert_eq!(
+            eval(&mut h, "performance.mark('b', { startTime: 15 }); \
+                          var x = performance.measure('ab', 'a', 'b'), y = performance.measure('o', { start: 'a', duration: 7, detail: [1] }), z = performance.measure('z', { end: 20, duration: 4 }); \
+                          [x.startTime, x.duration, y.startTime, y.duration, y.detail[0], z.startTime, z.duration, performance.measure('n').startTime, \
+                           performance.measure('fromNav', 'navigationStart', 'b').duration + (performance.clearMeasures('fromNav'), 0), \
+                           (() => { try { performance.measure('q', 'nope'); return 'no' } catch (e) { return e.name } })(), \
+                           (() => { try { performance.measure('q', { start: 1, end: 2, duration: 1 }); return 'no' } catch (e) { return e instanceof TypeError } })()].join()"),
+            "5,10,5,7,1,16,4,0,15,SyntaxError,true"
+        );
+        // The timeline in start order, by type and name; clearing.
+        assert_eq!(
+            eval(&mut h, "[performance.getEntries().map(e => e.name).join(' '), performance.getEntriesByType('mark').length, performance.getEntriesByName('ab', 'measure').length, \
+                           (performance.clearMarks('a'), performance.getEntriesByType('mark').map(e => e.name).join()), (performance.clearMeasures(), performance.getEntriesByType('measure').length), \
+                           JSON.stringify(performance.getEntriesByType('mark')[0].toJSON()) === '{\"name\":\"b\",\"entryType\":\"mark\",\"startTime\":15,\"duration\":0,\"detail\":null}'].join('|')"),
+            "n a ab o b z|2|1|b|0|true"
+        );
+        // An observer: called as a task with the new entries; buffered
+        // delivers what was there; takeRecords and disconnect.
+        h.run_script(
+            "var seen = []; var o = new PerformanceObserver((list, obs) => seen.push(list.getEntries().map(e => e.entryType + ':' + e.name).sort().join() + (obs === o))); \
+             o.observe({ type: 'mark', buffered: true }); performance.mark('c'); performance.measure('m');",
+        );
+        h.run_timers(std::time::Instant::now());
+        assert_eq!(eval(&mut h, "seen.join('|')"), "mark:b,mark:ctrue");
+        assert_eq!(
+            eval(&mut h, "[PerformanceObserver.supportedEntryTypes.join(), Object.isFrozen(PerformanceObserver.supportedEntryTypes), \
+                           (() => { try { o.observe({}); return 'no' } catch (e) { return e instanceof TypeError } })(), \
+                           (performance.mark('d'), o.takeRecords().length), (o.disconnect(), performance.mark('e'), o.takeRecords().length)].join()"),
+            "mark,measure,true,true,1,0"
+        );
     }
 
     #[test]

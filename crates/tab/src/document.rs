@@ -4046,6 +4046,7 @@ impl TabState {
             Ok(mut host) => {
                 host.set_cookie_access(std::rc::Rc::new(TabCookies(self.net.clone())));
                 host.set_navigation_rate_limit(self.navigation_rate.clone());
+                host.set_time_origin(self.doc_started);
                 if let Some(storage) = &self.origin_storage {
                     host.set_storage_access(storage.clone());
                 }

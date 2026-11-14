@@ -305,6 +305,35 @@ fn is_ordinary(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsVal
     Ok(args.get_or_undefined(0).as_object().is_some_and(|o| o.is_ordinary() && !o.is_callable()).into())
 }
 
+/// HTML's StructuredSerialize then StructuredDeserialize of `value`, for
+/// other APIs that keep a copy (`performance.mark`'s `detail`). `method`
+/// names the call in a `DataCloneError` ("mark' on 'Performance").
+pub(crate) fn structured_clone(value: &JsValue, method: &str, context: &mut Context) -> JsResult<JsValue> {
+    let (serialize, deserialize) = {
+        let shared = history(context)?;
+        let s = shared.borrow();
+        (s.serialize.clone(), s.deserialize.clone())
+    };
+    let (Some(serialize), Some(deserialize)) = (serialize, deserialize) else { return Err(illegal_invocation()) };
+    let ordinary = FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(is_ordinary)).build();
+    let fail = FunctionObjectBuilder::new(
+        context.realm(),
+        NativeFunction::from_copy_closure_with_captures(clone_error_named, JsString::from(method)),
+    )
+    .build();
+    let text = serialize.call(&JsValue::undefined(), &[value.clone(), ordinary.into(), fail.into()], context)?;
+    let Some(text) = text.as_string() else {
+        return Err(dom_exception("DataCloneError", &format!("Failed to execute '{}': the value could not be cloned.", method), context));
+    };
+    deserialize.call(&JsValue::undefined(), &[text.into()], context)
+}
+
+fn clone_error_named(_: &JsValue, args: &[JsValue], method: &JsString, context: &mut Context) -> JsResult<JsValue> {
+    let what = args.get_or_undefined(0).to_string(context)?.to_std_string_escaped();
+    let method = method.to_std_string_escaped();
+    Err(dom_exception("DataCloneError", &format!("Failed to execute '{method}': {what} could not be cloned."), context))
+}
+
 fn clone_failure(replace: bool, what: &str, context: &mut Context) -> boa_engine::JsError {
     let method = if replace { "replaceState" } else { "pushState" };
     dom_exception(

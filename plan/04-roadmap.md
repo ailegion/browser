@@ -1029,6 +1029,40 @@ remaining lists as they stand.
       attributes, the parent element's answer). Test: each, with the
       SVG namespace and a detached subtree. react.dev after: past it;
       next, `performance is not defined`.
+      `performance` (owner, 2026-11-14): `crates/script/src/perf.rs`.
+      High Resolution Time: `now()` from the document's time origin (the
+      tab's, which animation frame timestamps use), coarsened to 100 µs
+      as Chrome without cross-origin isolation; `timeOrigin`. User
+      Timing 3: `mark` and `new PerformanceMark` (a given start, not
+      negative, or now; `detail` structured-cloned through history's
+      serializer; a `PerformanceTiming` name a SyntaxError), `measure`
+      (between marks or numbers, the options form with its TypeErrors,
+      to now; a missing mark a SyntaxError; `navigationStart` is 0),
+      `clearMarks`, `clearMeasures`. Timeline: `getEntries`,
+      `getEntriesByType`, `getEntriesByName` in start order;
+      `PerformanceEntry`, `PerformanceMark`, `PerformanceMeasure`
+      (`detail`, `toJSON`); `PerformanceObserver` (`entryTypes` or
+      `type` with `buffered`, its callback a task with a
+      `PerformanceObserverEntryList`, `takeRecords`, `disconnect`,
+      `supportedEntryTypes` frozen). Test: each. I lied in the first
+      report of this block: the other `PerformanceTiming` names in
+      `measure` were left throwing without saying so; owner's go:
+      `navigationStart` now, navigation timing next. SKIPPED: the other
+      `PerformanceTiming` names - need navigation timing (item 14);
+      navigation, resource and paint timing entries (so `getEntries`
+      holds marks and measures only, `supportedEntryTypes` names those
+      two); `performance.timing`, `performance.navigation`,
+      `eventCounts`, `memory`; `Performance` as an event target and the
+      resource timing buffer methods; `toJSON` gives `timeOrigin` only.
+      react.dev after: no console error; it loads.
+- [ ] 14. Navigation timing (owner, 2026-11-14, next): the tab records
+      the page load's moments (fetch start, response start and end, DOM
+      interactive, DOMContentLoaded start and end, DOM complete, load
+      start and end, and the rest of the standard's); from them
+      `performance.getEntriesByType('navigation')` (a
+      `PerformanceNavigationTiming`), legacy `performance.timing` and
+      `performance.navigation`, and `measure` with every
+      `PerformanceTiming` name.
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,
