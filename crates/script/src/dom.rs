@@ -601,6 +601,23 @@ pub(crate) fn register(context: &mut Context) -> JsResult<()> {
     inherit::<HtmlElementClass, ElementClass>(context)?;
     inherit::<HtmlImageElementClass, HtmlElementClass>(context)?;
     crate::forms::register::<HtmlElementClass>(context)?;
+    // The rest of HTML's element interfaces, under `HTMLElement`; and the
+    // `Object.prototype.toString` names of those with classes here.
+    if let Some(html) = context.get_global_class::<HtmlElementClass>() {
+        crate::elements::register((html.prototype(), html.constructor().into()), context)?;
+    }
+    for (proto, name) in [
+        (prototype_of::<HtmlElementClass>(context)?, "HTMLElement"),
+        (prototype_of::<HtmlImageElementClass>(context)?, "HTMLImageElement"),
+        (crate::forms::prototype(crate::forms::FormInterface::Form, context)?, "HTMLFormElement"),
+        (crate::forms::prototype(crate::forms::FormInterface::Input, context)?, "HTMLInputElement"),
+        (crate::forms::prototype(crate::forms::FormInterface::TextArea, context)?, "HTMLTextAreaElement"),
+        (crate::forms::prototype(crate::forms::FormInterface::Select, context)?, "HTMLSelectElement"),
+        (crate::forms::prototype(crate::forms::FormInterface::Option, context)?, "HTMLOptionElement"),
+        (crate::forms::prototype(crate::forms::FormInterface::Button, context)?, "HTMLButtonElement"),
+    ] {
+        crate::elements::tag(&proto, name, context)?;
+    }
     inherit::<CharacterDataClass, NodeClass>(context)?;
     inherit::<TextClass, CharacterDataClass>(context)?;
     inherit::<CommentClass, CharacterDataClass>(context)?;
@@ -991,6 +1008,8 @@ enum Proto {
     HtmlImage,
     /// A form element's interface (`forms.rs`).
     Form(crate::forms::FormInterface),
+    /// An interface made in `elements.rs`, by name.
+    Made(&'static str),
     Text,
     Comment,
     DocumentFragment,
@@ -1014,7 +1033,10 @@ pub(crate) fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
             NodeKind::Element(e) if e.is_html() && &*e.name.local == "img" => Proto::HtmlImage,
             NodeKind::Element(e) if e.is_html() => match crate::forms::FormInterface::of(&e.name.local) {
                 Some(i) => Proto::Form(i),
-                None => Proto::HtmlElement,
+                None => match crate::elements::interface_for(&e.name.local) {
+                    "HTMLElement" => Proto::HtmlElement,
+                    name => Proto::Made(name),
+                },
             },
             NodeKind::Element(_) => Proto::Element,
             NodeKind::Text(_) => Proto::Text,
@@ -1029,6 +1051,10 @@ pub(crate) fn wrap(id: NodeId, context: &mut Context) -> JsResult<JsValue> {
         Proto::HtmlElement => prototype_of::<HtmlElementClass>(context)?,
         Proto::HtmlImage => prototype_of::<HtmlImageElementClass>(context)?,
         Proto::Form(i) => crate::forms::prototype(i, context)?,
+        Proto::Made(name) => match crate::elements::prototype(name, context) {
+            Some(p) => p,
+            None => prototype_of::<HtmlElementClass>(context)?,
+        },
         Proto::Text => prototype_of::<TextClass>(context)?,
         Proto::Comment => prototype_of::<CommentClass>(context)?,
         Proto::DocumentFragment => prototype_of::<DocumentFragmentClass>(context)?,

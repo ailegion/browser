@@ -8492,6 +8492,32 @@ mod tests {
         assert!(last.1.starts_with("Uncaught ReferenceError"), "{last:?}");
     }
 
+    #[test]
+    fn html_elements_have_their_interfaces() {
+        let mut h = Harness::load_url(data_url(
+            "<div id=d></div><a id=a></a><iframe id=f></iframe><h2 id=h></h2><video id=v></video><table><tbody id=b><tr><td id=c></td></tr></tbody></table><my-el id=m></my-el><foo id=u></foo><input id=i>",
+            None,
+        ));
+        let check = |h: &mut Harness, js: &str| run_js(h, &format!("[{js}].join()"));
+        let byid = "const $ = id => document.getElementById(id);";
+        assert_eq!(
+            check(&mut h, &format!("(() => {{ {byid} return [$('d') instanceof HTMLDivElement && $('d') instanceof HTMLElement && $('d') instanceof Element, $('a') instanceof HTMLAnchorElement, $('f') instanceof HTMLIFrameElement, $('h') instanceof HTMLHeadingElement, $('v') instanceof HTMLVideoElement && $('v') instanceof HTMLMediaElement, $('b') instanceof HTMLTableSectionElement, $('c') instanceof HTMLTableCellElement] }})()")),
+            "\"true,true,true,true,true,true,true\""
+        );
+        // A custom element name is HTMLElement; an unknown name is not.
+        assert_eq!(
+            check(&mut h, &format!("(() => {{ {byid} return [$('m') instanceof HTMLUnknownElement, $('m').constructor === HTMLElement, $('u') instanceof HTMLUnknownElement, document.createElement('section').constructor === HTMLElement, document.createElement('span') instanceof HTMLSpanElement] }})()")),
+            "\"false,true,true,true,true\""
+        );
+        // The interface objects: names, the chain, "Illegal constructor",
+        // on `window` but not enumerable, `toString` tags (the classes
+        // with members too).
+        assert_eq!(
+            check(&mut h, "HTMLDivElement.name, Object.getPrototypeOf(HTMLDivElement) === HTMLElement, Object.getPrototypeOf(HTMLAudioElement) === HTMLMediaElement, (() => { try { new HTMLDivElement(); return 'no' } catch (e) { return e instanceof TypeError && e.message } })(), 'HTMLIFrameElement' in window, Object.keys(window).includes('HTMLIFrameElement'), Object.prototype.toString.call(document.getElementById('d')), Object.prototype.toString.call(document.getElementById('i')), HTMLDivElement.prototype.constructor === HTMLDivElement"),
+            "\"HTMLDivElement,true,true,Illegal constructor,true,false,[object HTMLDivElement],[object HTMLInputElement],true\""
+        );
+    }
+
     fn page_url(title: &str) -> Url {
         data_url(&format!("<title>{title}</title>"), None)
     }

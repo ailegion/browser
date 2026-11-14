@@ -34,6 +34,7 @@
 
 mod cssom;
 mod dom;
+mod elements;
 mod events;
 mod fetch;
 mod fonts;

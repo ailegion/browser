@@ -995,6 +995,25 @@ remaining lists as they stand.
       `revokeObjectURL` - there is no `Blob` yet. Live react.dev after:
       past it, next stopped by `instanceof` with an undefined right side
       in React's framework code (React error #327).
+      HTML's element interfaces (owner, 2026-11-14; the `instanceof`
+      above was React's `instanceof window.HTMLIFrameElement`, and only
+      8 element interfaces existed): `crates/script/src/elements.rs`.
+      Every HTML element's wrapper has its interface per HTML's element
+      index (obsolete elements of §16 included; names not in HTML are
+      `HTMLUnknownElement`, valid custom element names `HTMLElement`).
+      The 63 interfaces without members here are made as interface
+      objects under `HTMLElement` (`HTMLAudioElement` and
+      `HTMLVideoElement` under `HTMLMediaElement`): on `window`, not
+      enumerable, "Illegal constructor" when called, `prototype` and
+      `constructor` linked, `Symbol.toStringTag` set (on the existing
+      `HTMLElement`, `HTMLImageElement` and form classes too). Test:
+      `instanceof` for several, custom and unknown names, the objects'
+      names, chain, error, enumerability and tags. Not built: each
+      interface's own members (`a.href`, `iframe.contentWindow`,
+      `canvas.getContext`, `video.play` and the rest), the legacy
+      constructors `Image`, `Audio`, `Option`. react.dev after: past the
+      `instanceof` (it was the cause); next, React's updates fail with
+      "not a callable function" at three places, not yet identified.
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,
