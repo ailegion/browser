@@ -970,6 +970,31 @@ remaining lists as they stand.
       (Firefox's per browsing context group, here per tab). Test: 200
       mixed calls pass, the 201st and later throw and change nothing, a
       new span allows 200 again.
+      `URL` and `URLSearchParams` (owner, 2026-11-14; react.dev failed on
+      `URLSearchParams is not defined`, and `URL` itself turned out to be
+      missing, though listed as present in a report that day:
+      `crates/script/src/urlapi.rs`. Parsing, the parts and the form
+      encoding are the `url` crate's (`url::quirks`,
+      `url::form_urlencoded`), which implements the URL Standard. `URL`:
+      the constructor with a base (TypeErrors for an invalid URL or
+      base, and without `new`), `URL.canParse`, `URL.parse`, every part's
+      getter and setter (an invalid `href` throws; the others ignore
+      what they cannot use), `origin`, `searchParams` (the same object),
+      `toString`, `toJSON`. `URLSearchParams`: from text (a leading `?`
+      dropped), pairs (each of two, else a TypeError) or an object's own
+      enumerable string keys; `append`, `delete` and `has` with the
+      optional value, `get`, `getAll`, `set`, a stable `sort` by UTF-16
+      code units, `size`, `toString`, `forEach`, `entries`, `keys`,
+      `values`, `for…of` (live iterators, tagged "URLSearchParams
+      Iterator"). Linked both ways: a change to the params rewrites the
+      URL's query (none when empty), a new `search` or `href` refills
+      the params. Strings are `USVString`s (lone surrogates to U+FFFD).
+      Tests: the parts, a base, the errors, `canParse` and `parse`, the
+      setters, the link both ways; the params' building, changes, sort,
+      encoding, iteration. SKIPPED: `URL.createObjectURL` and
+      `revokeObjectURL` - there is no `Blob` yet. Live react.dev after:
+      past it, next stopped by `instanceof` with an undefined right side
+      in React's framework code (React error #327).
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,

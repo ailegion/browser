@@ -41,6 +41,7 @@ mod forms;
 mod history;
 mod observers;
 mod storage;
+mod urlapi;
 mod view;
 mod xhr;
 
@@ -1011,6 +1012,7 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     // document properties of item 3.1 and reads `location` from the global.
     dom::register(context)?;
     fonts::register(context)?;
+    urlapi::register(context)?;
     fetch::register(context)?;
     xhr::register(context)?;
     storage::register(context)?;
@@ -3107,6 +3109,60 @@ mod tests {
         assert_eq!(eval(&mut h, "ev.join('|')"), "k null v https://example.test/other true true true|k|null null null https://example.test/other true true true|null");
         assert_eq!(eval(&mut h, "var se = new StorageEvent('storage', {key: 'a', newValue: 'b', storageArea: sessionStorage}); [se.key, String(se.oldValue), se.newValue, JSON.stringify(se.url), se.storageArea === sessionStorage].join('|')"), "a|null|b|\\\"\\\"|true");
         assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    #[test]
+    fn url_parses_reads_and_sets_its_parts() {
+        let mut h = host();
+        assert_eq!(
+            eval(&mut h, "var u = new URL('https://user:pw@example.com:8080/a/b?x=1&y=2#frag'); \
+                          [u.href, u.origin, u.protocol, u.username, u.password, u.host, u.hostname, u.port, u.pathname, u.search, u.hash].join('|')"),
+            "https://user:pw@example.com:8080/a/b?x=1&y=2#frag|https://example.com:8080|https:|user|pw|example.com:8080|example.com|8080|/a/b|?x=1&y=2|#frag"
+        );
+        // A base; invalid input and an invalid base throw TypeErrors.
+        assert_eq!(eval(&mut h, "new URL('../c', 'https://example.com/a/b/').href"), "https://example.com/a/c");
+        assert_eq!(eval(&mut h, "[() => new URL('nope'), () => new URL('/x', 'bad'), () => URL('https://a/')].map(f => { try { f(); return 'no' } catch (e) { return e instanceof TypeError } }).join()"), "true,true,true");
+        assert_eq!(eval(&mut h, "[URL.canParse('https://a'), URL.canParse('a'), URL.canParse('a', 'https://b/'), URL.parse('x'), URL.parse('https://a/').href].join()"), "true,false,true,,https://a/");
+        // Setters: what cannot be used is ignored; the default port goes.
+        assert_eq!(
+            eval(&mut h, "u.pathname = 'c d'; u.port = 'x'; u.hash = ''; u.protocol = 'http'; u.port = '80'; [u.pathname, u.port, u.hash, u.protocol, u.host].join('|')"),
+            "/c%20d|||http:|example.com"
+        );
+        // The search and its params are one: either way, both change.
+        assert_eq!(eval(&mut h, "u.search = '?q=a b'; [u.search, u.searchParams.get('q'), u.searchParams === u.searchParams].join('|')"), "?q=a%20b|a b|true");
+        assert_eq!(eval(&mut h, "u.searchParams.append('z', '1 2'); u.search"), "?q=a+b&z=1+2");
+        assert_eq!(eval(&mut h, "u.searchParams.delete('q'); u.searchParams.delete('z'); [u.search, u.href.includes('?')].join('|')"), "|false");
+        assert_eq!(eval(&mut h, "u.href = 'https://other.test/?k=v'; u.searchParams.get('k')"), "v");
+        assert_eq!(eval(&mut h, "try { u.href = 'nope'; 'no' } catch (e) { e instanceof TypeError && u.href }"), "https://other.test/?k=v");
+        assert_eq!(eval(&mut h, "[JSON.stringify({ u }) === '{\"u\":\"https://other.test/?k=v\"}', String(u)].join()"), "true,https://other.test/?k=v");
+    }
+
+    #[test]
+    fn url_search_params_build_change_sort_encode_and_iterate() {
+        let mut h = host();
+        assert_eq!(
+            eval(&mut h, "var p = new URLSearchParams('?a=1&b=2&a=3'); [p.getAll('a'), p.size, p.has('a', '3'), p.has('a', '4'), p.get('c')].join('|')"),
+            "1,3|3|true|false|"
+        );
+        assert_eq!(eval(&mut h, "p.delete('a', '1'); p.toString()"), "b=2&a=3");
+        assert_eq!(eval(&mut h, "p.append('a', '4'); p.set('a', '9'); p.toString()"), "b=2&a=9");
+        // From pairs, from an object; a pair not of two throws.
+        assert_eq!(eval(&mut h, "new URLSearchParams([['x', '1'], ['y', 2]]).toString()"), "x=1&y=2");
+        assert_eq!(eval(&mut h, "new URLSearchParams({ c: '3', d: '4' }).toString()"), "c=3&d=4");
+        assert_eq!(eval(&mut h, "try { new URLSearchParams([['x']]); 'no' } catch (e) { e instanceof TypeError }"), "true");
+        assert_eq!(eval(&mut h, "[new URLSearchParams(null).toString(), new URLSearchParams().toString()].join('|')"), "null=|");
+        // Sorting is stable, by name.
+        assert_eq!(eval(&mut h, "var s = new URLSearchParams('z=b&a=1&z=a&a=0'); s.sort(); s.toString()"), "a=1&a=0&z=b&z=a");
+        // The form encoding both ways.
+        assert_eq!(eval(&mut h, "new URLSearchParams({ q: 'a b&c=d/é' }).toString()"), "q=a+b%26c%3Dd%2F%C3%A9");
+        assert_eq!(eval(&mut h, "new URLSearchParams('q=a+b%20c').get('q')"), "a b c");
+        // Iteration, forEach, the iterator's tag; no `new`, a TypeError.
+        assert_eq!(
+            eval(&mut h, "var i = new URLSearchParams('a=1&b=2'); var seen = []; i.forEach((v, k) => seen.push(k + v)); \
+                          [[...i].join(';'), [...i.keys()].join(), [...i.values()].join(), seen.join(), Object.prototype.toString.call(i.entries())].join('|')"),
+            "a,1;b,2|a,b|1,2|a1,b2|[object URLSearchParams Iterator]"
+        );
+        assert_eq!(eval(&mut h, "try { URLSearchParams(); 'no' } catch (e) { e instanceof TypeError }"), "true");
     }
 
     #[test]
