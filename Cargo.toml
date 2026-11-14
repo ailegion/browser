@@ -72,6 +72,11 @@ url = "2"
 # The public suffix list, compiled in: registrable domains for "same site"
 # (referrer cap, cookies' Domain, CORP). Pure Rust, generated code.
 psl = "2"
+# The browser's database (history first): Turso's engine, a Rust rewrite of
+# SQLite (its SQL and file format). Defaults minus `simd` (C), plus
+# `pure-rust-crypto`, which must stay on: without it `aegis` compiles C
+# (deny.toml lets `aegis` declare `cc` on that condition).
+turso_core = { version = "0.8.3", default-features = false, features = ["fs", "uuid", "time", "json", "series", "encryption", "percentile", "autovacuum", "pure-rust-crypto"] }
 encoding_rs = "0.8"
 data-url = "0.3"
 mime = "0.3"

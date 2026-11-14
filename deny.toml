@@ -114,8 +114,14 @@ deny = [
     #                    fontique's `fontconfig-dlopen` feature sets it.
     #   x11-dl:          asks pkg-config for X11 library directories and
     #                    ignores failure; always runtime-loads libX11.
+    #   aegis:           not an OS binding: the cipher crate of Turso's
+    #                    engine (`turso_core`). Its build.rs (0.9.21, read
+    #                    2026-11-14 on docs.rs) returns before `cc` when the
+    #                    `pure-rust` feature is on, which turso_core's
+    #                    `pure-rust-crypto` sets; that feature must stay on.
+    #                    Allowed by the owner 2026-11-14.
     # If a new wrapper appears here, read its build.rs before adding it.
-    { crate = "cc", reason = "native code build; find a pure-Rust crate", wrappers = ["wayland-backend"] },
+    { crate = "cc", reason = "native code build; find a pure-Rust crate", wrappers = ["wayland-backend", "aegis"] },
     { crate = "cmake", reason = "native code build; find a pure-Rust crate" },
     { crate = "pkg-config", reason = "native library lookup; find a pure-Rust crate", wrappers = ["wayland-sys", "khronos-egl", "yeslogic-fontconfig-sys", "x11-dl"] },
     { crate = "vcpkg", reason = "native library lookup; find a pure-Rust crate" },
