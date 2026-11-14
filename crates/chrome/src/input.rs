@@ -204,6 +204,11 @@ impl TextInput {
         None
     }
 
+    /// Put the caret at the end of the text.
+    pub fn move_to_end(&mut self, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
+        self.editor.driver(fonts, lcx).move_to_text_end();
+    }
+
     pub fn select_all(&mut self, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
         self.editor.driver(fonts, lcx).select_all();
     }

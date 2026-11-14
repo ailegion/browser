@@ -72,6 +72,68 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Forget the page at `url` (Shift+Delete on its suggestion).
+    pub fn remove_history(&self, url: &str) -> Result<(), StoreError> {
+        self.execute("DELETE FROM history WHERE url = ?1", &[Value::build_text(url.to_owned())])
+    }
+}
+
+/// The address bar's matches for `query` among `entries`, best first, at
+/// most `limit`. Every word of the query must occur in the entry's
+/// address (its scheme and a leading `www.` aside) or title, ignoring
+/// case. The rank weighs how often and how recently the page was visited,
+/// typed visits more (Firefox's frecency and Chrome's history scoring do
+/// this, as recalled; their exact weights are not reproduced), and puts a
+/// page whose host starts with the query first.
+pub fn suggest(entries: &[HistoryEntry], query: &str, limit: usize, now: i64) -> Vec<HistoryEntry> {
+    let query = query.trim().to_lowercase();
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(f64, &HistoryEntry)> = entries
+        .iter()
+        .filter_map(|e| {
+            let address = bare_address(&e.url);
+            let title = e.title.as_deref().unwrap_or("").to_lowercase();
+            if !words.iter().all(|w| address.contains(w) || title.contains(w)) {
+                return None;
+            }
+            let host_start = words.len() == 1 && address.starts_with(words[0]);
+            Some((score(e, now) * if host_start { 4.0 } else { 1.0 }, e))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.last_visit.cmp(&a.1.last_visit)));
+    scored.into_iter().take(limit).map(|(_, e)| e.clone()).collect()
+}
+
+/// An entry's address as matched: lower case, without its scheme and a
+/// leading `www.`.
+fn bare_address(url: &str) -> String {
+    let lower = url.to_lowercase();
+    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
+    rest.strip_prefix("www.").unwrap_or(rest).to_owned()
+}
+
+/// Visits, typed ones counting three times, weighed by how long ago the
+/// last one was (Firefox's recency buckets: 4, 14, 31 and 90 days).
+fn score(e: &HistoryEntry, now: i64) -> f64 {
+    let days = (now - e.last_visit).max(0) as f64 / 86_400_000.0;
+    let recency = if days <= 4.0 {
+        100.0
+    } else if days <= 14.0 {
+        70.0
+    } else if days <= 31.0 {
+        50.0
+    } else if days <= 90.0 {
+        30.0
+    } else {
+        10.0
+    };
+    (f64::from(e.visit_count) + 2.0 * f64::from(e.typed_count)) * recency
+}
+
 /// The same change to the in-memory list as `record_visit` makes to the
 /// table; the entry moves to the front.
 fn apply_visit(entries: &mut Vec<HistoryEntry>, url: &str, title: Option<&str>, typed: bool, at: i64) {
@@ -97,6 +159,7 @@ fn apply_visit(entries: &mut Vec<HistoryEntry>, url: &str, title: Option<&str>, 
 enum Op {
     Visit { url: String, title: Option<String>, typed: bool, at: i64 },
     Title { url: String, title: String },
+    Remove { url: String },
 }
 
 /// The history for the shell: changes go to the database on the store's
@@ -141,6 +204,7 @@ impl HistoryService {
                     let result = match op {
                         Op::Visit { url, title, typed, at } => store.record_visit(&url, title.as_deref(), typed, at),
                         Op::Title { url, title } => store.set_history_title(&url, &title),
+                        Op::Remove { url } => store.remove_history(&url),
                     };
                     if let Err(e) = result {
                         tracing::error!("history write failed: {e}");
@@ -186,6 +250,21 @@ impl HistoryService {
             url: url.to_owned(),
             title: title.to_owned(),
         });
+    }
+
+    /// Forget a page.
+    pub fn remove(&self, url: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.retain(|e| e.url != url);
+        }
+        let Some(ops) = &self.ops else { return };
+        let _ = ops.send(Op::Remove { url: url.to_owned() });
+    }
+
+    /// The address bar's matches for what was typed, best first.
+    pub fn suggest(&self, query: &str, limit: usize) -> Vec<HistoryEntry> {
+        let Ok(entries) = self.entries.lock() else { return Vec::new() };
+        suggest(&entries, query, limit, now_ms())
     }
 
     /// The history as it stands, the most recent first.
@@ -242,6 +321,40 @@ mod tests {
     }
 
     #[test]
+    fn suggestions_match_every_word_and_rank_by_visits_typing_recency_and_host() {
+        let day = 86_400_000;
+        let now = 1000 * day;
+        let e = |url: &str, title: &str, visits: u32, typed: u32, ago: i64| HistoryEntry {
+            url: url.into(),
+            title: Some(title.into()),
+            visit_count: visits,
+            typed_count: typed,
+            last_visit: now - ago * day,
+        };
+        let entries = vec![
+            e("https://en.wikipedia.org/wiki/Main_Page", "Wikipedia, the free encyclopedia", 5, 0, 1),
+            e("https://www.wiktionary.org/", "Wiktionary", 1, 0, 1),
+            e("https://news.example/wiki-story", "A story", 30, 0, 200),
+            e("https://iana.org/protocols", "Protocol Registries", 2, 2, 2),
+        ];
+        let urls = |q: &str| -> Vec<String> { suggest(&entries, q, 8, now).into_iter().map(|e| e.url).collect() };
+        // Visits weighed by recency (30 old visits rank below 5 recent),
+        // the host's start (`www.` and the scheme aside) four times: 5
+        // recent visits still outrank 1 at the host's start.
+        assert_eq!(urls("wik"), ["https://en.wikipedia.org/wiki/Main_Page", "https://www.wiktionary.org/", "https://news.example/wiki-story"]);
+        let mut level = entries.clone();
+        level[0].visit_count = 1;
+        let first = suggest(&level, "wik", 8, now);
+        assert_eq!(first[0].url, "https://www.wiktionary.org/", "level visits: the host's start first");
+        // Titles match too, every word must, case aside.
+        assert_eq!(urls("FREE wiki"), ["https://en.wikipedia.org/wiki/Main_Page"]);
+        assert_eq!(urls("registries"), ["https://iana.org/protocols"]);
+        assert!(urls("https").is_empty(), "the scheme is not matched");
+        assert!(urls("   ").is_empty() && urls("nothing-like-it").is_empty());
+        assert_eq!(suggest(&entries, "wik", 1, now).len(), 1, "the limit");
+    }
+
+    #[test]
     fn the_service_keeps_memory_and_disk_in_step() {
         let dir = temp_profile("service");
         {
@@ -251,6 +364,9 @@ mod tests {
             service.visit("https://b.test/", Some("B"), false);
             let urls: Vec<String> = service.entries().into_iter().map(|e| e.url).collect();
             assert_eq!(urls, ["https://b.test/", "https://a.test/"], "most recent first, at once");
+            service.visit("https://c.test/", Some("C"), false);
+            service.remove("https://c.test/");
+            assert!(service.suggest("c.test", 8).is_empty(), "removed at once");
         }
         // The thread ends with the service; what it wrote is there.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

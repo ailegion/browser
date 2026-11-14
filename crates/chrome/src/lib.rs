@@ -24,6 +24,7 @@ mod find;
 mod input;
 mod menu;
 pub mod scrollbar;
+mod suggest;
 mod widgets;
 
 use std::time::{Duration, Instant};
@@ -39,6 +40,8 @@ use vello::peniko::{Color, Fill};
 use find::{FindBar, FindPart};
 use input::{InputEvent, TextInput, rounded_box};
 use menu::{Menu, MenuAction, MenuItem};
+pub use suggest::Suggestion;
+use suggest::{SuggestList, SuggestRow};
 use widgets::{Button, Icon, TextLine, draw_icon, draw_progress, draw_spinner, draw_text, draw_tooltip, scale_rect};
 
 /// Height of the tab strip in logical pixels.
@@ -151,6 +154,11 @@ pub enum ChromeAction {
     /// Tab (or Shift+Tab) left a chrome text box: the page should focus
     /// its first (or last) focusable element.
     FocusPage { forward: bool },
+    /// The address bar's text changed by the user's typing: the shell
+    /// answers with set_suggestions for it.
+    AddressTyped(String),
+    /// Shift+Delete on a suggestion: forget the page.
+    RemoveHistory(Url),
 }
 
 /// What the tab strip shows for one tab.
@@ -173,6 +181,8 @@ enum Part {
     Tab(TabId),
     TabClose(TabId),
     Find(FindPart),
+    /// A row of the address bar's suggestion list.
+    Suggestion(usize),
 }
 
 struct TabSlot {
@@ -223,6 +233,8 @@ pub struct Chrome {
     menu: Option<Menu>,
     /// The find bar, while open.
     find: Option<FindBar>,
+    /// The address bar's suggestion list, while the user types.
+    suggest: Option<SuggestList>,
     hover: Option<Part>,
     /// When the pointer arrived on `hover`, and where it is.
     hover_since: Option<Instant>,
@@ -404,6 +416,7 @@ impl Chrome {
             loading_since: None,
             menu: None,
             find: None,
+            suggest: None,
             hover: None,
             hover_since: None,
             mouse: (0.0, 0.0),
@@ -504,6 +517,110 @@ impl Chrome {
 
     fn find_focused(&self) -> bool {
         self.find.as_ref().is_some_and(|f| f.input.focused)
+    }
+
+    /// The history's matches for `typed`: shown under the address bar,
+    /// after a first row for what was typed itself (when it is an
+    /// address), that row selected. Nothing else starts selected. An
+    /// answer for text no longer in the
+    /// box, or for a box without focus, is dropped.
+    pub fn set_suggestions(&mut self, typed: &str, suggestions: Vec<Suggestion>) {
+        if !self.address.focused || self.address.text() != typed {
+            return;
+        }
+        let own = url_from_input(typed);
+        let mut rows: Vec<SuggestRow> = own
+            .iter()
+            .map(|url| SuggestRow {
+                url: url.clone(),
+                title: String::new(),
+                typed: true,
+            })
+            .collect();
+        rows.extend(suggestions.into_iter().filter(|s| own.as_ref() != Some(&s.url)).map(|s| SuggestRow {
+            url: s.url,
+            title: s.title,
+            typed: false,
+        }));
+        self.suggest = (!rows.is_empty()).then(|| SuggestList::new(typed.to_owned(), rows, self.address.rect));
+        self.dirty = true;
+    }
+
+    /// The suggestion rows shown, as (address, title, is the typed row),
+    /// and the selected one (tests and the shell).
+    pub fn suggestions(&self) -> (Vec<(Url, String, bool)>, Option<usize>) {
+        match &self.suggest {
+            Some(l) => (l.rows.iter().map(|r| (r.url.clone(), r.title.clone(), r.typed)).collect(), l.selected),
+            None => (Vec::new(), None),
+        }
+    }
+
+    /// Open a suggestion row: its page, from the address bar.
+    fn open_suggestion(&mut self, index: usize) -> Vec<ChromeAction> {
+        let Some(row) = self.suggest.as_ref().and_then(|l| l.rows.get(index)).cloned() else { return Vec::new() };
+        self.address.set_text(display_url(&row.url).as_str());
+        self.blur();
+        vec![ChromeAction::Navigate(row.url)]
+    }
+
+    /// The keys the suggestion list takes while open: arrows move the
+    /// selection (the box shows the selected address, the typed text on
+    /// the first row), Enter opens the selected row, Escape closes the
+    /// list and puts the typed text back, Shift+Delete forgets the
+    /// selected history row. `None`: the key goes to the box.
+    fn suggestion_key(&mut self, input: &KeyInput) -> Option<Vec<ChromeAction>> {
+        let list = self.suggest.as_mut()?;
+        match input.key {
+            Key::ArrowDown | Key::ArrowUp => {
+                list.step(input.key == Key::ArrowDown);
+                let shown = match list.selected.and_then(|i| list.rows.get(i)) {
+                    Some(r) if !r.typed => display_url(&r.url),
+                    _ => list.typed.clone(),
+                };
+                self.address.set_text(&shown);
+                self.address.move_to_end(&mut self.fonts, &mut self.lcx);
+                self.dirty = true;
+                Some(Vec::new())
+            }
+            Key::Enter => {
+                let index = list.selected.filter(|&i| list.rows.get(i).is_some_and(|r| !r.typed))?;
+                Some(self.open_suggestion(index))
+            }
+            Key::Escape => {
+                let typed = list.typed.clone();
+                self.suggest = None;
+                self.address.set_text(&typed);
+                self.address.move_to_end(&mut self.fonts, &mut self.lcx);
+                self.dirty = true;
+                Some(Vec::new())
+            }
+            Key::Delete if input.shift => {
+                let index = list.selected.filter(|&i| list.rows.get(i).is_some_and(|r| !r.typed))?;
+                let url = list.rows[index].url.clone();
+                list.remove(index, self.address.rect);
+                if list.rows.is_empty() {
+                    self.suggest = None;
+                }
+                self.dirty = true;
+                Some(vec![ChromeAction::RemoveHistory(url)])
+            }
+            _ => None,
+        }
+    }
+
+    /// After an edit of the address text: the typed text changed, so the
+    /// list waits for the shell's new matches (an empty box has none).
+    fn address_edited(&mut self, before: &str, actions: &mut Vec<ChromeAction>) {
+        let text = self.address.text();
+        if text == before {
+            return;
+        }
+        if text.trim().is_empty() {
+            self.suggest = None;
+            self.dirty = true;
+            return;
+        }
+        actions.push(ChromeAction::AddressTyped(text));
     }
 
     /// The tab's answer to the last query: the current match and the total.
@@ -689,9 +806,10 @@ impl Chrome {
     /// Keyboard focus goes back to the page; an edit in progress is
     /// kept in the box, as browsers do, until the tab reports a URL.
     pub fn blur(&mut self) {
-        if self.has_focus() {
+        if self.has_focus() || self.suggest.is_some() {
             self.dirty = true;
         }
+        self.suggest = None;
         self.address.blur(&mut self.fonts, &mut self.lcx);
         if let Some(f) = &mut self.find {
             f.input.blur(&mut self.fonts, &mut self.lcx);
@@ -754,10 +872,16 @@ impl Chrome {
     /// the find panel hanging under them. With a menu open the chrome
     /// takes every point, to close it on a click outside.
     pub fn contains(&self, x: f32, y: f32) -> bool {
-        self.menu.is_some() || y < self.height() || self.find.as_ref().is_some_and(|f| f.contains(x, y))
+        self.menu.is_some()
+            || y < self.height()
+            || self.find.as_ref().is_some_and(|f| f.contains(x, y))
+            || self.suggest.as_ref().is_some_and(|l| l.contains(x, y))
     }
 
     fn part_at(&self, x: f32, y: f32) -> Option<Part> {
+        if let Some(i) = self.suggest.as_ref().and_then(|l| l.row_at(x, y)) {
+            return Some(Part::Suggestion(i));
+        }
         if let Some(part) = self.find.as_ref().and_then(|f| f.part_at(x, y)) {
             return Some(Part::Find(part));
         }
@@ -815,6 +939,16 @@ impl Chrome {
             return if over.is_some() { Cursor::Pointer } else { Cursor::Default };
         }
         let part = self.part_at(x, y);
+        if let Some(list) = &mut self.suggest {
+            let row = match part {
+                Some(Part::Suggestion(i)) => Some(i),
+                _ => None,
+            };
+            if row != list.hover {
+                list.hover = row;
+                self.dirty = true;
+            }
+        }
         if part != self.hover {
             self.hover = part;
             self.hover_since = part.map(|_| Instant::now());
@@ -843,7 +977,7 @@ impl Chrome {
                 }
             }
             Some(Part::Find(FindPart::Close)) => Cursor::Pointer,
-            Some(Part::Reload | Part::NewTab | Part::Menu | Part::Tab(_) | Part::TabClose(_)) => Cursor::Pointer,
+            Some(Part::Reload | Part::NewTab | Part::Menu | Part::Tab(_) | Part::TabClose(_) | Part::Suggestion(_)) => Cursor::Pointer,
             _ => Cursor::Default,
         }
     }
@@ -894,6 +1028,8 @@ impl Chrome {
             }
             // The panel and its buttons leave the find box's focus alone.
             (MouseButton::Left, Some(Part::Find(FindPart::Panel))) => {}
+            // A suggestion opens on release; the box keeps focus till then.
+            (MouseButton::Left, Some(p @ Part::Suggestion(_))) => self.pressed = Some(p),
             (MouseButton::Left, Some(p @ Part::Find(_))) => self.pressed = Some(p),
             (MouseButton::Left, Some(p)) => {
                 if self.has_focus() {
@@ -958,6 +1094,7 @@ impl Chrome {
                     }
                 }
                 Part::Find(FindPart::Close) => self.close_find(),
+                Part::Suggestion(i) => self.open_suggestion(i),
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -1021,8 +1158,13 @@ impl Chrome {
             return Vec::new();
         }
         self.dirty = true;
+        if let Some(actions) = self.suggestion_key(&input) {
+            return actions;
+        }
+        let before = self.address.text();
         let event = self.address.key(&mut self.fonts, &mut self.lcx, &input);
         let mut actions = Vec::new();
+        self.address_edited(&before, &mut actions);
         match event {
             Some(InputEvent::Submit(text)) => {
                 if let Some(url) = url_from_input(&text) {
@@ -1054,8 +1196,12 @@ impl Chrome {
     /// new query.
     pub fn paste(&mut self, text: &str) -> Vec<ChromeAction> {
         if self.address.focused {
+            let before = self.address.text();
             self.address.paste(&mut self.fonts, &mut self.lcx, text);
             self.dirty = true;
+            let mut actions = Vec::new();
+            self.address_edited(&before, &mut actions);
+            return actions;
         } else if let Some(f) = &mut self.find
             && f.input.focused
         {
@@ -1080,8 +1226,12 @@ impl Chrome {
 
     pub fn ime_commit(&mut self, text: &str) -> Vec<ChromeAction> {
         if self.address.focused {
+            let before = self.address.text();
             self.address.ime_commit(&mut self.fonts, &mut self.lcx, text);
             self.dirty = true;
+            let mut actions = Vec::new();
+            self.address_edited(&before, &mut actions);
+            return actions;
         } else if let Some(f) = &mut self.find
             && f.input.focused
         {
@@ -1164,6 +1314,9 @@ impl Chrome {
             f.draw(&mut self.fonts, &mut self.lcx, scene, self.scale, hover, pressed);
         }
 
+        if let Some(list) = &self.suggest {
+            list.draw(&mut self.fonts, &mut self.lcx, scene, self.scale);
+        }
         if let Some(menu) = &self.menu {
             menu.draw(&mut self.fonts, &mut self.lcx, scene, self.scale);
         } else if self.tooltip_shown
@@ -1246,7 +1399,7 @@ fn tooltip_for(part: Part) -> Option<&'static str> {
         Part::Find(FindPart::Prev) => Some("Previous match (Shift+Enter)"),
         Part::Find(FindPart::Next) => Some("Next match (Enter)"),
         Part::Find(FindPart::Close) => Some("Close (Escape)"),
-        Part::Address | Part::Find(FindPart::Input | FindPart::Panel) => None,
+        Part::Address | Part::Find(FindPart::Input | FindPart::Panel) | Part::Suggestion(_) => None,
     }
 }
 
@@ -1308,6 +1461,72 @@ mod tests {
         let mut c = Chrome::new();
         c.resize(800.0, 1.0);
         c
+    }
+
+    #[test]
+    fn the_address_bar_lists_history_matches_and_its_keys_and_clicks_work() {
+        let mut c = chrome();
+        c.focus_address();
+        let wiki = Url::parse("https://en.wikipedia.org/wiki/Main_Page").unwrap();
+        let wikt = Url::parse("https://www.wiktionary.org/").unwrap();
+        let rows = || {
+            vec![
+                Suggestion { url: wiki.clone(), title: "Wikipedia".into() },
+                Suggestion { url: wikt.clone(), title: "Wiktionary".into() },
+            ]
+        };
+        // Typing asks for matches; an answer for older text is dropped.
+        let typed = type_str(&mut c, "wik");
+        assert_eq!(typed.last(), Some(&ChromeAction::AddressTyped("wik".into())));
+        c.set_suggestions("wi", rows());
+        assert!(c.suggestions().0.is_empty(), "stale answer");
+        c.set_suggestions("wik", rows());
+        let (list, selected) = c.suggestions();
+        assert_eq!(list.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), [wiki.clone(), wikt.clone()]);
+        assert_eq!(selected, None, "not an address: no row of its own, nothing selected");
+        let (bx, ..) = c.address_rect();
+        assert!(c.contains(bx + 20.0, c.height() + 10.0), "the list is the chrome's, over the page");
+        // Down twice, up once: the box shows the selected address; Enter
+        // opens it.
+        c.key(KeyInput::plain(Key::ArrowDown));
+        c.key(KeyInput::plain(Key::ArrowDown));
+        assert_eq!(c.address_text(), wikt.as_str());
+        c.key(KeyInput::plain(Key::ArrowUp));
+        assert_eq!(c.address_text(), wiki.as_str());
+        assert_eq!(c.key(KeyInput::plain(Key::Enter)), vec![ChromeAction::Navigate(wiki.clone())]);
+        assert!(c.suggestions().0.is_empty() && !c.has_focus(), "the list closes with the box");
+        // An address typed gets its own first row, selected; Escape puts
+        // the typed text back and closes the list; a second Escape is
+        // the box's own.
+        c.focus_address();
+        type_str(&mut c, "wiki.org");
+        c.set_suggestions("wiki.org", rows());
+        let (list, selected) = c.suggestions();
+        assert_eq!((list[0].0.as_str(), list[0].2, selected), ("https://wiki.org/", true, Some(0)));
+        c.key(KeyInput::plain(Key::ArrowDown));
+        assert_eq!(c.address_text(), wiki.as_str());
+        assert!(c.key(KeyInput::plain(Key::Escape)).is_empty());
+        assert_eq!(c.address_text(), "wiki.org");
+        assert!(c.suggestions().0.is_empty() && c.has_focus());
+        // Shift+Delete forgets the selected history row, not the typed one.
+        c.set_suggestions("wiki.org", rows());
+        assert!(!c.key(KeyInput::shift(Key::Delete)).iter().any(|a| matches!(a, ChromeAction::RemoveHistory(_))));
+        assert_eq!(c.suggestions().0.len(), 3);
+        c.key(KeyInput::plain(Key::ArrowDown));
+        assert_eq!(c.key(KeyInput::shift(Key::Delete)), vec![ChromeAction::RemoveHistory(wiki.clone())]);
+        assert_eq!(c.suggestions().0.len(), 2, "the typed row and the other");
+        // A click on a row opens it.
+        let (x, y, _, h) = c.address_rect();
+        let row_y = y + h + 2.0 + 4.0 + 32.0 + 16.0;
+        c.mouse_move(x + 20.0, row_y);
+        c.mouse_down(x + 20.0, row_y, MouseButton::Left, false);
+        assert_eq!(c.mouse_up(x + 20.0, row_y, MouseButton::Left), vec![ChromeAction::Navigate(wikt.clone())]);
+        // Clearing the box closes the list.
+        c.focus_address();
+        type_str(&mut c, "w");
+        c.set_suggestions("w", rows());
+        c.key(KeyInput::plain(Key::Backspace));
+        assert!(c.suggestions().0.is_empty());
     }
 
     fn type_str(c: &mut Chrome, s: &str) -> Vec<ChromeAction> {
@@ -1505,7 +1724,7 @@ mod tests {
         assert!(c.key(KeyInput::typed("x")).is_empty(), "unfocused: keys go nowhere");
         c.focus_address();
         assert!(c.has_focus());
-        assert!(type_str(&mut c, "example.com/a b").is_empty());
+        assert!(type_str(&mut c, "example.com/a b").iter().all(|a| matches!(a, ChromeAction::AddressTyped(_))));
         assert_eq!(c.address_text(), "example.com/a b");
         assert!(c.key(KeyInput::plain(Key::Enter)).is_empty(), "not a URL, nothing happens");
         assert!(c.has_focus());
@@ -1562,7 +1781,11 @@ mod tests {
             alt: false,
         });
         assert_eq!(c.key(KeyInput::ctrl(Key::Character("c".into()))), vec![ChromeAction::CopyText("xyz".into())]);
-        assert_eq!(c.key(KeyInput::ctrl(Key::Character("x".into()))), vec![ChromeAction::CopyText("xyz".into())]);
+        // A cut changes the text: the bar asks for matches for it too.
+        assert_eq!(
+            c.key(KeyInput::ctrl(Key::Character("x".into()))),
+            vec![ChromeAction::AddressTyped("bc ".into()), ChromeAction::CopyText("xyz".into())]
+        );
         assert_eq!(c.address_text(), "bc ");
         assert_eq!(c.key(KeyInput::ctrl(Key::Character("v".into()))), vec![ChromeAction::RequestPaste]);
         c.paste("two\nlines");

@@ -40,6 +40,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
+/// History rows the address bar lists at most, below the typed one.
+const SUGGESTIONS: usize = 8;
 /// Window background while there is no page yet.
 const CLEAR: Color = Color::from_rgb8(0x1e, 0x1e, 0x2e);
 const ACCENT: Color = Color::from_rgb8(0x89, 0xb4, 0xfa);
@@ -272,6 +274,25 @@ impl App {
                     ctrl: false,
                     alt: false,
                 }),
+                // The history's matches for the address bar's text.
+                ChromeAction::AddressTyped(text) => {
+                    let matches = self.history.as_ref().map(|h| h.suggest(&text, SUGGESTIONS)).unwrap_or_default();
+                    let list = matches
+                        .into_iter()
+                        .filter_map(|e| {
+                            Some(browser_chrome::Suggestion {
+                                url: Url::parse(&e.url).ok()?,
+                                title: e.title.unwrap_or_default(),
+                            })
+                        })
+                        .collect();
+                    self.chrome.set_suggestions(&text, list);
+                }
+                ChromeAction::RemoveHistory(url) => {
+                    if let Some(h) = &self.history {
+                        h.remove(url.as_str());
+                    }
+                }
             }
         }
         self.sync_ime();

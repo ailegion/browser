@@ -1465,6 +1465,28 @@ remaining lists as they stand.
       needs its UI, not part of this item. Not verified: which of
       reloads, back/forward and fragments Chrome and Firefox count as
       visits.
+      **Block 2 done 2026-11-14: suggestion list.** `browser_store::
+      suggest`: every word of the query in the address (scheme and a
+      leading `www.` aside) or title, case aside; ranked by visits plus
+      twice the typed ones, times a recency weight (Firefox's buckets:
+      4, 14, 31, 90 days), four times for a host starting with the
+      query; at most 8. `chrome::suggest`: the list under the address
+      box over the page; a first row for the typed text when it is an
+      address, selected; arrows move the selection and the box shows
+      the selected address (the typed text on the first row), Enter
+      opens it, Escape closes the list and puts the typed text back (a
+      second Escape is the box's), Shift+Delete forgets a history row
+      (`ChromeAction::RemoveHistory`, removed from memory and the
+      table), hover and click; the list closes with the box and when it
+      is emptied. Typing, cutting, pasting and an IME commit send
+      `ChromeAction::AddressTyped`; the shell answers with
+      `set_suggestions`, an answer for older text dropped. Opening a
+      suggestion counts as typed. Tests: matching and ranking, removal,
+      the list's keys, clicks and stale answers. Not verified: Chrome's
+      and Firefox's exact ranking weights and row count (8 here, as
+      recalled), their arrow behaviour at the list's ends (it stops
+      here). Full runs: the paint snapshots failed 2 of 3 (passing
+      alone).
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 
