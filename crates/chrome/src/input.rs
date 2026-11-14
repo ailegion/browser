@@ -204,6 +204,18 @@ impl TextInput {
         None
     }
 
+    /// Select from byte `start` to the end (an inline completion).
+    pub fn select_to_end_from(&mut self, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>, start: usize) {
+        let end = self.editor.text().to_string().len();
+        self.editor.driver(fonts, lcx).select_byte_range(start, end);
+    }
+
+    /// The caret is at the end of the text with nothing selected.
+    pub fn caret_at_end(&self) -> bool {
+        let sel = self.editor.raw_selection();
+        sel.is_collapsed() && sel.focus().index() == self.editor.text().to_string().len()
+    }
+
     /// Put the caret at the end of the text.
     pub fn move_to_end(&mut self, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
         self.editor.driver(fonts, lcx).move_to_text_end();

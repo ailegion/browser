@@ -1442,7 +1442,7 @@ remaining lists as they stand.
       frame scrolls once to the latest, the release ends at the last
       move; the harness applies the drag within each step, as it
       finishes scroll animations.
-- [ ] 11. Persistent history and address bar suggestions (owner,
+- [x] 11. Persistent history and address bar suggestions (owner,
       2026-11-14). Blocks: (1) history store, (2) suggestion list under
       the address bar (matches by address and title, ranked by how often
       and how recently visited; arrows, mouse, Enter, Escape,
@@ -1487,6 +1487,23 @@ remaining lists as they stand.
       recalled), their arrow behaviour at the list's ends (it stops
       here). Full runs: the paint snapshots failed 2 of 3 (passing
       alone).
+      **Block 3 done 2026-11-14: inline completion.** `browser_store::
+      autofill` (Firefox's origin autofill, as recalled): the
+      best-ranked entry whose address, scheme and `www.` aside (`www.`
+      kept when typed), starts with the text fills the rest of its host
+      and a `/`; text already past the host fills to the next `/`, or
+      the end; nothing for text with a space or a scheme, or nothing to
+      add. The box takes it only after an insertion (typing, a paste, an
+      IME commit) with the caret at the end, the added part selected:
+      typing on replaces it (and fills again), Backspace removes it and
+      nothing fills after a deletion, Escape takes it out with the
+      list. The first row is the filled site; Enter on it opens the
+      page with the scheme and `www.` it was visited with. Tests: the
+      fill rules; the box's fill, typing on, Enter, Backspace, the
+      caret not at the end, Escape. Not verified: Chrome's rule (it
+      completes whole URLs of often-typed pages) and Firefox's
+      frecency threshold for autofill (any visited site fills here).
+      Full run clean. Item 11 complete.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

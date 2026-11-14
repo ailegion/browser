@@ -108,6 +108,64 @@ pub fn suggest(entries: &[HistoryEntry], query: &str, limit: usize, now: i64) ->
     scored.into_iter().take(limit).map(|(_, e)| e.clone()).collect()
 }
 
+/// What the address bar fills in after `query`: the text the box then
+/// holds (the query as typed, then the rest, which the box selects) and
+/// the page it opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Autofill {
+    pub text: String,
+    pub url: String,
+}
+
+/// Inline completion of a visited site (Firefox's origin autofill, as
+/// recalled): the best-ranked entry whose address, scheme and `www.`
+/// aside (`www.` kept when the query has it), starts with `query` fills
+/// up to the end of its host and a `/`; a query that already reaches
+/// past the host fills to the next `/`, or the address's end. A query
+/// with a space, or a scheme, fills nothing.
+pub fn autofill(entries: &[HistoryEntry], query: &str, now: i64) -> Option<Autofill> {
+    if query.is_empty() || query.contains(char::is_whitespace) || query.contains("://") {
+        return None;
+    }
+    let lower = query.to_lowercase();
+    let keep_www = lower.starts_with("www.");
+    let mut best: Option<(f64, Autofill)> = None;
+    for e in entries {
+        let Some((scheme, rest)) = e.url.split_once("://") else { continue };
+        let (www, rest) = match rest.strip_prefix("www.") {
+            Some(r) if !keep_www => ("www.", r),
+            _ => ("", rest),
+        };
+        if !rest.to_lowercase().starts_with(&lower) {
+            continue;
+        }
+        let host_end = rest.find('/').unwrap_or(rest.len());
+        let end = if lower.len() < host_end {
+            host_end
+        } else {
+            // Past the host: to the next `/` after the query, kept.
+            rest[lower.len()..].find('/').map_or(rest.len(), |i| lower.len() + i + 1)
+        };
+        let mut filled = rest[..end].to_owned();
+        if end == host_end && !filled.ends_with('/') {
+            filled.push('/');
+        }
+        if filled.len() <= query.len() && filled.to_lowercase() == lower {
+            // Nothing left to fill.
+            continue;
+        }
+        let candidate = Autofill {
+            text: format!("{query}{}", &filled[query.len()..]),
+            url: format!("{scheme}://{www}{filled}"),
+        };
+        let s = score(e, now);
+        if best.as_ref().is_none_or(|(b, _)| s > *b) {
+            best = Some((s, candidate));
+        }
+    }
+    best.map(|(_, a)| a)
+}
+
 /// An entry's address as matched: lower case, without its scheme and a
 /// leading `www.`.
 fn bare_address(url: &str) -> String {
@@ -267,6 +325,12 @@ impl HistoryService {
         suggest(&entries, query, limit, now_ms())
     }
 
+    /// What the address bar fills in after `query`, if anything.
+    pub fn autofill(&self, query: &str) -> Option<Autofill> {
+        let entries = self.entries.lock().ok()?;
+        autofill(&entries, query, now_ms())
+    }
+
     /// The history as it stands, the most recent first.
     pub fn entries(&self) -> Vec<HistoryEntry> {
         self.entries.lock().map(|e| e.clone()).unwrap_or_default()
@@ -352,6 +416,38 @@ mod tests {
         assert!(urls("https").is_empty(), "the scheme is not matched");
         assert!(urls("   ").is_empty() && urls("nothing-like-it").is_empty());
         assert_eq!(suggest(&entries, "wik", 1, now).len(), 1, "the limit");
+    }
+
+    #[test]
+    fn autofill_completes_a_visited_host_then_up_to_the_next_slash() {
+        let now = 1000 * 86_400_000;
+        let e = |url: &str, visits: u32| HistoryEntry {
+            url: url.into(),
+            title: None,
+            visit_count: visits,
+            typed_count: 0,
+            last_visit: now,
+        };
+        let entries = vec![
+            e("https://www.wikipedia.org/", 3),
+            e("https://en.wikipedia.org/wiki/Main_Page", 9),
+            e("http://iana.org/protocols/http", 1),
+        ];
+        let fill = |q: &str| autofill(&entries, q, now).map(|a| (a.text, a.url));
+        // The host, `www.` aside, with its scheme and `www.` in the page.
+        assert_eq!(fill("wik"), Some(("wikipedia.org/".into(), "https://www.wikipedia.org/".into())));
+        assert_eq!(fill("WiK"), Some(("WiKipedia.org/".into(), "https://www.wikipedia.org/".into())), "the typed case is kept");
+        assert_eq!(fill("www.w"), Some(("www.wikipedia.org/".into(), "https://www.wikipedia.org/".into())));
+        // The best-ranked of several.
+        assert_eq!(fill("en"), Some(("en.wikipedia.org/".into(), "https://en.wikipedia.org/".into())));
+        // Past the host: to the next slash, then the end; http kept.
+        assert_eq!(fill("iana.org/"), Some(("iana.org/protocols/".into(), "http://iana.org/protocols/".into())));
+        assert_eq!(fill("iana.org/protocols/h"), Some(("iana.org/protocols/http".into(), "http://iana.org/protocols/http".into())));
+        // Nothing to add, a space, a scheme, no match.
+        assert_eq!(fill("iana.org/protocols/http"), None);
+        assert_eq!(fill("wik i"), None);
+        assert_eq!(fill("https://w"), None);
+        assert_eq!(fill("zzz"), None);
     }
 
     #[test]

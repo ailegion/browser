@@ -235,6 +235,12 @@ pub struct Chrome {
     find: Option<FindBar>,
     /// The address bar's suggestion list, while the user types.
     suggest: Option<SuggestList>,
+    /// The inline completion in the box: the box's text with it, and
+    /// the page Enter then opens.
+    inline: Option<(String, Url)>,
+    /// The last edit of the address text inserted text (typing, a
+    /// paste, an IME commit), not a deletion: only then is it filled in.
+    inserted: bool,
     hover: Option<Part>,
     /// When the pointer arrived on `hover`, and where it is.
     hover_since: Option<Instant>,
@@ -417,6 +423,8 @@ impl Chrome {
             menu: None,
             find: None,
             suggest: None,
+            inline: None,
+            inserted: false,
             hover: None,
             hover_since: None,
             mouse: (0.0, 0.0),
@@ -524,19 +532,37 @@ impl Chrome {
     /// address), that row selected. Nothing else starts selected. An
     /// answer for text no longer in the
     /// box, or for a box without focus, is dropped.
-    pub fn set_suggestions(&mut self, typed: &str, suggestions: Vec<Suggestion>) {
+    ///
+    /// `fill` is the history's inline completion for `typed` (the box's
+    /// text with it, and its page). It goes in only after an insertion
+    /// with the caret at the end, the added part selected, so typing on
+    /// replaces it and Backspace removes it; the first row is then that
+    /// page.
+    pub fn set_suggestions(&mut self, typed: &str, suggestions: Vec<Suggestion>, fill: Option<(String, Url)>) {
         if !self.address.focused || self.address.text() != typed {
             return;
         }
-        let own = url_from_input(typed);
+        let fill = fill.filter(|(text, _)| {
+            self.inserted && self.address.caret_at_end() && text.len() > typed.len() && text.starts_with(typed)
+        });
+        if let Some((text, url)) = &fill {
+            self.address.set_text(text);
+            self.address.select_to_end_from(&mut self.fonts, &mut self.lcx, typed.len());
+            self.inline = Some((text.clone(), url.clone()));
+        }
+        let own = match &fill {
+            Some((text, url)) => Some((url.clone(), text.clone())),
+            None => url_from_input(typed).map(|u| (u, String::new())),
+        };
         let mut rows: Vec<SuggestRow> = own
             .iter()
-            .map(|url| SuggestRow {
+            .map(|(url, shown)| SuggestRow {
                 url: url.clone(),
-                title: String::new(),
+                title: shown.clone(),
                 typed: true,
             })
             .collect();
+        let own = own.map(|(u, _)| u);
         rows.extend(suggestions.into_iter().filter(|s| own.as_ref() != Some(&s.url)).map(|s| SuggestRow {
             url: s.url,
             title: s.title,
@@ -575,6 +601,8 @@ impl Chrome {
                 list.step(input.key == Key::ArrowDown);
                 let shown = match list.selected.and_then(|i| list.rows.get(i)) {
                     Some(r) if !r.typed => display_url(&r.url),
+                    // The first row: the typed text, completed if it was.
+                    Some(r) if !r.title.is_empty() => r.title.clone(),
                     _ => list.typed.clone(),
                 };
                 self.address.set_text(&shown);
@@ -589,6 +617,7 @@ impl Chrome {
             Key::Escape => {
                 let typed = list.typed.clone();
                 self.suggest = None;
+                self.inline = None;
                 self.address.set_text(&typed);
                 self.address.move_to_end(&mut self.fonts, &mut self.lcx);
                 self.dirty = true;
@@ -615,6 +644,7 @@ impl Chrome {
         if text == before {
             return;
         }
+        self.inline = None;
         if text.trim().is_empty() {
             self.suggest = None;
             self.dirty = true;
@@ -810,6 +840,7 @@ impl Chrome {
             self.dirty = true;
         }
         self.suggest = None;
+        self.inline = None;
         self.address.blur(&mut self.fonts, &mut self.lcx);
         if let Some(f) = &mut self.find {
             f.input.blur(&mut self.fonts, &mut self.lcx);
@@ -1158,9 +1189,21 @@ impl Chrome {
             return Vec::new();
         }
         self.dirty = true;
+        // Enter on the inline completion, the first row selected, opens
+        // its page (with the scheme the site was visited with).
+        if input.key == Key::Enter
+            && let Some((text, url)) = self.inline.clone()
+            && self.address.text() == text
+            && self.suggest.as_ref().is_none_or(|l| l.selected.is_none_or(|i| l.rows.get(i).is_some_and(|r| r.typed)))
+        {
+            self.address.set_text(display_url(&url).as_str());
+            self.blur();
+            return vec![ChromeAction::Navigate(url)];
+        }
         if let Some(actions) = self.suggestion_key(&input) {
             return actions;
         }
+        self.inserted = matches!(input.key, Key::Character(_)) && !input.ctrl;
         let before = self.address.text();
         let event = self.address.key(&mut self.fonts, &mut self.lcx, &input);
         let mut actions = Vec::new();
@@ -1196,6 +1239,7 @@ impl Chrome {
     /// new query.
     pub fn paste(&mut self, text: &str) -> Vec<ChromeAction> {
         if self.address.focused {
+            self.inserted = true;
             let before = self.address.text();
             self.address.paste(&mut self.fonts, &mut self.lcx, text);
             self.dirty = true;
@@ -1226,6 +1270,7 @@ impl Chrome {
 
     pub fn ime_commit(&mut self, text: &str) -> Vec<ChromeAction> {
         if self.address.focused {
+            self.inserted = true;
             let before = self.address.text();
             self.address.ime_commit(&mut self.fonts, &mut self.lcx, text);
             self.dirty = true;
@@ -1478,9 +1523,9 @@ mod tests {
         // Typing asks for matches; an answer for older text is dropped.
         let typed = type_str(&mut c, "wik");
         assert_eq!(typed.last(), Some(&ChromeAction::AddressTyped("wik".into())));
-        c.set_suggestions("wi", rows());
+        c.set_suggestions("wi", rows(), None);
         assert!(c.suggestions().0.is_empty(), "stale answer");
-        c.set_suggestions("wik", rows());
+        c.set_suggestions("wik", rows(), None);
         let (list, selected) = c.suggestions();
         assert_eq!(list.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), [wiki.clone(), wikt.clone()]);
         assert_eq!(selected, None, "not an address: no row of its own, nothing selected");
@@ -1500,7 +1545,7 @@ mod tests {
         // the box's own.
         c.focus_address();
         type_str(&mut c, "wiki.org");
-        c.set_suggestions("wiki.org", rows());
+        c.set_suggestions("wiki.org", rows(), None);
         let (list, selected) = c.suggestions();
         assert_eq!((list[0].0.as_str(), list[0].2, selected), ("https://wiki.org/", true, Some(0)));
         c.key(KeyInput::plain(Key::ArrowDown));
@@ -1509,7 +1554,7 @@ mod tests {
         assert_eq!(c.address_text(), "wiki.org");
         assert!(c.suggestions().0.is_empty() && c.has_focus());
         // Shift+Delete forgets the selected history row, not the typed one.
-        c.set_suggestions("wiki.org", rows());
+        c.set_suggestions("wiki.org", rows(), None);
         assert!(!c.key(KeyInput::shift(Key::Delete)).iter().any(|a| matches!(a, ChromeAction::RemoveHistory(_))));
         assert_eq!(c.suggestions().0.len(), 3);
         c.key(KeyInput::plain(Key::ArrowDown));
@@ -1524,8 +1569,54 @@ mod tests {
         // Clearing the box closes the list.
         c.focus_address();
         type_str(&mut c, "w");
-        c.set_suggestions("w", rows());
+        c.set_suggestions("w", rows(), None);
         c.key(KeyInput::plain(Key::Backspace));
+        assert!(c.suggestions().0.is_empty());
+    }
+
+    #[test]
+    fn typing_fills_in_a_visited_site_and_enter_opens_it() {
+        let mut c = chrome();
+        c.focus_address();
+        let site = Url::parse("http://www.wikipedia.org/").unwrap();
+        let fill = || Some(("wikipedia.org/".to_owned(), site.clone()));
+        let fill_for = |typed: &str| Some((format!("{typed}{}", &"wikipedia.org/"[typed.len()..]), site.clone()));
+        // The rest of the host goes in, selected; the first row is the site.
+        type_str(&mut c, "wik");
+        c.set_suggestions("wik", Vec::new(), fill());
+        assert_eq!(c.address_text(), "wikipedia.org/");
+        let (rows, selected) = c.suggestions();
+        assert_eq!((rows[0].0.clone(), rows[0].1.as_str(), rows[0].2, selected), (site.clone(), "wikipedia.org/", true, Some(0)));
+        // Typing on replaces the selected part; the fill comes again.
+        assert_eq!(c.key(KeyInput::typed("i")), vec![ChromeAction::AddressTyped("wiki".into())]);
+        c.set_suggestions("wiki", Vec::new(), fill_for("wiki"));
+        assert_eq!(c.address_text(), "wikipedia.org/");
+        // Enter opens the site, with the scheme it was visited with.
+        assert_eq!(c.key(KeyInput::plain(Key::Enter)), vec![ChromeAction::Navigate(site.clone())]);
+        // Backspace removes the fill, and nothing fills after a deletion.
+        c.focus_address();
+        type_str(&mut c, "wik");
+        c.set_suggestions("wik", Vec::new(), fill());
+        assert_eq!(c.key(KeyInput::plain(Key::Backspace)), vec![ChromeAction::AddressTyped("wik".into())]);
+        c.set_suggestions("wik", Vec::new(), fill());
+        assert_eq!(c.address_text(), "wik");
+        assert_eq!(c.suggestions().0.len(), 0, "\"wik\" is no address, and no fill: no rows");
+        // The caret not at the end: no fill.
+        c.key(KeyInput::plain(Key::Home));
+        assert_eq!(c.key(KeyInput::typed("x")), vec![ChromeAction::AddressTyped("xwik".into())]);
+        c.set_suggestions("xwik", Vec::new(), Some(("xwikipedia.org/".to_owned(), site.clone())));
+        assert_eq!(c.address_text(), "xwik");
+        // Escape takes the fill out and closes the list.
+        c.key(KeyInput::plain(Key::End));
+        c.key(KeyInput::plain(Key::Backspace));
+        c.key(KeyInput::plain(Key::Backspace));
+        c.key(KeyInput::plain(Key::Backspace));
+        c.key(KeyInput::plain(Key::Backspace));
+        type_str(&mut c, "wik");
+        c.set_suggestions("wik", Vec::new(), fill());
+        assert_eq!(c.address_text(), "wikipedia.org/");
+        c.key(KeyInput::plain(Key::Escape));
+        assert_eq!(c.address_text(), "wik");
         assert!(c.suggestions().0.is_empty());
     }
 

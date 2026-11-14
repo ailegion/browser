@@ -14,7 +14,7 @@ mod db;
 mod history;
 
 pub use db::Store;
-pub use history::{HistoryEntry, HistoryService};
+pub use history::{Autofill, HistoryEntry, HistoryService};
 
 use std::path::PathBuf;
 

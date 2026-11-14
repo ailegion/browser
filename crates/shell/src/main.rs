@@ -286,7 +286,12 @@ impl App {
                             })
                         })
                         .collect();
-                    self.chrome.set_suggestions(&text, list);
+                    let fill = self
+                        .history
+                        .as_ref()
+                        .and_then(|h| h.autofill(&text))
+                        .and_then(|a| Some((a.text, Url::parse(&a.url).ok()?)));
+                    self.chrome.set_suggestions(&text, list, fill);
                 }
                 ChromeAction::RemoveHistory(url) => {
                     if let Some(h) = &self.history {

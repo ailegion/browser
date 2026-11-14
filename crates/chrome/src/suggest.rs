@@ -134,7 +134,9 @@ impl SuggestList {
             // The title (or, for the typed row, the text itself), then the
             // address dimmed.
             let (main, rest) = if row.typed {
-                (self.typed.clone(), "Visit".to_owned())
+                // The typed text, or with its inline completion.
+                let shown = if row.title.is_empty() { self.typed.clone() } else { row.title.clone() };
+                (shown, "Visit".to_owned())
             } else if row.title.is_empty() {
                 (row.url.to_string(), String::new())
             } else {
