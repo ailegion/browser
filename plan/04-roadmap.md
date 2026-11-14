@@ -1561,6 +1561,27 @@ remaining lists as they stand.
       message's text with the mouse (Copy all copies them all), Chrome's
       grouping of repeated messages, expanding objects logged (the text
       the engine gives is shown). Full run clean.
+      Owner's review 2026-11-14 (the design poor, no scrollbar, the
+      close mark a missing glyph): redone as Chrome's console lays it
+      out. Toolbar: Clear (a drawn circle with a slash), a "Default
+      levels" menu button (drawn triangle; "Custom levels" when one is
+      off) whose menu has Errors, Warnings, Info with drawn checks and
+      stays open while toggling (a press elsewhere closes it), the
+      error and warning counts with their icons, Copy all, a drawn ✕.
+      Rows: a drawn level icon (a red circle with a cross, a yellow
+      triangle with a mark), Chrome's error and warning backgrounds and
+      borders, the text wrapped beside the source, the source as
+      Chrome shows it (file and line, `(index)` for a page ending in
+      `/`, cut with `…` past 40% of the row) in link colour, underlined
+      on hover with the full address as a tooltip. A classic scrollbar
+      as the page's (17 px, arrows, track, thumb, their shades) when
+      the list overflows: arrows step 40 px, the track a page, both
+      repeating while held (250 ms then 50 ms), the thumb drags. The
+      "Uncaught" the owner's screenshot lacked was not a fault (every
+      uncaught path writes it; react.dev logged the error itself);
+      that line's missing source is not looked into yet (owner: later).
+      Tests: the toolbar and menu, Copy all, Clear, the scrollbar's
+      arrow, track, thumb and repeat, the source's short form.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

@@ -976,6 +976,10 @@ impl Chrome {
             let due = since + TOOLTIP_DELAY;
             next = Some(next.map_or(due, |n| n.min(due)));
         }
+        // A held arrow or track of the console's scrollbar.
+        if let Some(due) = self.console.as_ref().and_then(ConsolePanel::next_wake) {
+            next = Some(next.map_or(due, |n| n.min(due)));
+        }
         next
     }
 
@@ -988,6 +992,11 @@ impl Chrome {
             && self.hover.is_some_and(|p| tooltip_for(p).is_some())
         {
             self.tooltip_shown = true;
+            redraw = true;
+        }
+        if let Some(c) = &mut self.console
+            && c.tick(now)
+        {
             redraw = true;
         }
         if redraw {
@@ -1082,14 +1091,20 @@ impl Chrome {
             }
             return if over.is_some() { Cursor::Pointer } else { Cursor::Default };
         }
-        // The console's top edge being dragged: the panel follows.
-        if let Some(c) = &mut self.console
-            && c.resizing.is_some()
-        {
-            c.drag_to(y, self.window_height);
-            self.place_console();
-            self.dirty = true;
-            return Cursor::NsResize;
+        if let Some(c) = &mut self.console {
+            c.mouse = (x, y);
+            // The console's top edge being dragged: the panel follows.
+            if c.resizing.is_some() {
+                c.drag_edge(y, self.window_height);
+                self.place_console();
+                self.dirty = true;
+                return Cursor::NsResize;
+            }
+            // Its scrollbar's thumb being dragged: the list follows.
+            if c.drag_thumb(y) {
+                self.dirty = true;
+                return Cursor::Default;
+            }
         }
         let part = self.part_at(x, y);
         if let Some(c) = &mut self.console {
@@ -1097,7 +1112,8 @@ impl Chrome {
                 Some(Part::Console(p)) => Some(p),
                 _ => None,
             };
-            if over != c.hover {
+            // A source's tooltip follows the pointer.
+            if over != c.hover || matches!(over, Some(ConsolePart::Source(_))) {
                 c.hover = over;
                 self.dirty = true;
             }
@@ -1142,7 +1158,9 @@ impl Chrome {
             Some(Part::Find(FindPart::Close)) => Cursor::Pointer,
             Some(Part::Reload | Part::NewTab | Part::Menu | Part::Tab(_) | Part::TabClose(_) | Part::Suggestion(_)) => Cursor::Pointer,
             Some(Part::Console(ConsolePart::Resize)) => Cursor::NsResize,
-            Some(Part::Console(ConsolePart::Filter(_) | ConsolePart::Clear | ConsolePart::Copy | ConsolePart::Close)) => Cursor::Pointer,
+            Some(Part::Console(ConsolePart::Levels | ConsolePart::Level(_) | ConsolePart::Clear | ConsolePart::Copy | ConsolePart::Close | ConsolePart::Source(_))) => {
+                Cursor::Pointer
+            }
             _ => Cursor::Default,
         }
     }
@@ -1174,6 +1192,13 @@ impl Chrome {
             return Vec::new();
         }
         let part = self.part_at(x, y);
+        // A press anywhere but the console's levels menu closes it.
+        if let Some(c) = &mut self.console
+            && c.levels_open
+            && !matches!(part, Some(Part::Console(ConsolePart::Levels | ConsolePart::Level(_))))
+        {
+            c.levels_open = false;
+        }
         match (button, part) {
             (MouseButton::Left, Some(Part::Address)) => {
                 if self.find_focused() {
@@ -1201,6 +1226,17 @@ impl Chrome {
                     c.resizing = Some(y - c.rect.y0 as f32);
                 }
             }
+            // The rest of the panel: its scrollbar acts at once, its
+            // buttons on release.
+            (MouseButton::Left, Some(p @ Part::Console(cp))) => {
+                if self.has_focus() {
+                    self.blur();
+                }
+                if let Some(c) = &mut self.console {
+                    c.press(cp, y, &mut self.fonts, &mut self.lcx);
+                }
+                self.pressed = Some(p);
+            }
             (MouseButton::Left, Some(p @ Part::Find(_))) => self.pressed = Some(p),
             (MouseButton::Left, Some(p)) => {
                 if self.has_focus() {
@@ -1224,7 +1260,7 @@ impl Chrome {
     pub fn mouse_up(&mut self, x: f32, y: f32, button: MouseButton) -> Vec<ChromeAction> {
         let pressed = self.pressed.take();
         if let Some(c) = &mut self.console {
-            c.resizing = None;
+            c.release();
         }
         self.address.mouse_up();
         if let Some(f) = &mut self.find {
@@ -1269,9 +1305,9 @@ impl Chrome {
                 }
                 Part::Find(FindPart::Close) => self.close_find(),
                 Part::Suggestion(i) => self.open_suggestion(i),
-                Part::Console(ConsolePart::Filter(i)) => {
+                Part::Console(cp @ (ConsolePart::Levels | ConsolePart::Level(_))) => {
                     if let Some(c) = &mut self.console {
-                        c.show[i] = !c.show[i];
+                        c.click(cp);
                     }
                     Vec::new()
                 }
@@ -1808,20 +1844,58 @@ mod tests {
             c.mouse_down(x, y, MouseButton::Left, false);
             c.mouse_up(x, y, MouseButton::Left)
         };
-        // The header: Errors, Warnings, Info filters; Clear; Copy all; ✕.
-        let header = 600.0 - 260.0 + 14.0;
+        // The toolbar: Clear, the levels menu, Copy all, ✕. The menu opens
+        // under its button; each row shows or hides a level and the menu
+        // stays open; a press elsewhere closes it.
+        let top = 600.0 - 260.0;
+        let header = top + 14.0;
+        let menu_row = |i: f32| top + 28.0 + 4.0 + 13.0 + 26.0 * i;
         assert!(click(&mut c, 100.0, header).is_empty());
+        assert!(c.console.as_ref().unwrap().levels_open);
+        click(&mut c, 100.0, menu_row(0.0));
         assert!(!c.console_text().unwrap().contains("[error]"), "errors hidden");
-        click(&mut c, 100.0, header);
-        click(&mut c, 165.0, header);
+        click(&mut c, 100.0, menu_row(0.0));
+        click(&mut c, 100.0, menu_row(1.0));
         assert!(!c.console_text().unwrap().contains("[warn]"), "warnings hidden");
-        click(&mut c, 165.0, header);
+        click(&mut c, 100.0, menu_row(1.0));
+        assert!(c.console.as_ref().unwrap().levels_open, "still open");
+        c.mouse_down(400.0, 590.0, MouseButton::Left, false);
+        c.mouse_up(400.0, 590.0, MouseButton::Left);
+        assert!(!c.console.as_ref().unwrap().levels_open, "closed by a press elsewhere");
         let all = c.console_text().unwrap();
-        assert_eq!(click(&mut c, 375.0, header), vec![ChromeAction::CopyText(all)]);
-        // Drawing a full list does not fail; the wheel over it is taken.
+        assert_eq!(click(&mut c, 720.0, header), vec![ChromeAction::CopyText(all)]);
+        // Drawing does not fail; the wheel over the list is taken.
         c.draw(&mut Scene::new());
         assert!(c.console_wheel(400.0, 590.0, 40.0) && !c.console_wheel(400.0, 200.0, 40.0));
-        assert_eq!(click(&mut c, 300.0, header), vec![ChromeAction::ConsoleClear]);
+        // Many messages: the scrollbar's arrow, track and thumb scroll.
+        c.console_set((0..200).map(|i| entry(ConsoleLevel::Log, &format!("line {i}"), Some("https://a.test/x.js:1:1"))).collect());
+        c.draw(&mut Scene::new());
+        let scroll = |c: &Chrome| c.console.as_ref().unwrap().scroll_offset();
+        let at_end = scroll(&c);
+        assert!(at_end > 1000.0, "it follows the newest: {at_end}");
+        let bar_x = 800.0 - 8.0;
+        click(&mut c, bar_x, top + 28.0 + 5.0);
+        assert_eq!(scroll(&c), at_end - 40.0, "the up arrow: a line step");
+        click(&mut c, bar_x, top + 28.0 + 20.0);
+        assert!(scroll(&c) < at_end - 40.0 - 100.0, "the track above the thumb: a page");
+        // At the end again, the thumb sits at the track's bottom (above
+        // the down arrow): dragged up past the top, the list is at its top.
+        c.console_wheel(400.0, 590.0, 1.0e6);
+        assert_eq!(scroll(&c), at_end);
+        let thumb_y = 600.0 - 17.0 - 2.0;
+        c.mouse_move(bar_x, thumb_y);
+        c.mouse_down(bar_x, thumb_y, MouseButton::Left, false);
+        c.mouse_move(bar_x, 0.0);
+        c.mouse_up(bar_x, 0.0, MouseButton::Left);
+        assert_eq!(scroll(&c), 0.0);
+        // A held down arrow repeats.
+        let before = scroll(&c);
+        c.mouse_move(bar_x, 600.0 - 5.0);
+        c.mouse_down(bar_x, 600.0 - 5.0, MouseButton::Left, false);
+        let due = c.next_wake().expect("a repeat is due");
+        assert!(c.tick(due) && scroll(&c) == before + 80.0);
+        c.mouse_up(bar_x, 600.0 - 5.0, MouseButton::Left);
+        assert_eq!(click(&mut c, 19.0, header), vec![ChromeAction::ConsoleClear]);
         assert_eq!(c.console_text().unwrap(), "");
         // The top edge drags; the page keeps some room.
         c.mouse_move(400.0, 341.0);
