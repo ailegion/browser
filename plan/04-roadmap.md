@@ -955,7 +955,21 @@ remaining lists as they stand.
       (43.6–47.6); Wikipedia load 623–647 ms (631–651), relayout
       1.64–1.80 ms (1.77–1.81), iana load 4.94–5.00 s (4.98–5.04), full
       restyle 389–407 ms (393–411), relayout 37.4–38.9 ms (36.7–42.1),
-      heaps 30.3 and 435.7 MiB.
+      heaps 30.3 and 435.7 MiB. `pushState` limit, owner's ruling
+      2026-11-14: like Firefox. `NavigationRateLimit` (script crate),
+      kept by the tab and shared by its documents: 200 calls in a span
+      of 10 s from its first call; past it a `SecurityError` ("Too many
+      calls to Location or History APIs within a short timeframe.") and
+      nothing happens. Counted: `pushState`, `replaceState`, `back`,
+      `forward`, `go`, and every `location` navigation (`href` and the
+      part setters, `assign`, `replace`, `reload`). From Mozilla's bugs
+      1314912, 1720926 and 1947479: pushState, back, the `hash` setter
+      and `reload` count, 200/10 s, it throws. Not verified: the other
+      `location` setters and methods counting, the fixed span (not
+      sliding), the message text (as recalled), the counter's scope
+      (Firefox's per browsing context group, here per tab). Test: 200
+      mixed calls pass, the 201st and later throw and change nothing, a
+      new span allows 200 again.
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,

@@ -157,6 +157,7 @@ fn history_state(this: &JsValue, _: &[JsValue], context: &mut Context) -> JsResu
 /// the script; `go()` and `go(0)` reload.
 fn history_go(this: &JsValue, args: &[JsValue], fixed: &i32, context: &mut Context) -> JsResult<JsValue> {
     this_history(this)?;
+    crate::check_navigation_rate(context)?;
     let delta = if *fixed != 0 { *fixed } else { args.get_or_undefined(0).to_i32(context)? };
     let request = if delta == 0 { HostRequest::Reload } else { HostRequest::Traverse { delta } };
     host_state(context)?.borrow_mut().requests.push(request);
@@ -191,6 +192,7 @@ fn history_push(this: &JsValue, args: &[JsValue], replace: &bool, context: &mut 
             ))
             .into());
     }
+    crate::check_navigation_rate(context)?;
     let shared = history(context)?;
     // The state is serialized first: what cannot be cloned throws before
     // anything changes.

@@ -704,6 +704,9 @@ pub(crate) struct TabState {
     lifecycle: Lifecycle,
     /// When the next animation frame is due, while callbacks wait for one.
     frame_due: Option<std::time::Instant>,
+    /// The History and Location rate limit, shared by every document
+    /// the tab shows.
+    navigation_rate: std::rc::Rc<browser_script::NavigationRateLimit>,
     /// The document's time origin, for animation frame timestamps.
     doc_started: std::time::Instant,
     /// Recent console output, for tests and tools; the log gets it too.
@@ -998,6 +1001,7 @@ impl TabState {
             main_done: false,
             lifecycle: Lifecycle::Loading,
             frame_due: None,
+            navigation_rate: std::rc::Rc::default(),
             doc_started: std::time::Instant::now(),
             console: Vec::new(),
             history: Vec::new(),
@@ -3963,6 +3967,7 @@ impl TabState {
         self.script = match ScriptHost::new(self.url.clone(), browser_net::USER_AGENT) {
             Ok(mut host) => {
                 host.set_cookie_access(std::rc::Rc::new(TabCookies(self.net.clone())));
+                host.set_navigation_rate_limit(self.navigation_rate.clone());
                 if let Some(storage) = &self.origin_storage {
                     host.set_storage_access(storage.clone());
                 }

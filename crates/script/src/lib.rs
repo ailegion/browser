@@ -605,6 +605,54 @@ struct HostState {
     info: DocumentInfo,
     requests: Vec<HostRequest>,
     cookies: Option<Rc<dyn CookieAccess>>,
+    navigation_rate: Rc<NavigationRateLimit>,
+}
+
+/// Firefox's limit on History and Location navigations (200 in 10 s): a
+/// script calling past it gets a `SecurityError` and nothing happens.
+/// Kept by the tab, so it outlives a document, as Firefox's counter does
+/// for the browsing context.
+#[derive(Debug)]
+pub struct NavigationRateLimit {
+    /// When the current span began and how many calls it has counted.
+    span: std::cell::Cell<Option<(std::time::Instant, u32)>>,
+}
+
+impl Default for NavigationRateLimit {
+    fn default() -> Self {
+        Self { span: std::cell::Cell::new(None) }
+    }
+}
+
+impl NavigationRateLimit {
+    pub const COUNT: u32 = 200;
+    pub const SPAN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Count a call at `now`; false when it is past the limit. A span
+    /// starts at the first call and ends `SPAN` later.
+    pub fn allow(&self, now: std::time::Instant) -> bool {
+        let (start, count) = match self.span.get() {
+            Some((start, count)) if now.duration_since(start) < Self::SPAN => (start, count),
+            _ => (now, 0),
+        };
+        let count = count.saturating_add(1);
+        self.span.set(Some((start, count)));
+        count <= Self::COUNT
+    }
+}
+
+/// Count a History or Location navigation; past the limit, the
+/// `SecurityError` it throws.
+pub(crate) fn check_navigation_rate(context: &mut Context) -> JsResult<()> {
+    let limit = host_state(context)?.borrow().navigation_rate.clone();
+    if limit.allow(std::time::Instant::now()) {
+        return Ok(());
+    }
+    Err(dom::dom_exception(
+        "SecurityError",
+        "Too many calls to Location or History APIs within a short timeframe.",
+        context,
+    ))
 }
 
 type SharedHost = Rc<RefCell<HostState>>;
@@ -665,6 +713,7 @@ const NAV_HASH: u8 = 2;
 const NAV_RELOAD: u8 = 3;
 
 fn location_set(_: &JsValue, args: &[JsValue], what: &u8, context: &mut Context) -> JsResult<JsValue> {
+    check_navigation_rate(context)?;
     let host = host_state(context)?;
     if *what == NAV_RELOAD {
         host.borrow_mut().requests.push(HostRequest::Reload);
@@ -975,6 +1024,7 @@ impl ScriptHost {
             },
             requests: Vec::new(),
             cookies: None,
+            navigation_rate: Rc::new(NavigationRateLimit::default()),
         }));
         let mut context = ContextBuilder::new()
             .job_executor(executor.clone())
@@ -1315,6 +1365,11 @@ impl ScriptHost {
     /// Give `document.cookie` the browser's jar.
     pub fn set_cookie_access(&mut self, access: Rc<dyn CookieAccess>) {
         self.host.borrow_mut().cookies = Some(access);
+    }
+
+    /// The tab's History and Location rate limit, shared by its documents.
+    pub fn set_navigation_rate_limit(&mut self, limit: Rc<NavigationRateLimit>) {
+        self.host.borrow_mut().navigation_rate = limit;
     }
 
     /// The document's referrer (`document.referrer`), set once its load
@@ -2946,6 +3001,29 @@ mod tests {
         assert_eq!(eval(&mut h, "ev.join('|')"), "k null v https://example.test/other true true true|k|null null null https://example.test/other true true true|null");
         assert_eq!(eval(&mut h, "var se = new StorageEvent('storage', {key: 'a', newValue: 'b', storageArea: sessionStorage}); [se.key, String(se.oldValue), se.newValue, JSON.stringify(se.url), se.storageArea === sessionStorage].join('|')"), "a|null|b|\\\"\\\"|true");
         assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    #[test]
+    fn history_and_location_calls_past_the_rate_limit_throw() {
+        let mut h = host();
+        h.set_history(0, 1, None, false);
+        let limit = Rc::new(NavigationRateLimit::default());
+        h.set_navigation_rate_limit(limit.clone());
+        // 200 calls go through, mixed; the 201st throws and does nothing.
+        assert_eq!(
+            eval(&mut h, "for (var i = 0; i < 197; i++) history.replaceState(null, '', '/r' + i); history.pushState(null, '', '/p'); location.hash = 'h'; history.back(); \
+                          var e; try { history.pushState(null, '', '/q') } catch (x) { e = x } [e.name, e.message, location.pathname].join('|')"),
+            "SecurityError|Too many calls to Location or History APIs within a short timeframe.|/p"
+        );
+        assert_eq!(eval(&mut h, "try { location.reload(); 'no' } catch (x) { x.name }"), "SecurityError");
+        assert_eq!(eval(&mut h, "try { history.go(1); 'no' } catch (x) { x.name }"), "SecurityError");
+        // The span ends ten seconds after its first call; a new one starts.
+        let later = std::time::Instant::now() + NavigationRateLimit::SPAN;
+        assert!(limit.allow(later));
+        for _ in 1..NavigationRateLimit::COUNT {
+            assert!(limit.allow(later));
+        }
+        assert!(!limit.allow(later), "201st of the new span");
     }
 
     #[test]
