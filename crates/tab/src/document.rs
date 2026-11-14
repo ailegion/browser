@@ -2335,6 +2335,7 @@ impl TabState {
             if kind == NavKind::Push {
                 self.leave_entry();
             }
+            self.send(TabToShell::Visited { url: url.clone() });
             self.apply_history(url, kind, true);
             self.pending_fragment = true;
             self.state_dirty = true;
@@ -2422,6 +2423,7 @@ impl TabState {
             self.leave_entry();
         }
         self.apply_history(url.clone(), kind, true);
+        self.send(TabToShell::Visited { url: url.clone() });
         self.pending_fragment = true;
         self.state_dirty = true;
         self.document_url_changed(&url);
@@ -2508,6 +2510,10 @@ impl TabState {
                 referrer_policy,
             });
             self.cap_history();
+        }
+        // A new URL is a visit (the same one again is not).
+        if self.url.as_ref() != Some(&url) {
+            self.send(TabToShell::Visited { url: url.clone() });
         }
         self.url = Some(url.clone());
         self.document_url_changed(&url);
@@ -2650,6 +2656,7 @@ impl TabState {
             self.leave_entry();
         }
         self.apply_history(final_url.clone(), kind, false);
+        self.send(TabToShell::Visited { url: final_url.clone() });
         // A reload and a traversal restore the entry's scroll position
         // (`auto` scroll restoration).
         self.pending_scroll_restore = match kind {
@@ -6634,6 +6641,38 @@ mod tests {
 
     fn page(title: &str) -> Url {
         data_url(&format!("<title>{title}</title><p>{title}</p>"), None)
+    }
+
+    #[test]
+    fn committed_pages_and_url_changes_are_reported_as_visits() {
+        let visits = |h: &Harness| -> Vec<Url> {
+            h.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|m| match m {
+                    TabToShell::Visited { url } => Some(url.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let one = page("One");
+        let mut h = Harness::load_url(one.clone());
+        assert_eq!(visits(&h), [one.clone()], "a commit");
+        let mut fragment = one.clone();
+        fragment.set_fragment(Some("x"));
+        h.send(ShellToTab::Navigate { url: fragment.clone() });
+        h.send(ShellToTab::Reload);
+        h.send(ShellToTab::Navigate { url: page("Two") });
+        h.send(ShellToTab::GoBack);
+        assert_eq!(visits(&h), [one.clone(), fragment.clone(), fragment.clone(), page("Two"), fragment.clone()], "a fragment, a reload, a new page, back");
+        // A `pushState` to a new URL is one; to the same URL, not.
+        let before = visits(&h).len();
+        run_js(&mut h, "history.pushState(null, '', location.href); history.pushState(null, '', '#y')");
+        h.pump();
+        let mut y = one.clone();
+        y.set_fragment(Some("y"));
+        assert_eq!(visits(&h)[before..], [y]);
     }
 
     #[test]

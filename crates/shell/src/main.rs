@@ -124,6 +124,9 @@ struct Tab {
     /// The caret of the page's focused text control, in logical pixels
     /// within the page, for the IME.
     caret: Option<(f32, f32, f32, f32)>,
+    /// The navigation under way was typed in the address bar: its visit
+    /// counts as typed in the history.
+    typed: bool,
 }
 
 struct App {
@@ -133,6 +136,9 @@ struct App {
     net: Option<Arc<NetService>>,
     /// The browser's local storage (`localStorage`), shared by every tab.
     storage: Arc<WebStorage>,
+    /// The browsing history in the profile; none when the profile could
+    /// not be opened, or for a screenshot run.
+    history: Option<browser_store::HistoryService>,
     active: Option<Active>,
     /// The toolbar above the page.
     chrome: Chrome,
@@ -170,6 +176,7 @@ impl App {
             proxy,
             net: None,
             storage: Arc::new(WebStorage::new()),
+            history: None,
             active: None,
             chrome: Chrome::new(),
             clipboard: None,
@@ -219,7 +226,12 @@ impl App {
     fn handle_chrome_actions(&mut self, actions: Vec<ChromeAction>, event_loop: &ActiveEventLoop) {
         for action in actions {
             match action {
-                ChromeAction::Navigate(url) => self.send_to_current(ShellToTab::Navigate { url }),
+                ChromeAction::Navigate(url) => {
+                    if let Some(tab) = self.tabs.get_mut(self.current) {
+                        tab.typed = true;
+                    }
+                    self.send_to_current(ShellToTab::Navigate { url });
+                }
                 ChromeAction::Back => self.send_to_current(ShellToTab::GoBack),
                 ChromeAction::Forward => self.send_to_current(ShellToTab::GoForward),
                 ChromeAction::Reload => self.send_to_current(ShellToTab::Reload),
@@ -307,6 +319,17 @@ impl App {
     }
 
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        // The profile's history; a screenshot run leaves the profile alone.
+        // Without it the browser still runs, recording nothing.
+        if self.options.screenshot.is_none() {
+            self.history = match browser_store::default_profile_dir().and_then(browser_store::HistoryService::start) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::error!("history not available: {e}");
+                    None
+                }
+            };
+        }
         let attributes = Window::default_attributes()
             .with_title("browser")
             .with_inner_size(LogicalSize::new(self.options.width, self.options.height));
@@ -404,6 +427,7 @@ impl App {
             can_go_forward: false,
             cursor: CursorIcon::Default,
             caret: None,
+            typed: false,
         });
         tracing::info!(tab = id.0, tabs = self.tabs.len(), "tab opened");
         if activate {
@@ -798,8 +822,19 @@ impl ApplicationHandler<UserEvent> for App {
                 can_go_back,
                 can_go_forward,
             }) => {
+                // The page's own title, for its history entry.
+                if let (Some(history), Some(t)) = (&self.history, title.as_deref())
+                    && !t.is_empty()
+                {
+                    history.set_title(url.as_str(), t);
+                }
                 let (was_loading, has_page) = {
                     let tab = &mut self.tabs[index];
+                    // A typed navigation ends with its load, a failed one
+                    // too (no visit then).
+                    if !loading {
+                        tab.typed = false;
+                    }
                     tab.title = title.or_else(|| Some(url.to_string()));
                     tab.url = Some(url.clone());
                     tab.can_go_back = can_go_back;
@@ -898,6 +933,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             TabOutput::Message(TabToShell::Closed) => {}
+            // Web pages and files go in the history; `about:`, `data:`
+            // and the like do not.
+            TabOutput::Message(TabToShell::Visited { url }) => {
+                let typed = std::mem::take(&mut self.tabs[index].typed);
+                if let Some(history) = &self.history
+                    && matches!(url.scheme(), "http" | "https" | "file")
+                {
+                    history.visit(url.as_str(), None, typed);
+                }
+            }
         }
     }
 

@@ -227,6 +227,11 @@ pub enum ShellToTab {
 /// Tab to shell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TabToShell {
+    /// A page was opened at `url`, for the browsing history: a document
+    /// committed (a reload and a back/forward included, not an error
+    /// page), or the document moved to a new URL itself (a fragment, a
+    /// `pushState`).
+    Visited { url: Url },
     /// Navigation truth lives in the tab; the shell mirrors it for display.
     StateChanged {
         url: Url,

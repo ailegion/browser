@@ -64,6 +64,15 @@ least trustworthy body of data, so it stays off disk entirely.
 bookmarks) is stored in one encrypted file per profile using pure-Rust
 crypto: `argon2` for key derivation, `chacha20poly1305` for encryption.
 
+**Changed by the owner 2026-11-14:** the one file is a SQL database in
+Turso's engine (`turso_core`, a pure-Rust rewrite of SQLite), encrypted
+as a whole by the engine's own page encryption (AEGIS-256), not by
+`chacha20poly1305`. `argon2` stays for the passphrase's key. The profile
+is `%LOCALAPPDATA%\browser\Profile` on Windows (macOS
+`~/Library/Application Support/browser/Profile`, elsewhere
+`$XDG_DATA_HOME/browser/Profile`): `browser.db` and, with no passphrase,
+the random key beside it in `key`.
+
 - If the user sets a passphrase, the key derives from it and the data is
   unreadable without it. This is the equivalent of Firefox's primary password.
 - If the user does not set one, the key is random and stored beside the

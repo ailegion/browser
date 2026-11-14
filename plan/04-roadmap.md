@@ -1442,6 +1442,29 @@ remaining lists as they stand.
       frame scrolls once to the latest, the release ends at the last
       move; the harness applies the drag within each step, as it
       finishes scroll animations.
+- [ ] 11. Persistent history and address bar suggestions (owner,
+      2026-11-14). Blocks: (1) history store, (2) suggestion list under
+      the address bar (matches by address and title, ranked by how often
+      and how recently visited; arrows, mouse, Enter, Escape,
+      Shift+Delete), (3) inline completion of visited sites.
+      **Block 1 done 2026-11-14: history store.** `crates/store`: the
+      profile database (D03 as changed: Turso's engine, encrypted
+      AEGIS-256, random key in `key` beside `browser.db`), schema version
+      in `meta`, table `history` (url, title, visit and typed counts,
+      last visit). `HistoryService`: writes on a `store` thread, the
+      list in memory current at once (for block 2), the queued writes
+      finished when the browser closes. The tab reports
+      `TabToShell::Visited` on a document commit (reload and back/forward
+      included, not an error page), a fragment navigation and a
+      `pushState` to a new URL; the shell records http, https and file
+      URLs, typed when the navigation came from the address bar, and
+      titles as they arrive. A screenshot run leaves the profile alone.
+      Tests: kept across a reopen, nothing readable in the file, the
+      wrong key reads nothing; the service's memory and disk agree; the
+      visits a tab reports. SKIPPED: the passphrase (D03's option) -
+      needs its UI, not part of this item. Not verified: which of
+      reloads, back/forward and fragments Chrome and Firefox count as
+      visits.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

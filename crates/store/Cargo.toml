@@ -1,6 +1,6 @@
 [package]
 name = "browser-store"
-description = "Encrypted persistent store: argon2 + chacha20poly1305, optional passphrase (plan D03). Holds cookies, localStorage, passwords, history, bookmarks. Never the cache."
+description = "The persistent store (plan D02, D03): one encrypted database per profile in Turso's engine. History first; cookies, localStorage, passwords and bookmarks later. Never the cache."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-argon2.workspace = true
-chacha20poly1305.workspace = true
+turso_core.workspace = true
 rand.workspace = true
-serde.workspace = true
-postcard.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
