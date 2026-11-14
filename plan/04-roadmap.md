@@ -1417,7 +1417,17 @@ remaining lists as they stand.
       the probe calls them directly); iana full restyle 391–406 ms
       (389–407), heaps 30.1 and 435.8 MiB. Full run: the layout test
       `web_fonts_register_under_their_family` failed once (passing alone
-      and in a rerun of its crate).
+      and in a rerun of its crate). Owner's test: no change, and
+      Wikipedia's drag slower than before. The owner's fix, 2026-11-14:
+      the drag works like the track: a mouse move during a thumb drag
+      only records the pointer (`ScrollDrag::pointer`), and the thumb
+      follows from the tab's timers once per frame (`scroll_drag_tick`,
+      16 ms; the first move after a pause at once), not once per move;
+      the release applies the last move first. The two changes above
+      stay (owner). Test: moves before the frame scroll nothing, the
+      frame scrolls once to the latest, the release ends at the last
+      move; the harness applies the drag within each step, as it
+      finishes scroll animations.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

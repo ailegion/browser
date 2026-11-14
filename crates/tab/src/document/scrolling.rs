@@ -64,7 +64,18 @@ pub(super) struct ScrollDrag {
     pub grab: f32,
     /// The bar position when the drag began, to snap back to.
     pub origin: f32,
+    /// Where the pointer went since the thumb last moved. A move only
+    /// records it; the thumb follows at the next frame, once per frame
+    /// as a held track steps and a scroll animation moves, not once per
+    /// mouse move.
+    pub pointer: Option<(f32, f32)>,
+    /// When the thumb may move next.
+    pub next: Instant,
 }
+
+/// The interval a dragged thumb follows the pointer at (the frame
+/// interval the scroll animations step at).
+const DRAG_TICK: Duration = Duration::from_millis(16);
 
 /// A scrollbar button or track being held: it steps again when due.
 #[derive(Debug, Clone, Copy)]
@@ -718,6 +729,8 @@ impl TabState {
                     vertical: g.vertical,
                     grab: along - start,
                     origin: g.position,
+                    pointer: None,
+                    next: Instant::now(),
                 });
             }
             ScrollbarPart::TrackBefore | ScrollbarPart::TrackAfter if shift => {
@@ -769,14 +782,43 @@ impl TabState {
         self.set_scroll(target, want, true);
     }
 
-    /// The pointer moved during a thumb drag: the thumb follows along the
-    /// bar, or snaps back to where the drag began when the pointer is far
-    /// off the bar. True when a drag is on.
+    /// The pointer moved during a thumb drag: it is recorded, and the
+    /// thumb follows at the next frame (`scroll_drag_tick`). True when a
+    /// drag is on.
     pub(super) fn scrollbar_mouse_move(&mut self, x: f32, y: f32) -> bool {
-        let Some(drag) = self.scroll_drag else { return false };
-        let Some(info) = self.scroll_info(drag.target) else { return true };
+        let Some(drag) = self.scroll_drag.as_mut() else { return false };
+        drag.pointer = Some((x, y));
+        true
+    }
+
+    /// A thumb drag's frame: the thumb moves to the pointer's latest
+    /// position when one is waiting and the frame is due.
+    pub(super) fn scroll_drag_tick(&mut self, now: Instant) {
+        let Some(drag) = self.scroll_drag else { return };
+        if drag.pointer.is_none() || now < drag.next {
+            return;
+        }
+        self.apply_scroll_drag();
+        if let Some(d) = &mut self.scroll_drag {
+            d.next = now + DRAG_TICK;
+        }
+    }
+
+    /// When a thumb drag's next frame is due, while the pointer has moved.
+    pub(super) fn scroll_drag_wake(&self) -> Option<Instant> {
+        self.scroll_drag.filter(|d| d.pointer.is_some()).map(|d| d.next)
+    }
+
+    /// Move a dragged thumb to the pointer's waiting position: along the
+    /// bar, or back to where the drag began when the pointer is far off
+    /// the bar.
+    fn apply_scroll_drag(&mut self) {
+        let Some(drag) = self.scroll_drag.as_mut() else { return };
+        let Some((x, y)) = drag.pointer.take() else { return };
+        let drag = *drag;
+        let Some(info) = self.scroll_info(drag.target) else { return };
         let geometry = if drag.vertical { info.vertical_scrollbar() } else { info.horizontal_scrollbar() };
-        let Some(g) = geometry else { return true };
+        let Some(g) = geometry else { return };
         let (along, px, py) = self.along_bar(drag.target, drag.vertical, x, y);
         let position = if g.distance_across(px, py) > SNAP_BACK_MULTIPLIER * g.thickness {
             drag.origin
@@ -784,12 +826,18 @@ impl TabState {
             g.position_for_thumb_start(along - drag.grab)
         };
         self.set_bar_position(drag.target, drag.vertical, position);
-        true
+    }
+
+    /// Let a dragged thumb reach the pointer now (tests).
+    #[cfg(test)]
+    pub(super) fn finish_scroll_drag(&mut self) {
+        self.apply_scroll_drag();
     }
 
     /// The button went up: a drag or a held button or track ends. True
-    /// when one was on.
+    /// when one was on. A drag ends where the pointer last was.
     pub(super) fn scrollbar_mouse_up(&mut self) -> bool {
+        self.apply_scroll_drag();
         let had = self.scroll_drag.is_some() || self.bar_repeat.is_some() || self.bar_pressed.is_some();
         self.scroll_drag = None;
         self.bar_repeat = None;

@@ -2748,6 +2748,7 @@ impl TabState {
             self.refresh.as_ref().map(|(at, _)| *at),
             self.autoscroll,
             self.bar_repeat.as_ref().map(|r| r.next),
+            self.scroll_drag_wake(),
             self.pan_next_wake(),
             self.scrollend_wake(),
             self.scroll_animation_wake(),
@@ -2772,6 +2773,7 @@ impl TabState {
             self.autoscroll = self.autoscroll_step();
         }
         self.bar_repeat_tick(now);
+        self.scroll_drag_tick(now);
         self.pan_tick(now);
         self.scroll_animations_tick(now);
         // A web font's block period ended (its text is drawn in the
@@ -6166,6 +6168,7 @@ mod tests {
                 // watches them frame by frame.
                 if self.instant_scroll {
                     self.state.finish_scroll_animations();
+                    self.state.finish_scroll_drag();
                 }
                 self.show_frame();
                 self.state.flush();
@@ -6281,6 +6284,7 @@ mod tests {
         let batch = |h: &mut Harness, msg: ShellToTab| {
             h.state.handle_shell(msg);
             h.state.tick();
+            h.state.finish_scroll_drag();
             h.state.flush();
         };
         batch(&mut h, ShellToTab::MouseDown { x, y: grab, button: MouseButton::Left });
@@ -6305,6 +6309,50 @@ mod tests {
         assert!(h.state.scroll_y > dragged);
         assert_eq!(frames(&h), sent + 2);
         batch(&mut h, ShellToTab::MouseUp { x, y: grab + 60.0, button: MouseButton::Left });
+        assert!(h.state.scroll_drag.is_none());
+    }
+
+    #[test]
+    fn a_dragged_thumb_follows_the_pointer_once_per_frame() {
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        if t == 0.0 {
+            return; // overlay scrollbars: nothing to drag
+        }
+        let mut h = Harness::load(TALL);
+        let bar = h.state.scroll_info(ScrollTarget::Page).expect("layout").vertical_scrollbar().expect("bar");
+        let x = bar.bar.x + t / 2.0;
+        let grab = bar.thumb_rect().y + 5.0;
+        h.send(ShellToTab::MouseDown { x, y: grab, button: MouseButton::Left });
+        // The first move after the press: the thumb follows at once.
+        h.state.handle_shell(ShellToTab::MouseMove { x, y: grab + 10.0 });
+        h.state.tick();
+        let first = h.state.scroll_y;
+        assert!(first > 0.0, "{first}");
+        // More moves before the next frame: recorded, nothing scrolls,
+        // and the tab wakes for that frame.
+        h.state.scroll_drag.as_mut().expect("drag").next = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        for i in 2..=5 {
+            h.state.handle_shell(ShellToTab::MouseMove { x, y: grab + 10.0 * i as f32 });
+            h.state.tick();
+        }
+        assert_eq!(h.state.scroll_y, first, "no scroll per move");
+        let due = h.state.scroll_drag.expect("drag").next;
+        assert!(h.state.next_wake().is_some_and(|w| w <= due));
+        // The frame: one scroll, to the latest move.
+        h.state.scroll_drag.as_mut().expect("drag").next = std::time::Instant::now();
+        h.state.tick();
+        let latest = h.state.scroll_y;
+        assert!(latest > first, "{latest}");
+        assert!(h.state.scroll_drag.expect("drag").pointer.is_none());
+        assert!(h.state.scroll_drag_wake().is_none(), "nothing waits, no wake");
+        // Where a drag with no frame since its last move is released: the
+        // thumb ends there.
+        h.state.scroll_drag.as_mut().expect("drag").next = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        h.state.handle_shell(ShellToTab::MouseMove { x, y: grab + 80.0 });
+        h.state.tick();
+        assert_eq!(h.state.scroll_y, latest);
+        h.state.handle_shell(ShellToTab::MouseUp { x, y: grab + 80.0, button: MouseButton::Left });
+        assert!(h.state.scroll_y > latest, "the release applies the last move");
         assert!(h.state.scroll_drag.is_none());
     }
 
