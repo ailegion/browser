@@ -1379,6 +1379,45 @@ remaining lists as they stand.
       43.6–47.6 ms (45.0–47.0), relayout 1.77–1.81 ms (1.79–2.11), heaps
       30.3 and 435.7 MiB. Full run: the paint snapshots failed once
       (passing alone).
+- [x] 10. Scrollbar thumb drag stutters and freezes (owner, 2026-11-14;
+      holding the track was smooth). Cause, from the code and the docs
+      (not measured on the owner's machine): the shell drew a page frame
+      only at the window's redraw, which on Windows is `WM_PAINT`
+      (winit 0.30's `request_redraw` docs), delivered after every
+      pending input message (`GetMessage` order: posted, then input,
+      then `WM_PAINT`); during a drag the mouse moves and the tab's
+      frames, one per batch without any pacing, kept it off. Fix, both
+      parts with the owner's go: (1) the shell draws a page frame as it
+      arrives (`user_event`), presenting waits for the display
+      (`AutoVsync`); the chrome and the OS's own redraws stay on
+      `request_redraw`. (2) Frame pacing by acknowledgement (Chrome's
+      renderer and display compositor pace the same way, as recalled:
+      a frame is acknowledged before the next is sent): the shell
+      answers every frame with `ShellToTab::FrameShown` once drawn, or at
+      once when it will not draw it (a background tab, a hidden or
+      minimized window); the tab keeps one frame on its way at most
+      (`frame_in_flight`), its batches go on handling input, scripts,
+      style and layout while one is, and the next paint, of the latest
+      state, waits for the answer. The pace is the screen's, whatever
+      its rate. `FrameShown` is not input: it returns before the IME
+      settling, so a cleared composition still waits for its commit
+      (the IME test now has one between the two). The tab harness
+      answers each frame before each flush, as a shell that draws at
+      once. Test: a thumb drag's moves before the answer scroll the page
+      and paint nothing, the answer paints one frame, a second answer
+      with nothing changed paints none, a move with nothing on its way
+      paints in its own batch. Not changed: `scroll` and `pointermove`
+      fire once per batch, not once per frame as browsers do; a separate
+      item if wanted. Timing (release probe, live, against line 7's
+      small fixes): slower: iana relayout 38.3–41.4 ms (37.4–38.9), load
+      4.90–5.90 s (4.94–5.00, the 5.90 s run waited on the network: 435
+      rounds against 33–55), Wikipedia relayout 1.71–1.93 ms
+      (1.64–1.80), load 605–697 ms (623–647), full restyle 44.1–49.0 ms
+      (45.3–47.7), not attributed (nothing here touches style or layout;
+      the probe calls them directly); iana full restyle 391–406 ms
+      (389–407), heaps 30.1 and 435.8 MiB. Full run: the layout test
+      `web_fonts_register_under_their_family` failed once (passing alone
+      and in a rerun of its crate).
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

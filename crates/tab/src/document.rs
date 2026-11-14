@@ -748,6 +748,11 @@ pub(crate) struct TabState {
     needs_style: bool,
     needs_layout: bool,
     needs_paint: bool,
+    /// A frame was sent and the shell has not yet said it was shown
+    /// (`ShellToTab::FrameShown`): the next paint waits for that, so at
+    /// most one frame is on its way and the tab paints at the rate the
+    /// screen shows frames, the latest state each time.
+    frame_in_flight: bool,
     state_dirty: bool,
 }
 
@@ -1003,6 +1008,7 @@ impl TabState {
             needs_style: false,
             needs_layout: false,
             needs_paint: false,
+            frame_in_flight: false,
             state_dirty: false,
         }
     }
@@ -1038,6 +1044,13 @@ impl TabState {
     // ----- shell messages -----
 
     pub fn handle_shell(&mut self, msg: ShellToTab) {
+        // Not input: the next paint may go (in this batch's flush), and
+        // nothing else changes, an IME composition waiting for its commit
+        // included.
+        if let ShellToTab::FrameShown = msg {
+            self.frame_in_flight = false;
+            return;
+        }
         // A composition the IME cleared is a cancel unless a commit comes
         // next.
         if !matches!(msg, ShellToTab::ImeCommit { .. }) {
@@ -1336,7 +1349,7 @@ impl TabState {
             ShellToTab::Modifiers { shift, ctrl, alt, meta } => {
                 self.modifiers = Modifiers { shift, ctrl, alt, meta };
             }
-            ShellToTab::Close => {}
+            ShellToTab::Close | ShellToTab::FrameShown => {}
         }
     }
 
@@ -5530,7 +5543,9 @@ impl TabState {
             self.settle();
         }
         self.report_caret();
-        if self.needs_paint && self.layout.is_some() {
+        // With a frame still on its way to the screen, the paint waits
+        // (`needs_paint` stays) for the shell's `FrameShown`.
+        if self.needs_paint && self.layout.is_some() && !self.frame_in_flight {
             self.repaint();
             self.needs_paint = false;
         }
@@ -5751,6 +5766,7 @@ impl TabState {
         self.perf.paint += started.elapsed();
         self.perf.paints += 1;
         (self.output)(self.id, TabOutput::Frame(scene));
+        self.frame_in_flight = true;
     }
 }
 
@@ -5993,6 +6009,8 @@ mod tests {
         state: TabState,
         net_events: Receiver<NetToTab>,
         messages: Arc<Mutex<Vec<TabToShell>>>,
+        /// How many frames the tab has sent.
+        frames: Arc<std::sync::atomic::AtomicUsize>,
         /// Scroll animations complete within each `pump` (the default);
         /// off, a test steps them itself.
         instant_scroll: bool,
@@ -6038,9 +6056,12 @@ mod tests {
             });
             let messages = Arc::new(Mutex::new(Vec::new()));
             let sink_messages = messages.clone();
-            let output: Arc<OutputSink> = Arc::new(Box::new(move |_, out| {
-                if let TabOutput::Message(m) = out {
-                    sink_messages.lock().expect("lock").push(m);
+            let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let sink_frames = frames.clone();
+            let output: Arc<OutputSink> = Arc::new(Box::new(move |_, out| match out {
+                TabOutput::Message(m) => sink_messages.lock().expect("lock").push(m),
+                TabOutput::Frame(_) => {
+                    sink_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }));
             let viewport = Viewport {
@@ -6053,6 +6074,7 @@ mod tests {
                 state,
                 net_events,
                 messages,
+                frames,
                 instant_scroll: true,
             };
             h.state.handle_shell(ShellToTab::Navigate { url });
@@ -6066,7 +6088,16 @@ mod tests {
                 self.state.handle_net(ev);
             }
             self.state.tick();
+            self.show_frame();
             self.state.flush();
+        }
+
+        /// What the shell does with a frame: shown at once here, so every
+        /// flush may paint (tests that watch the pacing skip this).
+        fn show_frame(&mut self) {
+            if self.state.frame_in_flight {
+                self.state.handle_shell(ShellToTab::FrameShown);
+            }
         }
 
         /// Keep delivering net events, waiting for the network, until the
@@ -6136,6 +6167,7 @@ mod tests {
                 if self.instant_scroll {
                     self.state.finish_scroll_animations();
                 }
+                self.show_frame();
                 self.state.flush();
                 // The timing log, as the tab loop writes it.
                 self.state.end_batch();
@@ -6229,6 +6261,51 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn a_frame_waits_until_the_shell_has_shown_the_last() {
+        let t = browser_layout::SCROLLBAR_THICKNESS;
+        if t == 0.0 {
+            return; // overlay scrollbars: nothing to drag
+        }
+        let mut h = Harness::load(TALL);
+        let frames = |h: &Harness| h.frames.load(std::sync::atomic::Ordering::Relaxed);
+        let bar = h.state.scroll_info(ScrollTarget::Page).expect("layout").vertical_scrollbar().expect("bar");
+        let x = bar.bar.x + t / 2.0;
+        let grab = bar.thumb_rect().y + 5.0;
+        // The load's last frame is on its way; a thumb drag's moves come
+        // before the shell has shown it, each in a batch of its own.
+        assert!(h.state.frame_in_flight);
+        let sent = frames(&h);
+        let batch = |h: &mut Harness, msg: ShellToTab| {
+            h.state.handle_shell(msg);
+            h.state.tick();
+            h.state.flush();
+        };
+        batch(&mut h, ShellToTab::MouseDown { x, y: grab, button: MouseButton::Left });
+        for i in 1..=5 {
+            batch(&mut h, ShellToTab::MouseMove { x, y: grab + 10.0 * i as f32 });
+        }
+        // The page scrolled with every move; nothing was painted.
+        let dragged = h.state.scroll_y;
+        assert!(dragged > 0.0, "{dragged}");
+        assert_eq!(frames(&h), sent, "no frame before the last is shown");
+        assert!(h.state.needs_paint);
+        // Shown: one frame, of where the drag is now.
+        batch(&mut h, ShellToTab::FrameShown);
+        assert_eq!(frames(&h), sent + 1);
+        assert!(!h.state.needs_paint && h.state.frame_in_flight);
+        // Shown again with nothing changed: no frame.
+        batch(&mut h, ShellToTab::FrameShown);
+        assert_eq!(frames(&h), sent + 1);
+        assert!(!h.state.frame_in_flight);
+        // Nothing waiting: the next change paints in its own batch.
+        batch(&mut h, ShellToTab::MouseMove { x, y: grab + 60.0 });
+        assert!(h.state.scroll_y > dragged);
+        assert_eq!(frames(&h), sent + 2);
+        batch(&mut h, ShellToTab::MouseUp { x, y: grab + 60.0, button: MouseButton::Left });
+        assert!(h.state.scroll_drag.is_none());
     }
 
     #[test]

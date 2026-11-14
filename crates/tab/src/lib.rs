@@ -235,6 +235,7 @@ fn shell_kind(msg: &ShellToTab) -> &'static str {
         ShellToTab::Screen { .. } => "screen",
         ShellToTab::Scroll { .. } => "scroll",
         ShellToTab::MouseMove { .. } => "mousemove",
+        ShellToTab::FrameShown => "frameshown",
         ShellToTab::MouseDown { .. } => "mousedown",
         ShellToTab::MouseUp { .. } => "mouseup",
         ShellToTab::MouseLeave => "mouseleave",

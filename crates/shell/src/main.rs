@@ -769,12 +769,26 @@ impl ApplicationHandler<UserEvent> for App {
                         );
                     }
                     self.frame_arrived = Some(now);
-                    if let Some(active) = &self.active {
-                        active.window.request_redraw();
+                    // Drawn now, not at the window's next redraw: on
+                    // Windows that comes with `WM_PAINT`, which waits for
+                    // every pending input message, so a stream of mouse
+                    // moves (a thumb drag) held the page's frames off the
+                    // screen. Presenting waits for the display, and the
+                    // tab paints its next frame only once told this one
+                    // was shown: the two go at the screen's rate.
+                    if let Err(e) = self.render() {
+                        self.failure = Some(e);
+                        event_loop.exit();
+                        return;
                     }
                     if self.options.screenshot.is_some() && !loading {
                         self.take_screenshot(event_loop);
                     }
+                }
+                // Shown, or not to be (a background tab, a hidden or
+                // minimized window): the tab may paint its next frame.
+                if let Some(tab) = self.tabs.get(index) {
+                    tab.handle.send(ShellToTab::FrameShown);
                 }
             }
             TabOutput::Message(TabToShell::StateChanged {

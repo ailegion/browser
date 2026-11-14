@@ -216,6 +216,11 @@ pub enum ShellToTab {
     Cut,
     /// Clipboard text to paste into the focused text control.
     Paste { text: String },
+    /// The tab's last frame was shown, or will not be (the tab is in the
+    /// background, the window hidden or minimized). The tab keeps one
+    /// frame on its way at most and paints the next after this, so it
+    /// paints at the rate the screen shows frames.
+    FrameShown,
     Close,
 }
 
