@@ -3163,6 +3163,79 @@ mod tests {
         assert_eq!(lines(&mut h), Vec::<String>::new());
     }
 
+    /// What `Intl` and Annex B give (Boa's `intl_bundled` and `annex-b`).
+    const INTL_PROBE: &str = r#"(() => { const r = []; const t = (name, f) => { try { r.push(name + ' = ' + f()); } catch (e) { r.push(name + ' ! ' + e); } };
+        t('Intl', () => typeof Intl);
+        t('Collator', () => new Intl.Collator('en').compare('a', 'b'));
+        t('Collator de sort', () => ['z', 'ä', 'a'].sort(new Intl.Collator('de').compare).join());
+        t('DateTimeFormat', () => new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' }).format(new Date(Date.UTC(2024, 0, 15))));
+        t('DateTimeFormat default', () => new Intl.DateTimeFormat('en-US', { timeZone: 'UTC' }).format(new Date(Date.UTC(2024, 0, 15))));
+        t('DateTimeFormat time', () => new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'UTC' }).format(new Date(Date.UTC(2024, 0, 15, 13, 5))));
+        t('DateTimeFormat formatToParts', () => typeof new Intl.DateTimeFormat('en-US').formatToParts);
+        t('DateTimeFormat timeZone', () => new Intl.DateTimeFormat().resolvedOptions().timeZone);
+        t('NumberFormat', () => new Intl.NumberFormat('en-US').format(1234567.891));
+        t('NumberFormat de', () => new Intl.NumberFormat('de-DE').format(1234.5));
+        t('NumberFormat currency', () => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(12.5));
+        t('NumberFormat percent', () => new Intl.NumberFormat('en-US', { style: 'percent' }).format(0.25));
+        t('NumberFormat compact', () => new Intl.NumberFormat('en-US', { notation: 'compact' }).format(1234567));
+        t('PluralRules', () => [new Intl.PluralRules('en').select(1), new Intl.PluralRules('en').select(2), new Intl.PluralRules('en', { type: 'ordinal' }).select(2)].join());
+        t('ListFormat', () => new Intl.ListFormat('en').format(['a', 'b', 'c']));
+        t('Segmenter', () => [...new Intl.Segmenter('en', { granularity: 'word' }).segment('hi there')].map(s => s.segment).join('|'));
+        t('Locale', () => [new Intl.Locale('en-US').language, new Intl.Locale('en-US').region].join());
+        t('RelativeTimeFormat', () => new Intl.RelativeTimeFormat('en').format(-1, 'day'));
+        t('DisplayNames', () => new Intl.DisplayNames(['en'], { type: 'region' }).of('US'));
+        t('DurationFormat', () => typeof Intl.DurationFormat);
+        t('getCanonicalLocales', () => Intl.getCanonicalLocales('EN-us').join());
+        t('supportedValuesOf', () => typeof Intl.supportedValuesOf);
+        t('Number toLocaleString', () => (1234.5).toLocaleString('en-US'));
+        t('Date toLocaleDateString', () => new Date(Date.UTC(2024, 0, 15)).toLocaleDateString('en-US', { timeZone: 'UTC' }));
+        t('Date toLocaleString', () => new Date(Date.UTC(2024, 0, 15, 13, 5)).toLocaleString('en-US', { timeZone: 'UTC' }));
+        t('localeCompare', () => ['a'.localeCompare('b'), 'ä'.localeCompare('z', 'de')].join());
+        t('toLocaleUpperCase tr', () => 'i'.toLocaleUpperCase('tr'));
+        t('annexB escape', () => escape('a b') + ' ' + unescape('%41'));
+        t('annexB __proto__', () => ({ __proto__: Array.prototype }) instanceof Array);
+        t('annexB html comment', () => eval('1 <!-- comment\n'));
+        t('annexB substr', () => 'abc'.substr(1, 1));
+        t('annexB anchor', () => 'x'.anchor('n'));
+        t('annexB __defineGetter__', () => typeof ({}).__defineGetter__);
+        t('annexB RegExp.$1', () => (/(b)/.test('abc'), RegExp.$1));
+        t('annexB compile', () => typeof /x/.compile);
+        return r.join('\n'); })()"#;
+
+    #[test]
+    fn intl_and_annex_b_work_where_boa_has_them() {
+        let mut h = host();
+        let out = eval(&mut h, INTL_PROBE).replace("\\n", "\n");
+        let lines: Vec<&str> = out.trim_matches('"').lines().collect();
+        // What works as in Chrome.
+        for want in [
+            "Intl = object",
+            "Collator = -1",
+            "Collator de sort = a,ä,z",
+            "DateTimeFormat = January 15, 2024",
+            "NumberFormat = 1,234,567.891",
+            "NumberFormat de = 1.234,5",
+            "NumberFormat compact = 1.2M",
+            "PluralRules = one,other,two",
+            "ListFormat = a, b, and c",
+            "Segmenter = hi| |there",
+            "Locale = en,US",
+            "getCanonicalLocales = en-US",
+            "Number toLocaleString = 1,234.5",
+            "localeCompare = -1,-1",
+            "toLocaleUpperCase tr = İ",
+            "annexB escape = a%20b A",
+            "annexB __proto__ = true",
+            "annexB html comment = 1",
+            "annexB substr = b",
+            "annexB __defineGetter__ = function",
+            "annexB compile = function",
+        ] {
+            assert!(lines.contains(&want), "missing {want:?} in {lines:#?}");
+        }
+        assert!(lines.iter().any(|l| l.starts_with("annexB anchor = <a name=")), "{lines:#?}");
+    }
+
     #[test]
     fn performance_times_marks_measures_and_observes() {
         let mut h = host();

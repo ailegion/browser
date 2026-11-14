@@ -83,7 +83,9 @@ mime = "0.3"
 image = { version = "0.25", default-features = false }
 
 # script (Boa group)
-boa_engine = "0.22.0"
+# `intl_bundled`: `Intl` on ICU4X with its data compiled in; `annex-b`:
+# the web browser part of ECMAScript (Annex B), which browsers all have.
+boa_engine = { version = "0.22.0", features = ["intl_bundled", "annex-b"] }
 boa_gc = "0.22.0"
 boa_runtime = "0.22.0"
 

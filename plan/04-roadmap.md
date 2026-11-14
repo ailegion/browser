@@ -1063,6 +1063,24 @@ remaining lists as they stand.
       `PerformanceNavigationTiming`), legacy `performance.timing` and
       `performance.navigation`, and `measure` with every
       `PerformanceTiming` name.
+- [ ] 15. `Intl` and Annex B (owner, 2026-11-14; a site's `Intl is not
+      defined`). Boa's `intl_bundled` (ICU4X, data compiled in) and
+      `annex-b` features on (owner: only switching them on and testing
+      what works; the ban list and the size not checked). Works as in
+      Chrome (tested): `Intl.Collator`, `DateTimeFormat` with options,
+      `NumberFormat` (plain, `de-DE`, compact), `PluralRules` (cardinal
+      and ordinal), `ListFormat`, `Segmenter`, `Locale`,
+      `getCanonicalLocales`, `Number.prototype.toLocaleString`,
+      `localeCompare` with a locale, `toLocaleUpperCase('tr')`; Annex
+      B's `escape`/`unescape`, `__proto__` in literals, `<!--` comments,
+      `substr`, the HTML string methods, `__defineGetter__`,
+      `RegExp.prototype.compile`. SKIPPED (Boa lacks or differs, as
+      seen): `NumberFormat` currency ("unimplemented") and percent (0
+      for 0.25), `DateTimeFormat`'s default and `toLocaleDateString`/
+      `toLocaleString` give a two-digit year (Chrome "1/15/2024"),
+      `formatToParts`, the system time zone (`resolvedOptions().timeZone`
+      is "utc"), `RelativeTimeFormat`, `DisplayNames`, `DurationFormat`,
+      `supportedValuesOf`; the legacy `RegExp.$1` statics (undefined).
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,
