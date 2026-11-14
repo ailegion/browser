@@ -8493,6 +8493,45 @@ mod tests {
     }
 
     #[test]
+    fn nodes_compare_find_their_root_and_look_up_namespaces() {
+        let mut h = Harness::load_url(data_url(
+            "<div id=a class=x title=t><p id=p>one<b>two</b></p><p id=q>one<b>two</b></p></div><span id=s></span>\
+             <svg id=g xmlns:xl='http://www.w3.org/1999/xlink'><circle id='c'/></svg>",
+            None,
+        ));
+        let check = |h: &mut Harness, js: &str| run_js(h, &format!("(() => {{ const $ = id => document.getElementById(id); return [{js}].join() }})()"));
+        // isEqualNode: deep, attributes in any order, null false, a non-node a TypeError.
+        assert_eq!(
+            check(&mut h, "$('p').isEqualNode($('q')) === false, (() => { const c = $('p').cloneNode(true); const same = $('p').isEqualNode(c); c.lastChild.textContent = 'three'; return same && !$('p').isEqualNode(c) })(), \
+                           (() => { const x = document.createElement('i'); x.setAttribute('a', '1'); x.setAttribute('b', '2'); const y = document.createElement('i'); y.setAttribute('b', '2'); y.setAttribute('a', '1'); return x.isEqualNode(y) })(), \
+                           $('a').isEqualNode($('s')), document.createTextNode('t').isEqualNode(document.createTextNode('t')), $('a').isEqualNode(null), \
+                           (() => { try { $('a').isEqualNode({}); return 'no' } catch (e) { return e instanceof TypeError } })()"),
+            "\"true,true,true,false,true,false,true\""
+        );
+        // compareDocumentPosition: same, ancestor, descendant, before, after, disconnected.
+        assert_eq!(
+            check(&mut h, "$('p').compareDocumentPosition($('p')), $('p').compareDocumentPosition($('a')), $('a').compareDocumentPosition($('p')), \
+                           $('q').compareDocumentPosition($('p')), $('p').compareDocumentPosition($('s')), document.compareDocumentPosition($('s')), \
+                           (() => { const d = document.createElement('div'); const r = $('p').compareDocumentPosition(d); return (r & 0x21) === 0x21 && ((r & 6) === 2 || (r & 6) === 4) && (r & 6) !== (d.compareDocumentPosition($('p')) & 6) })(), \
+                           Node.DOCUMENT_POSITION_CONTAINED_BY, $('p').DOCUMENT_POSITION_FOLLOWING"),
+            "\"0,10,20,2,4,20,true,16,4\""
+        );
+        // getRootNode: the document, or a detached subtree's top.
+        assert_eq!(
+            check(&mut h, "$('p').firstChild.getRootNode() === document, document.getRootNode() === document, \
+                           (() => { const d = document.createElement('div'); const e = d.appendChild(document.createElement('em')); return e.getRootNode({ composed: true }) === d })()"),
+            "\"true,true,true\""
+        );
+        // Namespaces: the HTML and SVG defaults, a declared prefix, xml fixed.
+        assert_eq!(
+            check(&mut h, "$('p').lookupNamespaceURI(null), $('c').lookupNamespaceURI(null), $('p').isDefaultNamespace('http://www.w3.org/1999/xhtml'), \
+                           $('p').isDefaultNamespace(''), $('p').lookupNamespaceURI('xml'), $('p').lookupPrefix('http://www.w3.org/1999/xhtml'), \
+                           document.lookupNamespaceURI(null), document.createDocumentFragment().lookupNamespaceURI(null)"),
+            "\"http://www.w3.org/1999/xhtml,http://www.w3.org/2000/svg,true,false,http://www.w3.org/XML/1998/namespace,,http://www.w3.org/1999/xhtml,\""
+        );
+    }
+
+    #[test]
     fn html_elements_have_their_interfaces() {
         let mut h = Harness::load_url(data_url(
             "<div id=d></div><a id=a></a><iframe id=f></iframe><h2 id=h></h2><video id=v></video><table><tbody id=b><tr><td id=c></td></tr></tbody></table><my-el id=m></my-el><foo id=u></foo><input id=i>",

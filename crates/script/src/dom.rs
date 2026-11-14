@@ -820,6 +820,12 @@ fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
     add_method(class, "hasChildNodes", 0, Method::HasChildNodes);
     add_method(class, "contains", 1, Method::Contains);
     add_method(class, "isSameNode", 1, Method::IsSameNode);
+    add_method(class, "isEqualNode", 1, Method::IsEqualNode);
+    add_method(class, "compareDocumentPosition", 1, Method::CompareDocumentPosition);
+    add_method(class, "lookupPrefix", 1, Method::LookupPrefix);
+    add_method(class, "lookupNamespaceURI", 1, Method::LookupNamespaceUri);
+    add_method(class, "isDefaultNamespace", 1, Method::IsDefaultNamespace);
+    class.method(js_string!("getRootNode"), 0, NativeFunction::from_fn_ptr(get_root_node));
     add_mutator(class, "appendChild", 1, MutMethod::AppendChild);
     add_mutator(class, "insertBefore", 2, MutMethod::InsertBefore);
     add_mutator(class, "removeChild", 1, MutMethod::RemoveChild);
@@ -836,6 +842,12 @@ fn init_node(class: &mut ClassBuilder<'_>) -> JsResult<()> {
         ("DOCUMENT_NODE", 9),
         ("DOCUMENT_TYPE_NODE", 10),
         ("DOCUMENT_FRAGMENT_NODE", 11),
+        ("DOCUMENT_POSITION_DISCONNECTED", 0x01),
+        ("DOCUMENT_POSITION_PRECEDING", 0x02),
+        ("DOCUMENT_POSITION_FOLLOWING", 0x04),
+        ("DOCUMENT_POSITION_CONTAINS", 0x08),
+        ("DOCUMENT_POSITION_CONTAINED_BY", 0x10),
+        ("DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 0x20),
     ] {
         class.property(JsString::from(name), value, Attribute::ENUMERABLE);
         class.static_property(JsString::from(name), value, Attribute::ENUMERABLE);
@@ -1381,12 +1393,197 @@ enum Method {
     HasChildNodes,
     Contains,
     IsSameNode,
+    IsEqualNode,
+    CompareDocumentPosition,
+    LookupPrefix,
+    LookupNamespaceUri,
+    IsDefaultNamespace,
     GetAttribute,
     HasAttribute,
     HasAttributes,
     GetAttributeNames,
     GetAttributeNs,
     HasAttributeNs,
+}
+
+// ----- comparing nodes and namespaces (DOM §4.4) -----
+
+/// DOM's "equals": the same type and the type's data (a doctype's name
+/// and ids; an element's namespace, prefix, local name and attributes,
+/// in any order; a text's or comment's data; an instruction's target and
+/// data), then the same number of children, each equal in order.
+fn nodes_equal(doc: &browser_dom::Document, a: NodeId, b: NodeId) -> bool {
+    use browser_dom::NodeKind as K;
+    let same = match (&doc.get(a).kind, &doc.get(b).kind) {
+        (K::Document, K::Document) | (K::DocumentFragment, K::DocumentFragment) => true,
+        (K::Doctype { name: n1, public_id: p1, system_id: s1 }, K::Doctype { name: n2, public_id: p2, system_id: s2 }) => {
+            n1 == n2 && p1 == p2 && s1 == s2
+        }
+        (K::Element(e1), K::Element(e2)) => {
+            e1.name.ns == e2.name.ns
+                && e1.name.prefix == e2.name.prefix
+                && e1.name.local == e2.name.local
+                && e1.attrs.len() == e2.attrs.len()
+                && e1.attrs.iter().all(|x| {
+                    e2.attrs.iter().any(|y| x.name.ns == y.name.ns && x.name.local == y.name.local && x.value == y.value)
+                })
+        }
+        (K::Text(t1), K::Text(t2)) | (K::Comment(t1), K::Comment(t2)) => t1 == t2,
+        (K::ProcessingInstruction { target: t1, data: d1 }, K::ProcessingInstruction { target: t2, data: d2 }) => t1 == t2 && d1 == d2,
+        _ => false,
+    };
+    if !same {
+        return false;
+    }
+    let (mut x, mut y) = (doc.children(a), doc.children(b));
+    loop {
+        match (x.next(), y.next()) {
+            (None, None) => return true,
+            (Some(c1), Some(c2)) if nodes_equal(doc, c1, c2) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// A node's root: its topmost ancestor, or itself.
+fn root_of(doc: &browser_dom::Document, id: NodeId) -> NodeId {
+    doc.ancestors(id).last().unwrap_or(id)
+}
+
+/// Whether `a` comes before `b` in tree order (one tree, neither the
+/// other's ancestor).
+fn precedes(doc: &browser_dom::Document, a: NodeId, b: NodeId) -> bool {
+    // Each one's chain from the root; past the shared part, the order of
+    // the two diverging siblings decides.
+    let chain = |id: NodeId| {
+        let mut c: Vec<NodeId> = doc.ancestors(id).collect();
+        c.reverse();
+        c.push(id);
+        c
+    };
+    let (ca, cb) = (chain(a), chain(b));
+    let shared = ca.iter().zip(&cb).take_while(|(x, y)| x == y).count();
+    let (Some(&sa), Some(&sb)) = (ca.get(shared), cb.get(shared)) else { return ca.len() < cb.len() };
+    let mut sibling = doc.next_sibling(sa);
+    while let Some(s) = sibling {
+        if s == sb {
+            return true;
+        }
+        sibling = doc.next_sibling(s);
+    }
+    false
+}
+
+/// DOM's `compareDocumentPosition`, with `this` as node 2 and `other` as
+/// node 1: 0 for the same node; disconnected (with an order of our own,
+/// kept consistent) for nodes of different trees; contains plus preceding
+/// for an ancestor; contained-by plus following for a descendant; else
+/// preceding or following.
+fn compare_position(doc: &browser_dom::Document, this: NodeId, other: NodeId) -> u32 {
+    const DISCONNECTED: u32 = 0x01;
+    const PRECEDING: u32 = 0x02;
+    const FOLLOWING: u32 = 0x04;
+    const CONTAINS: u32 = 0x08;
+    const CONTAINED_BY: u32 = 0x10;
+    const IMPLEMENTATION_SPECIFIC: u32 = 0x20;
+    if this == other {
+        return 0;
+    }
+    if root_of(doc, this) != root_of(doc, other) {
+        let order = if other < this { PRECEDING } else { FOLLOWING };
+        return DISCONNECTED | IMPLEMENTATION_SPECIFIC | order;
+    }
+    if doc.ancestors(this).any(|a| a == other) {
+        return CONTAINS | PRECEDING;
+    }
+    if doc.ancestors(other).any(|a| a == this) {
+        return CONTAINED_BY | FOLLOWING;
+    }
+    if precedes(doc, other, this) { PRECEDING } else { FOLLOWING }
+}
+
+/// The element whose namespace lookups a node defers to: an element
+/// itself, a document's document element, another node's parent element;
+/// none for a doctype or a fragment.
+fn lookup_element(doc: &browser_dom::Document, id: NodeId) -> Option<NodeId> {
+    use browser_dom::NodeKind as K;
+    match &doc.get(id).kind {
+        K::Element(_) => Some(id),
+        K::Document => doc.document_element(),
+        K::Doctype { .. } | K::DocumentFragment => None,
+        _ => doc.parent(id).filter(|&p| doc.get(p).is_element()),
+    }
+}
+
+/// DOM's "locate a namespace prefix": the element's own prefix when its
+/// namespace is `namespace`, else the local name of an `xmlns:` attribute
+/// declaring it, else the parent element's answer.
+fn lookup_prefix(doc: &browser_dom::Document, id: NodeId, namespace: &str) -> Option<String> {
+    let mut cur = lookup_element(doc, id);
+    while let Some(e_id) = cur {
+        let e = doc.element(e_id)?;
+        if &*e.name.ns == namespace
+            && let Some(p) = &e.name.prefix
+        {
+            return Some(p.to_string());
+        }
+        if let Some(a) = e.attrs.iter().find(|a| a.name.prefix.as_deref() == Some("xmlns") && &*a.value == namespace) {
+            return Some(a.name.local.to_string());
+        }
+        cur = doc.parent(e_id).filter(|&p| doc.get(p).is_element());
+    }
+    None
+}
+
+/// DOM's "locate a namespace" for `prefix` (none for the default one):
+/// `xml` and `xmlns` are fixed; an element whose prefix it is gives its
+/// namespace; an `xmlns:prefix` (or, for the default, an `xmlns`)
+/// attribute in the XMLNS namespace gives its value (none when empty);
+/// else the parent element's answer.
+fn locate_namespace(doc: &browser_dom::Document, id: NodeId, prefix: Option<&str>) -> Option<String> {
+    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+    let mut cur = lookup_element(doc, id);
+    while let Some(e_id) = cur {
+        let e = doc.element(e_id)?;
+        match prefix {
+            Some("xml") => return Some(XML.to_owned()),
+            Some("xmlns") => return Some(XMLNS.to_owned()),
+            _ => {}
+        }
+        if !e.name.ns.is_empty() && e.name.prefix.as_deref() == prefix {
+            return Some(e.name.ns.to_string());
+        }
+        let declared = e.attrs.iter().find(|a| {
+            &*a.name.ns == XMLNS
+                && match prefix {
+                    Some(p) => a.name.prefix.as_deref() == Some("xmlns") && &*a.name.local == p,
+                    None => a.name.prefix.is_none() && &*a.name.local == "xmlns",
+                }
+        });
+        if let Some(a) = declared {
+            return (!a.value.is_empty()).then(|| a.value.to_string());
+        }
+        cur = doc.parent(e_id).filter(|&p| doc.get(p).is_element());
+    }
+    None
+}
+
+/// `getRootNode(options)`: the node's root (`composed` changes nothing:
+/// there are no shadow trees). The option is still read, as the
+/// dictionary's conversion does.
+fn get_root_node(this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let node = this_node(this)?;
+    if let Some(options) = args.get_or_undefined(0).as_object() {
+        let _ = options.get(js_string!("composed"), context)?.to_boolean();
+    }
+    let root = {
+        let shared = dom(context)?;
+        let dom = shared.borrow();
+        let Some(id) = node.resolve(&dom.doc) else { return Ok(this.clone()) };
+        root_of(&dom.doc, id)
+    };
+    wrap(root, context)
 }
 
 /// A namespace argument: null and undefined mean no namespace.
@@ -1412,6 +1609,28 @@ fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context
     };
     let ns = match method {
         Method::GetAttributeNs | Method::HasAttributeNs => Some(namespace_arg(args, 0, context)?),
+        // A namespace or prefix: null, undefined (and, as the standard
+        // says, the empty string) mean none.
+        Method::LookupPrefix | Method::LookupNamespaceUri | Method::IsDefaultNamespace => Some(namespace_arg(args, 0, context)?),
+        _ => None,
+    };
+    // The other node: `isEqualNode` takes null; both throw for a value
+    // that is not a node.
+    let other = match method {
+        Method::IsEqualNode | Method::CompareDocumentPosition => {
+            let value = args.get_or_undefined(0);
+            let equal = matches!(method, Method::IsEqualNode);
+            let what = if equal { "isEqualNode" } else { "compareDocumentPosition" };
+            match arg_node(args, 0) {
+                Some(n) => Some(n),
+                None if value.is_null_or_undefined() && equal => None,
+                None => {
+                    return Err(JsNativeError::typ()
+                        .with_message(format!("Failed to execute '{what}' on 'Node': parameter 1 is not of type 'Node'."))
+                        .into());
+                }
+            }
+        }
         _ => None,
     };
     let shared = dom(context)?;
@@ -1425,7 +1644,14 @@ fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context
         });
     };
     let receiver = match method {
-        Method::HasChildNodes | Method::Contains | Method::IsSameNode => Receiver::Any,
+        Method::HasChildNodes
+        | Method::Contains
+        | Method::IsSameNode
+        | Method::IsEqualNode
+        | Method::CompareDocumentPosition
+        | Method::LookupPrefix
+        | Method::LookupNamespaceUri
+        | Method::IsDefaultNamespace => Receiver::Any,
         _ => Receiver::Element,
     };
     if let Err(fail) = check_receiver(doc, id, receiver) {
@@ -1445,6 +1671,23 @@ fn call(this: &JsValue, args: &[JsValue], method: &Method, context: &mut Context
             other.is_some_and(|o| o == id || doc.ancestors(o).any(|a| a == id)).into()
         }
         Method::IsSameNode => arg_node(args, 0).and_then(|n| n.resolve(doc)).is_some_and(|o| o == id).into(),
+        Method::IsEqualNode => other.and_then(|n| n.resolve(doc)).is_some_and(|o| nodes_equal(doc, id, o)).into(),
+        Method::CompareDocumentPosition => match other.and_then(|n| n.resolve(doc)) {
+            Some(o) => compare_position(doc, id, o).into(),
+            None => (0x01 | 0x20 | 0x04).into(),
+        },
+        Method::LookupPrefix => match ns.as_deref().filter(|n| !n.is_empty()) {
+            Some(n) => lookup_prefix(doc, id, n).map_or(JsValue::null(), |p| js_str(&p)),
+            None => JsValue::null(),
+        },
+        Method::LookupNamespaceUri => {
+            let prefix = ns.as_deref().filter(|p| !p.is_empty());
+            locate_namespace(doc, id, prefix).map_or(JsValue::null(), |n| js_str(&n))
+        }
+        Method::IsDefaultNamespace => {
+            let want = ns.as_deref().filter(|n| !n.is_empty());
+            (locate_namespace(doc, id, None).as_deref() == want).into()
+        }
         Method::GetAttribute => element
             .and_then(|e| e.attr(&attr_name(e)))
             .map_or(JsValue::null(), js_str),

@@ -1014,6 +1014,21 @@ remaining lists as they stand.
       constructors `Image`, `Audio`, `Option`. react.dev after: past the
       `instanceof` (it was the cause); next, React's updates fail with
       "not a callable function" at three places, not yet identified.
+      `Node`'s missing members (owner, 2026-11-14; the "not a callable
+      function" was Next.js's `updateHead` calling `isEqualNode`, found
+      with the console's error stacks), per DOM §4.4: `isEqualNode`
+      (type and data, attributes in any order, children deep; null
+      false, a non-node a TypeError), `compareDocumentPosition` (0,
+      contains|preceding, contained-by|following, preceding, following;
+      disconnected|implementation-specific with a consistent order for
+      other trees; a non-node a TypeError) with the six
+      `DOCUMENT_POSITION_*` constants on `Node` and its prototype,
+      `getRootNode` (`composed` read, no effect: no shadow trees),
+      `lookupPrefix`, `lookupNamespaceURI`, `isDefaultNamespace`
+      ("locate a namespace (prefix)", `xml`/`xmlns` fixed, `xmlns`
+      attributes, the parent element's answer). Test: each, with the
+      SVG namespace and a detached subtree. react.dev after: past it;
+      next, `performance is not defined`.
 - [ ] 8. From Phase 3 item 3, sub-item 7 (forms): GET/POST submit with
       the encodings, control values, form events, navigation on submit;
       `appearance` (and `-webkit-appearance`/`-moz-appearance`; owner,
