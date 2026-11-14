@@ -221,6 +221,10 @@ pub enum ShellToTab {
     /// frame on its way at most and paints the next after this, so it
     /// paints at the rate the screen shows frames.
     FrameShown,
+    /// Code typed in the developer console: run in the page as a script,
+    /// answered with its echo, what it logs and its result (or error) as
+    /// console messages.
+    Evaluate { code: String },
     Close,
 }
 
@@ -231,6 +235,10 @@ pub enum ConsoleLevel {
     Info,
     Warn,
     Error,
+    /// Code typed in the console's input line, echoed.
+    Command,
+    /// What that code evaluated to.
+    Result,
 }
 
 /// Tab to shell.

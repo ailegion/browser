@@ -1504,7 +1504,7 @@ remaining lists as they stand.
       completes whole URLs of often-typed pages) and Firefox's
       frecency threshold for autofill (any visited site fills here).
       Full run clean. Item 11 complete.
-- [ ] 12. Developer console (owner, 2026-11-14: so failures on sites
+- [x] 12. Developer console (owner, 2026-11-14: so failures on sites
       are seen and reported). Blocks: (1) the messages, (2) the panel
       (F12 / Ctrl+Shift+J, docked at the bottom, levels coloured,
       filters, Clear, Copy all, cleared on navigation), (3) the input
@@ -1582,6 +1582,34 @@ remaining lists as they stand.
       that line's missing source is not looked into yet (owner: later).
       Tests: the toolbar and menu, Copy all, Clear, the scrollbar's
       arrow, track, thumb and repeat, the source's short form.
+      **Block 3 done 2026-11-14: the input line.** At the panel's bottom
+      (pinned there, as Firefox's; Chrome's follows the last message), a
+      blue chevron and a monospace line: a click on it, or in the list,
+      gives it the keyboard; Enter sends `ShellToTab::Evaluate`, the
+      line empties (an empty line runs nothing); Up and Down walk the
+      code run before (the oldest stays; past the newest the line being
+      written returns); Tab leaves for the page, Escape blurs; copy,
+      paste, IME and a selection drag work as in the address bar. The
+      tab echoes the code (`ConsoleLevel::Command`, a blue chevron),
+      runs it as a script task in the page (what it logs follows, its
+      declarations stay, the page updates), then sends its result
+      (`ConsoleLevel::Result`, a grey chevron back) or its error as
+      `Uncaught …`; with no script context, an error says so. Echoes
+      and results show whatever the level filters. Tests: the tab's
+      echo, log, result, a declaration kept, the page changed, an
+      error; the line's focus, Enter, history, paste, Tab, the filters
+      leaving echoes. Not built: Shift+Enter for a second line,
+      completions as one types, the result's eager preview, results
+      shown as expandable objects (the engine's text form is shown), a
+      `let` declared again in a later line (an error here; Chrome's
+      console allows it), the history kept across restarts. Item 12
+      complete.
+- [ ] 13. Source viewer (owner, 2026-11-14, to do later): clicking a
+      console message's source opens the file in a viewer in the
+      developer tools at that line, highlighted, as Chrome's Sources
+      panel and Firefox's Debugger do, with pretty printing for
+      minified files. Until then the source in the console looks like
+      a link and does nothing.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

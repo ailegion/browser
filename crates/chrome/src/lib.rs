@@ -162,6 +162,8 @@ pub enum ChromeAction {
     AddressTyped(String),
     /// Shift+Delete on a suggestion: forget the page.
     RemoveHistory(Url),
+    /// Enter in the console's input line: run this code in the page.
+    ConsoleEvaluate(String),
     /// The console's Clear: the shell drops the tab's messages too.
     ConsoleClear,
 }
@@ -613,6 +615,7 @@ impl Chrome {
     fn place_console(&mut self) {
         let (width, height, top) = (self.width, self.window_height, self.height());
         if let Some(c) = &mut self.console {
+            c.input.set_scale(self.scale);
             let before = c.rect;
             c.place(width, height, top);
             if c.rect != before {
@@ -914,7 +917,41 @@ impl Chrome {
 
     /// The address bar or the find box has keyboard focus.
     pub fn has_focus(&self) -> bool {
-        self.address.focused || self.find_focused()
+        self.address.focused || self.find_focused() || self.console_focused()
+    }
+
+    /// The console's input line has the keyboard.
+    fn console_focused(&self) -> bool {
+        self.console.as_ref().is_some_and(|c| c.input.focused)
+    }
+
+    /// The keys the console's input line takes: Enter runs the code, Up
+    /// and Down walk the code run before, Tab leaves for the page; the
+    /// rest edit the line.
+    fn console_key(&mut self, input: KeyInput) -> Vec<ChromeAction> {
+        let Some(c) = &mut self.console else { return Vec::new() };
+        self.dirty = true;
+        match input.key {
+            Key::Enter => return c.submit(&mut self.fonts, &mut self.lcx).map(ChromeAction::ConsoleEvaluate).into_iter().collect(),
+            Key::ArrowUp | Key::ArrowDown => {
+                c.history_step(input.key == Key::ArrowUp, &mut self.fonts, &mut self.lcx);
+                return Vec::new();
+            }
+            _ => {}
+        }
+        match c.input.key(&mut self.fonts, &mut self.lcx, &input) {
+            Some(InputEvent::Copy(text)) => vec![ChromeAction::CopyText(text)],
+            Some(InputEvent::RequestPaste) => vec![ChromeAction::RequestPaste],
+            Some(InputEvent::Blur) => {
+                self.blur();
+                vec![ChromeAction::FocusPage { forward: !input.shift }]
+            }
+            Some(InputEvent::Cancel) => {
+                self.blur();
+                Vec::new()
+            }
+            Some(InputEvent::Submit(_)) | None => Vec::new(),
+        }
     }
 
     /// The chrome wants the keyboard: a text box is focused or a menu is
@@ -953,6 +990,9 @@ impl Chrome {
         self.address.blur(&mut self.fonts, &mut self.lcx);
         if let Some(f) = &mut self.find {
             f.input.blur(&mut self.fonts, &mut self.lcx);
+        }
+        if let Some(c) = &mut self.console {
+            c.input.blur(&mut self.fonts, &mut self.lcx);
         }
     }
 
@@ -1010,6 +1050,11 @@ impl Chrome {
     pub fn ime_cursor_area(&mut self) -> Option<(f32, f32, f32, f32)> {
         if self.address.focused {
             return Some(self.address.ime_cursor_area(&mut self.fonts, &mut self.lcx));
+        }
+        if let Some(c) = &mut self.console
+            && c.input.focused
+        {
+            return Some(c.input.ime_cursor_area(&mut self.fonts, &mut self.lcx));
         }
         match &mut self.find {
             Some(f) if f.input.focused => Some(f.input.ime_cursor_area(&mut self.fonts, &mut self.lcx)),
@@ -1105,6 +1150,11 @@ impl Chrome {
                 self.dirty = true;
                 return Cursor::Default;
             }
+            // A selection drag in its input line.
+            if self.pressed == Some(Part::Console(ConsolePart::Input)) {
+                c.input.mouse_move(&mut self.fonts, &mut self.lcx, x, y);
+                self.dirty = true;
+            }
         }
         let part = self.part_at(x, y);
         if let Some(c) = &mut self.console {
@@ -1158,6 +1208,7 @@ impl Chrome {
             Some(Part::Find(FindPart::Close)) => Cursor::Pointer,
             Some(Part::Reload | Part::NewTab | Part::Menu | Part::Tab(_) | Part::TabClose(_) | Part::Suggestion(_)) => Cursor::Pointer,
             Some(Part::Console(ConsolePart::Resize)) => Cursor::NsResize,
+            Some(Part::Console(ConsolePart::Input)) => Cursor::Text,
             Some(Part::Console(ConsolePart::Levels | ConsolePart::Level(_) | ConsolePart::Clear | ConsolePart::Copy | ConsolePart::Close | ConsolePart::Source(_))) => {
                 Cursor::Pointer
             }
@@ -1226,6 +1277,22 @@ impl Chrome {
                     c.resizing = Some(y - c.rect.y0 as f32);
                 }
             }
+            // The input line takes the keyboard and the caret; a press in
+            // the list gives it the keyboard too (Chrome's console does).
+            (MouseButton::Left, Some(p @ Part::Console(cp @ (ConsolePart::Input | ConsolePart::List)))) => {
+                if self.address.focused || self.find_focused() {
+                    self.blur();
+                }
+                if let Some(c) = &mut self.console {
+                    c.press(cp, y, &mut self.fonts, &mut self.lcx);
+                    if cp == ConsolePart::Input {
+                        c.input.mouse_down(&mut self.fonts, &mut self.lcx, x, y, shift);
+                    } else {
+                        c.input.focused = true;
+                    }
+                }
+                self.pressed = Some(p);
+            }
             // The rest of the panel: its scrollbar acts at once, its
             // buttons on release.
             (MouseButton::Left, Some(p @ Part::Console(cp))) => {
@@ -1261,6 +1328,7 @@ impl Chrome {
         let pressed = self.pressed.take();
         if let Some(c) = &mut self.console {
             c.release();
+            c.input.mouse_up();
         }
         self.address.mouse_up();
         if let Some(f) = &mut self.find {
@@ -1380,6 +1448,9 @@ impl Chrome {
         if self.find_focused() {
             return self.find_key(input);
         }
+        if self.console_focused() {
+            return self.console_key(input);
+        }
         if !self.address.focused {
             return Vec::new();
         }
@@ -1433,6 +1504,13 @@ impl Chrome {
     /// Clipboard text for a `RequestPaste`. Into the find box it is a
     /// new query.
     pub fn paste(&mut self, text: &str) -> Vec<ChromeAction> {
+        if let Some(c) = &mut self.console
+            && c.input.focused
+        {
+            c.input.paste(&mut self.fonts, &mut self.lcx, text);
+            self.dirty = true;
+            return Vec::new();
+        }
         if self.address.focused {
             self.inserted = true;
             let before = self.address.text();
@@ -1452,6 +1530,13 @@ impl Chrome {
     }
 
     pub fn ime_preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        if let Some(c) = &mut self.console
+            && c.input.focused
+        {
+            c.input.ime_preedit(&mut self.fonts, &mut self.lcx, text, cursor);
+            self.dirty = true;
+            return;
+        }
         if self.address.focused {
             self.address.ime_preedit(&mut self.fonts, &mut self.lcx, text, cursor);
             self.dirty = true;
@@ -1464,6 +1549,13 @@ impl Chrome {
     }
 
     pub fn ime_commit(&mut self, text: &str) -> Vec<ChromeAction> {
+        if let Some(c) = &mut self.console
+            && c.input.focused
+        {
+            c.input.ime_commit(&mut self.fonts, &mut self.lcx, text);
+            self.dirty = true;
+            return Vec::new();
+        }
         if self.address.focused {
             self.inserted = true;
             let before = self.address.text();
@@ -1879,10 +1971,12 @@ mod tests {
         click(&mut c, bar_x, top + 28.0 + 20.0);
         assert!(scroll(&c) < at_end - 40.0 - 100.0, "the track above the thumb: a page");
         // At the end again, the thumb sits at the track's bottom (above
-        // the down arrow): dragged up past the top, the list is at its top.
+        // the down arrow, the input line under the list): dragged up past
+        // the top, the list is at its top.
         c.console_wheel(400.0, 590.0, 1.0e6);
         assert_eq!(scroll(&c), at_end);
-        let thumb_y = 600.0 - 17.0 - 2.0;
+        let list_bottom = 600.0 - 26.0;
+        let thumb_y = list_bottom - 17.0 - 2.0;
         c.mouse_move(bar_x, thumb_y);
         c.mouse_down(bar_x, thumb_y, MouseButton::Left, false);
         c.mouse_move(bar_x, 0.0);
@@ -1890,11 +1984,11 @@ mod tests {
         assert_eq!(scroll(&c), 0.0);
         // A held down arrow repeats.
         let before = scroll(&c);
-        c.mouse_move(bar_x, 600.0 - 5.0);
-        c.mouse_down(bar_x, 600.0 - 5.0, MouseButton::Left, false);
+        c.mouse_move(bar_x, list_bottom - 5.0);
+        c.mouse_down(bar_x, list_bottom - 5.0, MouseButton::Left, false);
         let due = c.next_wake().expect("a repeat is due");
         assert!(c.tick(due) && scroll(&c) == before + 80.0);
-        c.mouse_up(bar_x, 600.0 - 5.0, MouseButton::Left);
+        c.mouse_up(bar_x, list_bottom - 5.0, MouseButton::Left);
         assert_eq!(click(&mut c, 19.0, header), vec![ChromeAction::ConsoleClear]);
         assert_eq!(c.console_text().unwrap(), "");
         // The top edge drags; the page keeps some room.
@@ -1915,6 +2009,53 @@ mod tests {
         assert!(!c.console_open() && c.console_height() == 0.0 && c.take_console_layout_changed());
         c.toggle_console(Vec::new());
         assert_eq!(c.console_height(), 600.0 - c.height() - 80.0);
+    }
+
+    #[test]
+    fn the_console_input_line_runs_code_and_walks_its_history() {
+        let mut c = chrome();
+        c.set_window_height(600.0);
+        c.toggle_console(Vec::new());
+        // A click on the input line (the panel's bottom row) takes the
+        // keyboard, from the address bar too.
+        c.focus_address();
+        c.mouse_move(200.0, 590.0);
+        c.mouse_down(200.0, 590.0, MouseButton::Left, false);
+        c.mouse_up(200.0, 590.0, MouseButton::Left);
+        assert!(c.has_focus() && c.wants_keys() && !c.address.focused);
+        // Typing and Enter: the code goes to the page, the line empties.
+        type_str(&mut c, "1 + 2");
+        assert_eq!(c.key(KeyInput::plain(Key::Enter)), vec![ChromeAction::ConsoleEvaluate("1 + 2".into())]);
+        assert!(c.key(KeyInput::plain(Key::Enter)).is_empty(), "an empty line runs nothing");
+        type_str(&mut c, "document.title");
+        c.key(KeyInput::plain(Key::Enter));
+        // Up walks back, Down forward, past the newest the draft returns.
+        type_str(&mut c, "dra");
+        c.key(KeyInput::plain(Key::ArrowUp));
+        assert_eq!(c.console.as_ref().unwrap().input.text(), "document.title");
+        c.key(KeyInput::plain(Key::ArrowUp));
+        assert_eq!(c.console.as_ref().unwrap().input.text(), "1 + 2");
+        c.key(KeyInput::plain(Key::ArrowUp));
+        assert_eq!(c.console.as_ref().unwrap().input.text(), "1 + 2", "the oldest stays");
+        c.key(KeyInput::plain(Key::ArrowDown));
+        c.key(KeyInput::plain(Key::ArrowDown));
+        assert_eq!(c.console.as_ref().unwrap().input.text(), "dra");
+        // A paste goes into the line; Tab leaves it for the page.
+        c.paste("ft");
+        assert_eq!(c.console.as_ref().unwrap().input.text(), "draft");
+        assert_eq!(c.key(KeyInput::plain(Key::Tab)), vec![ChromeAction::FocusPage { forward: true }]);
+        assert!(!c.has_focus());
+        // A click in the list gives it the keyboard again.
+        c.mouse_down(200.0, 450.0, MouseButton::Left, false);
+        c.mouse_up(200.0, 450.0, MouseButton::Left);
+        assert!(c.has_focus());
+        // The echo and the result show whatever the level filters say.
+        c.console_push(ConsoleEntry { level: browser_ipc_types::ConsoleLevel::Command, text: "1 + 2".into(), source: None });
+        c.console_push(ConsoleEntry { level: browser_ipc_types::ConsoleLevel::Result, text: "3".into(), source: None });
+        let panel = c.console.as_mut().unwrap();
+        panel.show = [false; 3];
+        assert_eq!(c.console_text().unwrap(), "> 1 + 2\n< 3\n");
+        c.draw(&mut Scene::new());
     }
 
     fn type_str(c: &mut Chrome, s: &str) -> Vec<ChromeAction> {

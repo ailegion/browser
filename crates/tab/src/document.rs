@@ -1353,8 +1353,33 @@ impl TabState {
             ShellToTab::Modifiers { shift, ctrl, alt, meta } => {
                 self.modifiers = Modifiers { shift, ctrl, alt, meta };
             }
+            ShellToTab::Evaluate { code } => self.console_evaluate(code),
             ShellToTab::Close | ShellToTab::FrameShown => {}
         }
+    }
+
+    /// Code typed in the developer console: echoed, run in the page as a
+    /// script task (what it logs follows the echo), then its result, or
+    /// the error it threw as an uncaught one, as Chrome's console shows.
+    fn console_evaluate(&mut self, code: String) {
+        use browser_ipc_types::ConsoleLevel as L;
+        self.send(TabToShell::Console { level: L::Command, text: code.clone(), source: None });
+        if self.script.is_none() {
+            self.send(TabToShell::Console {
+                level: L::Error,
+                text: "Uncaught: this page has no script context".to_owned(),
+                source: None,
+            });
+            return;
+        }
+        let mut result = None;
+        self.script_task(|host| result = Some(host.eval_to_string(&code)));
+        let message = match result {
+            Some(Ok(value)) => TabToShell::Console { level: L::Result, text: value, source: None },
+            Some(Err(error)) => TabToShell::Console { level: L::Error, text: format!("Uncaught {error}"), source: None },
+            None => return,
+        };
+        self.send(message);
     }
 
     // ----- keys and form controls -----
@@ -8435,6 +8460,36 @@ mod tests {
         let failed: Vec<&String> = t.iter().filter(|l| l.starts_with("Failed to load resource")).collect();
         assert_eq!(failed.len(), 2, "{t:?}");
         assert!(failed[1].contains("status of 404"), "{t:?}");
+    }
+
+    #[test]
+    fn console_code_runs_in_the_page_with_its_echo_logs_and_result() {
+        let mut h = Harness::load_url(page("Before"));
+        let start = h.messages.lock().expect("lock").len();
+        let console = |h: &Harness| -> Vec<(browser_ipc_types::ConsoleLevel, String)> {
+            h.messages.lock().expect("lock")[start..]
+                .iter()
+                .filter_map(|m| match m {
+                    TabToShell::Console { level, text, .. } => Some((*level, text.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        use browser_ipc_types::ConsoleLevel as L;
+        h.send(ShellToTab::Evaluate { code: "console.log('inside'); document.title = 'After'; var z = 5; 1 + 2".into() });
+        assert_eq!(
+            console(&h),
+            [(L::Command, "console.log('inside'); document.title = 'After'; var z = 5; 1 + 2".into()), (L::Log, "inside".into()), (L::Result, "3".into())]
+        );
+        // The page changed, and what the code declared stays.
+        assert_eq!(h.title().as_deref(), Some("After"));
+        h.send(ShellToTab::Evaluate { code: "z * 2".into() });
+        assert_eq!(console(&h).last(), Some(&(L::Result, "10".into())));
+        // An error is reported as an uncaught one.
+        h.send(ShellToTab::Evaluate { code: "nope()".into() });
+        let last = console(&h).last().cloned().expect("a line");
+        assert_eq!(last.0, L::Error);
+        assert!(last.1.starts_with("Uncaught ReferenceError"), "{last:?}");
     }
 
     fn page_url(title: &str) -> Url {

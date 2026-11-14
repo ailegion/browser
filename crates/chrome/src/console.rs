@@ -14,11 +14,13 @@ use vello::kurbo::{Affine, BezPath, Circle, Point, Rect, RoundedRect, Stroke};
 use vello::peniko::{Color, Fill};
 
 use crate::Brush;
-use crate::input::draw_layout;
+use crate::input::{TextInput, draw_layout};
 use crate::widgets::{Icon, TextLine, draw_icon, draw_text, draw_tooltip};
 
 /// The toolbar's height, logical pixels.
 const TOOLBAR: f32 = 28.0;
+/// The input line's height, at the panel's bottom (as Firefox's).
+const INPUT_H: f32 = 26.0;
 /// The resize handle's thickness at the top edge.
 const EDGE: f32 = 5.0;
 const PAD_X: f32 = 8.0;
@@ -86,6 +88,8 @@ pub(crate) enum ConsolePart {
     Bar(BarPart),
     /// The source of the entry at this index.
     Source(usize),
+    /// The input line.
+    Input,
     List,
 }
 
@@ -98,7 +102,6 @@ struct Metrics {
     source_width: f32,
 }
 
-#[derive(Debug)]
 pub(crate) struct ConsolePanel {
     pub entries: Vec<ConsoleEntry>,
     /// Logical height, the toolbar included.
@@ -125,10 +128,31 @@ pub(crate) struct ConsolePanel {
     repeat: Option<(BarPart, Instant)>,
     /// The pointer, for the source's tooltip.
     pub mouse: (f32, f32),
+    /// The input line: code to run in the page.
+    pub input: TextInput,
+    /// The code run so far, oldest first, for Up and Down.
+    history: Vec<String>,
+    /// Where Up and Down are in `history`, and the line being written
+    /// before they started.
+    history_pos: Option<usize>,
+    draft: String,
+}
+
+impl std::fmt::Debug for ConsolePanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsolePanel")
+            .field("entries", &self.entries.len())
+            .field("height", &self.height)
+            .field("focused", &self.input.focused)
+            .finish()
+    }
 }
 
 impl ConsolePanel {
     pub fn new(height: f32) -> Self {
+        let mut input = TextInput::new(FONT_SIZE, "");
+        input.set_monospace();
+        input.pad_left = 2.0;
         Self {
             entries: Vec::new(),
             height,
@@ -145,6 +169,10 @@ impl ConsolePanel {
             thumb_grab: None,
             repeat: None,
             mouse: (0.0, 0.0),
+            input,
+            history: Vec::new(),
+            history_pos: None,
+            draft: String::new(),
         }
     }
 
@@ -155,6 +183,54 @@ impl ConsolePanel {
         self.height = self.height.clamp(MIN_HEIGHT, max);
         let y0 = (window_height - self.height).max(top);
         self.rect = Rect::new(0.0, f64::from(y0), f64::from(width), f64::from(window_height));
+        let row = self.input_row();
+        self.input.rect = Rect::new(row.x0 + 26.0, row.y0, row.x1 - 4.0, row.y1);
+    }
+
+    fn input_row(&self) -> Rect {
+        Rect::new(self.rect.x0, self.rect.y1 - f64::from(INPUT_H), self.rect.x1, self.rect.y1)
+    }
+
+    /// Enter on the input line: the code to run (nothing for an empty
+    /// line), kept for Up and Down; the line empties.
+    pub fn submit(&mut self, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) -> Option<String> {
+        let code = self.input.text();
+        if code.trim().is_empty() {
+            return None;
+        }
+        if self.history.last() != Some(&code) {
+            self.history.push(code.clone());
+        }
+        self.history_pos = None;
+        self.draft.clear();
+        self.input.set_text("");
+        // The caret comes back to the (now empty) text.
+        self.input.move_to_end(fonts, lcx);
+        // What it prints follows; the list shows it.
+        self.follow = true;
+        Some(code)
+    }
+
+    /// Up (`back`) or Down: the code run before, or after, in the input
+    /// line; past the newest, the line being written comes back.
+    pub fn history_step(&mut self, back: bool, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match (self.history_pos, back) {
+            (None, true) => {
+                self.draft = self.input.text();
+                Some(self.history.len() - 1)
+            }
+            (None, false) => return,
+            (Some(i), true) => Some(i.saturating_sub(1)),
+            (Some(i), false) if i + 1 < self.history.len() => Some(i + 1),
+            (Some(_), false) => None,
+        };
+        self.history_pos = next;
+        let text = next.map_or_else(|| self.draft.clone(), |i| self.history[i].clone());
+        self.input.set_text(&text);
+        self.input.move_to_end(fonts, lcx);
     }
 
     fn shown(&self, e: &ConsoleEntry) -> bool {
@@ -162,6 +238,8 @@ impl ConsolePanel {
             ConsoleLevel::Error => self.show[0],
             ConsoleLevel::Warn => self.show[1],
             ConsoleLevel::Info | ConsoleLevel::Log => self.show[2],
+            // What was typed and its result always show (as in Chrome).
+            ConsoleLevel::Command | ConsoleLevel::Result => true,
         }
     }
 
@@ -188,12 +266,14 @@ impl ConsolePanel {
         let mut out = String::new();
         for e in self.entries.iter().filter(|e| self.shown(e)) {
             let level = match e.level {
-                ConsoleLevel::Error => "error",
-                ConsoleLevel::Warn => "warn",
-                ConsoleLevel::Info => "info",
-                ConsoleLevel::Log => "log",
+                ConsoleLevel::Error => "[error] ",
+                ConsoleLevel::Warn => "[warn] ",
+                ConsoleLevel::Info => "[info] ",
+                ConsoleLevel::Log => "[log] ",
+                ConsoleLevel::Command => "> ",
+                ConsoleLevel::Result => "< ",
             };
-            out.push_str(&format!("[{level}] {}", e.text));
+            out.push_str(&format!("{level}{}", e.text));
             if let Some(s) = &e.source {
                 out.push_str(&format!("  ({s})"));
             }
@@ -215,7 +295,8 @@ impl ConsolePanel {
     }
 
     fn list(&self) -> Rect {
-        Rect::new(self.rect.x0, self.rect.y0 + f64::from(TOOLBAR), self.rect.x1, self.rect.y1)
+        let y0 = self.rect.y0 + f64::from(TOOLBAR);
+        Rect::new(self.rect.x0, y0, self.rect.x1, (self.rect.y1 - f64::from(INPUT_H)).max(y0))
     }
 
     /// The rows' area: the list without the scrollbar's column.
@@ -308,6 +389,9 @@ impl ConsolePanel {
             if rect.contains(p) {
                 return Some(part);
             }
+        }
+        if self.input_row().contains(p) {
+            return Some(ConsolePart::Input);
         }
         if let Some(bar) = self.bar()
             && bar.area.contains(p)
@@ -583,14 +667,16 @@ impl ConsolePanel {
             let (bg, line, color) = match e.level {
                 ConsoleLevel::Error => (Some(Color::from_rgb8(0xff, 0xf0, 0xf0)), Color::from_rgb8(0xff, 0xd6, 0xd6), ERROR_TEXT),
                 ConsoleLevel::Warn => (Some(Color::from_rgb8(0xff, 0xfb, 0xe5)), Color::from_rgb8(0xff, 0xf5, 0xc2), WARN_TEXT),
-                ConsoleLevel::Info | ConsoleLevel::Log => (None, Color::from_rgb8(0xf0, 0xf0, 0xf0), TEXT),
+                ConsoleLevel::Info | ConsoleLevel::Log | ConsoleLevel::Command | ConsoleLevel::Result => {
+                    (None, Color::from_rgb8(0xf0, 0xf0, 0xf0), TEXT)
+                }
             };
             if let Some(bg) = bg {
                 fill(scene, row, bg);
             }
             fill(scene, Rect::new(row.x0, row.y1 - s.max(1.0), row.x1, row.y1), line);
             let first_line = f64::from(Self::line_height()) * s;
-            if matches!(e.level, ConsoleLevel::Error | ConsoleLevel::Warn) {
+            if matches!(e.level, ConsoleLevel::Error | ConsoleLevel::Warn | ConsoleLevel::Command | ConsoleLevel::Result) {
                 level_icon(scene, e.level, (row.x0 + f64::from(ICON_COL) / 2.0 * s + 2.0 * s, row.y0 + first_line / 2.0), s);
             }
             let layout = text_layout(fonts, lcx, &e.text, self.text_width(m.source_width), scale);
@@ -606,6 +692,13 @@ impl ConsolePanel {
             }
         }
         scene.pop_layer();
+
+        // The input line: a line above it, Chrome's blue chevron, the text.
+        let input = sr(self.input_row());
+        fill(scene, input, Color::from_rgb8(0xff, 0xff, 0xff));
+        fill(scene, Rect::new(input.x0, input.y0, input.x1, input.y0 + s.max(1.0)), Color::from_rgb8(0xda, 0xdc, 0xe0));
+        chevron(scene, (input.x0 + 13.0 * s, (input.y0 + input.y1) / 2.0), s, true, Color::from_rgb8(0x1a, 0x73, 0xe8));
+        self.input.draw(fonts, lcx, scene);
 
         // The scrollbar, as the page's classic one.
         if let Some(bar) = self.bar() {
@@ -757,8 +850,22 @@ fn level_icon(scene: &mut Scene, level: ConsoleLevel, c: (f64, f64), s: f64) {
             scene.fill(Fill::NonZero, Affine::IDENTITY, dark, None, &Rect::new(c.0 - 0.7 * s, c.1 - 2.5 * s, c.0 + 0.7 * s, c.1 + 1.5 * s));
             scene.fill(Fill::NonZero, Affine::IDENTITY, dark, None, &Rect::new(c.0 - 0.7 * s, c.1 + 2.5 * s, c.0 + 0.7 * s, c.1 + 3.9 * s));
         }
+        // What was typed: a blue chevron; its result: a grey one back.
+        ConsoleLevel::Command => chevron(scene, c, s, true, Color::from_rgb8(0x1a, 0x73, 0xe8)),
+        ConsoleLevel::Result => chevron(scene, c, s, false, Color::from_rgb8(0x9a, 0xa0, 0xa6)),
         ConsoleLevel::Info | ConsoleLevel::Log => {}
     }
+}
+
+/// A chevron centred at `c`, pointing right (`>`) or left (`<`).
+fn chevron(scene: &mut Scene, c: (f64, f64), s: f64, right: bool, color: Color) {
+    let (w, h) = (3.0 * s, 4.5 * s);
+    let dir = if right { 1.0 } else { -1.0 };
+    let mut path = BezPath::new();
+    path.move_to((c.0 - w * dir, c.1 - h));
+    path.line_to((c.0 + w * dir, c.1));
+    path.line_to((c.0 - w * dir, c.1 + h));
+    scene.stroke(&Stroke::new(1.6 * s), Affine::IDENTITY, color, None, &path);
 }
 
 /// A source as Chrome shows it: the file's name and the line

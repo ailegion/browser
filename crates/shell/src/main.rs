@@ -303,6 +303,7 @@ impl App {
                         h.remove(url.as_str());
                     }
                 }
+                ChromeAction::ConsoleEvaluate(code) => self.send_to_current(ShellToTab::Evaluate { code }),
                 ChromeAction::ConsoleClear => {
                     if let Some(tab) = self.tabs.get_mut(self.current) {
                         tab.console.clear();

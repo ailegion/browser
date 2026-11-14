@@ -204,6 +204,13 @@ impl TextInput {
         None
     }
 
+    /// Write in the monospace face (the console's input line).
+    pub fn set_monospace(&mut self) {
+        self.editor
+            .edit_styles()
+            .insert(StyleProperty::FontFamily(parley::FontFamily::Source(std::borrow::Cow::Borrowed("monospace"))));
+    }
+
     /// Select from byte `start` to the end (an inline completion).
     pub fn select_to_end_from(&mut self, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>, start: usize) {
         let end = self.editor.text().to_string().len();
