@@ -917,12 +917,38 @@ impl Chrome {
 
     /// The address bar or the find box has keyboard focus.
     pub fn has_focus(&self) -> bool {
-        self.address.focused || self.find_focused() || self.console_focused()
+        self.address.focused || self.find_focused() || self.console_focused() || self.console_list_focused()
     }
 
     /// The console's input line has the keyboard.
     fn console_focused(&self) -> bool {
         self.console.as_ref().is_some_and(|c| c.input.focused)
+    }
+
+    /// The console's messages have the keyboard (a selection was made).
+    fn console_list_focused(&self) -> bool {
+        self.console.as_ref().is_some_and(|c| c.list_focused)
+    }
+
+    /// The keys the messages take: Ctrl+C copies the selection, Ctrl+A
+    /// selects every message; typing goes to the input line, as Chrome's
+    /// console sends it to its prompt.
+    fn console_list_key(&mut self, input: KeyInput) -> Vec<ChromeAction> {
+        let Some(c) = &mut self.console else { return Vec::new() };
+        self.dirty = true;
+        match &input.key {
+            Key::Character(ch) if input.ctrl && ch.eq_ignore_ascii_case("c") => c.selected_text().map(ChromeAction::CopyText).into_iter().collect(),
+            Key::Character(ch) if input.ctrl && ch.eq_ignore_ascii_case("a") => {
+                c.select_all();
+                Vec::new()
+            }
+            Key::Character(_) if !input.ctrl && !input.alt => {
+                c.list_focused = false;
+                c.input.focused = true;
+                self.console_key(input)
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// The keys the console's input line takes: Enter runs the code, Up
@@ -993,6 +1019,8 @@ impl Chrome {
         }
         if let Some(c) = &mut self.console {
             c.input.blur(&mut self.fonts, &mut self.lcx);
+            // The selection stays, dimmed, without the keyboard.
+            c.list_focused = false;
         }
     }
 
@@ -1035,7 +1063,7 @@ impl Chrome {
             redraw = true;
         }
         if let Some(c) = &mut self.console
-            && c.tick(now)
+            && c.tick(now, &mut self.fonts, &mut self.lcx)
         {
             redraw = true;
         }
@@ -1150,10 +1178,14 @@ impl Chrome {
                 self.dirty = true;
                 return Cursor::Default;
             }
-            // A selection drag in its input line.
+            // A selection drag in its input line, or in its messages.
             if self.pressed == Some(Part::Console(ConsolePart::Input)) {
                 c.input.mouse_move(&mut self.fonts, &mut self.lcx, x, y);
                 self.dirty = true;
+            }
+            if self.pressed == Some(Part::Console(ConsolePart::List)) && c.drag_text(x, y, &mut self.fonts, &mut self.lcx) {
+                self.dirty = true;
+                return Cursor::Text;
             }
         }
         let part = self.part_at(x, y);
@@ -1286,9 +1318,14 @@ impl Chrome {
                 if let Some(c) = &mut self.console {
                     c.press(cp, y, &mut self.fonts, &mut self.lcx);
                     if cp == ConsolePart::Input {
+                        c.list_focused = false;
                         c.input.mouse_down(&mut self.fonts, &mut self.lcx, x, y, shift);
                     } else {
-                        c.input.focused = true;
+                        // A selection in the messages starts; a press that
+                        // does not drag gives the input line the keyboard
+                        // on release.
+                        c.input.blur(&mut self.fonts, &mut self.lcx);
+                        c.press_text(x, y, shift, &mut self.fonts, &mut self.lcx);
                     }
                 }
                 self.pressed = Some(p);
@@ -1329,6 +1366,11 @@ impl Chrome {
         if let Some(c) = &mut self.console {
             c.release();
             c.input.mouse_up();
+            // A press in the messages: a drag leaves its selection, with
+            // the keyboard; a click gives the input line the keyboard.
+            if matches!(pressed, Some(Part::Console(ConsolePart::List))) && !c.release_text() {
+                c.input.focused = true;
+            }
         }
         self.address.mouse_up();
         if let Some(f) = &mut self.find {
@@ -1450,6 +1492,9 @@ impl Chrome {
         }
         if self.console_focused() {
             return self.console_key(input);
+        }
+        if self.console_list_focused() {
+            return self.console_list_key(input);
         }
         if !self.address.focused {
             return Vec::new();
@@ -2009,6 +2054,63 @@ mod tests {
         assert!(!c.console_open() && c.console_height() == 0.0 && c.take_console_layout_changed());
         c.toggle_console(Vec::new());
         assert_eq!(c.console_height(), 600.0 - c.height() - 80.0);
+    }
+
+    #[test]
+    fn console_messages_select_by_drag_word_and_message_and_copy() {
+        use browser_ipc_types::ConsoleLevel;
+        let mut c = chrome();
+        c.set_window_height(600.0);
+        let entry = |text: &str| ConsoleEntry { level: ConsoleLevel::Log, text: text.into(), source: None };
+        c.toggle_console(vec![entry("hello world"), entry("second line"), entry("third")]);
+        c.draw(&mut Scene::new());
+        let (row0, row1) = (368.0 + 10.0, 390.0 + 12.0);
+        let text_x = 22.0 + 1.0;
+        let copy = |c: &mut Chrome| c.key(KeyInput::ctrl(Key::Character("c".into())));
+        // A drag from the first message's start to past the second's end.
+        c.mouse_move(text_x, row0);
+        c.mouse_down(text_x, row0, MouseButton::Left, false);
+        c.mouse_move(500.0, row1);
+        c.mouse_up(500.0, row1, MouseButton::Left);
+        assert!(c.has_focus() && c.wants_keys(), "the messages have the keyboard");
+        assert!(!c.console.as_ref().unwrap().input.focused);
+        assert_eq!(copy(&mut c), vec![ChromeAction::CopyText("hello world\nsecond line".into())]);
+        // A double click past a line's end takes the last word; a triple
+        // click the whole message.
+        for n in 1..=2 {
+            c.mouse_down(500.0, row0, MouseButton::Left, false);
+            c.mouse_up(500.0, row0, MouseButton::Left);
+            if n == 2 {
+                assert_eq!(copy(&mut c), vec![ChromeAction::CopyText("world".into())]);
+            }
+        }
+        c.mouse_down(500.0, row0, MouseButton::Left, false);
+        c.mouse_up(500.0, row0, MouseButton::Left);
+        assert_eq!(copy(&mut c), vec![ChromeAction::CopyText("hello world".into())]);
+        // Shift+click extends; Ctrl+A takes every message.
+        c.mouse_down(500.0, row1, MouseButton::Left, true);
+        c.mouse_up(500.0, row1, MouseButton::Left);
+        assert_eq!(copy(&mut c), vec![ChromeAction::CopyText("hello world\nsecond line".into())]);
+        c.key(KeyInput::ctrl(Key::Character("a".into())));
+        assert_eq!(copy(&mut c), vec![ChromeAction::CopyText("hello world\nsecond line\nthird".into())]);
+        c.draw(&mut Scene::new());
+        // Typing goes to the input line.
+        c.key(KeyInput::typed("x"));
+        assert!(c.console.as_ref().unwrap().input.focused);
+        assert_eq!(c.console.as_ref().unwrap().input.text(), "x");
+        // A click without a drag: no selection, the input line has the
+        // keyboard.
+        std::thread::sleep(std::time::Duration::from_millis(510));
+        c.mouse_down(text_x, row1, MouseButton::Left, false);
+        c.mouse_up(text_x, row1, MouseButton::Left);
+        assert!(c.console.as_ref().unwrap().input.focused && !c.console.as_ref().unwrap().has_selection());
+        // A press on the page side takes the keyboard away; the panel's
+        // messages being replaced drop the selection.
+        c.console.as_mut().unwrap().select_all();
+        c.blur();
+        assert!(!c.has_focus() && c.console.as_ref().unwrap().has_selection());
+        c.console_set(vec![entry("new")]);
+        assert!(!c.console.as_ref().unwrap().has_selection());
     }
 
     #[test]

@@ -1707,6 +1707,22 @@ remaining lists as they stand.
       known flaky one). Through it, react.dev's blank page (React
       starting, then failing in Next.js's `updateHead`) traced to
       `Node.isEqualNode` missing.
+      Selecting and copying messages (owner, 2026-11-14, as Chrome's
+      console): a drag in the messages selects their text, across
+      messages too (clamped to the first and last shown when the pointer
+      leaves the list, which scrolls toward it); a double click a word
+      (letters, digits and `_`, or white space, or one other character),
+      a triple click the message, Shift+click extends; highlighted, dim
+      without the keyboard; it stays while scrolling. A drag gives the
+      messages the keyboard: Ctrl+C copies the selection (each message's
+      part on its own line), Ctrl+A selects every shown message, typing
+      goes to the input line; a click without a drag gives the input line
+      the keyboard as before; a press elsewhere takes the keyboard (the
+      selection stays, dim); new messages for another tab or a document
+      drop it. Test: drag across messages, word, message, Shift+click,
+      Ctrl+A, typing, a plain click, blur, replacement. Not built: the
+      source labels' text in a selection (Chrome copies them too), a
+      right-click "Copy" (no context menu yet).
 - [ ] 13. Source viewer (owner, 2026-11-14, to do later): clicking a
       console message's source opens the file in a viewer in the
       developer tools at that line, highlighted, as Chrome's Sources

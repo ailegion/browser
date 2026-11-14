@@ -136,6 +136,26 @@ pub(crate) struct ConsolePanel {
     /// before they started.
     history_pos: Option<usize>,
     draft: String,
+    /// The selected message text: where the drag began and where it is.
+    sel_anchor: Option<TextPos>,
+    sel_focus: Option<TextPos>,
+    /// A drag selection is under way.
+    selecting: bool,
+    /// The last press in the list, for double and triple clicks.
+    last_press: Option<(Instant, f32, f32, u8)>,
+    /// The list has the keyboard (a selection was made there): Ctrl+C
+    /// copies it, Ctrl+A selects every message.
+    pub list_focused: bool,
+    /// While a drag holds the pointer above or below the list: when it
+    /// scrolls next.
+    drag_scroll: Option<Instant>,
+}
+
+/// A place in the messages' text: the entry's index and a byte offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TextPos {
+    entry: usize,
+    byte: usize,
 }
 
 impl std::fmt::Debug for ConsolePanel {
@@ -173,7 +193,147 @@ impl ConsolePanel {
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
+            sel_anchor: None,
+            sel_focus: None,
+            selecting: false,
+            last_press: None,
+            list_focused: false,
+            drag_scroll: None,
         }
+    }
+
+    // ----- selecting message text -----
+
+    /// The text place under a point of the list (clamped to it: above the
+    /// first shown message, its start; below the last, its end).
+    fn pos_at(&mut self, x: f32, y: f32, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) -> Option<TextPos> {
+        self.measure(fonts, lcx);
+        let rows = self.visible_rows();
+        let list = self.list();
+        let (first, last) = (rows.first().copied(), rows.last().copied());
+        let (i, top, _) = match rows.iter().copied().find(|(_, top, h)| y >= *top && y < top + h) {
+            Some(r) => r,
+            None if y < list.y0 as f32 => return first.map(|(i, _, _)| TextPos { entry: i, byte: 0 }),
+            None => return last.map(|(i, _, _)| TextPos { entry: i, byte: self.entries[i].text.len() }),
+        };
+        let layout = text_layout(fonts, lcx, &self.entries[i].text, self.text_width(self.metrics[i].source_width), 1.0);
+        let lx = x - (self.rows().x0 as f32 + ICON_COL);
+        let ly = y - (top + PAD_Y);
+        let cursor = parley::Cursor::from_point(&layout, lx, ly);
+        Some(TextPos { entry: i, byte: cursor.index().min(self.entries[i].text.len()) })
+    }
+
+    /// A press on the list at a point: a new selection there (a word on a
+    /// double click, the message on a triple one), or the old one
+    /// extended with Shift.
+    pub fn press_text(&mut self, x: f32, y: f32, shift: bool, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) {
+        let Some(pos) = self.pos_at(x, y, fonts, lcx) else { return };
+        let now = Instant::now();
+        let count = match self.last_press {
+            Some((at, px, py, n)) if now.duration_since(at) < Duration::from_millis(500) && (px - x).abs() < 4.0 && (py - y).abs() < 4.0 => {
+                n % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some((now, x, y, count));
+        self.selecting = true;
+        if shift && self.sel_anchor.is_some() {
+            self.sel_focus = Some(pos);
+            return;
+        }
+        let text = &self.entries[pos.entry].text;
+        let (start, end) = match count {
+            2 => word_at(text, pos.byte),
+            3 => (0, text.len()),
+            _ => (pos.byte, pos.byte),
+        };
+        self.sel_anchor = Some(TextPos { entry: pos.entry, byte: start });
+        self.sel_focus = Some(TextPos { entry: pos.entry, byte: end });
+    }
+
+    /// The pointer moved during a drag selection: the selection follows it;
+    /// past the list's top or bottom, the list scrolls (in `tick`).
+    pub fn drag_text(&mut self, x: f32, y: f32, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) -> bool {
+        if !self.selecting {
+            return false;
+        }
+        if let Some(pos) = self.pos_at(x, y, fonts, lcx) {
+            self.sel_focus = Some(pos);
+        }
+        let list = self.list();
+        let outside = y < list.y0 as f32 || y > list.y1 as f32;
+        if outside && self.drag_scroll.is_none() {
+            self.drag_scroll = Some(Instant::now() + REPEAT);
+        } else if !outside {
+            self.drag_scroll = None;
+        }
+        true
+    }
+
+    /// The button came up after a press in the list: true when it left a
+    /// selection (else the press was a click, which the input line takes).
+    pub fn release_text(&mut self) -> bool {
+        let was = std::mem::take(&mut self.selecting);
+        self.drag_scroll = None;
+        let selected = self.has_selection();
+        if was {
+            if selected {
+                self.list_focused = true;
+            } else {
+                self.clear_selection();
+            }
+        }
+        was && selected
+    }
+
+    pub fn has_selection(&self) -> bool {
+        matches!((self.sel_anchor, self.sel_focus), (Some(a), Some(f)) if a != f)
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.sel_anchor = None;
+        self.sel_focus = None;
+        self.selecting = false;
+        self.list_focused = false;
+    }
+
+    /// Ctrl+A in the list: every shown message.
+    pub fn select_all(&mut self) {
+        let shown: Vec<usize> = (0..self.entries.len()).filter(|&i| self.shown(&self.entries[i])).collect();
+        if let (Some(&first), Some(&last)) = (shown.first(), shown.last()) {
+            self.sel_anchor = Some(TextPos { entry: first, byte: 0 });
+            self.sel_focus = Some(TextPos { entry: last, byte: self.entries[last].text.len() });
+            self.list_focused = true;
+        }
+    }
+
+    /// The selection in order, start first.
+    fn selection(&self) -> Option<(TextPos, TextPos)> {
+        let (a, f) = (self.sel_anchor?, self.sel_focus?);
+        (a != f).then(|| if a <= f { (a, f) } else { (f, a) })
+    }
+
+    /// The bytes of entry `i` the selection covers.
+    fn selected_range(&self, i: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.selection()?;
+        if i < start.entry || i > end.entry {
+            return None;
+        }
+        let len = self.entries[i].text.len();
+        let from = if i == start.entry { start.byte.min(len) } else { 0 };
+        let to = if i == end.entry { end.byte.min(len) } else { len };
+        (from < to || (from == to && i != start.entry && i != end.entry)).then_some((from, to))
+    }
+
+    /// The selected text: each shown message's selected part, one per
+    /// line (Ctrl+C).
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let parts: Vec<&str> = (start.entry..=end.entry)
+            .filter(|&i| i < self.entries.len() && self.shown(&self.entries[i]))
+            .filter_map(|i| self.selected_range(i).map(|(a, b)| &self.entries[i].text[a..b]))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
     /// Lay out in a window `width` × `window_height` whose page starts at
@@ -252,12 +412,14 @@ impl ConsolePanel {
         self.metrics.clear();
         self.scroll = 0.0;
         self.follow = true;
+        self.clear_selection();
     }
 
     pub fn set(&mut self, entries: Vec<ConsoleEntry>) {
         self.entries = entries;
         self.metrics.clear();
         self.follow = true;
+        self.clear_selection();
     }
 
     /// The text Copy all puts on the clipboard: the shown messages, one
@@ -541,14 +703,39 @@ impl ConsolePanel {
         self.scroll
     }
 
-    /// When a held arrow or track steps next.
+    /// When a held arrow or track steps next, or a drag past an edge
+    /// scrolls.
     pub fn next_wake(&self) -> Option<Instant> {
-        self.repeat.map(|(_, at)| at)
+        match (self.repeat.map(|(_, at)| at), self.drag_scroll) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// A held arrow or track steps again when due, the track only while
-    /// the thumb has not reached the pointer. True when it scrolled.
-    pub fn tick(&mut self, now: Instant) -> bool {
+    /// the thumb has not reached the pointer; a selection drag past the
+    /// list's top or bottom scrolls toward the pointer (faster the further
+    /// it is) and extends. True when it scrolled.
+    pub fn tick(&mut self, now: Instant, fonts: &mut FontContext, lcx: &mut LayoutContext<Brush>) -> bool {
+        if let Some(at) = self.drag_scroll
+            && now >= at
+        {
+            self.drag_scroll = Some(now + REPEAT);
+            let list = self.list();
+            let (x, y) = self.mouse;
+            let over = if y < list.y0 as f32 { y - list.y0 as f32 } else if y > list.y1 as f32 { y - list.y1 as f32 } else { 0.0 };
+            if over != 0.0 {
+                let before = self.scroll;
+                self.follow = false;
+                self.scroll_by((over * 0.5).clamp(-60.0, 60.0));
+                if let Some(pos) = self.pos_at(x, y, fonts, lcx) {
+                    self.sel_focus = Some(pos);
+                }
+                if self.scroll != before {
+                    return true;
+                }
+            }
+        }
         let Some((part, at)) = self.repeat else { return false };
         if now < at {
             return false;
@@ -681,6 +868,17 @@ impl ConsolePanel {
             }
             let layout = text_layout(fonts, lcx, &e.text, self.text_width(m.source_width), scale);
             let origin = Affine::translate((row.x0 + f64::from(ICON_COL) * s, row.y0 + f64::from(PAD_Y) * s));
+            // The selected part of the text, under it.
+            if let Some((from, to)) = self.selected_range(i) {
+                let sel = parley::Selection::new(
+                    parley::Cursor::from_byte_index(&layout, from, parley::Affinity::Downstream),
+                    parley::Cursor::from_byte_index(&layout, to, parley::Affinity::Upstream),
+                );
+                let color = if self.list_focused || self.selecting { Color::from_rgb8(0xb4, 0xd5, 0xfe) } else { Color::from_rgb8(0xdc, 0xdc, 0xdc) };
+                for (r, _) in sel.geometry(&layout) {
+                    scene.fill(Fill::NonZero, origin, color, None, &Rect::new(r.x0, r.y0, r.x1.max(r.x0 + 4.0 * s), r.y1));
+                }
+            }
             draw_layout(scene, &layout, origin, Some(Color::from_rgba8(color[0], color[1], color[2], color[3])));
             if !m.source.is_empty() {
                 let r = sr(self.source_rect(top, m));
@@ -866,6 +1064,41 @@ fn chevron(scene: &mut Scene, c: (f64, f64), s: f64, right: bool, color: Color) 
     path.line_to((c.0 + w * dir, c.1));
     path.line_to((c.0 - w * dir, c.1 + h));
     scene.stroke(&Stroke::new(1.6 * s), Affine::IDENTITY, color, None, &path);
+}
+
+/// The word around byte `at` for a double click: a run of letters, digits
+/// and `_`, or of white space; any other character alone.
+fn word_at(text: &str, at: usize) -> (usize, usize) {
+    let class = |c: char| if c.is_alphanumeric() || c == '_' { 0 } else if c.is_whitespace() { 1 } else { 2 };
+    let at = at.min(text.len());
+    // The character under the point: the one starting at `at`, else the
+    // one before it (a point past a line's end).
+    let (start_char, c) = match text[at..].chars().next() {
+        Some(c) => (at, c),
+        None => match text[..at].char_indices().next_back() {
+            Some((i, c)) => (i, c),
+            None => return (0, 0),
+        },
+    };
+    let k = class(c);
+    if k == 2 {
+        return (start_char, start_char + c.len_utf8());
+    }
+    let mut start = start_char;
+    for (i, ch) in text[..start_char].char_indices().rev() {
+        if class(ch) != k {
+            break;
+        }
+        start = i;
+    }
+    let mut end = start_char;
+    for (i, ch) in text[start_char..].char_indices() {
+        if class(ch) != k {
+            break;
+        }
+        end = start_char + i + ch.len_utf8();
+    }
+    (start, end)
 }
 
 /// A source as Chrome shows it: the file's name and the line
