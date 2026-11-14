@@ -132,8 +132,7 @@ struct Tab {
     /// counts as typed in the history.
     typed: bool,
     /// The developer console's messages for the current document, the
-    /// last CONSOLE_LIMIT (read by the console panel).
-    #[allow(dead_code)]
+    /// last `CONSOLE_LIMIT` (shown by the console panel).
     console: std::collections::VecDeque<(browser_ipc_types::ConsoleLevel, String, Option<String>)>,
 }
 
@@ -304,8 +303,14 @@ impl App {
                         h.remove(url.as_str());
                     }
                 }
+                ChromeAction::ConsoleClear => {
+                    if let Some(tab) = self.tabs.get_mut(self.current) {
+                        tab.console.clear();
+                    }
+                }
             }
         }
+        self.sync_console_layout();
         self.sync_ime();
     }
 
@@ -345,7 +350,8 @@ impl App {
         let scale = active.window.scale_factor() as f32;
         Some(Viewport {
             width: size.width as f32 / scale,
-            height: (size.height as f32 / scale - self.page_top()).max(1.0),
+            // The developer console takes the bottom of the window.
+            height: (size.height as f32 / scale - self.page_top() - self.chrome.console_height()).max(1.0),
             scale_factor: scale,
         })
     }
@@ -401,6 +407,7 @@ impl App {
 
         let scale = window.scale_factor() as f32;
         self.chrome.resize(size.width as f32 / scale, scale);
+        self.chrome.set_window_height(size.height as f32 / scale);
         window.set_ime_allowed(false);
         self.active = Some(Active {
             window,
@@ -547,6 +554,9 @@ impl App {
             }
         }
         self.current = index;
+        // The console shows the tab now in front.
+        let entries = self.current_tab().map(console_entries).unwrap_or_default();
+        self.chrome.console_set(entries);
         // Background tabs are not told about resizes; the one coming to
         // the front lays out for the current window if it has to.
         self.send_viewport();
@@ -626,7 +636,29 @@ impl App {
         active.window.request_redraw();
         let scale = active.window.scale_factor() as f32;
         self.chrome.resize(width as f32 / scale, scale);
+        self.chrome.set_window_height(height as f32 / scale);
+        // The viewport goes once, the console's new place included.
+        self.chrome.take_console_layout_changed();
         self.send_viewport();
+    }
+
+    /// The console panel opened, closed or changed height: the page gets
+    /// the height left.
+    fn sync_console_layout(&mut self) {
+        if self.chrome.take_console_layout_changed() {
+            self.send_viewport();
+            if let Some(active) = &self.active {
+                active.window.request_redraw();
+            }
+        }
+    }
+
+    /// F12 or Ctrl+Shift+J: the console panel, with the current tab's
+    /// messages.
+    fn toggle_console(&mut self) {
+        let entries = self.current_tab().map(console_entries).unwrap_or_default();
+        self.chrome.toggle_console(entries);
+        self.sync_console_layout();
     }
 
     fn render(&mut self) -> Result<()> {
@@ -967,13 +999,31 @@ impl ApplicationHandler<UserEvent> for App {
             }
             TabOutput::Message(TabToShell::Closed) => {}
             TabOutput::Message(TabToShell::Console { level, text, source }) => {
+                if is_current {
+                    self.chrome.console_push(browser_chrome::ConsoleEntry { level, text: text.clone(), source: source.clone() });
+                    if self.chrome.console_open()
+                        && let Some(active) = &self.active
+                    {
+                        active.window.request_redraw();
+                    }
+                }
                 let console = &mut self.tabs[index].console;
                 if console.len() == CONSOLE_LIMIT {
                     console.pop_front();
                 }
                 console.push_back((level, text, source));
             }
-            TabOutput::Message(TabToShell::ConsoleCleared) => self.tabs[index].console.clear(),
+            TabOutput::Message(TabToShell::ConsoleCleared) => {
+                self.tabs[index].console.clear();
+                if is_current {
+                    self.chrome.console_clear();
+                    if self.chrome.console_open()
+                        && let Some(active) = &self.active
+                    {
+                        active.window.request_redraw();
+                    }
+                }
+            }
             // Web pages and files go in the history; `about:`, `data:`
             // and the like do not.
             TabOutput::Message(TabToShell::Visited { url }) => {
@@ -1040,6 +1090,15 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.modifiers.state().shift_key() && dx == 0.0 {
                     (dx, dy) = (dy, 0.0);
                 }
+                // Over the console panel the wheel scrolls its list.
+                if let Some((x, y)) = self.cursor_pos
+                    && self.chrome.console_wheel(x, y, dy)
+                {
+                    if let Some(active) = &self.active {
+                        active.window.request_redraw();
+                    }
+                    return;
+                }
                 self.scroll(dx, dy);
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1054,6 +1113,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if (self.chrome.contains(x, y) && !self.pointer_on_page) || self.press_in_chrome {
                     let cursor = self.chrome.mouse_move(x, y);
+                    self.sync_console_layout();
                     let dirty = self.chrome.take_dirty();
                     if let Some(active) = &self.active {
                         active.window.set_cursor_visible(true);
@@ -1196,6 +1256,14 @@ impl ApplicationHandler<UserEvent> for App {
                 let ctrl = self.modifiers.state().control_key();
                 let shift = self.modifiers.state().shift_key();
                 let alt = self.modifiers.state().alt_key();
+                // F12 and Ctrl+Shift+J open and close the developer
+                // console wherever focus is, as in Chrome.
+                let console_key = matches!(event.logical_key, Key::Named(NamedKey::F12))
+                    || (ctrl && shift && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("j")));
+                if console_key {
+                    self.toggle_console();
+                    return;
+                }
                 // F3 steps through find matches wherever focus is.
                 if matches!(event.logical_key, Key::Named(NamedKey::F3)) {
                     if self.chrome.find_open() {
@@ -1313,6 +1381,18 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// A tab's console messages as the panel takes them.
+fn console_entries(tab: &Tab) -> Vec<browser_chrome::ConsoleEntry> {
+    tab.console
+        .iter()
+        .map(|(level, text, source)| browser_chrome::ConsoleEntry {
+            level: *level,
+            text: text.clone(),
+            source: source.clone(),
+        })
+        .collect()
 }
 
 /// The key the page gets for a key the chrome and the shell's shortcuts

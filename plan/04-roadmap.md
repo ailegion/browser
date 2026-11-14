@@ -1544,6 +1544,23 @@ remaining lists as they stand.
       the module graph fails, the font's next source is fetched (a
       stylesheet was already skipped either way). Test: the three from
       a refused port, the page completing. Full run clean.
+      **Block 2 done 2026-11-14: the panel.** `chrome::console`: F12 or
+      Ctrl+Shift+J (wherever focus is) opens and closes it at the
+      bottom of the window, 260 px at first, the page's viewport the
+      height left; its top edge drags (at least 90 px, the page keeps
+      80), the height kept while closed. Messages in a monospace font,
+      wrapped to the text column, errors and warnings tinted, the
+      source dimmed at the right of the first line; the list follows
+      new messages while at its end, the wheel over it scrolls it.
+      Header: Errors, Warnings, Info (with logs) filters, Clear (the
+      tab's messages too), Copy all (the shown messages, level and
+      source with each), ✕. It shows the current tab's messages,
+      changes with the tab, and empties with a new document. Test: the
+      panel's opening, filters, Copy all, Clear, wheel, drag, its
+      bounds, closing and reopening. Not built: selecting part of a
+      message's text with the mouse (Copy all copies them all), Chrome's
+      grouping of repeated messages, expanding objects logged (the text
+      the engine gives is shown). Full run clean.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

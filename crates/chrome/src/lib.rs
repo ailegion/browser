@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+mod console;
 mod find;
 mod input;
 mod menu;
@@ -37,6 +38,8 @@ use vello::Scene;
 use vello::kurbo::{Affine, Rect, RoundedRect};
 use vello::peniko::{Color, Fill};
 
+pub use console::ConsoleEntry;
+use console::{ConsolePanel, ConsolePart};
 use find::{FindBar, FindPart};
 use input::{InputEvent, TextInput, rounded_box};
 use menu::{Menu, MenuAction, MenuItem};
@@ -159,6 +162,8 @@ pub enum ChromeAction {
     AddressTyped(String),
     /// Shift+Delete on a suggestion: forget the page.
     RemoveHistory(Url),
+    /// The console's Clear: the shell drops the tab's messages too.
+    ConsoleClear,
 }
 
 /// What the tab strip shows for one tab.
@@ -183,6 +188,8 @@ enum Part {
     Find(FindPart),
     /// A row of the address bar's suggestion list.
     Suggestion(usize),
+    /// A part of the developer console panel.
+    Console(ConsolePart),
 }
 
 struct TabSlot {
@@ -238,6 +245,15 @@ pub struct Chrome {
     /// The inline completion in the box: the box's text with it, and
     /// the page Enter then opens.
     inline: Option<(String, Url)>,
+    /// The developer console panel, while open.
+    console: Option<ConsolePanel>,
+    /// The panel's height, kept while it is closed.
+    console_height: f32,
+    /// The panel opened, closed or changed height: the page's viewport
+    /// changes (`take_console_layout_changed`).
+    console_layout_changed: bool,
+    /// The window's logical height, for the panel.
+    window_height: f32,
     /// The last edit of the address text inserted text (typing, a
     /// paste, an IME commit), not a deletion: only then is it filled in.
     inserted: bool,
@@ -424,6 +440,10 @@ impl Chrome {
             find: None,
             suggest: None,
             inline: None,
+            console: None,
+            console_height: 260.0,
+            console_layout_changed: false,
+            window_height: 600.0,
             inserted: false,
             hover: None,
             hover_since: None,
@@ -453,6 +473,7 @@ impl Chrome {
         }
         self.menu = None;
         self.relayout();
+        self.place_console();
     }
 
     fn relayout(&mut self) {
@@ -579,6 +600,94 @@ impl Chrome {
             Some(l) => (l.rows.iter().map(|r| (r.url.clone(), r.title.clone(), r.typed)).collect(), l.selected),
             None => (Vec::new(), None),
         }
+    }
+
+    // ----- the developer console panel -----
+
+    /// The window's logical height (the panel sits at its bottom).
+    pub fn set_window_height(&mut self, height: f32) {
+        self.window_height = height.max(0.0);
+        self.place_console();
+    }
+
+    fn place_console(&mut self) {
+        let (width, height, top) = (self.width, self.window_height, self.height());
+        if let Some(c) = &mut self.console {
+            let before = c.rect;
+            c.place(width, height, top);
+            if c.rect != before {
+                self.console_layout_changed = true;
+            }
+            self.console_height = c.height;
+        }
+    }
+
+    /// Open or close the panel (F12, Ctrl+Shift+J), with `entries` (the
+    /// current tab's messages) when it opens.
+    pub fn toggle_console(&mut self, entries: Vec<ConsoleEntry>) {
+        if self.console.take().is_none() {
+            let mut panel = ConsolePanel::new(self.console_height);
+            panel.set(entries);
+            self.console = Some(panel);
+            self.place_console();
+        }
+        self.console_layout_changed = true;
+        self.dirty = true;
+    }
+
+    pub fn console_open(&self) -> bool {
+        self.console.is_some()
+    }
+
+    /// The logical height the panel takes from the page (0 when closed).
+    pub fn console_height(&self) -> f32 {
+        self.console.as_ref().map_or(0.0, |c| c.rect.height() as f32)
+    }
+
+    /// Whether the panel opened, closed or was resized since the last
+    /// call: the page's viewport is to be sized again.
+    pub fn take_console_layout_changed(&mut self) -> bool {
+        std::mem::take(&mut self.console_layout_changed)
+    }
+
+    /// A new message from the current tab.
+    pub fn console_push(&mut self, entry: ConsoleEntry) {
+        if let Some(c) = &mut self.console {
+            c.push(entry);
+            self.dirty = true;
+        }
+    }
+
+    /// The messages of another tab (the current one changed).
+    pub fn console_set(&mut self, entries: Vec<ConsoleEntry>) {
+        if let Some(c) = &mut self.console {
+            c.set(entries);
+            self.dirty = true;
+        }
+    }
+
+    /// The current tab's document changed: its console starts empty.
+    pub fn console_clear(&mut self) {
+        if let Some(c) = &mut self.console {
+            c.clear();
+            self.dirty = true;
+        }
+    }
+
+    /// A wheel over the panel scrolls its list; true when it took it.
+    pub fn console_wheel(&mut self, x: f32, y: f32, dy: f32) -> bool {
+        let Some(c) = &mut self.console else { return false };
+        if !c.contains(x, y) {
+            return false;
+        }
+        c.wheel(dy, &mut self.fonts, &mut self.lcx);
+        self.dirty = true;
+        true
+    }
+
+    /// What Copy all would put on the clipboard (tests).
+    pub fn console_text(&self) -> Option<String> {
+        self.console.as_ref().map(ConsolePanel::copy_text)
     }
 
     /// Open a suggestion row: its page, from the address bar.
@@ -907,9 +1016,13 @@ impl Chrome {
             || y < self.height()
             || self.find.as_ref().is_some_and(|f| f.contains(x, y))
             || self.suggest.as_ref().is_some_and(|l| l.contains(x, y))
+            || self.console.as_ref().is_some_and(|c| c.contains(x, y))
     }
 
     fn part_at(&self, x: f32, y: f32) -> Option<Part> {
+        if let Some(p) = self.console.as_ref().and_then(|c| c.part_at(x, y)) {
+            return Some(Part::Console(p));
+        }
         if let Some(i) = self.suggest.as_ref().and_then(|l| l.row_at(x, y)) {
             return Some(Part::Suggestion(i));
         }
@@ -969,7 +1082,26 @@ impl Chrome {
             }
             return if over.is_some() { Cursor::Pointer } else { Cursor::Default };
         }
+        // The console's top edge being dragged: the panel follows.
+        if let Some(c) = &mut self.console
+            && c.resizing.is_some()
+        {
+            c.drag_to(y, self.window_height);
+            self.place_console();
+            self.dirty = true;
+            return Cursor::NsResize;
+        }
         let part = self.part_at(x, y);
+        if let Some(c) = &mut self.console {
+            let over = match part {
+                Some(Part::Console(p)) => Some(p),
+                _ => None,
+            };
+            if over != c.hover {
+                c.hover = over;
+                self.dirty = true;
+            }
+        }
         if let Some(list) = &mut self.suggest {
             let row = match part {
                 Some(Part::Suggestion(i)) => Some(i),
@@ -1009,6 +1141,8 @@ impl Chrome {
             }
             Some(Part::Find(FindPart::Close)) => Cursor::Pointer,
             Some(Part::Reload | Part::NewTab | Part::Menu | Part::Tab(_) | Part::TabClose(_) | Part::Suggestion(_)) => Cursor::Pointer,
+            Some(Part::Console(ConsolePart::Resize)) => Cursor::NsResize,
+            Some(Part::Console(ConsolePart::Filter(_) | ConsolePart::Clear | ConsolePart::Copy | ConsolePart::Close)) => Cursor::Pointer,
             _ => Cursor::Default,
         }
     }
@@ -1061,6 +1195,12 @@ impl Chrome {
             (MouseButton::Left, Some(Part::Find(FindPart::Panel))) => {}
             // A suggestion opens on release; the box keeps focus till then.
             (MouseButton::Left, Some(p @ Part::Suggestion(_))) => self.pressed = Some(p),
+            // The console's top edge: a drag resizes the panel.
+            (MouseButton::Left, Some(Part::Console(ConsolePart::Resize))) => {
+                if let Some(c) = &mut self.console {
+                    c.resizing = Some(y - c.rect.y0 as f32);
+                }
+            }
             (MouseButton::Left, Some(p @ Part::Find(_))) => self.pressed = Some(p),
             (MouseButton::Left, Some(p)) => {
                 if self.has_focus() {
@@ -1083,6 +1223,9 @@ impl Chrome {
     /// The button came up. Buttons act on release over the part pressed.
     pub fn mouse_up(&mut self, x: f32, y: f32, button: MouseButton) -> Vec<ChromeAction> {
         let pressed = self.pressed.take();
+        if let Some(c) = &mut self.console {
+            c.resizing = None;
+        }
         self.address.mouse_up();
         if let Some(f) = &mut self.find {
             f.input.mouse_up();
@@ -1126,6 +1269,22 @@ impl Chrome {
                 }
                 Part::Find(FindPart::Close) => self.close_find(),
                 Part::Suggestion(i) => self.open_suggestion(i),
+                Part::Console(ConsolePart::Filter(i)) => {
+                    if let Some(c) = &mut self.console {
+                        c.show[i] = !c.show[i];
+                    }
+                    Vec::new()
+                }
+                Part::Console(ConsolePart::Clear) => {
+                    self.console_clear();
+                    vec![ChromeAction::ConsoleClear]
+                }
+                Part::Console(ConsolePart::Copy) => self.console_text().map(ChromeAction::CopyText).into_iter().collect(),
+                Part::Console(ConsolePart::Close) => {
+                    self.console = None;
+                    self.console_layout_changed = true;
+                    Vec::new()
+                }
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -1359,6 +1518,9 @@ impl Chrome {
             f.draw(&mut self.fonts, &mut self.lcx, scene, self.scale, hover, pressed);
         }
 
+        if let Some(panel) = &mut self.console {
+            panel.draw(&mut self.fonts, &mut self.lcx, scene, self.scale);
+        }
         if let Some(list) = &self.suggest {
             list.draw(&mut self.fonts, &mut self.lcx, scene, self.scale);
         }
@@ -1444,7 +1606,7 @@ fn tooltip_for(part: Part) -> Option<&'static str> {
         Part::Find(FindPart::Prev) => Some("Previous match (Shift+Enter)"),
         Part::Find(FindPart::Next) => Some("Next match (Enter)"),
         Part::Find(FindPart::Close) => Some("Close (Escape)"),
-        Part::Address | Part::Find(FindPart::Input | FindPart::Panel) | Part::Suggestion(_) => None,
+        Part::Address | Part::Find(FindPart::Input | FindPart::Panel) | Part::Suggestion(_) | Part::Console(_) => None,
     }
 }
 
@@ -1618,6 +1780,67 @@ mod tests {
         c.key(KeyInput::plain(Key::Escape));
         assert_eq!(c.address_text(), "wik");
         assert!(c.suggestions().0.is_empty());
+    }
+
+    #[test]
+    fn the_console_panel_shows_filters_copies_clears_resizes_and_closes() {
+        use browser_ipc_types::ConsoleLevel;
+        let mut c = chrome();
+        c.set_window_height(600.0);
+        let entry = |level, text: &str, source: Option<&str>| ConsoleEntry { level, text: text.into(), source: source.map(str::to_owned) };
+        assert_eq!(c.console_height(), 0.0);
+        c.toggle_console(vec![
+            entry(ConsoleLevel::Log, "hello", Some("https://a.test/app.js:1:2")),
+            entry(ConsoleLevel::Warn, "careful", None),
+            entry(ConsoleLevel::Error, "Uncaught TypeError: x\n    at f (https://a.test/app.js:3:4)", Some("https://a.test/app.js:3:4")),
+        ]);
+        assert!(c.console_open() && c.take_console_layout_changed());
+        assert_eq!(c.console_height(), 260.0);
+        assert!(c.contains(400.0, 590.0), "the panel is the chrome's");
+        // Pushed messages join; Copy all has them, with level and source.
+        c.console_push(entry(ConsoleLevel::Info, "later", None));
+        assert_eq!(
+            c.console_text().unwrap(),
+            "[log] hello  (https://a.test/app.js:1:2)\n[warn] careful\n[error] Uncaught TypeError: x\n    at f (https://a.test/app.js:3:4)  (https://a.test/app.js:3:4)\n[info] later\n"
+        );
+        let click = |c: &mut Chrome, x: f32, y: f32| {
+            c.mouse_move(x, y);
+            c.mouse_down(x, y, MouseButton::Left, false);
+            c.mouse_up(x, y, MouseButton::Left)
+        };
+        // The header: Errors, Warnings, Info filters; Clear; Copy all; ✕.
+        let header = 600.0 - 260.0 + 14.0;
+        assert!(click(&mut c, 100.0, header).is_empty());
+        assert!(!c.console_text().unwrap().contains("[error]"), "errors hidden");
+        click(&mut c, 100.0, header);
+        click(&mut c, 165.0, header);
+        assert!(!c.console_text().unwrap().contains("[warn]"), "warnings hidden");
+        click(&mut c, 165.0, header);
+        let all = c.console_text().unwrap();
+        assert_eq!(click(&mut c, 375.0, header), vec![ChromeAction::CopyText(all)]);
+        // Drawing a full list does not fail; the wheel over it is taken.
+        c.draw(&mut Scene::new());
+        assert!(c.console_wheel(400.0, 590.0, 40.0) && !c.console_wheel(400.0, 200.0, 40.0));
+        assert_eq!(click(&mut c, 300.0, header), vec![ChromeAction::ConsoleClear]);
+        assert_eq!(c.console_text().unwrap(), "");
+        // The top edge drags; the page keeps some room.
+        c.mouse_move(400.0, 341.0);
+        c.mouse_down(400.0, 341.0, MouseButton::Left, false);
+        c.mouse_move(400.0, 241.0);
+        c.mouse_up(400.0, 241.0, MouseButton::Left);
+        assert_eq!(c.console_height(), 360.0);
+        assert!(c.take_console_layout_changed());
+        c.mouse_move(400.0, 241.0);
+        c.mouse_down(400.0, 241.0, MouseButton::Left, false);
+        c.mouse_move(400.0, 0.0);
+        c.mouse_up(400.0, 0.0, MouseButton::Left);
+        assert_eq!(c.console_height(), 600.0 - c.height() - 80.0);
+        // ✕ closes; the height is kept for the next opening.
+        let close_y = 600.0 - c.console_height() + 14.0;
+        click(&mut c, 800.0 - 20.0, close_y);
+        assert!(!c.console_open() && c.console_height() == 0.0 && c.take_console_layout_changed());
+        c.toggle_console(Vec::new());
+        assert_eq!(c.console_height(), 600.0 - c.height() - 80.0);
     }
 
     fn type_str(c: &mut Chrome, s: &str) -> Vec<ChromeAction> {
