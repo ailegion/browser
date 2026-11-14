@@ -141,6 +141,48 @@ fn caller_location(context: &mut Context) -> Option<String> {
     first_frame(&callers)
 }
 
+/// An `Error` given to `console.log` and the others shows with its stack,
+/// as Chrome's console shows it: each console method is wrapped
+/// (natively, so no script frame is added and the caller's source stays)
+/// to pass an error's `stack` text instead of the error.
+fn log_errors_with_stacks(context: &mut Context) -> JsResult<()> {
+    let Some(console) = context.global_object().get(js_string!("console"), context)?.as_object() else { return Ok(()) };
+    for name in ["log", "info", "warn", "error", "debug"] {
+        let Some(original) = console.get(JsString::from(name), context)?.as_object().filter(boa_engine::JsObject::is_callable) else { continue };
+        let wrapped = FunctionObjectBuilder::new(
+            context.realm(),
+            NativeFunction::from_copy_closure_with_captures(
+                |this, args, original: &boa_engine::JsObject, context| {
+                    let error_ctor: JsValue = context.intrinsics().constructors().error().constructor().into();
+                    let mut shown = Vec::with_capacity(args.len());
+                    for arg in args {
+                        let stack = match arg.as_object() {
+                            Some(o) if arg.instance_of(&error_ctor, context)? => o.get(js_string!("stack"), context)?.as_string().map(|s| s.to_std_string_escaped()),
+                            _ => None,
+                        };
+                        shown.push(match stack {
+                            Some(stack) => {
+                                // The stack starts with the error's own line,
+                                // as browsers write it.
+                                let head = arg.to_string(context)?.to_std_string_escaped();
+                                if stack.starts_with(&head) { js_str(&stack) } else { js_str(&format!("{head}\n{stack}")) }
+                            }
+                            None => arg.clone(),
+                        });
+                    }
+                    original.call(this, &shown, context)
+                },
+                original,
+            ),
+        )
+        .name(JsString::from(name))
+        .length(0)
+        .build();
+        console.set(JsString::from(name), wrapped, false, context)?;
+    }
+    Ok(())
+}
+
 /// The location in the first `at …` line of a stack as the engine writes
 /// it: `at f (address at :line:column)` gives `address at :line:column`.
 fn first_frame(stack: &str) -> Option<String> {
@@ -1111,6 +1153,7 @@ impl ScriptHost {
             &mut context,
         )
         .map_err(|e| e.to_string())?;
+        log_errors_with_stacks(&mut context).map_err(|e| e.to_string())?;
         let frames: SharedFrames = Rc::new(RefCell::new(Frames::default()));
         let dom: SharedDom = Rc::new(RefCell::new(Dom::default()));
         context.insert_data(frames.clone());
@@ -3110,6 +3153,17 @@ mod tests {
         assert_eq!(eval(&mut h, "ev.join('|')"), "k null v https://example.test/other true true true|k|null null null https://example.test/other true true true|null");
         assert_eq!(eval(&mut h, "var se = new StorageEvent('storage', {key: 'a', newValue: 'b', storageArea: sessionStorage}); [se.key, String(se.oldValue), se.newValue, JSON.stringify(se.url), se.storageArea === sessionStorage].join('|')"), "a|null|b|\\\"\\\"|true");
         assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_logged_error_shows_its_stack() {
+        let mut h = host();
+        h.run_script("function inner() { return new TypeError('boom') } function outer() { return inner() } console.error(outer()); console.log('plain', 1)");
+        let l = lines(&mut h);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert!(l[0].starts_with("TypeError: boom"), "{l:?}");
+        assert!(l[0].lines().any(|s| s.trim_start().starts_with("at inner")) && l[0].lines().any(|s| s.trim_start().starts_with("at outer")), "{l:?}");
+        assert_eq!(l[1], "plain 1");
     }
 
     #[test]

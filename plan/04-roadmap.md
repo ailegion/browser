@@ -1648,6 +1648,16 @@ remaining lists as they stand.
       `let` declared again in a later line (an error here; Chrome's
       console allows it), the history kept across restarts. Item 12
       complete.
+      Added after, owner's go 2026-11-14 (to find what react.dev calls
+      that is missing): an `Error` given to `console.log` and the others
+      shows with its stack, as Chrome's console shows it (each console
+      method natively wrapped to pass the error's `stack` text, its own
+      line first; the caller's source unchanged). Test: a logged error's
+      message and frames, a plain log unchanged. Full run: the layout
+      test `web_fonts_register_under_their_family` failed once (the
+      known flaky one). Through it, react.dev's blank page (React
+      starting, then failing in Next.js's `updateHead`) traced to
+      `Node.isEqualNode` missing.
 - [ ] 13. Source viewer (owner, 2026-11-14, to do later): clicking a
       console message's source opens the file in a viewer in the
       developer tools at that line, highlighted, as Chrome's Sources
