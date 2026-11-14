@@ -40,6 +40,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
+/// Console messages kept per tab, the oldest dropped first.
+const CONSOLE_LIMIT: usize = 1000;
 /// History rows the address bar lists at most, below the typed one.
 const SUGGESTIONS: usize = 8;
 /// Window background while there is no page yet.
@@ -129,6 +131,10 @@ struct Tab {
     /// The navigation under way was typed in the address bar: its visit
     /// counts as typed in the history.
     typed: bool,
+    /// The developer console's messages for the current document, the
+    /// last CONSOLE_LIMIT (read by the console panel).
+    #[allow(dead_code)]
+    console: std::collections::VecDeque<(browser_ipc_types::ConsoleLevel, String, Option<String>)>,
 }
 
 struct App {
@@ -454,6 +460,7 @@ impl App {
             cursor: CursorIcon::Default,
             caret: None,
             typed: false,
+            console: std::collections::VecDeque::new(),
         });
         tracing::info!(tab = id.0, tabs = self.tabs.len(), "tab opened");
         if activate {
@@ -959,6 +966,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             TabOutput::Message(TabToShell::Closed) => {}
+            TabOutput::Message(TabToShell::Console { level, text, source }) => {
+                let console = &mut self.tabs[index].console;
+                if console.len() == CONSOLE_LIMIT {
+                    console.pop_front();
+                }
+                console.push_back((level, text, source));
+            }
+            TabOutput::Message(TabToShell::ConsoleCleared) => self.tabs[index].console.clear(),
             // Web pages and files go in the history; `about:`, `data:`
             // and the like do not.
             TabOutput::Message(TabToShell::Visited { url }) => {

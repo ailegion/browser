@@ -96,6 +96,9 @@ pub enum ConsoleLevel {
 pub struct ConsoleLine {
     pub level: ConsoleLevel,
     pub text: String,
+    /// Where the call was made: the script's address and line, when the
+    /// engine knows it.
+    pub source: Option<String>,
 }
 
 /// Console output kept for the owner to drain.
@@ -112,26 +115,62 @@ impl std::fmt::Debug for Collector {
 }
 
 impl Collector {
-    fn push(&self, level: ConsoleLevel, text: String) {
-        self.lines.borrow_mut().push(ConsoleLine { level, text });
+    fn push(&self, level: ConsoleLevel, text: String, context: &mut Context) {
+        let source = caller_location(context);
+        self.lines.borrow_mut().push(ConsoleLine { level, text, source });
     }
 }
 
+/// Where the running script is: the first frame of a stack taken now, as
+/// the engine writes it (`address:line:column`), without the frame's
+/// function name.
+fn caller_location(context: &mut Context) -> Option<String> {
+    // An error made by script gets the engine's stack: its first frame is
+    // this lookup's own, then the console method (native), then the code
+    // that called it.
+    let stack = context.eval(Source::from_bytes(b"new Error().stack")).ok()?;
+    let stack = stack.as_string()?.to_std_string_escaped();
+    let callers: String = stack
+        .lines()
+        .filter(|l| l.trim().starts_with("at ") && !l.contains("(native)"))
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    first_frame(&callers)
+}
+
+/// The location in the first `at …` line of a stack as the engine writes
+/// it: `at f (address at :line:column)` gives `address at :line:column`.
+fn first_frame(stack: &str) -> Option<String> {
+    let frame = stack.lines().map(str::trim).find(|l| l.starts_with("at "))?;
+    let inner = frame.rsplit_once('(').map_or(frame, |(_, r)| r.trim_end_matches(')'));
+    let inner = inner.strip_prefix("at ").unwrap_or(inner).trim();
+    (!inner.is_empty()).then(|| inner.to_owned())
+}
+
+/// `prefix` and an error as the console shows it (the engine's text
+/// carries its position and stack), and its first frame.
+fn uncaught_text(prefix: &str, err: &JsError, _context: &mut Context) -> (String, Option<String>) {
+    let text = format!("{prefix} {err}");
+    let source = first_frame(&text);
+    (text, source)
+}
+
 impl Logger for Collector {
-    fn log(&self, msg: String, _: &ConsoleState, _: &mut Context) -> JsResult<()> {
-        self.push(ConsoleLevel::Log, msg);
+    fn log(&self, msg: String, _: &ConsoleState, context: &mut Context) -> JsResult<()> {
+        self.push(ConsoleLevel::Log, msg, context);
         Ok(())
     }
-    fn info(&self, msg: String, _: &ConsoleState, _: &mut Context) -> JsResult<()> {
-        self.push(ConsoleLevel::Info, msg);
+    fn info(&self, msg: String, _: &ConsoleState, context: &mut Context) -> JsResult<()> {
+        self.push(ConsoleLevel::Info, msg, context);
         Ok(())
     }
-    fn warn(&self, msg: String, _: &ConsoleState, _: &mut Context) -> JsResult<()> {
-        self.push(ConsoleLevel::Warn, msg);
+    fn warn(&self, msg: String, _: &ConsoleState, context: &mut Context) -> JsResult<()> {
+        self.push(ConsoleLevel::Warn, msg, context);
         Ok(())
     }
-    fn error(&self, msg: String, _: &ConsoleState, _: &mut Context) -> JsResult<()> {
-        self.push(ConsoleLevel::Error, msg);
+    fn error(&self, msg: String, _: &ConsoleState, context: &mut Context) -> JsResult<()> {
+        self.push(ConsoleLevel::Error, msg, context);
         Ok(())
     }
 }
@@ -980,10 +1019,36 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     Ok(())
 }
 
+/// Promises rejected with no handler yet (HTML's "about-to-be-notified
+/// rejected promises"): after a microtask checkpoint, those still
+/// without one are reported, as Chrome's `Uncaught (in promise)`.
+#[derive(Default)]
+struct RejectionTracker {
+    rejected: RefCell<Vec<boa_engine::JsObject>>,
+}
+
+impl boa_engine::context::HostHooks for RejectionTracker {
+    fn promise_rejection_tracker(&self, promise: &boa_engine::JsObject<boa_engine::builtins::promise::Promise>, operation: boa_engine::builtins::promise::OperationType, _: &mut Context) {
+        let promise = promise.clone().upcast();
+        match operation {
+            boa_engine::builtins::promise::OperationType::Reject => self.rejected.borrow_mut().push(promise),
+            boa_engine::builtins::promise::OperationType::Handle => self.rejected.borrow_mut().retain(|p| !boa_engine::JsObject::equals(p, &promise)),
+        }
+    }
+}
+
+impl RejectionTracker {
+    /// A rejection the host reports itself (a module's evaluation).
+    fn forget(&self, promise: &boa_engine::JsObject) {
+        self.rejected.borrow_mut().retain(|p| !boa_engine::JsObject::equals(p, promise));
+    }
+}
+
 /// A document's script context and its queues.
 pub struct ScriptHost {
     context: Context,
     executor: Rc<WebExecutor>,
+    rejections: Rc<RejectionTracker>,
     frames: SharedFrames,
     console: Rc<RefCell<Vec<ConsoleLine>>>,
     modules: Rc<ModuleMap>,
@@ -1026,7 +1091,9 @@ impl ScriptHost {
             cookies: None,
             navigation_rate: Rc::new(NavigationRateLimit::default()),
         }));
+        let rejections = Rc::new(RejectionTracker::default());
         let mut context = ContextBuilder::new()
+            .host_hooks(rejections.clone())
             .job_executor(executor.clone())
             .module_loader(modules.clone())
             .build()
@@ -1064,6 +1131,7 @@ impl ScriptHost {
         Ok(Self {
             context,
             executor,
+            rejections,
             frames,
             console,
             modules,
@@ -1438,7 +1506,10 @@ impl ScriptHost {
     /// `referrerpolicy` is `policy`, which a dynamic `import()` from it
     /// inherits.
     pub fn run_inline_script(&mut self, source: &str, base: &Url, policy: browser_ipc_types::ReferrerPolicy) {
-        self.eval_classic(source, None, Some(base.clone()), policy);
+        // Named by the document's address in errors and stacks, as
+        // Chrome shows inline scripts (lines count from the script).
+        let name = current_url(&self.host.borrow().info);
+        self.eval_classic(source, Some(&name), Some(base.clone()), policy);
     }
 
     /// `run_script` for an external script: its URL names it in errors
@@ -1554,6 +1625,9 @@ impl ScriptHost {
             return ModuleProgress::Ready;
         }
         let promise = script.module.load(&mut self.context);
+        // A round that waits on modules not fetched yet rejects; the host
+        // reads the state itself and tries again: no unhandled rejection.
+        self.handled_by_host(&promise);
         self.microtask_checkpoint();
         match promise.state() {
             PromiseState::Fulfilled(_) => {
@@ -1589,6 +1663,9 @@ impl ScriptHost {
         match script.module.evaluate(&mut self.context) {
             Err(err) => self.report_uncaught(&err),
             Ok(promise) => {
+                // Its rejection is reported here as an uncaught error, not
+                // again as an unhandled rejection.
+                self.handled_by_host(&promise);
                 self.microtask_checkpoint();
                 if let PromiseState::Rejected(reason) = promise.state() {
                     self.report_uncaught(&JsError::from_opaque(reason));
@@ -1604,6 +1681,7 @@ impl ScriptHost {
         self.console.borrow_mut().push(ConsoleLine {
             level: ConsoleLevel::Error,
             text,
+            source: None,
         });
     }
 
@@ -1623,6 +1701,27 @@ impl ScriptHost {
     pub fn microtask_checkpoint(&mut self) {
         self.executor.checkpoint(&mut self.context);
         self.collect_job_errors();
+        self.report_unhandled_rejections();
+    }
+
+    /// A promise whose outcome the host reads itself: never reported as
+    /// an unhandled rejection.
+    fn handled_by_host(&mut self, promise: &boa_engine::object::builtins::JsPromise) {
+        let ignore = FunctionObjectBuilder::new(self.context.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(JsValue::undefined()))).build();
+        let _ = promise.catch(ignore, &mut self.context);
+        self.rejections.forget(&boa_engine::JsObject::from(promise.clone()));
+    }
+
+    /// The promises rejected with no handler by the end of a checkpoint.
+    fn report_unhandled_rejections(&mut self) {
+        let rejected = std::mem::take(&mut *self.rejections.rejected.borrow_mut());
+        for promise in rejected {
+            let Ok(p) = boa_engine::object::builtins::JsPromise::from_object(promise) else { continue };
+            if let PromiseState::Rejected(reason) = p.state() {
+                let (text, source) = uncaught_text("Uncaught (in promise)", &JsError::from_opaque(reason), &mut self.context);
+                self.console.borrow_mut().push(ConsoleLine { level: ConsoleLevel::Error, text, source });
+            }
+        }
     }
 
     /// When the earliest timer is due, if any.
@@ -1662,10 +1761,14 @@ impl ScriptHost {
         std::mem::take(&mut *self.console.borrow_mut())
     }
 
+    /// An uncaught error: Uncaught and the error, its stack under it
+    /// (as the engine writes it), the first frame as the source.
     fn report_uncaught(&mut self, err: &boa_engine::JsError) {
+        let (text, source) = uncaught_text("Uncaught", err, &mut self.context);
         self.console.borrow_mut().push(ConsoleLine {
             level: ConsoleLevel::Error,
-            text: format!("Uncaught {err}"),
+            text,
+            source,
         });
     }
 
@@ -1676,6 +1779,7 @@ impl ScriptHost {
         let mut console = self.console.borrow_mut();
         console.extend(errors.into_iter().map(|text| ConsoleLine {
             level: ConsoleLevel::Error,
+            source: first_frame(&text),
             text,
         }));
     }
@@ -2390,16 +2494,18 @@ mod tests {
     #[test]
     fn errors_are_reported_and_the_queue_goes_on() {
         let mut h = host();
-        // A throw inside a reaction rejects the derived promise; with no
-        // rejection tracker yet that is silent, and the next job still runs.
+        // A throw inside a reaction rejects the derived promise: nothing
+        // handles it, so it is reported (Chrome's `Uncaught (in promise)`),
+        // and the next job still runs.
         h.run_script("var seen = []; Promise.resolve().then(() => { throw new Error('in job'); }); Promise.resolve().then(() => seen.push('after'));");
         h.run_script("nonsense(");
         h.run_script("seen.push('next script'); throw new TypeError('top');");
         assert_eq!(h.eval_to_string("seen.join(',')").as_deref(), Ok("\"after,next script\""));
         let l = lines(&mut h);
-        assert_eq!(l.len(), 2, "{l:?}");
-        assert!(l[0].starts_with("Uncaught SyntaxError"), "{}", l[0]);
-        assert!(l[1].contains("TypeError: top"), "{}", l[1]);
+        assert_eq!(l.len(), 3, "{l:?}");
+        assert!(l[0].starts_with("Uncaught (in promise) Error: in job"), "{}", l[0]);
+        assert!(l[1].starts_with("Uncaught SyntaxError"), "{}", l[1]);
+        assert!(l[2].contains("TypeError: top"), "{}", l[2]);
         // A timer callback that throws is reported and the queue goes on.
         h.run_script("setTimeout(() => { throw new RangeError('timer'); }, 0); setTimeout(() => seen.push('still'), 0);");
         std::thread::sleep(Duration::from_millis(2));

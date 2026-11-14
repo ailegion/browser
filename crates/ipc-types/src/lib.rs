@@ -224,9 +224,25 @@ pub enum ShellToTab {
     Close,
 }
 
+/// A console message's level, as the developer console shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsoleLevel {
+    Log,
+    Info,
+    Warn,
+    Error,
+}
+
 /// Tab to shell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TabToShell {
+    /// A message for the developer console: what the page logged, an
+    /// uncaught error or unhandled rejection (with its stack), a resource
+    /// that failed to load. `source` is where it came from (a script's
+    /// address and line, or the resource's address).
+    Console { level: ConsoleLevel, text: String, source: Option<String> },
+    /// A new document: the console starts empty (Chrome's default).
+    ConsoleCleared,
     /// A page was opened at `url`, for the browsing history: a document
     /// committed (a reload and a back/forward included, not an error
     /// page), or the document moved to a new URL itself (a fragment, a

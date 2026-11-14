@@ -3376,6 +3376,10 @@ impl TabState {
             NetToTab::Failed { id, error } => {
                 let Some(p) = self.pending.remove(&id) else { return };
                 tracing::warn!(tab = self.id.0, "request {} failed: {error}", id.0);
+                if !matches!(p.kind, PendingKind::Main) {
+                    let url = self.pending_url(&p);
+                    self.resource_failed(url.as_ref(), error.clone());
+                }
                 if let PendingKind::Image { url, .. } = &p.kind {
                     let url = url.clone();
                     self.image_fetch_finished(&url, false);
@@ -3489,7 +3493,15 @@ impl TabState {
                     self.net_to_script.insert(hop, id);
                     self.net.fetch(hop, request, self.net_sink.clone());
                 }
-                Action::Head(head) => self.script_task(|host| host.net_response(id, head)),
+                Action::Head(head) => {
+                    // An error status is no failure for the script, but
+                    // the console shows it, as Chrome does.
+                    if head.status >= 400 {
+                        let url = head.url.clone();
+                        self.resource_failed(Some(&url), format!("the server responded with a status of {} ({})", head.status, head.status_text));
+                    }
+                    self.script_task(|host| host.net_response(id, head));
+                }
                 Action::Data(bytes) => self.script_task(|host| host.net_data(id, bytes)),
                 Action::Done => {
                     self.finish_script_fetch(id);
@@ -3639,6 +3651,12 @@ impl TabState {
     }
 
     fn finish_response(&mut self, id: RequestId, p: Pending) {
+        // A stylesheet, image or font with an error status (a script's
+        // and a module's failures are reported where they are handled).
+        if matches!(p.kind, PendingKind::Stylesheet { .. } | PendingKind::Image { .. } | PendingKind::Font { .. }) && p.status >= 400 {
+            let url = self.pending_url(&p);
+            self.resource_failed(url.as_ref(), format!("the server responded with a status of {} ({})", p.status, p.status_text));
+        }
         match p.kind {
             PendingKind::Main => {
                 if self.nav.take_if(|n| n.request == id).is_none() {
@@ -3942,6 +3960,8 @@ impl TabState {
     /// script sets goes on the next request and a cookie a response set
     /// is readable at once.
     fn new_script_host(&mut self) {
+        // The developer console starts empty for the new document.
+        self.send(TabToShell::ConsoleCleared);
         self.frame_due = None;
         self.doc_started = std::time::Instant::now();
         self.scripts = Scripts::default();
@@ -4467,6 +4487,56 @@ impl TabState {
         self.after_script();
     }
 
+    /// A message for the developer console: logged, kept (the last 500,
+    /// for tests and tools) and sent to the shell.
+    fn console_line(&mut self, line: ConsoleLine) {
+        let level = match line.level {
+            ConsoleLevel::Warn | ConsoleLevel::Error => {
+                tracing::warn!(tab = self.id.0, "console: {}", line.text);
+                if line.level == ConsoleLevel::Warn { browser_ipc_types::ConsoleLevel::Warn } else { browser_ipc_types::ConsoleLevel::Error }
+            }
+            ConsoleLevel::Log | ConsoleLevel::Info => {
+                tracing::info!(tab = self.id.0, "console: {}", line.text);
+                if line.level == ConsoleLevel::Log { browser_ipc_types::ConsoleLevel::Log } else { browser_ipc_types::ConsoleLevel::Info }
+            }
+        };
+        self.send(TabToShell::Console {
+            level,
+            text: line.text.clone(),
+            source: line.source.clone(),
+        });
+        self.console.push(line);
+        if self.console.len() > 500 {
+            let excess = self.console.len() - 500;
+            self.console.drain(..excess);
+        }
+    }
+
+    /// A resource the document asked for did not load: Chrome's console
+    /// line for it, the resource's address as the source.
+    fn resource_failed(&mut self, url: Option<&Url>, why: String) {
+        self.console_line(ConsoleLine {
+            level: ConsoleLevel::Error,
+            text: format!("Failed to load resource: {why}"),
+            source: url.map(|u| u.to_string()),
+        });
+    }
+
+    /// The address a pending request is for.
+    fn pending_url(&self, p: &Pending) -> Option<Url> {
+        match &p.kind {
+            PendingKind::Main => None,
+            PendingKind::Stylesheet { url, .. } | PendingKind::Image { url, .. } | PendingKind::Font { url } | PendingKind::ModuleSource { url } => {
+                Some(url.clone())
+            }
+            PendingKind::Script { id } => {
+                let s = &self.scripts;
+                s.blocking.iter().chain(s.deferred.iter()).chain(s.asap.iter()).find(|l| l.id == *id).and_then(|l| l.url.clone())
+            }
+        }
+        .or_else(|| p.final_url.clone())
+    }
+
     fn report_script_error(&mut self, text: String) {
         if let Some(host) = &mut self.script {
             host.report_error(text);
@@ -4484,23 +4554,12 @@ impl TabState {
         let mutated = host.take_dom_mutated();
         let changes = host.take_dom_changes();
         let net_ops = host.take_net_ops();
-        for line in host.take_console() {
-            match line.level {
-                ConsoleLevel::Warn | ConsoleLevel::Error => {
-                    tracing::warn!(tab = self.id.0, "console: {}", line.text);
-                }
-                ConsoleLevel::Log | ConsoleLevel::Info => {
-                    tracing::info!(tab = self.id.0, "console: {}", line.text);
-                }
-            }
-            self.console.push(line);
-        }
-        if self.console.len() > 500 {
-            let excess = self.console.len() - 500;
-            self.console.drain(..excess);
-        }
+        let lines = host.take_console();
         if host.has_frame_callbacks() && self.frame_due.is_none() {
             self.frame_due = Some(std::time::Instant::now() + Self::FRAME);
+        }
+        for line in lines {
+            self.console_line(line);
         }
         // A dynamic `import()` of a module not in the map rejects for now
         // and is fetched here, so the map has it the next time (known
@@ -8278,6 +8337,60 @@ mod tests {
     /// Console text so far, in order.
     fn console_texts(h: &Harness) -> Vec<String> {
         h.state.console.iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn console_messages_errors_rejections_and_failed_resources_reach_the_shell() {
+        let page = "<link rel=stylesheet href='/missing.css'><script src='/a.js'></script>\
+            <script>console.warn('w'); Promise.reject(new TypeError('nope')); Promise.reject(1).catch(() => {}); fetch('/gone')</script>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html; charset=utf-8", page),
+                ("/a.js", "text/javascript", "console.log('from a');\nsetTimeout(() => { throw new Error('later') }, 0)"),
+            ],
+            &[],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        let shown = |h: &Harness| -> Vec<(browser_ipc_types::ConsoleLevel, String, Option<String>)> {
+            h.messages
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|m| match m {
+                    TabToShell::Console { level, text, source } => Some((*level, text.clone(), source.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let has = |h: &Harness, text: &str| shown(h).iter().any(|m| m.1.starts_with(text));
+        h.pump_polling(|h| has(h, "Uncaught Error: later") && shown(h).iter().filter(|m| m.1.starts_with("Failed to load resource")).count() == 2);
+        let all = shown(&h);
+        use browser_ipc_types::ConsoleLevel as L;
+        let find = |text: &str| all.iter().find(|m| m.1.starts_with(text)).cloned().unwrap_or_else(|| panic!("no {text:?} in {all:#?}"));
+        // What the page logged, with where it was called.
+        let a = find("from a");
+        assert_eq!(a.0, L::Log);
+        assert!(a.2.as_deref().is_some_and(|s| s.contains("/a.js")), "{a:?}");
+        assert_eq!(find("w").0, L::Warn);
+        // An uncaught error with its stack, its first frame the source.
+        let later = find("Uncaught Error: later");
+        assert_eq!(later.0, L::Error);
+        assert!(later.2.as_deref().is_some_and(|s| s.contains("/a.js")), "{later:?}");
+        // A rejection nobody handled, once; a handled one, never.
+        assert_eq!(all.iter().filter(|m| m.1.starts_with("Uncaught (in promise) TypeError: nope")).count(), 1, "{all:#?}");
+        assert!(!all.iter().any(|m| m.1.starts_with("Uncaught (in promise) 1")));
+        // A stylesheet and a fetch answered 404.
+        let failed: Vec<_> = all.iter().filter(|m| m.1.starts_with("Failed to load resource")).collect();
+        assert!(failed.iter().all(|m| m.0 == L::Error && m.1.contains("status of 404")), "{failed:#?}");
+        let sources: Vec<&str> = failed.iter().filter_map(|m| m.2.as_deref()).collect();
+        assert!(sources.iter().any(|s| s.ends_with("/missing.css")) && sources.iter().any(|s| s.ends_with("/gone")), "{sources:?}");
+        // A new document: the console is cleared.
+        h.send(ShellToTab::Navigate { url: page_url("Next") });
+        assert!(h.messages.lock().expect("lock").iter().any(|m| matches!(m, TabToShell::ConsoleCleared)));
+    }
+
+    fn page_url(title: &str) -> Url {
+        data_url(&format!("<title>{title}</title>"), None)
     }
 
     #[test]

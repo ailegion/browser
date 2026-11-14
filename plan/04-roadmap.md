@@ -1504,6 +1504,42 @@ remaining lists as they stand.
       completes whole URLs of often-typed pages) and Firefox's
       frecency threshold for autofill (any visited site fills here).
       Full run clean. Item 11 complete.
+- [ ] 12. Developer console (owner, 2026-11-14: so failures on sites
+      are seen and reported). Blocks: (1) the messages, (2) the panel
+      (F12 / Ctrl+Shift+J, docked at the bottom, levels coloured,
+      filters, Clear, Copy all, cleared on navigation), (3) the input
+      line (run JavaScript in the page, results, command history).
+      **Block 1 done 2026-11-14: the messages.** `TabToShell::Console
+      { level, text, source }` and `ConsoleCleared` (a new document);
+      the shell keeps the last 1000 per tab. Sent: what the page logs
+      (`console.log`/`info`/`warn`/`error`) with the caller's address,
+      line and column (from the stack of an `Error` made at the call;
+      native frames skipped); uncaught errors with the engine's stack,
+      the first frame as source (timers' and listeners' too); promises
+      rejected with no handler by the end of a microtask checkpoint
+      (`Uncaught (in promise)`, a Boa `HostHooks` rejection tracker; a
+      handler added in the same checkpoint keeps it quiet; the host's
+      own module load and evaluation promises are not reported);
+      `Failed to load resource: …` for a subresource the network
+      failed, a stylesheet, image or font answered 400 or more, and a
+      `fetch`/XHR answered 400 or more (scripts' and modules' own
+      failure lines stay); a failed script fetch (CORS refusals
+      included) as before. Inline scripts are now named by the
+      document's address in errors and stacks (as Chrome shows them;
+      lines count from the script, not the document). Tests: a page's
+      log and warning with sources, a timer's uncaught error, one
+      unhandled rejection and no report for a handled one, a 404
+      stylesheet and fetch, the clearing on navigation; the job error
+      test now expects the rejection it says was silent only for want
+      of a tracker. Not built: the `unhandledrejection` and
+      `rejectionhandled` events (not part of this item); CSP and mixed
+      content messages (nothing here blocks on them). Found, not
+      fixed (owner to decide): a `<script src>`, module import,
+      stylesheet or font whose request fails on the network (not an
+      HTTP error) is never marked failed: the `Failed` handler only
+      handles images and the main document, so a parser-blocking
+      script that fails this way stops the page's parsing for good.
+      Full runs: the paint snapshots failed once (passing alone).
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 
