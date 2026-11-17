@@ -778,6 +778,7 @@ dependencies = [
  "browser-style",
  "encoding_rs",
  "html5ever",
+ "rand 0.10.3",
  "url",
 ]
 

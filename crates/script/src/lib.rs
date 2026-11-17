@@ -32,6 +32,8 @@
 
 #![forbid(unsafe_code)]
 
+mod crypto;
+mod cssns;
 mod cssom;
 mod dom;
 mod elements;
@@ -1058,6 +1060,8 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     fonts::register(context)?;
     urlapi::register(context)?;
     perf::register(context)?;
+    cssns::register(context)?;
+    crypto::register(context)?;
     fetch::register(context)?;
     xhr::register(context)?;
     storage::register(context)?;
@@ -3481,5 +3485,131 @@ mod tests {
             "TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError|function|0"
         );
         assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// The `CSS` namespace: `escape` as WPT `css/cssom/escape.html` has
+    /// it, `supports` as `css/css-conditional/js/CSS-supports-L3`, `-L4`
+    /// and `-L5` have it.
+    #[test]
+    fn css_namespace_escapes_identifiers_and_answers_supports() {
+        let mut h = host();
+        assert_eq!(
+            eval(
+                &mut h,
+                "var threw = f => { try { f(); return 'no' } catch (e) { return e instanceof TypeError } }; \
+                 [typeof CSS, CSS.escape.length, CSS.supports.length, Object.prototype.toString.call(CSS), Object.keys(CSS).sort().join('+'), \
+                  Object.getPrototypeOf(CSS) === Object.prototype, Object.keys(window).includes('CSS'), threw(() => CSS.escape()), threw(() => CSS.supports())].join()"
+            ),
+            "object,1,1,[object CSS],escape+supports,true,false,true,true"
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                r#"var cases = [[true,'true'],[false,'false'],[null,'null'],[undefined,'undefined'],[123,'\\31 23'],['',''],
+                   ['\0','\uFFFD'],['a\0','a\uFFFD'],['\0b','\uFFFDb'],['a\0b','a\uFFFDb'],['\uFFFD','\uFFFD'],['a\uFFFDb','a\uFFFDb'],
+                   ['0a','\\30 a'],['5a','\\35 a'],['9a','\\39 a'],['a0b','a0b'],['a9b','a9b'],['-0a','-\\30 a'],['-9a','-\\39 a'],['--a','--a'],
+                   ['\x01\x02\x1E\x1F','\\1 \\2 \\1e \\1f '],['\x80\x2D\x5F\xA9','\x80\x2D\x5F\xA9'],['\x7F\x80\x9F','\\7f \x80\x9F'],['\xA0\xA1\xA2','\xA0\xA1\xA2'],
+                   ['a0123456789b','a0123456789b'],['abcdefghijklmnopqrstuvwxyz','abcdefghijklmnopqrstuvwxyz'],['ABCDEFGHIJKLMNOPQRSTUVWXYZ','ABCDEFGHIJKLMNOPQRSTUVWXYZ'],
+                   ['hello\\world','hello\\\\world'],['hello\u1234world','hello\u1234world'],['-','\\-'],['\x20\x21\x78\x79','\\ \\!xy'],
+                   ['\uD834\uDF06','\uD834\uDF06'],['\uDF06','\uDF06'],['\uD834','\uD834']];
+                   cases.filter(c => CSS.escape(c[0]) !== c[1]).map(c => JSON.stringify(c[0]) + ' gave ' + JSON.stringify(CSS.escape(c[0]))).join(' ; ')"#
+            ),
+            ""
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                r#"var one = [['(color: red)',true],['color: red',true],['(color: red) and (color: blue)',true],['not (foobar)',true],
+                   ['color: something-pointless var(--foo)',true],['color: something-pointless(var(--foo))',true],['unknownproperty: blah',false],
+                   ['unicode-range: U+0-7F',false],['unicode-range: inherit',false],['width: blah',false],['--foo: blah',true],
+                   ['selector(div)',true],['selector(div, div)',false],['selector(::-webkit-unknown-pseudo-element)',false],['selector(::before)',true],
+                   ['selector(div + .c)',true],['selector(div | .c)',false],['selector(:is(:foo))',false],['selector(:is(:foo, div))',false],
+                   ['selector(:where(:foo))',false],['selector(:where(:foo, div))',false],['selector(:has(:foo))',false],['selector(:has(:foo, div))',false],
+                   ['selector(:nth-child(2n + 3 of :foo))',false],['selector(:nth-last-child(2n + 3 of :foo))',false],
+                   ['selector(:nth-child(2n + 3 of :foo, div))',false],['selector(:nth-last-child(2n + 3 of :foo, div))',false],
+                   ['selector(:nth-child(2n 4))',false],['selector(:nth-last-child(2n 4))',false],
+                   ['font-format(opentype)',true],['font-format(xyzzy)',false],['font-format(opentype, truetype)',false],["font-format('opentype')",false],
+                   ['font-tech(features-opentype)',true],['font-tech(feature-opentype)',false],['font-tech(foobar)',false],
+                   ['font-tech(features-opentype, color-COLRv0)',false],["font-tech('features-opentype')",false],
+                   ['(display: grid) and (not (display: nonsense))',true],['(a: b) and (c: d) or (e: f)',false],['garbage',false],['',false]];
+                   one.filter(c => CSS.supports(c[0]) !== c[1]).map(c => c[0]).join(' ; ')"#
+            ),
+            ""
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                r#"var two = [['color','red',true],['unknownproperty','blah',false],['unicode-range','U+0-7F',false],['unicode-range','inherit',false],
+                   ['width','blah',false],['--foo','blah',true],['COLOR','red',true],[' color','red',false],['color ','red',false],
+                   ['width','5px !important',false],['width','5px; color: red',false],['width',' 5px ',true],['color','var(--x)',true],
+                   ['color','var(--x); width: 1px',false],['width','',false],['margin','1px 2px',true],['width','inherit',true],['--foo','a;b',false]];
+                   two.filter(c => CSS.supports(c[0], c[1]) !== c[2]).map(c => c[0] + ':' + c[1]).join(' ; ')"#
+            ),
+            ""
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// `crypto.getRandomValues` and `randomUUID` as WPT
+    /// `WebCryptoAPI/getRandomValues.any.js` and `randomUUID.https.any.js`
+    /// have them; `randomUUID` only in a secure context.
+    #[test]
+    fn crypto_fills_integer_arrays_and_makes_uuids() {
+        let mut h = host();
+        assert_eq!(
+            eval(
+                &mut h,
+                "var name = f => { try { f(); return 'no' } catch (e) { return e.name } }; \
+                 [typeof crypto, crypto instanceof Crypto, Object.prototype.toString.call(crypto), crypto === self.crypto, Object.keys(Crypto.prototype).sort().join('+'), \
+                  crypto.getRandomValues.length, crypto.randomUUID.length, name(() => new Crypto()), name(() => crypto.getRandomValues.call({}, new Uint8Array(1))), \
+                  name(() => crypto.randomUUID.call({})), name(() => crypto.getRandomValues())].join()"
+            ),
+            "object,true,[object Crypto],true,getRandomValues+randomUUID,1,0,TypeError,TypeError,TypeError,TypeError"
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                "var bad = []; \
+                 for (var T of [Int8Array, Int16Array, Int32Array, BigInt64Array, Uint8Array, Uint8ClampedArray, Uint16Array, Uint32Array, BigUint64Array]) { \
+                   var a = new T(8); var r = crypto.getRandomValues(a); if (r !== a || r.constructor !== T) bad.push(T.name + ' returned'); \
+                   var q = name(() => crypto.getRandomValues(new T(65536 / T.BYTES_PER_ELEMENT + 1))); if (q !== 'QuotaExceededError') bad.push(T.name + ' quota ' + q); \
+                   if (name(() => crypto.getRandomValues(new T(65536 / T.BYTES_PER_ELEMENT))) !== 'no') bad.push(T.name + ' at the quota'); \
+                   if (crypto.getRandomValues(new T(0)).length !== 0) bad.push(T.name + ' empty'); \
+                   var Sub = class extends T {}; if (name(() => crypto.getRandomValues(new Sub(256))) !== 'no') bad.push(T.name + ' subclass'); \
+                 } \
+                 var floats = [Float32Array, Float64Array]; if (typeof Float16Array === 'function') floats.push(Float16Array); \
+                 for (var F of floats) for (var n of [6, 65536]) { var m = name(() => crypto.getRandomValues(new F(n))); if (m !== 'TypeMismatchError') bad.push(F.name + ' ' + m); } \
+                 for (var n of [6, 65537]) { var m = name(() => crypto.getRandomValues(new DataView(new ArrayBuffer(n)))); if (m !== 'TypeMismatchError') bad.push('DataView ' + m); } \
+                 for (var v of [{}, [1, 2], 1, 'x', null, undefined, new ArrayBuffer(8)]) { var m = name(() => crypto.getRandomValues(v)); if (m !== 'TypeError') bad.push(String(v) + ' ' + m); } \
+                 var big = new Uint8Array(1024); crypto.getRandomValues(big); if (!big.some(x => x !== 0)) bad.push('not filled'); \
+                 var whole = new Uint8Array(64); crypto.getRandomValues(whole.subarray(16, 32)); \
+                 if (!whole.slice(0, 16).every(x => x === 0) || !whole.slice(32).every(x => x === 0) || !whole.slice(16, 32).some(x => x !== 0)) bad.push('the view only'); \
+                 var wide = new Uint32Array(64); crypto.getRandomValues(wide); if (!wide.some(x => x > 0xFFFFFF)) bad.push('every byte of an element'); \
+                 bad.join(' ; ')"
+            ),
+            ""
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                "var seen = new Set(), wrong = []; \
+                 for (var i = 0; i < 256; i++) { var u = crypto.randomUUID(); \
+                   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(u)) wrong.push('format ' + u); \
+                   if ((parseInt(u.split('-')[2].slice(0, 2), 16) & 0xF0) !== 0x40) wrong.push('version ' + u); \
+                   if ((parseInt(u.split('-')[3].slice(0, 2), 16) & 0xC0) !== 0x80) wrong.push('variant ' + u); \
+                   if (seen.has(u)) wrong.push('again ' + u); seen.add(u); } \
+                 wrong.join(' ; ')"
+            ),
+            ""
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+        // Plain http is not a secure context: no `randomUUID`.
+        let mut plain = ScriptHost::new(Some(Url::parse("http://example.test/").expect("url")), "browser/test").expect("script host");
+        assert_eq!(
+            eval(&mut plain, "[typeof crypto.randomUUID, 'randomUUID' in crypto, crypto.getRandomValues(new Uint8Array(4)).length].join()"),
+            "undefined,false,4"
+        );
+        let mut local = ScriptHost::new(Some(Url::parse("http://localhost:8080/").expect("url")), "browser/test").expect("script host");
+        assert_eq!(eval(&mut local, "typeof crypto.randomUUID"), "function");
     }
 }

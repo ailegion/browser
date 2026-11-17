@@ -1747,6 +1747,93 @@ remaining lists as they stand.
       panel and Firefox's Debugger do, with pretty printing for
       minified files. Until then the source in the console looks like
       a link and does nothing.
+- [ ] 16. `crypto` and the `CSS` namespace (owner, 2026-11-18; found by
+      running the release probe over google, youtube, wikipedia, github,
+      bbc, cloudflare, iana, amazon, reddit, stackoverflow and react.dev
+      and reading the console: google stopped at `CSS is not defined`,
+      cloudflare at `crypto is not defined`, amazon's challenge at
+      `crypto.getRandomValues() not supported`).
+      Built 2026-11-18, not ticked (SKIPPED parts at the end). Script:
+      `crates/script/src/cssns.rs`, the `CSS` namespace object (a plain
+      object tagged "CSS", not enumerable on `window`): `CSS.escape`
+      (CSSOM's "serialize an identifier" on UTF-16 code units, a lone
+      surrogate kept; the 34 cases of WPT `css/cssom/escape.html`) and
+      `CSS.supports` in both forms (a condition or a bare declaration;
+      a property and a value). `crates/script/src/crypto.rs`: `Crypto`
+      and `window.crypto` (an accessor): `getRandomValues` (the nine
+      integer typed arrays and their subclasses filled in place, only
+      the view's bytes, the array returned; `TypeMismatchError` for
+      float arrays and a `DataView`, `QuotaExceededError` past 65536
+      bytes, a TypeError for anything else and for a view on a shared
+      buffer) and `randomUUID` (version 4, lowercase), which only a
+      secure context has (`potentially_trustworthy` of the document's
+      URL: plain http has none). The bytes are `rand`'s (`03-crates.md`:
+      already approved, now a dependency of the script crate too).
+      Style: `supports_condition_text` and `supports_property_value`
+      (nothing trimmed from the property, matched ASCII
+      case-insensitively; a value with a top-level `;` or `!`, a bad
+      string or URL or an unmatched closing bracket fails, so
+      `!important` does).
+      Behaviour of existing features changed on the way (owner's go the
+      same day, line 6d's `@supports` evaluator, which `CSS.supports`
+      shares and which answered four WPT cases wrongly): `selector()`
+      forgives nothing inside `:is()`, `:where()` and `:has()`
+      (`SelectorParser::unforgiving`, the `selectors` crate's
+      `allow_forgiving_selectors`; a style rule's lists forgive as
+      before) and takes exactly one complex selector, so a comma inside
+      `:is()` no longer makes it false; `font-format()` takes one
+      keyword, a string or a list is false (a quoted format was true);
+      `font-tech()` takes one keyword and `features-opentype` is true
+      beside `variations`.
+      Tests: script `css_namespace_escapes_identifiers_and_answers_supports`
+      (WPT `escape.html`, `CSS-supports-L3`, `-L4`, `-L5` and cases of
+      our own), `crypto_fills_integer_arrays_and_makes_uuids` (WPT
+      `WebCryptoAPI/getRandomValues.any.js` and `randomUUID.https.any.js`,
+      a subarray, http and localhost documents); style
+      `supports_blocks_apply_when_their_condition_holds` gained the
+      `selector()`, `font-format()`, `font-tech()` and `CSS.supports`
+      cases. Full runs: style 92, script 31, tab 112, layout 119, paint
+      27 passing; the layout test `declared_web_families_hide_installed_ones`
+      failed once (the known one), passing alone and in the run after.
+      The dom, net, chrome, shell and store suites were not run.
+      SKIPPED: `crypto.subtle` (`SubtleCrypto`, `CryptoKey`); the rest of
+      the `CSS` namespace (`registerProperty`, `highlights`, the numeric
+      factories such as `CSS.px`); `font-tech()` answers false for
+      `features-aat`, `color-COLRv0`, `color-COLRv1`, `color-SVG`,
+      `color-sbix`, `color-CBDT` and `palettes`, where Chrome and Firefox
+      mostly answer true (text is drawn through vello's `draw_glyphs`;
+      whether colour and AAT fonts render was not confirmed, so they are
+      not claimed). Not verified against Chrome and Firefox:
+      `CSS.supports('--foo', 'a;b')` false; a custom property with an
+      empty value true; `--` alone taken as a custom property name; the
+      error messages' texts. Found, not changed: `@font-face`'s
+      `src: … tech()` has its own list (`fontface.rs`, `variations`
+      only), so a source marked `tech(features-opentype)` is passed
+      over; `window.isSecureContext` does not exist; methods of the
+      older interfaces are not enumerable (these two are, as WebIDL has
+      them).
+      Timing (release probe, live, two runs against one of the build
+      before): slower: iana.org load 522–545 ms (503), relayout
+      294–402 µs (275–338), not attributed (nothing changed runs in a
+      relayout); Wikipedia Main Page load 636–647 ms (760), full restyle
+      41.1–43.3 ms (48.7), relayout 1.56–1.65 ms (1.75–1.79); iana.org
+      full restyle 2.30–2.55 ms (2.41–2.65).
+      The sites after: google past `CSS`, next "not a callable function"
+      in the same script, its inline "cannot convert null or undefined
+      to object" still there; cloudflare past `crypto`, next a
+      null/undefined error later in the beacon script, `customElements
+      is not defined` (twice) still there; amazon past
+      `getRandomValues`, its challenge script next fails with "Network
+      response was not ok" and still shows the 31-node challenge page
+      (line 1's block stands). Seen in the same runs, for later lines:
+      `customElements` (cloudflare, reddit; youtube's polyfill of it
+      stops at `NodeFilter is not defined`), `MessageChannel is not
+      defined` (youtube), import maps (github: `Failed to resolve module
+      specifier "react"`), bbc's `performance.measure` ("The mark
+      '[object Object]' does not exist") and its 13 "chunk path empty
+      but not in a worker" errors (cause not found), stackoverflow's
+      22-node page with no script error; wikipedia, iana.org and
+      react.dev log no error.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

@@ -224,11 +224,20 @@ impl SelectorImpl for BrowserSelectors {
 
 /// The selector parser. HTML documents use the HTML namespace by default.
 #[derive(Debug, Default)]
-pub struct SelectorParser;
+pub struct SelectorParser {
+    /// `@supports selector()`: an invalid selector inside `:is()` or
+    /// `:where()` fails the whole selector (CSS Conditional 4 §2.1; in a
+    /// style rule those lists forgive it).
+    unforgiving: bool,
+}
 
 impl<'i> parser::Parser<'i> for SelectorParser {
     type Impl = BrowserSelectors;
     type Error = SelectorParseErrorKind<'i>;
+
+    fn allow_forgiving_selectors(&self) -> bool {
+        !self.unforgiving
+    }
 
     fn parse_is_and_where(&self) -> bool {
         true
@@ -554,7 +563,14 @@ impl selectors::Element for ElementRef<'_> {
 
 /// Parse a selector list. Returns `None` on any error, which drops the rule.
 pub fn parse_selectors(input: &mut cssparser::Parser<'_, '_>) -> Option<Selectors> {
-    SelectorList::parse(&SelectorParser, input, parser::ParseRelative::No).ok()
+    SelectorList::parse(&SelectorParser::default(), input, parser::ParseRelative::No).ok()
+}
+
+/// `@supports selector(<complex-selector>)`: one complex selector (not a
+/// list) that parses with nothing forgiven.
+pub fn supports_selector(input: &mut cssparser::Parser<'_, '_>) -> bool {
+    let parser = SelectorParser { unforgiving: true };
+    SelectorList::parse(&parser, input, parser::ParseRelative::No).is_ok_and(|list| list.slice().len() == 1) && input.is_exhausted()
 }
 
 /// Parse a selector list from text, as `querySelector` and `matches`

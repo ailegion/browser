@@ -52,6 +52,7 @@ pub use media::{MediaCondition, MediaQueryList};
 pub use serialize::{UsedGrid, UsedTracks, UsedValues, resolved_value, serialize_block, serialize_declared, serialize_shorthand};
 pub use stylesheet::{
     Origin, Rule, StyleRule, Stylesheet, parse_cssom_block, parse_declaration_block, parse_declaration_value,
+    supports_condition_text, supports_property_value,
 };
 pub use values::{CalcHandle, ComputedLp, ComputedLpAuto, ComputedSize, Rgba, css_number};
 

@@ -21,3 +21,5 @@ boa_runtime.workspace = true
 url.workspace = true
 # `XMLHttpRequest.responseText` decodes by the response's charset.
 encoding_rs.workspace = true
+# `crypto.getRandomValues` and `crypto.randomUUID`.
+rand.workspace = true

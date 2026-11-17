@@ -501,29 +501,35 @@ fn supports_in_parens<'i>(input: &mut Parser<'i, '_>) -> Result<bool, ParseError
         cssparser::Token::Function(name) => {
             let name = name.to_ascii_lowercase();
             input.parse_nested_block(|i| {
-                let start = i.position();
-                while i.next().is_ok() {}
-                let text = i.slice_from(start).trim().to_owned();
-                Ok(match name.as_str() {
-                    // A complex selector the engine parses.
-                    "selector" => parse_selectors_text(&text),
-                    "font-format" => matches!(
-                        text.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase().as_str(),
-                        "woff2" | "woff" | "truetype" | "opentype" | "collection"
-                    ),
-                    "font-tech" => text.eq_ignore_ascii_case("variations"),
+                let holds = match name.as_str() {
+                    // One complex selector the engine parses, nothing in
+                    // it forgiven.
+                    "selector" => crate::selector_impl::supports_selector(i),
+                    // One keyword (a string is not one: CSS Conditional 5
+                    // §2.1) naming a format the engine decodes.
+                    "font-format" => {
+                        single_keyword(i).is_some_and(|k| matches!(k.as_str(), "woff2" | "woff" | "truetype" | "opentype" | "collection"))
+                    }
+                    // One keyword naming a technology the engine has:
+                    // OpenType layout tables are shaped and variable fonts
+                    // drawn.
+                    "font-tech" => single_keyword(i).is_some_and(|k| matches!(k.as_str(), "features-opentype" | "variations")),
                     _ => false,
-                })
+                };
+                // Whatever is left belongs to the function: skipped.
+                while i.next().is_ok() {}
+                Ok(holds)
             })
         }
         t => Err(location.new_unexpected_token_error(t)),
     }
 }
 
-fn parse_selectors_text(text: &str) -> bool {
-    let mut input = ParserInput::new(text);
-    let mut p = Parser::new(&mut input);
-    parse_selectors(&mut p).is_some() && !text.contains(',')
+/// The lowercased identifier that is all of the input; `None` for
+/// anything else (a string, a list, nothing).
+fn single_keyword(input: &mut Parser<'_, '_>) -> Option<String> {
+    let keyword = input.expect_ident().ok()?.to_ascii_lowercase();
+    input.is_exhausted().then_some(keyword)
 }
 
 /// `<declaration>` inside parentheses: supported when the property is one
@@ -541,6 +547,59 @@ fn supports_declaration(input: &mut Parser<'_, '_>) -> bool {
         return true;
     }
     !parse_declaration_block(&format!("{name}:{value}")).is_empty()
+}
+
+/// `CSS.supports(conditionText)` (CSS Conditional 3, "The CSS namespace"):
+/// the text as a `<supports-condition>`, or else as what it would be
+/// inside one pair of parentheses, a bare declaration.
+pub fn supports_condition_text(text: &str) -> bool {
+    let mut input = ParserInput::new(text);
+    let mut parser = Parser::new(&mut input);
+    if parser.parse_entirely(supports_condition).unwrap_or(false) {
+        return true;
+    }
+    let mut input = ParserInput::new(text);
+    let mut parser = Parser::new(&mut input);
+    supports_declaration(&mut parser)
+}
+
+/// `CSS.supports(property, value)`: the property is one the engine knows
+/// (ASCII case-insensitively, nothing trimmed) and the value parses for
+/// it, or the property is a custom property. `!important` is not part of
+/// a value, so it fails.
+pub fn supports_property_value(property: &str, value: &str) -> bool {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    if !declaration_value_tokens(&mut parser, true).unwrap_or(false) {
+        return false;
+    }
+    if property.starts_with("--") {
+        return true;
+    }
+    parse_declaration_value(property, value).is_some()
+}
+
+/// Whether tokens can be a `<declaration-value>` (CSS Syntax 3 §8.2): no
+/// bad string or URL, no unmatched closing bracket, and at the top level
+/// no semicolon and no `!`.
+fn declaration_value_tokens<'i>(input: &mut Parser<'i, '_>, top: bool) -> Result<bool, ParseError<'i, ()>> {
+    use cssparser::Token as T;
+    loop {
+        let token = match input.next() {
+            Ok(t) => t.clone(),
+            Err(_) => return Ok(true),
+        };
+        match token {
+            T::BadString(_) | T::BadUrl(_) | T::CloseParenthesis | T::CloseSquareBracket | T::CloseCurlyBracket => return Ok(false),
+            T::Semicolon | T::Delim('!') if top => return Ok(false),
+            T::Function(_) | T::ParenthesisBlock | T::SquareBracketBlock | T::CurlyBracketBlock => {
+                if !input.parse_nested_block(|i| declaration_value_tokens(i, false))? {
+                    return Ok(false);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Rules inside a block (`@media { ... }`).
@@ -786,6 +845,26 @@ mod tests {
         assert!(!holds("(a: b) and (c: d) or (e: f)"), "and with or needs parentheses");
         assert!(!holds("unknown-function(x)"), "general-enclosed is false");
         assert!(!holds("garbage"));
+        // `selector()` takes one complex selector and forgives nothing in
+        // it (WPT `CSS-supports-L4`); a style rule's `:is()` still does.
+        assert!(holds("selector(:is(a, b) > c)"), "a comma inside :is() is not a list");
+        assert!(!holds("selector(a, b)"));
+        assert!(!holds("selector(:is(:foo))") && !holds("selector(:where(:foo, div))") && !holds("selector(:has(:foo))"));
+        assert!(!holds("selector(:nth-child(2n + 3 of :foo))") && !holds("selector()"));
+        assert_eq!(Stylesheet::parse(":is(:foo, p) { color: red }", Origin::Author).rule_count(), 1);
+        // `font-format()` and `font-tech()` take one keyword, never a
+        // string or a list (WPT `CSS-supports-L5`).
+        assert!(holds("font-format(opentype)") && holds("font-format(WOFF2)") && !holds("font-format('opentype')"));
+        assert!(!holds("font-format(opentype, truetype)") && !holds("font-format(xyzzy)") && !holds("font-format()"));
+        assert!(holds("font-tech(features-opentype)") && holds("font-tech(variations)") && !holds("font-tech(feature-opentype)"));
+        assert!(!holds("font-tech(features-opentype, variations)") && !holds("font-tech('features-opentype')"));
+        // `CSS.supports`: a condition or a bare declaration; a property
+        // with a value.
+        assert!(supports_condition_text("color: red") && supports_condition_text("(color: red) and (color: blue)"));
+        assert!(supports_condition_text("not (foobar)") && !supports_condition_text("width: blah") && !supports_condition_text(""));
+        assert!(supports_property_value("COLOR", "red") && supports_property_value("--x", "anything"));
+        assert!(!supports_property_value(" color", "red") && !supports_property_value("width", "5px !important"));
+        assert!(!supports_property_value("width", "5px; color: red") && !supports_property_value("color", "var(--x); width: 1px"));
         // Nested in @media, and @import's supports().
         assert_eq!(Stylesheet::parse("@media all { @supports (display: flex) { p { color: red } } }", Origin::Author).rule_count(), 1);
         let s = Stylesheet::parse("@import url(a.css) supports(display: grid); @import url(b.css) supports(display: nonsense);", Origin::Author);
