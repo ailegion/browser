@@ -113,6 +113,10 @@ struct ScriptLoad {
     state: LoadState,
     /// The element's `referrerpolicy` (its fetch options').
     policy: ReferrerPolicy,
+    /// The `<script>` element: `document.currentScript` while a classic
+    /// script runs, and where an external script's `load` or `error`
+    /// event is fired.
+    node: Option<NodeId>,
 }
 
 impl ScriptLoad {
@@ -141,6 +145,15 @@ struct Scripts {
     module_urls: HashSet<Url>,
     /// A deferred script is running: the document is still `interactive`.
     running_deferred: bool,
+    /// Scripts a script inserted after `async = false`: each runs when it
+    /// is ready and those inserted before it have run (HTML's "list of
+    /// scripts that will execute in order as soon as possible").
+    ordered: VecDeque<ScriptLoad>,
+    /// `run_ready_scripts` is at work (a script it runs may ask for more).
+    running_ready: bool,
+    /// A script asked for a load that needs no fetch to start (an inline
+    /// module): `run_ready_scripts` is due.
+    kick: bool,
 }
 
 impl Scripts {
@@ -154,6 +167,7 @@ impl Scripts {
             .iter_mut()
             .chain(self.deferred.iter_mut())
             .chain(self.asap.iter_mut())
+            .chain(self.ordered.iter_mut())
     }
 
     fn get_mut(&mut self, id: u64) -> Option<&mut ScriptLoad> {
@@ -165,6 +179,7 @@ impl Scripts {
         self.blocking = None;
         self.deferred.clear();
         self.asap.clear();
+        self.ordered.clear();
     }
 }
 
@@ -4224,6 +4239,9 @@ impl TabState {
         for request in requests {
             match request {
                 HostRequest::Submit { .. } => {}
+                HostRequest::LoadScript { node, url, module, in_order, policy } => self.load_inserted_script(node, url, module, in_order, policy),
+                HostRequest::InlineModule { node, source, in_order, policy } => self.load_inserted_module(node, source, in_order, policy),
+                HostRequest::ScriptError { node } => self.fire_script_event(node, "error"),
                 // The script changed the document itself; the shell hears
                 // of the new title.
                 HostRequest::SetTitle(_) => self.state_dirty = true,
@@ -4303,9 +4321,13 @@ impl TabState {
             match self.prepare_script(node) {
                 Prepared::Run(source, base, policy) => {
                     self.sync_document_info();
-                    self.with_script(|host| match &base {
-                        Some(base) => host.run_inline_script(&source, base, policy),
-                        None => host.run_script(&source),
+                    self.with_script(|host| {
+                        host.set_current_script(Some(node));
+                        match &base {
+                            Some(base) => host.run_inline_script(&source, base, policy),
+                            None => host.run_script(&source),
+                        }
+                        host.set_current_script(None);
                     });
                     self.after_script();
                 }
@@ -4357,6 +4379,11 @@ impl TabState {
                 policy,
             )
         };
+        // It has "already started": moved or changed later, it does not
+        // run again.
+        if let Some(parser) = &mut self.parser {
+            parser.document_mut().mark_script_started(node);
+        }
         match src {
             Some((raw, resolved)) => {
                 let url = match resolved {
@@ -4373,6 +4400,7 @@ impl TabState {
                     url: Some(url.clone()),
                     state: LoadState::Fetching,
                     policy,
+                    node: Some(node),
                 };
                 let blocking = !is_async && !defer && kind == ScriptKind::Classic;
                 if is_async {
@@ -4409,6 +4437,7 @@ impl TabState {
                                 url: None,
                                 state: LoadState::Module(m),
                                 policy,
+                                node: Some(node),
                             };
                             if is_async {
                                 self.scripts.asap.push(load);
@@ -4432,7 +4461,18 @@ impl TabState {
     /// polled first so a module whose last import just arrived counts as
     /// ready.
     fn run_ready_scripts(&mut self) {
+        // A script run here may ask for more loads: the loop sees them.
+        if self.scripts.running_ready {
+            return;
+        }
+        self.scripts.running_ready = true;
+        self.run_ready_scripts_loop();
+        self.scripts.running_ready = false;
+    }
+
+    fn run_ready_scripts_loop(&mut self) {
         loop {
+            self.scripts.kick = false;
             let mut progressed = self.poll_modules();
             if self.scripts.blocking.as_ref().is_some_and(ScriptLoad::is_ready)
                 && let Some(load) = self.scripts.blocking.take()
@@ -4466,9 +4506,81 @@ impl TabState {
                 self.scripts.running_deferred = false;
                 progressed = true;
             }
-            if !progressed {
+            // Scripts a script inserted to run in order.
+            while self.scripts.ordered.front().is_some_and(ScriptLoad::is_ready)
+                && let Some(load) = self.scripts.ordered.pop_front()
+            {
+                self.execute_script(load);
+                progressed = true;
+            }
+            if !progressed && !self.scripts.kick {
                 break;
             }
+        }
+    }
+
+    /// A script inserted a `<script>` with a `src` (`HostRequest::
+    /// LoadScript`): fetch it; it runs when it arrives, or in its turn.
+    fn load_inserted_script(&mut self, node: NodeId, url: Url, module: bool, in_order: bool, policy: ReferrerPolicy) {
+        if !matches!(url.scheme(), "http" | "https" | "data") {
+            self.report_script_error(format!("Failed to load script: cannot use src \"{url}\""));
+            self.fire_script_event(node, "error");
+            return;
+        }
+        let id = self.scripts.next_id();
+        let load = ScriptLoad {
+            id,
+            kind: if module { ScriptKind::Module } else { ScriptKind::Classic },
+            url: Some(url.clone()),
+            state: LoadState::Fetching,
+            policy,
+            node: Some(node),
+        };
+        if in_order {
+            self.scripts.ordered.push_back(load);
+        } else {
+            self.scripts.asap.push(load);
+        }
+        let mut request = self.subresource(url, self.element_referrer(Some(node)));
+        request.headers.push(("accept".to_owned(), "*/*".to_owned()));
+        self.fetch(request, PendingKind::Script { id });
+    }
+
+    /// A script inserted an inline module script (`HostRequest::
+    /// InlineModule`): its graph is loaded, then it runs.
+    fn load_inserted_module(&mut self, node: NodeId, source: String, in_order: bool, policy: ReferrerPolicy) {
+        let url = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.base_url.clone())
+            .or_else(|| self.url.clone())
+            .unwrap_or_else(|| Url::parse("about:blank").expect("static url"));
+        let Some(host) = &mut self.script else { return };
+        match host.parse_inline_module(&source, &url, policy) {
+            Ok(m) => {
+                let load = ScriptLoad {
+                    id: self.scripts.next_id(),
+                    kind: ScriptKind::Module,
+                    url: None,
+                    state: LoadState::Module(m),
+                    policy,
+                    node: Some(node),
+                };
+                if in_order {
+                    self.scripts.ordered.push_back(load);
+                } else {
+                    self.scripts.asap.push(load);
+                }
+                self.scripts.kick = true;
+            }
+            Err(e) => self.report_script_error(format!("Uncaught {e}")),
+        }
+    }
+
+    /// Fire `load` or `error` at a `<script>` element, if it still exists.
+    fn fire_script_event(&mut self, node: NodeId, kind: &str) {
+        if self.with_image_doc(|doc, _| doc.contains(node)).unwrap_or(false) {
+            self.fire_lifecycle_event(EventTargetRef::Node(node), kind, false);
         }
     }
 
@@ -4530,13 +4642,24 @@ impl TabState {
     /// Run a ready script as a task, or report why it cannot run.
     fn execute_script(&mut self, load: ScriptLoad) {
         self.sync_document_info();
+        let node = load.node;
+        let external = load.url.is_some();
+        let failed = matches!(load.state, LoadState::Failed(_));
         self.with_script(|host| match load.state {
-            LoadState::Classic(source) => host.run_script_from(&source, load.url.as_ref(), load.policy),
+            LoadState::Classic(source) => {
+                host.set_current_script(node);
+                host.run_script_from(&source, load.url.as_ref(), load.policy);
+                host.set_current_script(None);
+            }
             LoadState::Module(m) => host.run_module(m),
             LoadState::Failed(why) => host.report_error(why),
             LoadState::Fetching => {}
         });
         self.after_script();
+        // An external script's element hears how it went.
+        if external && let Some(node) = node {
+            self.fire_script_event(node, if failed { "error" } else { "load" });
+        }
     }
 
     /// A message for the developer console: logged, kept (the last 500,
@@ -4583,7 +4706,13 @@ impl TabState {
             }
             PendingKind::Script { id } => {
                 let s = &self.scripts;
-                s.blocking.iter().chain(s.deferred.iter()).chain(s.asap.iter()).find(|l| l.id == *id).and_then(|l| l.url.clone())
+                s.blocking
+                    .iter()
+                    .chain(s.deferred.iter())
+                    .chain(s.asap.iter())
+                    .chain(s.ordered.iter())
+                    .find(|l| l.id == *id)
+                    .and_then(|l| l.url.clone())
             }
         }
         .or_else(|| p.final_url.clone())
@@ -4623,6 +4752,10 @@ impl TabState {
             self.dom_changed(&changes);
         }
         self.apply_host_requests(host_requests);
+        // An inline module a script inserted starts loading its graph.
+        if self.scripts.kick {
+            self.run_ready_scripts();
+        }
         // The requests the script made (`fetch`, `XMLHttpRequest`) start.
         self.apply_net_ops(net_ops);
         self.apply_font_requests();
@@ -8560,6 +8693,48 @@ mod tests {
 
     fn page_url(title: &str) -> Url {
         data_url(&format!("<title>{title}</title>"), None)
+    }
+
+    /// Scripts a script inserts (HTML §4.12.1): an inline one runs in the
+    /// insertion, external ones as they arrive or, after `async = false`,
+    /// in the order inserted; each external one's element gets `load` or
+    /// `error`; `document.currentScript` names a classic one's element.
+    #[test]
+    fn scripts_a_script_inserts_load_and_run() {
+        let page = "<!DOCTYPE html><title>Inserted</title><body><script>\
+            var log = m => console.log(m);\
+            function add(src, ordered, id) { var s = document.createElement('script'); s.id = id; if (ordered) s.async = false; s.src = src;\
+              s.onload = () => log('load:' + id); s.onerror = () => log('error:' + id); document.body.appendChild(s); }\
+            add('/slow.js', true, 'o1'); add('/fast.js', true, 'o2'); add('/free.js', false, 'f'); add('/missing.js', false, 'm');\
+            var inl = document.createElement('script'); inl.textContent = \"log('inline:' + (document.currentScript === inl))\"; document.body.appendChild(inl);\
+            var mod = document.createElement('script'); mod.type = 'module'; mod.textContent = \"log('module:' + String(document.currentScript))\";\
+            document.body.appendChild(mod); log('end:' + (document.currentScript instanceof HTMLScriptElement));\
+            </script>";
+        let server = Server::start(
+            &[
+                ("/page", "text/html", page),
+                ("/slow.js", "text/javascript", "log('slow:' + document.currentScript.id)"),
+                ("/fast.js", "text/javascript", "log('fast:' + document.currentScript.id)"),
+                ("/free.js", "text/javascript", "log('free:' + document.currentScript.id)"),
+            ],
+            &["/slow.js"],
+        );
+        let mut h = Harness::load_url(server.url("/page"));
+        let has = |h: &Harness, text: &str| console_texts(h).iter().any(|t| t == text);
+        h.pump_until(|h| has(h, "load:f") && has(h, "error:m") && has(h, "module:null"));
+        let t = console_texts(&h);
+        // The inline one ran inside its insertion; the parser's own script
+        // is `currentScript` again after.
+        assert_eq!(t[..2], ["inline:true", "end:true"], "{t:?}");
+        assert!(has(&h, "free:f"), "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("Failed to load script")), "the missing one is reported: {t:?}");
+        assert!(!has(&h, "fast:o2") && !has(&h, "slow:o1"), "the ordered ones wait for the first: {t:?}");
+        server.release("/slow.js");
+        h.pump_until(|h| has(h, "load:o2"));
+        let t = console_texts(&h);
+        let at = |text: &str| t.iter().position(|l| l == text).unwrap_or_else(|| panic!("no {text:?} in {t:?}"));
+        assert!(at("slow:o1") < at("load:o1") && at("load:o1") < at("fast:o2") && at("fast:o2") < at("load:o2"), "{t:?}");
+        assert_eq!(t.iter().filter(|l| l.starts_with("load:") || l.starts_with("error:")).count(), 4, "{t:?}");
     }
 
     #[test]

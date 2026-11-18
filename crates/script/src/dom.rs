@@ -122,6 +122,8 @@ pub(crate) struct Dom {
     /// Elements whose `click()` is under way: a `click()` inside it does
     /// nothing.
     pub(crate) clicking: std::collections::HashSet<NodeId>,
+    /// The classic `<script>` element being run (`document.currentScript`).
+    pub(crate) current_script: Option<NodeId>,
 }
 
 /// An attribute of a custom element was set, changed or removed: the
@@ -359,6 +361,10 @@ impl Dom {
         }
         if name == "nonce" {
             self.nonces.remove(&element);
+        }
+        // A `<script>` given a `src` it did not have may run now.
+        if name == "src" && old.is_none() {
+            self.doc.note_script_candidate(element);
         }
         // A custom element hears of it (DOM's "handle attribute changes").
         if self.doc.custom_elements_watched()

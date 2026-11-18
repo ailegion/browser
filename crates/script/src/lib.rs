@@ -47,6 +47,7 @@ mod history;
 mod observers;
 mod perf;
 mod reflect;
+mod scripts;
 mod storage;
 mod urlapi;
 mod view;
@@ -676,6 +677,27 @@ pub enum HostRequest {
         target: String,
         noreferrer: bool,
     },
+    /// A `<script>` a script inserted names an external script (HTML's
+    /// "prepare the script element"): the tab fetches it and runs it, as
+    /// soon as it arrives or, `in_order`, after those asked for before it.
+    LoadScript {
+        node: NodeId,
+        url: Url,
+        module: bool,
+        in_order: bool,
+        policy: browser_ipc_types::ReferrerPolicy,
+    },
+    /// An inline module script a script inserted: the tab loads its graph
+    /// and runs it.
+    InlineModule {
+        node: NodeId,
+        source: String,
+        in_order: bool,
+        policy: browser_ipc_types::ReferrerPolicy,
+    },
+    /// A `<script>` a script inserted has a `src` that names nothing: an
+    /// `error` event is fired at it, as a task.
+    ScriptError { node: NodeId },
 }
 
 /// The browser's cookie jar as `document.cookie` sees it (HTML §7.9.2,
@@ -1064,6 +1086,7 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     custom::register(context)?;
     attrs::register(context)?;
     reflect::register(context)?;
+    scripts::register(context)?;
     fonts::register(context)?;
     urlapi::register(context)?;
     perf::register(context)?;
@@ -1524,6 +1547,12 @@ impl ScriptHost {
         state.info.ready_state = ready_state.to_owned();
         state.info.charset = charset.to_owned();
         state.info.quirks = quirks;
+    }
+
+    /// Which `<script>` element the classic script about to run is
+    /// (`document.currentScript`), or none once it has run.
+    pub fn set_current_script(&mut self, element: Option<NodeId>) {
+        self.dom.borrow_mut().current_script = element;
     }
 
     /// What scripts asked of the document or tab since the last call.
@@ -3631,6 +3660,98 @@ mod tests {
             Ok(text) => println!("{}", text.trim_matches('"').replace("\\n", "\n")),
             Err(err) => println!("the probe failed: {err}"),
         }
+    }
+
+    /// A `<script>` a script inserts is prepared (HTML §4.12.1): an inline
+    /// classic one runs where it is inserted, an external one and a
+    /// module are asked of the tab; the element's members;
+    /// `document.currentScript`.
+    #[test]
+    fn inserted_scripts_run_and_script_elements_reflect() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(b"<!DOCTYPE html><head></head><body><script id=parsed>window.parsed = (window.parsed || 0) + 1;</script></body>");
+        h.lend_document(doc, false, Default::default());
+        h.run_script("var mk = (code, id) => { var s = document.createElement('script'); if (id) s.id = id; if (code != null) s.textContent = code; return s; }; window.n = 0;");
+        // Inline: runs inside the insertion, with currentScript; once.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var s = mk('window.n++; window.cur = document.currentScript.id;', 'dyn'); var before = [window.n, String(document.currentScript)]; \
+                 document.head.appendChild(s); var after = [window.n, window.cur, String(document.currentScript)]; document.body.appendChild(s); \
+                 document.body.appendChild(s.cloneNode(true)); before.concat(after, [window.n]).join()"
+            ),
+            "0,null,1,dyn,null,1"
+        );
+        // What does not run: detached, a data block, nomodule, markup set
+        // through innerHTML, a parser's script moved, for/event of another
+        // target; an empty one runs when it gets its text.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var loose = document.createElement('div'); loose.appendChild(mk('window.n++')); var d = mk('window.n++'); d.type = 'text/plain'; document.head.append(d); \
+                 var nm = mk('window.n++'); nm.noModule = true; document.head.append(nm); var box = document.createElement('div'); \
+                 box.innerHTML = '<script>window.n++<\\/script>'; document.body.append(box); document.head.append(document.getElementById('parsed')); \
+                 var fe = mk('window.n++'); fe.htmlFor = 'document'; fe.event = 'onload'; document.head.append(fe); var a = window.n; \
+                 var late = mk(null); document.head.append(late); var b = window.n; late.append('window.n++'); var c = window.n; late.append(' window.n++'); \
+                 var ok = mk('window.n++'); ok.htmlFor = ' WINDOW '; ok.event = 'onload()'; document.head.append(ok); \
+                 var nested = mk('document.head.append(mk(\"window.order = (window.order || \\'\\') + \\'in\\';\")); window.order += \\'out\\';'); document.head.append(nested); \
+                 [a, b, c, window.n, window.order, window.parsed === document.getElementById('parsed')].join()"
+            ),
+            // (`window.parsed` is still the element of that id: its script
+            // never set the number.)
+            "1,1,2,3,inout,true"
+        );
+        // A script that throws is reported, and its inserter goes on.
+        assert_eq!(eval(&mut h, "document.head.append(mk('throw new RangeError(\"inline boom\")')); 'went on'"), "went on");
+        let reported = lines(&mut h);
+        assert!(reported.len() == 1 && reported[0].contains("inline boom"), "{reported:?}");
+        // External scripts and modules are asked of the tab: as soon as
+        // possible by default, in order after `async = false`.
+        let _ = h.take_requests();
+        h.run_script(
+            "var e1 = mk(null); e1.src = '/a.js'; document.head.append(e1); var e2 = mk(null); e2.async = false; e2.src = 'b.js?x=1'; e2.referrerPolicy = 'origin'; \
+             document.head.append(e2); var e3 = mk(null); e3.type = 'module'; e3.src = 'https://other.test/m.js'; document.head.append(e3); \
+             var e4 = mk('export {}'); e4.type = 'module'; document.head.append(e4); var e5 = mk(null); e5.setAttribute('src', ''); document.head.append(e5); \
+             var e6 = mk(null); document.head.append(e6); e6.src = '/late.js'; e6.src = '/again.js'; var e7 = mk(null); e7.src = '/never.js';",
+        );
+        let asked: Vec<String> = h
+            .take_requests()
+            .into_iter()
+            .map(|r| match r {
+                HostRequest::LoadScript { url, module, in_order, policy, .. } => format!("load {url} module={module} ordered={in_order} {policy:?}"),
+                HostRequest::InlineModule { source, in_order, .. } => format!("inline module {source:?} ordered={in_order}"),
+                HostRequest::ScriptError { .. } => "error".to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "load https://example.test/a.js module=false ordered=false Empty",
+                "load https://example.test/app/b.js?x=1 module=false ordered=true Origin",
+                "load https://other.test/m.js module=true ordered=false Empty",
+                "inline module \"export {}\" ordered=false",
+                "error",
+                "load https://example.test/late.js module=false ordered=false Empty",
+            ]
+        );
+        // The members.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var p = document.getElementById('parsed'), f = mk('a = 1;'); f.append(document.createElement('b'), 'b = 2;'); \
+                 [e2.src, mk(null).src === '', e2.getAttribute('src'), p.async, mk(null).async, e2.async, e2.hasAttribute('async'), (e2.async = true, e2.getAttribute('async') === ''), \
+                  (e2.async = false, e2.hasAttribute('async')), e2.async, (p.defer = true, p.hasAttribute('defer')), p.noModule, e3.type, (p.charset = 'utf-8', p.getAttribute('charset')), \
+                  String(p.crossOrigin), (p.crossOrigin = 'bogus', p.crossOrigin), (p.crossOrigin = 'USE-CREDENTIALS', p.crossOrigin), (p.crossOrigin = null, p.hasAttribute('crossorigin')), \
+                  e2.referrerPolicy, (p.referrerPolicy = 'nope', p.referrerPolicy === ''), p.fetchPriority, (p.fetchPriority = 'HIGH', p.fetchPriority), \
+                  (p.integrity = 'sha256-x', p.getAttribute('integrity')), (p.htmlFor = 'w', p.getAttribute('for')), (p.event = 'e', p.getAttribute('event')), \
+                  f.text, (f.text = 'c = 3;', f.childNodes.length), f.text, HTMLScriptElement.supports('classic'), HTMLScriptElement.supports('module'), \
+                  HTMLScriptElement.supports('importmap'), 'src' in HTMLScriptElement.prototype, 'src' in HTMLElement.prototype].join()"
+            ),
+            "https://example.test/app/b.js?x=1,true,b.js?x=1,false,true,false,false,true,false,false,true,false,module,utf-8,null,anonymous,use-credentials,false,\
+             origin,true,auto,high,sha256-x,w,e,a = 1;b = 2;,1,c = 3;,true,true,false,true,false"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
     }
 
     /// The members every HTML element reflects its attributes through

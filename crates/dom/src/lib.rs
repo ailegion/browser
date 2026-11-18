@@ -11,6 +11,7 @@ pub mod encoding;
 pub mod forms;
 mod fragment;
 pub mod image;
+pub mod scripts;
 mod sink;
 
 use std::fmt::Write as _;
@@ -350,6 +351,8 @@ pub struct Document {
     /// custom element definition exists (`None` before): what custom
     /// element reactions are enqueued from (`custom.rs`).
     custom_log: Option<Vec<custom::CustomTreeEvent>>,
+    /// `<script>` elements' state beyond their attributes (`scripts.rs`).
+    scripts: scripts::Scripts,
 }
 
 /// One change to the tree, as a `MutationObserver` is told of it (DOM
@@ -416,6 +419,7 @@ impl Document {
             referrer_policy: browser_ipc_types::ReferrerPolicy::Empty,
             custom: Default::default(),
             custom_log: None,
+            scripts: Default::default(),
         }
     }
 
@@ -1023,6 +1027,7 @@ impl Document {
             self.note_created_element(&local);
         }
         let has_style = matches!(&kind, NodeKind::Element(e) if e.attr("style").is_some());
+        self.note_created_script(&kind);
         // Made with an `is` attribute (the parser, a fragment): that is
         // its `is` value (a clone takes its original's, `clone_subtree`).
         let is = match &kind {
@@ -1097,6 +1102,7 @@ impl Document {
         let copy = self.create_node(kind);
         let is = self.is_value(id).map(str::to_owned);
         self.set_is_value(copy, is.as_deref());
+        self.clone_script_state(id, copy);
         self.clone_control_state(id, copy);
         // A clone's `style` keeps the base its original was parsed with.
         match self.style_bases.get(&id).cloned() {
@@ -1175,6 +1181,7 @@ impl Document {
         self.forms_inserted(child, parent);
         self.meta_inserted(child, parent);
         self.log_custom_inserted(child, parent);
+        self.scripts_inserted(child, parent);
         self.log_child_list(parent, Some(child), None, last, None);
     }
 
@@ -1276,6 +1283,7 @@ impl Document {
         self.forms_inserted(new, parent);
         self.meta_inserted(new, parent);
         self.log_custom_inserted(new, parent);
+        self.scripts_inserted(new, parent);
         self.log_child_list(parent, Some(new), None, prev, Some(sibling));
     }
 
@@ -1390,6 +1398,7 @@ impl Document {
             self.link_bases.remove(&n);
             self.sheet_bases.remove(&n);
             self.custom.remove(&n);
+            self.forget_script(n);
             self.nodes.remove(n);
         }
     }

@@ -89,6 +89,10 @@ impl TreeSink for Sink {
     ) -> NodeId {
         let mut doc = self.doc.borrow_mut();
         let id = doc.create_element(name, attrs);
+        // The parser prepares its own scripts (a fragment's never run).
+        if doc.is_script_element(id) {
+            doc.mark_parser_script(id);
+        }
         if flags.template {
             let contents = doc.create_node(NodeKind::DocumentFragment);
             if let Some(e) = doc.get_mut(id).as_element_mut() {

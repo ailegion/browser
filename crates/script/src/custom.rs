@@ -283,6 +283,9 @@ pub(crate) fn with_reactions<T>(context: &mut Context, operation: impl FnOnce(&m
     let Ok(shared) = registry(context) else { return operation(context) };
     shared.borrow_mut().stack.push(Vec::new());
     let result = operation(context);
+    // A `<script>` the operation connected is prepared, and run when it
+    // is an inline classic one, before the operation returns.
+    crate::scripts::prepare_pending(context);
     // What the operation did to the tree and to custom elements'
     // attributes becomes reactions on its queue.
     collect(context);

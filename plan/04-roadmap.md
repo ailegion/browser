@@ -2152,6 +2152,79 @@ remaining lists as they stand.
         `disabled`, `required`, `placeholder`, the selection and
         validity members, ...), `form`'s, and the legacy constructors
         `Image`, `Audio`, `Option`.
+      - [x] 19s. Scripts a script inserts run (Phase 5's DOM item (D),
+        moved up and built 2026-11-18: until now only the parser's
+        scripts ran, so no page loading its code through inserted
+        `<script>` elements got it), with `document.currentScript` and
+        the `HTMLScriptElement` members. DOM (`crates/dom/src/scripts.rs`):
+        beside the tree, each `<script>`'s "already started" flag (a
+        clone has its original's), whether the HTML parser made it (the
+        sink marks them; a fragment's never run), whether `async` was
+        assigned ("force async" ended), and the candidates the tree
+        primitives note: a script that became connected, one whose
+        children changed; `script_type` (the `type`, else `language`,
+        against the JavaScript MIME type essences; a second copy of the
+        tab's `script_kind`, kept apart so the parser's path is as it
+        was: to be merged). Script (`crates/script/src/scripts.rs`):
+        `prepare_pending`, run by `with_reactions` after its operation,
+        is "prepare the script element" for each candidate not made by
+        the parser (no `src` and no text, not connected, a data block,
+        `nomodule`, a `for`/`event` pair naming another target: nothing;
+        else "already started"): an inline classic script is parsed and
+        run there, nested in whatever is running, `currentScript` naming
+        it meanwhile and what it throws reported; an external one, a
+        module and an empty or unparsable `src` are asked of the tab
+        (`HostRequest::LoadScript` with `in_order` when neither the
+        `async` attribute nor "force async" holds, `InlineModule`,
+        `ScriptError`); a `src` set where there was none is a candidate
+        too (`Dom::record_attr`). Members: `src` (resolved against the
+        document base URL), `type`, `charset`, `integrity`, `event`,
+        `htmlFor`, `noModule`, `defer`, `async` ("force async" or the
+        attribute; assigning ends the first), `crossOrigin`,
+        `referrerPolicy`, `fetchPriority`, `text`, and
+        `HTMLScriptElement.supports` (`classic`, `module`). Tab:
+        `ScriptLoad::node`; `Scripts::ordered` (HTML's list of scripts
+        that execute in order as soon as possible), run from its front
+        by `run_ready_scripts` (now guarded against running inside
+        itself); `load_inserted_script`, `load_inserted_module`;
+        `execute_script` sets `currentScript` for a classic script and
+        fires `load` or `error` at an external script's element.
+        Behaviour of existing features changed: the parser's external
+        scripts fire `load`/`error` at their elements (nothing fired
+        before); `currentScript` is set for the parser's classic
+        scripts; `prepare_script` marks its element "already started".
+        Tests: script `inserted_scripts_run_and_script_elements_reflect`,
+        tab `scripts_a_script_inserts_load_and_run` (a loopback server:
+        inline at once, the ordered pair waiting for a held first, the
+        free one meanwhile, a 404's `error`, an inline module). Full
+        runs: dom 27, style 92, script 37, tab 113, layout 119, paint 27
+        passing; clippy: none in the changed code.
+        SKIPPED: `blocking`; import maps (`supports('importmap')` is
+        false); a dynamic `import()` from an inserted inline script
+        takes the document's base URL and policy, not the script's own;
+        `ScriptError`'s event is fired at once, not as a task; the
+        document's `load` does not wait for inserted scripts beyond
+        their fetch; an inline script's wait for a pending
+        style sheet ("has a style sheet that is blocking scripts") is
+        not there, as for the parser's.
+        Timing (release probe, live, two runs against line 19a-1's
+        two): slower, the pages now running the scripts they insert:
+        Wikipedia Main Page load 791–808 ms (607–628), relayout
+        1.72–1.98 ms (1.62–1.74), heap 46.5 MiB (29.9), full restyle
+        44.4–44.9 ms (41.9–42.6); iana.org load 874–935 ms (514–526,
+        it now fetches and runs Google's search element), full restyle
+        2.44–2.63 ms (2.19–2.49), relayout 349–460 µs (272–360), heap
+        23.2 MiB (8.0). Not the same work as before; not measured
+        apart from it.
+        The sites after: bbc's 13 "chunk path empty but not in a
+        worker" errors are gone (`currentScript`); what the newly run
+        scripts stop at: `Image is not defined` and two errors in a
+        marketing script (cloudflare), `Blob is not defined`, a "not a
+        callable function" in its web components polyfill and a module
+        "not loaded yet" on a dynamic import (reddit), one error each
+        in Google's search element (iana.org), in Cloudflare's
+        challenge script (stackoverflow, which was a silent 22-node
+        page) and in a bbc chunk; react.dev logs none.
       - [ ] 19c. `document`: `currentScript` (the cause suspected for
         bbc's "chunk path empty but not in a worker"), `activeElement`,
         `hasFocus`, `visibilityState`, `hidden`, `scripts`, `links`,
