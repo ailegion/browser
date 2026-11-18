@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod custom;
 pub mod encoding;
 pub mod forms;
 mod fragment;
@@ -343,6 +344,8 @@ pub struct Document {
     /// `<meta name=referrer>` inserted or changed later replaces it
     /// (`meta_referrer`). `Empty` means the default.
     pub referrer_policy: browser_ipc_types::ReferrerPolicy,
+    /// Custom element data of the elements that have any (`custom.rs`).
+    custom: std::collections::HashMap<NodeId, custom::CustomData>,
 }
 
 /// One change to the tree, as a `MutationObserver` is told of it (DOM
@@ -407,6 +410,7 @@ impl Document {
             pending_radios: Vec::new(),
             controls_changed: Vec::new(),
             referrer_policy: browser_ipc_types::ReferrerPolicy::Empty,
+            custom: Default::default(),
         }
     }
 
@@ -1014,7 +1018,16 @@ impl Document {
             self.note_created_element(&local);
         }
         let has_style = matches!(&kind, NodeKind::Element(e) if e.attr("style").is_some());
+        // Made with an `is` attribute (the parser, a fragment): that is
+        // its `is` value (a clone takes its original's, `clone_subtree`).
+        let is = match &kind {
+            NodeKind::Element(e) => e.attr_ns("", "is").map(str::to_owned),
+            _ => None,
+        };
         let id = self.nodes.insert(Node::new(kind));
+        if let Some(is) = is {
+            self.set_is_value(id, Some(&is));
+        }
         if img {
             self.created_images.push(id);
         }
@@ -1077,6 +1090,8 @@ impl Document {
             });
         }
         let copy = self.create_node(kind);
+        let is = self.is_value(id).map(str::to_owned);
+        self.set_is_value(copy, is.as_deref());
         self.clone_control_state(id, copy);
         // A clone's `style` keeps the base its original was parsed with.
         match self.style_bases.get(&id).cloned() {
@@ -1366,6 +1381,7 @@ impl Document {
             self.style_bases.remove(&n);
             self.link_bases.remove(&n);
             self.sheet_bases.remove(&n);
+            self.custom.remove(&n);
             self.nodes.remove(n);
         }
     }

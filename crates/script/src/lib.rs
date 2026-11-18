@@ -32,8 +32,10 @@
 
 #![forbid(unsafe_code)]
 
+mod attrs;
 mod crypto;
 mod cssns;
+mod custom;
 mod cssom;
 mod dom;
 mod elements;
@@ -1057,6 +1059,8 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     // `document` and the node classes; `Document.prototype` carries the
     // document properties of item 3.1 and reads `location` from the global.
     dom::register(context)?;
+    custom::register(context)?;
+    attrs::register(context)?;
     fonts::register(context)?;
     urlapi::register(context)?;
     perf::register(context)?;
@@ -3483,6 +3487,305 @@ mod tests {
                           () => m.observe(document.body, {characterData: false, characterDataOldValue: true}), () => m.observe(document.body, {attributes: false, attributeFilter: ['a']}), () => new MutationObserver(1), () => MutationObserver(() => {})]) \
                           { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } [errs.join(','), typeof WebKitMutationObserver, m.takeRecords().length].join('|')"),
             "TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError|function|0"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// `element.attributes`, `Attr` and the attribute node methods (DOM
+    /// §4.9.1, §4.9.2).
+    #[test]
+    fn attributes_are_a_live_map_of_attr_nodes() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><body><div id=d class='a b' data-x=1 Title=T></div><p id=other></p>\
+              <svg viewBox='0 0 1 1' xlink:href='#x'></svg></body>",
+        );
+        h.lend_document(doc, false, Default::default());
+        // The map: indexed, named, iterable, the same object each time.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var name = f => { try { f(); return 'no' } catch (e) { return e.name } }; \
+                 var d = document.getElementById('d'), m = d.attributes; \
+                 [m === d.attributes, m instanceof NamedNodeMap, Object.prototype.toString.call(m), m.length, Array.from(m).map(a => a.name).join('+'), [...m].length, \
+                  m[0].name, m[0] === m[0], m.id === m[0], m.item(1).value, m.item(9), m[9], m.getNamedItem('CLASS') === m[1], m.getNamedItem('nope'), \
+                  'id' in m, 0 in m, 9 in m, 'nope' in m, Object.keys(m).join('+'), Object.getOwnPropertyNames(m).join('+'), typeof m.item, \
+                  name(() => new NamedNodeMap()), name(() => new Attr())].join()"
+            ),
+            "true,true,[object NamedNodeMap],4,id+class+data-x+title,4,id,true,true,a b,,,true,,true,true,false,false,0+1+2+3,0+1+2+3+id+class+data-x+title,function,TypeError,TypeError"
+        );
+        // An Attr: a Node of type 2 that reads and writes its element's attribute.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var a = m[0]; var facts = [a instanceof Attr, a instanceof Node, Object.prototype.toString.call(a), a.nodeType, a.nodeName, a.name, a.localName, \
+                  String(a.prefix), String(a.namespaceURI), a.value, a.ownerElement === d, a.specified, a.ownerDocument === document, String(a.parentNode), a.isConnected, \
+                  a.hasChildNodes(), a === d.getAttributeNode('ID'), a.getRootNode() === a]; \
+                 d.setAttribute('id', 'e'); facts.push(a.value); a.value = 'f'; facts.push(d.id); a.nodeValue = null; facts.push(d.getAttribute('id') === ''); \
+                 a.textContent = 'g'; facts.push(d.id, a.nodeValue, a.textContent); facts.join()"
+            ),
+            "true,true,[object Attr],2,id,id,id,null,null,d,true,true,true,null,false,false,true,true,e,f,true,g,g,g"
+        );
+        // Removed, it keeps its value and has no element; set again, it is
+        // the element's attribute once more.
+        assert_eq!(
+            eval(
+                &mut h,
+                "d.removeAttribute('id'); var gone = [String(a.ownerElement), a.value, m.length, String(d.getAttributeNode('id'))]; a.value = 'z'; \
+                 gone.push(d.hasAttribute('id'), String(d.setAttributeNode(a)), d.getAttribute('id'), a.ownerElement === d, d.getAttributeNode('id') === a, \
+                   d.setAttributeNode(a) === a, Array.from(m).map(x => x.name).join('+')); gone.join()"
+            ),
+            "null,g,3,null,false,null,z,true,true,true,class+data-x+title+id"
+        );
+        // An attribute replaced by a node keeps its place; the old node is
+        // let go with its value; a node in use elsewhere is refused.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var n = document.createAttribute('CLASS'); n.value = 'c'; var was = m.class; var old = d.setAttributeNode(n); \
+                 var other = document.getElementById('other'); \
+                 [n.name, old === was, old.value, String(old.ownerElement), d.className, m.class === n, Array.from(m).map(x => x.name).join('+'), \
+                  name(() => other.setAttributeNode(n)), String(other.setAttributeNode(n.cloneNode())), other.className, n.cloneNode().isEqualNode(n), n.cloneNode() === n, \
+                  n.isEqualNode(a), n.isEqualNode(null), n.isSameNode(n), d.removeAttributeNode(n) === n, d.hasAttribute('class'), String(n.ownerElement), \
+                  name(() => d.removeAttributeNode(n)), name(() => m.removeNamedItem('nope')), m.removeNamedItem('data-x').value, m.length, \
+                  name(() => d.setAttributeNode({})), name(() => m.setNamedItem())].join()"
+            ),
+            "class,true,a b,null,c,true,class+data-x+title+id,InUseAttributesError,null,c,true,false,false,false,true,true,false,null,NotFoundError,NotFoundError,1,2,TypeError,TypeError"
+        );
+        // Every way an attribute goes lets its node go: `dataset`, `classList`.
+        assert_eq!(
+            eval(
+                &mut h,
+                "d.dataset.k = 'v'; var k = d.getAttributeNode('data-k'); delete d.dataset.k; d.className = 'q'; var c = m.class; d.classList.add('r'); \
+                 [String(k.ownerElement), k.value, c.value, c.ownerElement === d].join()"
+            ),
+            "null,v,q r,true"
+        );
+        // Namespaced attributes, and names as written outside HTML.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var s = document.querySelector('svg'), x = s.getAttributeNodeNS('http://www.w3.org/1999/xlink', 'href'); \
+                 [x.name, x.prefix, x.localName, x.namespaceURI, x.value, s.attributes['xlink:href'] === x, s.attributes.viewBox.value, s.attributes.getNamedItem('viewbox'), \
+                  String(s.attributes.getNamedItemNS(null, 'viewBox').namespaceURI), s.attributes.removeNamedItemNS('http://www.w3.org/1999/xlink', 'href') === x, \
+                  String(x.ownerElement), x.value, s.attributes.length].join()"
+            ),
+            "xlink:href,xlink,href,http://www.w3.org/1999/xlink,#x,true,0 0 1 1,,null,true,null,#x,1"
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                "var q = document.createAttributeNS('http://example.test/ns', 'p:Loc'); \
+                 [q.name, q.prefix, q.localName, q.namespaceURI, q.value, String(q.ownerElement), name(() => document.createAttribute('')), name(() => document.createAttribute()), \
+                  name(() => document.createAttributeNS('', 'a:b')), name(() => document.createAttributeNS('http://example.test/', 'xmlns')), \
+                  name(() => document.createAttributeNS('http://example.test/', 'xml:a')), name(() => document.createAttributeNS('http://www.w3.org/2000/xmlns/', 'a')), \
+                  name(() => document.createAttributeNS(null, 'a b')), document.createAttributeNS(null, 'Plain').name, \
+                  (s.setAttributeNodeNS(q), s.getAttributeNS('http://example.test/ns', 'Loc') === ''), s.attributes['p:Loc'] === q].join()"
+            ),
+            "p:Loc,p,Loc,http://example.test/ns,,null,InvalidCharacterError,TypeError,NamespaceError,NamespaceError,NamespaceError,NamespaceError,InvalidCharacterError,Plain,true,true"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// `customElements`: `define()` with its checks and the order it reads
+    /// a constructor in, `get`, `getName`, `whenDefined` (HTML §4.13.4).
+    #[test]
+    fn custom_element_registry_defines_and_answers() {
+        let mut h = host();
+        h.lend_document(browser_dom::parse_html(b"<!DOCTYPE html><body></body>"), false, Default::default());
+        assert_eq!(
+            eval(
+                &mut h,
+                "var name = f => { try { f(); return 'no' } catch (e) { return e.name } }; \
+                 [typeof customElements, customElements instanceof CustomElementRegistry, Object.prototype.toString.call(customElements), \
+                  customElements === window.customElements, Object.keys(CustomElementRegistry.prototype).sort().join('+'), customElements.define.length, \
+                  name(() => customElements.define.call({}, 'a-b', class extends HTMLElement {}))].join()"
+            ),
+            "object,true,[object CustomElementRegistry],true,define+get+getName+upgrade+whenDefined,2,TypeError"
+        );
+        // What define() refuses, each with its exception; a refused name stays free.
+        assert_eq!(
+            eval(
+                &mut h,
+                "class Used extends HTMLElement {} customElements.define('x-used', Used); \
+                 var proto = cb => { var C = function () {}; C.prototype = cb; return C; }; \
+                 [name(() => customElements.define('x-a')), name(() => customElements.define('x-a', 1)), name(() => customElements.define('x-a', () => {})), \
+                  name(() => customElements.define('nohyphen', class extends HTMLElement {})), name(() => customElements.define('X-a', class extends HTMLElement {})), \
+                  name(() => customElements.define('font-face', class extends HTMLElement {})), name(() => customElements.define('x-used', class extends HTMLElement {})), \
+                  name(() => customElements.define('x-again', Used)), name(() => customElements.define('x-a', class extends HTMLElement {}, { extends: 'x-used' })), \
+                  name(() => customElements.define('x-a', class extends HTMLElement {}, { extends: 'nosuchelement' })), \
+                  name(() => customElements.define('x-a', class extends HTMLElement {}, 5)), name(() => customElements.define('x-a', proto(1))), \
+                  name(() => customElements.define('x-a', proto({ connectedCallback: 1 }))), \
+                  name(() => customElements.define('x-a', class extends HTMLElement { static observedAttributes = 5; attributeChangedCallback() {} })), \
+                  name(() => customElements.define('x-a', class extends HTMLElement { static get disabledFeatures() { throw new RangeError('mine') } })), \
+                  name(() => customElements.define('x-a', class extends HTMLElement { static get formAssociated() { customElements.define('x-nested', class extends HTMLElement {}); } })), \
+                  customElements.get('x-a'), customElements.get('x-nested'), name(() => customElements.define('x-a', class extends HTMLElement {})), typeof customElements.get('x-a')].join()"
+            ),
+            "TypeError,TypeError,TypeError,SyntaxError,SyntaxError,SyntaxError,NotSupportedError,NotSupportedError,NotSupportedError,NotSupportedError,\
+             TypeError,TypeError,TypeError,TypeError,RangeError,NotSupportedError,,,no,function"
+        );
+        // The order a constructor is read in: its prototype, the five
+        // callbacks, observedAttributes only with an attributeChangedCallback,
+        // disabledFeatures, formAssociated, the form callbacks only then.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var order = []; var C = function () {}; \
+                 C.prototype = new Proxy({}, { get(t, k) { if (typeof k === 'string') order.push('p.' + k); return undefined; } }); \
+                 customElements.define('x-order', new Proxy(C, { get(t, k, r) { if (typeof k === 'string') order.push('c.' + k); return Reflect.get(t, k, r); } })); \
+                 order.join(' ')"
+            ),
+            "c.prototype p.connectedCallback p.disconnectedCallback p.connectedMoveCallback p.adoptedCallback p.attributeChangedCallback c.disabledFeatures c.formAssociated"
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                "order = []; customElements.define('x-form', class extends HTMLElement { \
+                   static get observedAttributes() { order.push('observed'); return new Set(['x']); } static get disabledFeatures() { order.push('disabled'); return ['shadow']; } \
+                   static get formAssociated() { order.push('form'); return 1; } attributeChangedCallback() {} \
+                   get formAssociatedCallback() { order.push('fa'); } get formResetCallback() { order.push('fr'); } \
+                   get formDisabledCallback() { order.push('fd'); } get formStateRestoreCallback() { order.push('fs'); } }); order.join(' ')"
+            ),
+            "observed disabled form fa fr fd fs"
+        );
+        // get, getName, whenDefined.
+        assert_eq!(
+            eval(
+                &mut h,
+                "[customElements.get('x-used') === Used, customElements.get('x-none'), customElements.getName(Used), customElements.getName(class {}), \
+                  name(() => customElements.getName(1)), name(() => customElements.get())].join()"
+            ),
+            "true,,x-used,,TypeError,TypeError"
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                "var seen = []; var pending = customElements.whenDefined('x-later'); \
+                 pending.then(c => seen.push('later:' + (c === Later))); customElements.whenDefined('x-used').then(c => seen.push('used:' + (c === Used))); \
+                 customElements.whenDefined('bad').catch(e => seen.push('bad:' + e.name)); \
+                 var same = pending === customElements.whenDefined('x-later'); class Later extends HTMLElement {} customElements.define('x-later', Later); \
+                 [same, pending instanceof Promise, pending !== customElements.whenDefined('x-later'), seen.length].join()"
+            ),
+            "true,true,true,0"
+        );
+        assert_eq!(eval(&mut h, "seen.sort().join()"), "bad:SyntaxError,later:true,used:true");
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// Custom elements are constructed and upgraded: `new`, `createElement`,
+    /// the elements already in the document when `define()` runs,
+    /// `customElements.upgrade`, and what a failing constructor leaves.
+    #[test]
+    fn custom_elements_construct_and_upgrade() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><body><x-early a=1 b=2></x-early><div><x-early></x-early></div><x-bad></x-bad><x-twice></x-twice><x-other></x-other>\
+              <section is=fancy-section></section><section></section></body>",
+        );
+        h.lend_document(doc, false, Default::default());
+        // define() upgrades the document's elements of that name in tree
+        // order: the constructor, then the reactions the upgrade enqueued.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var name = f => { try { f(); return 'no' } catch (e) { return e.name } }; var log = []; \
+                 var first = document.querySelector('x-early'), before = Object.getPrototypeOf(first) === HTMLElement.prototype; \
+                 class Early extends HTMLElement { static observedAttributes = ['a']; \
+                   constructor() { super(); log.push('new:' + (this instanceof Early) + ':' + this.getAttribute('a')); } \
+                   connectedCallback() { log.push('connected:' + this.isConnected); } \
+                   attributeChangedCallback(n, o, v, ns) { log.push(['attr', n, o, v, ns].map(String).join(':')); } } \
+                 customElements.define('x-early', Early); \
+                 [before, first === document.querySelector('x-early'), first instanceof Early, Object.getPrototypeOf(first) === Early.prototype, \
+                  document.querySelectorAll('x-early')[1] instanceof Early, document.querySelector('x-other') instanceof Early, log.join(' ')].join()"
+            ),
+            "true,true,true,true,true,false,new:true:1 attr:a:null:1:null connected:true new:true:null connected:true"
+        );
+        // `new` and createElement make a custom element at once.
+        assert_eq!(
+            eval(
+                &mut h,
+                "log = []; var made = new Early(); var created = document.createElement('X-Early'); \
+                 [made instanceof Early, made.localName, made.isConnected, made.ownerDocument === document, made.getAttributeNames().length, created instanceof Early, \
+                  created !== made, created.localName, log.join(' '), name(() => new HTMLElement()), name(() => HTMLElement()), \
+                  name(() => new (class extends HTMLElement {})())].join()"
+            ),
+            "true,x-early,false,true,0,true,true,x-early,new:true:null new:true:null,TypeError,TypeError,TypeError"
+        );
+        // A detached element is not found by define(); upgrade() takes it
+        // and its descendants.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var loose = document.createElement('div'); loose.innerHTML = '<x-late></x-late>'; var late = loose.firstChild; \
+                 var alone = document.createElement('x-late'); class Late extends HTMLElement {} customElements.define('x-late', Late); \
+                 var a = [late instanceof Late, alone instanceof Late]; customElements.upgrade(loose); customElements.upgrade(alone); \
+                 a.concat([late instanceof Late, alone instanceof Late, name(() => customElements.upgrade(1)), name(() => customElements.upgrade())]).join()"
+            ),
+            "false,false,true,true,TypeError,TypeError"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+        // A constructor that throws during an upgrade: reported, the
+        // element stays an HTMLElement and is not tried again.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var tries = 0; class Bad extends HTMLElement { constructor() { super(); tries++; throw new RangeError('bad constructor'); } } \
+                 customElements.define('x-bad', Bad); var bad = document.querySelector('x-bad'); customElements.upgrade(bad); \
+                 [tries, bad instanceof HTMLElement, document.querySelector('x-other') instanceof Bad].join()"
+            ),
+            "1,true,false"
+        );
+        let reported = lines(&mut h);
+        assert!(reported.len() == 1 && reported[0].contains("RangeError") && reported[0].contains("bad constructor"), "{reported:?}");
+        // createElement with it: reported, an HTMLUnknownElement of that name.
+        assert_eq!(
+            eval(&mut h, "var failed = document.createElement('x-bad'); [failed instanceof HTMLUnknownElement, failed instanceof Bad, failed.localName, tries].join()"),
+            "true,false,x-bad,2"
+        );
+        assert_eq!(lines(&mut h).len(), 1);
+        // What createElement refuses of a constructor's result; `new` takes it.
+        assert_eq!(
+            eval(
+                &mut h,
+                "class Attr extends HTMLElement { constructor() { super(); this.setAttribute('made', ''); } } customElements.define('x-attr', Attr); \
+                 class Child extends HTMLElement { constructor() { super(); this.append('text'); } } customElements.define('x-child', Child); \
+                 class Other extends HTMLElement { constructor() { super(); return document.createElement('div'); } } customElements.define('x-div', Other); \
+                 class NotNode extends HTMLElement { constructor() { super(); return {}; } } customElements.define('x-object', NotNode); \
+                 [document.createElement('x-attr') instanceof HTMLUnknownElement, document.createElement('x-child') instanceof HTMLUnknownElement, \
+                  document.createElement('x-div') instanceof HTMLUnknownElement, document.createElement('x-object') instanceof HTMLUnknownElement, \
+                  new Attr().hasAttribute('made'), new Child().textContent].join()"
+            ),
+            "true,true,true,true,true,text"
+        );
+        let reported = lines(&mut h);
+        assert_eq!(reported.len(), 4, "{reported:?}");
+        assert!(reported[0].contains("NotSupportedError") && reported[1].contains("NotSupportedError"), "{reported:?}");
+        // super() twice in an upgrade, and a constructor returning another
+        // object: the upgrade fails with a TypeError (the prototype its
+        // super() gave the element stays, as the standard's steps leave it).
+        assert_eq!(
+            eval(
+                &mut h,
+                "var second = ''; class Twice extends HTMLElement { constructor() { super(); try { Reflect.construct(HTMLElement, [], Twice); } catch (e) { second = e.name; } } } \
+                 customElements.define('x-twice', Twice); class Swap extends HTMLElement { constructor() { super(); return document.createElement('p'); } } \
+                 customElements.define('x-other', Swap); \
+                 var swapped = document.querySelector('x-other'); customElements.upgrade(swapped); \
+                 [second, document.querySelector('x-twice') instanceof Twice, swapped instanceof Swap, swapped.localName].join()"
+            ),
+            "TypeError,true,true,x-other"
+        );
+        let reported = lines(&mut h);
+        assert!(reported.len() == 1 && reported[0].contains("TypeError"), "{reported:?}");
+        // A customized built-in of an element with no interface of its own
+        // is reached through HTMLElement: the `is` value picks it.
+        assert_eq!(
+            eval(
+                &mut h,
+                "class Fancy extends HTMLElement {} customElements.define('fancy-section', Fancy, { extends: 'section' }); var s = document.querySelectorAll('section'); \
+                 var fresh = new Fancy(); [s[0] instanceof Fancy, s[1] instanceof Fancy, fresh.localName, fresh instanceof Fancy, customElements.getName(Fancy), \
+                  document.createElement('fancy-section') instanceof Fancy].join()"
+            ),
+            "true,false,section,true,fancy-section,false"
         );
         assert_eq!(lines(&mut h), Vec::<String>::new());
     }

@@ -108,13 +108,7 @@ pub(crate) fn interface_for(local: &str) -> &'static str {
 /// `createElement` give them (lower case): a lower-case ASCII letter
 /// first, a hyphen in it, none of the names SVG and MathML took.
 fn is_custom_element_name(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_lowercase())
-        && name.contains('-')
-        && !name.bytes().any(|b| b.is_ascii_uppercase())
-        && !matches!(
-            name,
-            "annotation-xml" | "color-profile" | "font-face" | "font-face-src" | "font-face-uri" | "font-face-format" | "font-face-name" | "missing-glyph"
-        )
+    browser_dom::custom::is_valid_custom_element_name(name)
 }
 
 /// The interfaces made here, each with the interface it inherits from

@@ -1834,6 +1834,196 @@ remaining lists as they stand.
       but not in a worker" errors (cause not found), stackoverflow's
       22-node page with no script error; wikipedia, iana.org and
       react.dev log no error.
+- [ ] 17. Custom elements (owner, 2026-11-18, the largest gap line 16's
+      probe run found: cloudflare and reddit stopped at `customElements
+      is not defined`; from line 7's "Later"). HTML §4.13 and DOM's
+      "create an element". The owner left the decisions to the
+      implementer ("don't ask, just do"); each is recorded here. Built
+      in blocks:
+      - [x] 17a. Registry, definitions, constructors, upgrades (built
+        2026-11-18).
+      - [ ] 17b. The reactions the tree enqueues: `connectedCallback` on
+        insertion, `disconnectedCallback`, `connectedMoveCallback`,
+        `attributeChangedCallback` on every attribute change (the
+        bindings that write attributes have no single path: `dataset`,
+        `classList`, `style`, form `value`, dialog `open`,
+        `document.title`), "try to upgrade" on insertion (an element
+        `innerHTML` or the parser made after its definition exists is
+        not upgraded until then), `cloneNode`, and `:defined` with its
+        restyle.
+      - [ ] 17c. The parser's "create an element for the token": a
+        defined element's constructor runs where the parser meets its
+        tag. Decision to take when built: html5ever hands control back
+        only at `</script>`, so either its sink calls into script
+        mid-parse (how the tab lends the document changes) or the
+        element is upgraded when the parser next yields (the
+        constructor then runs later than in browsers).
+      - [ ] 17d. Customized built-ins: the HTML element constructor
+        steps for every interface but `HTMLElement` (their constructors
+        throw today, so upgrading `<p is=…>` reports a TypeError),
+        `createElement(name, { is })`.
+      - [ ] 17e. `ElementInternals`, `attachInternals()`, form-associated
+        custom elements (the four form callbacks are read and kept by
+        `define()` already), `CustomStateSet` and `:state()`.
+      - [ ] 17f. Scoped registries: `new CustomElementRegistry()`,
+        `initialize()`, the `customElementRegistry` options. Which
+        browsers ship them was not checked.
+      - [ ] 17g. `adoptedCallback`: needs a second document
+        (`adoptNode`, `importNode`), which nothing has yet.
+      Shadow DOM (`attachShadow`, `ShadowRoot`, slots, style scoping,
+      event retargeting, layout over the flat tree) is not part of this
+      line: a line of its own, after.
+      17a, built 2026-11-18. DOM (`crates/dom/src/custom.rs`): beside
+      the tree, only for the elements that have any, each element's
+      custom element state (`CustomElementState`; with no entry
+      "undefined" for an HTML element with a valid custom element name
+      or an `is` value, "uncustomized" otherwise), its `is` value (the
+      `is` attribute the parser or a fragment saw at creation; a clone
+      takes its original's, not what its attribute says) and its
+      definition's number; `is_valid_custom_element_name` and
+      `is_valid_element_local_name` as the standards have them (the
+      script crate's own name check now calls the first). Script
+      (`crates/script/src/custom.rs`): `CustomElementRegistry` and
+      `window.customElements` (an accessor); `define()` (WebIDL's
+      conversions, then the standard's steps in order: not a
+      constructor a TypeError, an invalid name a SyntaxError, a name or
+      constructor used before, `extends` naming a custom element or an
+      unknown element, and a `define()` inside a `define()` each a
+      NotSupportedError; the prototype, the five callbacks,
+      `observedAttributes` only with an `attributeChangedCallback`,
+      `disabledFeatures`, `formAssociated` and then the four form
+      callbacks read in that order, a sequence read through the
+      iterator protocol itself; what a getter throws goes on and the
+      name stays free), `get`, `getName`, `whenDefined` (one promise
+      per name until it is defined; an invalid name a rejected
+      promise), `upgrade(root)`; "upgrade an element" (the states, the
+      construction stack with its "already constructed" marker, the
+      reactions it enqueues: `attributeChangedCallback` for each
+      observed attribute, `connectedCallback` when connected; a
+      constructor that throws or returns another object is reported
+      and the element left "failed", never tried again); the HTML
+      element constructor steps for `HTMLElement` (`new` on a defined
+      constructor makes a custom element with `new.target`'s
+      prototype; `super()` during an upgrade returns the element being
+      upgraded with that prototype; `HTMLElement` itself and an
+      undefined subclass throw; a customized built-in of an element
+      with no interface of its own, `section` and the like, is reached
+      through it and gets its `is` value); `document.createElement`
+      for a defined name (the constructor runs at once; a result with
+      attributes, children, a parent or another name, one that is not
+      an element, and a throw are reported and give an
+      `HTMLUnknownElement` in the "failed" state); the custom element
+      reactions stack (`with_reactions`, around every method of
+      `mutate_call` and every setter of `set`, and around `define` and
+      `upgrade`), the backup element queue as a microtask, each
+      element's reaction queue, `connectedMoveCallback`'s fallback to
+      the other two. `define()` upgrades the document's elements of
+      that name (and `is` value) in tree order.
+      Behaviour of existing features changed on the way:
+      `new HTMLElement()` and `HTMLElement()` still throw a TypeError
+      but through the constructor steps (the message of the call
+      without `new` differs); every `mutate_call` method and `set`
+      setter pushes and pops an element queue.
+      Tests: dom `custom::tests::names_states_and_is_values`; script
+      `custom_element_registry_defines_and_answers` (the refusals, the
+      read order through proxies and getters, `whenDefined`),
+      `custom_elements_construct_and_upgrade` (upgrade order and
+      reactions, `new`, `createElement` and its refusals, `upgrade()`
+      on detached nodes, failing constructors, `super()` twice, a
+      `section` customized built-in). Full runs: dom 27, style 92,
+      script 33, tab 112, layout 119, paint 27 passing; clippy: none in
+      the new code.
+      SKIPPED in 17a (each a block above): the active custom element
+      constructor map and `initialize()` (17f); "upgrade an element"
+      step 11.1's shadow root check (no shadow roots) and step 12's
+      form association (17e). Not verified against Chrome and Firefox:
+      the error messages' texts; `customElements` methods being
+      enumerable (WebIDL's rule; the older interfaces here are not).
+      Found, not changed: `element.attributes` (`NamedNodeMap`) does
+      not exist in the engine.
+      Timing (release probe, live, two runs against line 16's two):
+      slower: Wikipedia Main Page full restyle 45.9–47.3 ms (41.1–43.3),
+      relayout 1.61–1.92 ms (1.56–1.65), iana.org load 535–567 ms
+      (522–545), not attributed (the page had 4198 nodes against 4098,
+      nothing in 17a runs in a restyle or a relayout, and the build
+      before line 16 measured 48.7 ms); Wikipedia load 602–629 ms
+      (636–647), iana.org full restyle 2.44–2.57 ms (2.30–2.55),
+      relayout 294–333 µs (294–402).
+      The sites after: reddit logs no error (it stopped twice at
+      `customElements`), 3436 nodes; cloudflare is past `customElements`,
+      next "not a callable function" in its search modal's script (not
+      identified), the beacon's null/undefined error and the inline
+      "not a callable function" still there; youtube unchanged (its
+      own polyfill stops at `NodeFilter is not defined`, then
+      `MessageChannel is not defined`), 12.6 s and a 731 MiB peak this
+      run (1.7 s and 113 MiB the run before; the same swing was seen
+      before this line).
+- [ ] 18. `element.attributes`, `Attr` and the attribute node methods
+      (owner, 2026-11-18; found missing while testing line 17a; DOM
+      §4.9.1, §4.9.2).
+      Built 2026-11-18, not ticked (SKIPPED parts at the end). Script
+      (`crates/script/src/attrs.rs`): `Element.attributes`, a
+      `NamedNodeMap` (one per element, a proxy over the element's
+      attribute list at the time of each read: indices, `length`,
+      `item`, the attributes' qualified names as unenumerable named
+      properties after the interface's own, for an HTML element not
+      those with an upper-case ASCII letter; iterable;
+      `getNamedItem`/`NS`, `setNamedItem`/`NS`, `removeNamedItem`/`NS`
+      with their NotFoundError); `Attr` (under `Node`: `name`,
+      `localName`, `prefix`, `namespaceURI`, `value`, `ownerElement`,
+      `specified`; one object per attribute for as long as it is on its
+      element, made when first asked for, `Dom::attr_nodes`; its value
+      read from the element; a write to `value`, `nodeValue` or
+      `textContent`, null the empty string for the last two, changes
+      the attribute); an `Attr` whose attribute goes away, by any of
+      the bindings that write attributes (`Dom::record_attr`, which
+      every one of them calls), keeps the value it had and has no
+      element; `getAttributeNode`/`NS`, `setAttributeNode`/`NS` (a node
+      of another element an InUseAttributesError; the attribute it
+      replaces keeps its place in the list and its node is let go with
+      its value and returned), `removeAttributeNode` (not this
+      element's a NotFoundError); `document.createAttribute` (lower
+      case, InvalidCharacterError) and `createAttributeNS` ("validate
+      and extract" with its NamespaceErrors). `dom.rs`:
+      `write_attribute`, an attribute write by namespace and local name
+      with nothing validated or lowercased, followed by what `mutate`
+      runs after its own (the image, form, `<meta>`, `<base>`, `style`
+      and `<link>` hooks, the mutation record, the tab's restyle); the
+      writes run inside `with_reactions`.
+      Test: script `attributes_are_a_live_map_of_attr_nodes` (the map,
+      an `Attr`'s members, live values both ways, removal and setting
+      again, replacement in place, the errors, `dataset` and
+      `classList` letting a node go, namespaced attributes and names as
+      written on an SVG element, the two `create` methods). Full runs:
+      dom 27, style 92, script 34, tab 112, layout 119, paint 27
+      passing; the paint unit tests' process ended once with an access
+      violation and no test named (the known one, line 7's record),
+      passing in the run after; clippy: none in the new code.
+      SKIPPED: the rest of `Node` and `EventTarget` on an `Attr`
+      (`childNodes`, `contains`, `compareDocumentPosition`, the
+      namespace lookups, `normalize`, the insertion methods,
+      `addEventListener` and its relatives throw "Illegal invocation";
+      built: `nodeType`, `nodeName`, `nodeValue`, `textContent`,
+      `ownerDocument`, `parentNode`, `parentElement`, the sibling and
+      child getters, `isConnected`, `cloneNode`, `isEqualNode`,
+      `isSameNode`, `getRootNode`, `hasChildNodes`); an element's
+      `isEqualNode`/`contains`/`compareDocumentPosition` given an
+      `Attr` (a TypeError here); `attributeChangedCallback` from these
+      writes (line 17b, with every other attribute write). Not
+      verified against Chrome and Firefox: the error messages' texts;
+      a detached namespaced `Attr`'s value when `removeAttribute(name)`
+      (which here drops every attribute of that local name) took it.
+      Found, not changed: `Dom::wrappers`, the `classList`, `dataset`
+      and now `attributes` maps keep their entry after a node is freed.
+      Timing (release probe, live, two runs against line 17a's two):
+      none slower: Wikipedia Main Page load 602–621 ms (602–629), full
+      restyle 44.2–47.2 ms (45.9–47.3), relayout 1.51–1.69 ms
+      (1.61–1.92); iana.org load 437–496 ms (535–567), full restyle
+      2.24–2.54 ms (2.44–2.57), relayout 272–319 µs (294–333).
+      The sites after: no console line changed. The "cannot convert
+      'null' or 'undefined' to object" errors of google, youtube,
+      amazon's challenge and cloudflare's beacon are all still there,
+      so `attributes` was not their cause.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

@@ -107,6 +107,12 @@ pub(crate) struct Dom {
     pending_free: Vec<NodeId>,
     /// The forms' submission and reset flags (`forms.rs`).
     pub(crate) forms: crate::forms::FormFlags,
+    /// The `Attr` objects scripts hold for attributes that are on an
+    /// element, and one `attributes` map per element (`attrs.rs`).
+    pub(crate) attr_nodes: HashMap<NodeId, Vec<JsObject>>,
+    pub(crate) attr_maps: HashMap<NodeId, JsObject>,
+    /// The private key an `attributes` proxy answers with its target.
+    pub(crate) attr_key: Option<boa_engine::JsSymbol>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -327,6 +333,11 @@ impl Dom {
     /// or not): the record a `MutationObserver` gets. `name` is the local
     /// name.
     pub(crate) fn record_attr(&mut self, element: NodeId, name: &str, namespace: Option<&str>, old: Option<String>) {
+        // An `Attr` a script holds for an attribute that went away keeps
+        // the value it had and has no element any more.
+        if self.attr_nodes.contains_key(&element) {
+            crate::attrs::attribute_changed(self, element, name, old.as_deref());
+        }
         if self.doc.mutations_observed() {
             self.doc.log_mutation(browser_dom::TreeMutation::Attribute {
                 element,
@@ -538,10 +549,94 @@ macro_rules! dom_class {
 
 dom_class!(NodeClass, "Node", init_node);
 dom_class!(ElementClass, "Element", init_element);
-dom_class!(HtmlElementClass, "HTMLElement", |class| {
-    crate::view::add_html_element_geometry(class);
-    Ok(())
-});
+#[derive(Debug, Trace, Finalize, JsData)]
+struct HtmlElementClass;
+
+impl Class for HtmlElementClass {
+    const NAME: &'static str = "HTMLElement";
+
+    fn init(class: &mut ClassBuilder<'_>) -> JsResult<()> {
+        crate::view::add_html_element_geometry(class);
+        Ok(())
+    }
+
+    fn data_constructor(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<Self> {
+        Err(JsNativeError::typ().with_message("Illegal constructor").into())
+    }
+
+    /// HTML's element constructor steps: `new` on a custom element's
+    /// constructor, and its `super()` during an upgrade (`custom.rs`).
+    fn construct(new_target: &JsValue, _: &[JsValue], context: &mut Context) -> JsResult<JsObject> {
+        crate::custom::html_element_constructor(new_target, context)
+    }
+}
+
+/// `HTMLElement`'s interface prototype object and its interface object.
+pub(crate) fn html_element_interface(context: &mut Context) -> JsResult<(JsObject, JsObject)> {
+    context
+        .get_global_class::<HtmlElementClass>()
+        .map(|c| (c.prototype(), c.constructor()))
+        .ok_or_else(|| JsNativeError::typ().with_message("HTMLElement is not registered").into())
+}
+
+/// The interface prototype objects of `Node`, `Element` and `Document`.
+pub(crate) fn node_element_document_prototypes(context: &mut Context) -> JsResult<(JsObject, JsObject, JsObject)> {
+    Ok((prototype_of::<NodeClass>(context)?, prototype_of::<ElementClass>(context)?, prototype_of::<DocumentClass>(context)?))
+}
+
+/// Set (`Some`) or remove (`None`) the attribute of `element` with that
+/// namespace (empty for none) and local name, as an `Attr` or the
+/// `attributes` map does it: nothing is validated or lowercased, an
+/// attribute that is there keeps its place, and what follows an attribute
+/// change follows (the element's own reactions, the mutation record, the
+/// tab's restyle). The value before.
+pub(crate) fn write_attribute(dom: &mut Dom, element: NodeId, namespace: &str, prefix: Option<&str>, local: &str, value: Option<&str>) -> Option<String> {
+    use html5ever::{Attribute as Attr, LocalName, Namespace, Prefix, QualName};
+    dom.generation += 1;
+    let e = dom.doc.get_mut(element).as_element_mut()?;
+    let old = e.attr_ns(namespace, local).map(str::to_owned);
+    match value {
+        Some(value) => {
+            let name = QualName::new(prefix.map(Prefix::from), Namespace::from(namespace), LocalName::from(local));
+            match e.attrs.iter_mut().find(|a| *a.name.ns == *namespace && *a.name.local == *local) {
+                Some(a) => {
+                    a.name = name;
+                    a.value = value.into();
+                }
+                None => e.attrs.push(Attr { name, value: value.into() }),
+            }
+        }
+        None if old.is_none() => return None,
+        None => e.remove_attr_ns(namespace, local),
+    }
+    if namespace.is_empty() {
+        let name = local.to_ascii_lowercase();
+        dom.doc.note_image_attribute(element, &name);
+        dom.doc.note_form_attribute(element, &name, old.as_deref());
+        if matches!(name.as_str(), "name" | "content") {
+            dom.doc.meta_referrer(element);
+        }
+        dom.doc.note_base_attribute(element, &name);
+        if name == "style" {
+            dom.doc.note_style_attribute(element);
+        }
+        dom.doc.note_link_attribute(element, &name);
+    }
+    dom.record_attr(element, local, (!namespace.is_empty()).then_some(namespace), old.clone());
+    if dom.doc.is_connected(element) {
+        dom.note_attr(element, &local.to_ascii_lowercase(), old.clone());
+    }
+    old
+}
+
+/// The wrapper of a node that has none yet, with the prototype given (a
+/// custom element's constructor's, `HTMLUnknownElement`'s for one whose
+/// constructor failed).
+pub(crate) fn wrap_with(id: NodeId, prototype: JsObject, context: &mut Context) -> JsResult<JsObject> {
+    let object = JsObject::from_proto_and_data(prototype, DomNode { id: Some(id) });
+    dom(context)?.borrow_mut().wrappers.insert(id, object.clone());
+    Ok(object)
+}
 // The `img` interface ("Working sites first" 6m: `currentSrc`; its other
 // members are Phase 5's DOM bindings).
 dom_class!(HtmlImageElementClass, "HTMLImageElement", |class| {
@@ -1792,7 +1887,7 @@ fn log_replace_all(doc: &mut Document, parent: NodeId, added: Vec<NodeId>, remov
 
 /// An attribute name a script may set: not empty, no whitespace or
 /// markup characters.
-fn valid_attribute_name(name: &str) -> bool {
+pub(crate) fn valid_attribute_name(name: &str) -> bool {
     !name.is_empty()
         && !name
             .chars()
@@ -1843,12 +1938,15 @@ fn replace_children_with_html(dom: &mut Dom, id: NodeId, html: &str) {
 }
 
 fn set(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) -> JsResult<JsValue> {
-    let result = set_prop(this, args, prop, context);
-    // `innerHTML` may have made `<img>` elements; `textContent` may have
-    // taken some out of a `<picture>`.
-    flush_images(context);
-    crate::observers::drain(context);
-    result
+    // Each of these setters is `[CEReactions]`.
+    crate::custom::with_reactions(context, |context| {
+        let result = set_prop(this, args, prop, context);
+        // `innerHTML` may have made `<img>` elements; `textContent` may have
+        // taken some out of a `<picture>`.
+        flush_images(context);
+        crate::observers::drain(context);
+        result
+    })
 }
 
 fn set_prop(this: &JsValue, args: &[JsValue], prop: &SetProp, context: &mut Context) -> JsResult<JsValue> {
@@ -2341,6 +2439,11 @@ fn viable_sibling(doc: &Document, id: NodeId, nodes: &[NodeId], backwards: bool)
 }
 
 fn mutate_call(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &mut Context) -> JsResult<JsValue> {
+    // Each of these operations is `[CEReactions]`.
+    crate::custom::with_reactions(context, |context| mutate_steps(this, args, method, context))
+}
+
+fn mutate_steps(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &mut Context) -> JsResult<JsValue> {
     use MutMethod::*;
     let node = this_node(this)?;
     // String arguments are converted before the borrow: that can run script.
@@ -2377,6 +2480,16 @@ fn mutate_call(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &m
         CloneNode => Some(args.get_or_undefined(0).to_boolean()),
         _ => None,
     };
+    // A name with a custom element definition: its constructor makes the
+    // element (DOM's "create an element", synchronously).
+    if matches!(method, CreateElement) {
+        let name = strings[0].to_ascii_lowercase();
+        if valid_element_name(&name)
+            && let Some(element) = crate::custom::create_element(&name, context)?
+        {
+            return Ok(element);
+        }
+    }
     let shared = dom(context)?;
     let result = {
         let mut dom = shared.borrow_mut();
