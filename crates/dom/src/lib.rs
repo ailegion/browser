@@ -346,6 +346,10 @@ pub struct Document {
     pub referrer_policy: browser_ipc_types::ReferrerPolicy,
     /// Custom element data of the elements that have any (`custom.rs`).
     custom: std::collections::HashMap<NodeId, custom::CustomData>,
+    /// Elements and fragments placed in or taken out of a tree, while a
+    /// custom element definition exists (`None` before): what custom
+    /// element reactions are enqueued from (`custom.rs`).
+    custom_log: Option<Vec<custom::CustomTreeEvent>>,
 }
 
 /// One change to the tree, as a `MutationObserver` is told of it (DOM
@@ -411,6 +415,7 @@ impl Document {
             controls_changed: Vec::new(),
             referrer_policy: browser_ipc_types::ReferrerPolicy::Empty,
             custom: Default::default(),
+            custom_log: None,
         }
     }
 
@@ -659,7 +664,7 @@ impl Document {
 
     /// Whether anything was logged that no one has taken yet.
     pub fn has_logged_mutations(&self) -> bool {
-        self.mutation_log.as_ref().is_some_and(|log| !log.is_empty())
+        self.mutation_log.as_ref().is_some_and(|log| !log.is_empty()) || self.custom_log.as_ref().is_some_and(|log| !log.is_empty())
     }
 
     /// Keep the insertion and removal primitives from logging until the
@@ -1169,6 +1174,7 @@ impl Document {
         self.picture_child_moved(child, parent);
         self.forms_inserted(child, parent);
         self.meta_inserted(child, parent);
+        self.log_custom_inserted(child, parent);
         self.log_child_list(parent, Some(child), None, last, None);
     }
 
@@ -1269,6 +1275,7 @@ impl Document {
         self.picture_child_moved(new, parent);
         self.forms_inserted(new, parent);
         self.meta_inserted(new, parent);
+        self.log_custom_inserted(new, parent);
         self.log_child_list(parent, Some(new), None, prev, Some(sibling));
     }
 
@@ -1283,6 +1290,7 @@ impl Document {
             (n.parent, n.prev_sibling, n.next_sibling)
         };
         let Some(parent) = parent else { return };
+        self.log_custom_removed(id, parent);
         self.log_child_list(parent, None, Some(id), prev, next);
         match prev {
             Some(prev) => self.nodes[prev].next_sibling = next,

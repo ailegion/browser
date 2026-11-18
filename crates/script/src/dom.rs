@@ -113,6 +113,19 @@ pub(crate) struct Dom {
     pub(crate) attr_maps: HashMap<NodeId, JsObject>,
     /// The private key an `attributes` proxy answers with its target.
     pub(crate) attr_key: Option<boa_engine::JsSymbol>,
+    /// Attribute changes of custom elements not yet turned into
+    /// `attributeChangedCallback` reactions (`custom.rs`).
+    pub(crate) attr_reactions: Vec<AttrReaction>,
+}
+
+/// An attribute of a custom element was set, changed or removed: the
+/// local name, the value before and after, the namespace.
+pub(crate) struct AttrReaction {
+    pub(crate) element: NodeId,
+    pub(crate) local: String,
+    pub(crate) old: Option<String>,
+    pub(crate) new: Option<String>,
+    pub(crate) namespace: Option<String>,
 }
 
 /// How many parsed selector lists are kept before the cache is emptied.
@@ -337,6 +350,20 @@ impl Dom {
         // the value it had and has no element any more.
         if self.attr_nodes.contains_key(&element) {
             crate::attrs::attribute_changed(self, element, name, old.as_deref());
+        }
+        // A custom element hears of it (DOM's "handle attribute changes").
+        if self.doc.custom_elements_watched()
+            && self.doc.contains(element)
+            && self.doc.custom_element_state(element) == browser_dom::custom::CustomElementState::Custom
+        {
+            let new = self.doc.element(element).and_then(|e| e.attr_ns(namespace.unwrap_or(""), name)).map(str::to_owned);
+            self.attr_reactions.push(AttrReaction {
+                element,
+                local: name.to_owned(),
+                old: old.clone(),
+                new,
+                namespace: namespace.map(str::to_owned),
+            });
         }
         if self.doc.mutations_observed() {
             self.doc.log_mutation(browser_dom::TreeMutation::Attribute {
@@ -2497,6 +2524,18 @@ fn mutate_steps(this: &JsValue, args: &[JsValue], method: &MutMethod, context: &
     };
     flush_images(context);
     crate::observers::drain(context);
+    // A clone is made as DOM's "create an element" makes one without the
+    // synchronous flag: an element with a definition is upgraded when the
+    // operation ends, connected or not.
+    if let (CloneNode, Ok(Out::Node(Some(copy)))) = (method, &result) {
+        let elements: Vec<NodeId> = {
+            let dom = shared.borrow();
+            std::iter::once(*copy).chain(dom.doc.descendants(*copy)).filter(|&id| dom.doc.get(id).is_element()).collect()
+        };
+        for element in elements {
+            crate::custom::try_to_upgrade(element, context);
+        }
+    }
     match result {
         Ok(out) => finish(out, context),
         Err(fail) => Err(fail.into_error(context)),
@@ -3488,6 +3527,7 @@ fn dataset_set(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult
     }
     drop(dom);
     crate::observers::drain(context);
+    crate::custom::settle(context);
     Ok(true.into())
 }
 
@@ -3528,6 +3568,7 @@ fn dataset_delete(_: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
     }
     drop(dom);
     crate::observers::drain(context);
+    crate::custom::settle(context);
     Ok(true.into())
 }
 
@@ -3672,6 +3713,7 @@ fn token_call(this: &JsValue, args: &[JsValue], method: &TokenMethod, context: &
         token_mutate(&mut dom, list.id, method, index, &strings, force)
     };
     crate::observers::drain(context);
+    crate::custom::settle(context);
     result.map_err(|fail| fail.into_error(context))
 }
 

@@ -604,6 +604,7 @@ fn set_property(target: &JsObject, name: &str, value: &str, priority: &str, cont
         }
     }
     crate::observers::drain(context);
+    crate::custom::settle(context);
     Ok(())
 }
 
@@ -625,6 +626,7 @@ fn remove_property(target: &JsObject, name: &str, context: &mut Context) -> JsRe
         old
     };
     crate::observers::drain(context);
+    crate::custom::settle(context);
     Ok(old)
 }
 
@@ -667,6 +669,7 @@ fn member_set(this: &JsValue, args: &[JsValue], member: &Member, context: &mut C
                 write_inline(&target, &mut dom, decls);
             }
             crate::observers::drain(context);
+            crate::custom::settle(context);
         }
         _ => {}
     }

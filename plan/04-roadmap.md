@@ -1842,7 +1842,7 @@ remaining lists as they stand.
       in blocks:
       - [x] 17a. Registry, definitions, constructors, upgrades (built
         2026-11-18).
-      - [ ] 17b. The reactions the tree enqueues: `connectedCallback` on
+      - [x] 17b. (Built 2026-11-18, record below.) The reactions the tree enqueues: `connectedCallback` on
         insertion, `disconnectedCallback`, `connectedMoveCallback`,
         `attributeChangedCallback` on every attribute change (the
         bindings that write attributes have no single path: `dataset`,
@@ -1958,6 +1958,70 @@ remaining lists as they stand.
       `MessageChannel is not defined`), 12.6 s and a 731 MiB peak this
       run (1.7 s and 113 MiB the run before; the same swing was seen
       before this line).
+      17b, built 2026-11-18. DOM (`custom.rs`, `lib.rs`): from the
+      first definition on (`watch_custom_elements`) `append_child`,
+      `insert_before` and `detach` log each element or fragment placed
+      under, or taken from, a connected parent (`CustomTreeEvent`,
+      `take_custom_events`), whoever called them; `has_logged_mutations`
+      answers for this log too, so the tab's `deliver_parser_mutations`
+      lends the document after the parser's insertions. Script
+      (`custom.rs`): `collect`, run by `with_reactions` after its
+      operation and before the queue is popped, turns the log into
+      reactions (DOM's insert and remove: each inclusive descendant
+      element in tree order; a custom one gets `connectedCallback` or
+      `disconnectedCallback`, any other inserted one is tried for an
+      upgrade) and `Dom::attr_reactions` into `attributeChangedCallback`
+      (`Dom::record_attr`, which every attribute write calls, records
+      the change of a custom element: local name, old and new value,
+      namespace); `settle`, the same tail for the bindings that are not
+      wrapped (`dataset`, `classList`, the three `style` writes, a form
+      reset's `<output>`, `document.title`), called after each;
+      `cloneNode` tries its copy's elements for an upgrade when it ends,
+      connected or not (DOM's "create an element" without the
+      synchronous flag); `ScriptHost::deliver_mutations` settles what
+      the parser inserted and performs a microtask checkpoint when a
+      reaction ran. Style: `:defined` (`PseudoClass::Defined`: the
+      state is "uncustomized" or "custom"), its invalidation by the
+      attribute-feature path `:checked` uses, under a name no attribute
+      has (`DEFINED_FEATURE`, noted by a successful upgrade of a
+      connected element), so only rules with `:defined` restyle.
+      Decision taken (17c): the tab's flow is not changed. An element
+      the parser makes after its definition exists is upgraded when
+      the parser next yields, with its attributes and whatever children
+      were parsed by then; browsers run its constructor where the
+      parser meets the tag. 17c stays open for that.
+      Test: script
+      `custom_elements_react_to_the_tree_and_their_attributes` (markup
+      set on a connected and on a detached element, connect, disconnect
+      and a move with what `isConnected` reads in each, twelve kinds of
+      attribute write, a clone, `:defined` before and after and for a
+      failed constructor, the change the tab restyles for, an element
+      appended as the parser does). Full runs: dom 27, style 92, script
+      35, tab 112, layout 119, paint 25 unit tests passing; the paint
+      snapshots differed by one pixel in 2 of 4 runs (`01-text-and-boxes`
+      once, `03-floats` once; the known one, line 7's record), passing
+      in the other two; clippy: none in the changed code.
+      SKIPPED: `connectedMoveCallback` never fires (`moveBefore()`,
+      which enqueues it, does not exist in the engine); a form
+      control's `value` attribute write and a dialog's `open` do not
+      settle at once (their reactions run with the next operation's;
+      they concern customized built-ins, 17d); the parser's timing
+      (17c). Not verified against Chrome and Firefox: `innerHTML` on a
+      detached element leaving its custom elements undefined until
+      connected (as recalled, no test read).
+      Timing (release probe, live, two runs against line 18's two):
+      slower: Wikipedia Main Page relayout 1.70–2.08 ms (1.51–1.69),
+      iana.org load 530–868 ms (437–496; the 868 ms run took 214 rounds
+      against 74, the network), neither attributed (with no definition
+      the new code is one `None` check per insertion); Wikipedia load
+      612–623 ms (602–621), full restyle 41.7–44.0 ms (44.2–47.2);
+      iana.org full restyle 2.25–2.36 ms (2.24–2.54), relayout
+      266–334 µs (272–319).
+      The sites after: reddit's components run now and it logs two new
+      errors, its own "Deferred script in <head> must have a src
+      attribute. Inline modules are not supported." (a rejected
+      promise) and "not a callable function (native)" (not identified);
+      the others' console lines are unchanged.
 - [ ] 18. `element.attributes`, `Attr` and the attribute node methods
       (owner, 2026-11-18; found missing while testing line 17a; DOM
       §4.9.1, §4.9.2).

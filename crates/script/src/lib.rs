@@ -943,6 +943,7 @@ pub(crate) fn document_set_title(_: &JsValue, args: &[JsValue], context: &mut Co
         dom.doc.set_title(&title);
     }
     observers::drain(context);
+    custom::settle(context);
     Ok(JsValue::undefined())
 }
 
@@ -1216,6 +1217,12 @@ impl ScriptHost {
     /// parser's work and precedes the next script. The document and the
     /// view must be lent.
     pub fn deliver_mutations(&mut self) {
+        // What the parser inserted while a custom element definition
+        // exists: those elements are upgraded, or told they are connected.
+        custom::settle(&mut self.context);
+        if custom::take_ran(&mut self.context) {
+            self.microtask_checkpoint();
+        }
         observers::drain(&mut self.context);
         let pending = self
             .context
@@ -3787,6 +3794,101 @@ mod tests {
             ),
             "true,false,section,true,fancy-section,false"
         );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// Custom element reactions from the tree: insertion, removal and
+    /// every attribute write tell a custom element at the end of the
+    /// operation; an element is upgraded when it becomes connected and
+    /// when it is cloned; `:defined`.
+    #[test]
+    fn custom_elements_react_to_the_tree_and_their_attributes() {
+        let mut h = host();
+        h.lend_document(browser_dom::parse_html(b"<!DOCTYPE html><body><div id=host></div></body>"), false, Default::default());
+        h.run_script(
+            "var log = [], take = () => { var l = log.join(' '); log = []; return l; }; \
+             class C extends HTMLElement { static observedAttributes = ['a', 'style', 'class', 'data-k', 'title']; \
+               constructor() { super(); log.push('new'); } \
+               connectedCallback() { log.push('connected:' + this.isConnected); } \
+               disconnectedCallback() { log.push('disconnected:' + this.isConnected); } \
+               attributeChangedCallback(n, o, v, ns) { log.push(['attr', n, o, v, ns].map(String).join(':')); } } \
+             customElements.define('x-c', C); var host = document.getElementById('host');",
+        );
+        // Markup set on a connected element: upgraded in tree order,
+        // before the setter returns. On a detached one: not until it is
+        // connected.
+        assert_eq!(
+            eval(&mut h, "host.innerHTML = '<x-c a=1><x-c></x-c></x-c>'; var now = take(); [now, host.firstChild instanceof C, host.firstChild.firstChild instanceof C].join()"),
+            "new attr:a:null:1:null connected:true new connected:true,true,true"
+        );
+        assert_eq!(
+            eval(
+                &mut h,
+                "var loose = document.createElement('div'); loose.innerHTML = '<x-c></x-c>'; var a = [take(), loose.firstChild instanceof C]; \
+                 host.append(loose); a.concat([take(), loose.firstChild instanceof C]).join()"
+            ),
+            ",false,new connected:true,true"
+        );
+        // Connected and disconnected, each at the end of its operation; a
+        // move is one after the other, both run once it is in its new
+        // place (so the first sees itself connected).
+        assert_eq!(
+            eval(
+                &mut h,
+                "var e = document.createElement('x-c'); var steps = [take()]; host.append(e); steps.push(take()); e.remove(); steps.push(take()); \
+                 var d = document.createElement('div'); d.append(e); steps.push(take()); host.append(d); steps.push(take()); \
+                 host.prepend(e); steps.push(take()); host.textContent = ''; steps.push(take()); steps.join('|')"
+            ),
+            "new|connected:true|disconnected:false||connected:true|disconnected:true connected:true|disconnected:false disconnected:false disconnected:false disconnected:false"
+        );
+        // Every way an attribute is written tells it, observed names only.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var w = []; e.setAttribute('a', '1'); w.push(take()); e.setAttribute('a', '1'); w.push(take()); e.setAttribute('b', 'x'); e.id = 'q'; w.push(take()); \
+                 e.removeAttribute('a'); w.push(take()); e.toggleAttribute('a'); w.push(take()); e.classList.add('k'); w.push(take()); e.className = 'z'; w.push(take()); \
+                 e.dataset.k = 'v'; w.push(take()); delete e.dataset.k; w.push(take()); e.attributes.a.value = '9'; w.push(take()); \
+                 e.setAttributeNode(document.createAttribute('title')); w.push(take()); e.removeAttributeNode(e.getAttributeNode('title')); w.push(take()); \
+                 e.style.color = 'red'; var s = take(); w.push(s.startsWith('attr:style:null:color') && s.endsWith(':null')); w.join('|')"
+            ),
+            "attr:a:null:1:null|attr:a:1:1:null||attr:a:1:null:null|attr:a:null::null|attr:class:null:k:null|attr:class:k:z:null|attr:data-k:null:v:null|\
+             attr:data-k:v:null:null|attr:a::9:null|attr:title:null::null|attr:title::null:null|true"
+        );
+        // A clone is upgraded when cloneNode returns, detached or not.
+        assert_eq!(
+            eval(&mut h, "var copy = e.cloneNode(true); var made = take(); [copy instanceof C, copy !== e, made.startsWith('new attr:'), made.includes('connected')].join()"),
+            "true,true,true,false"
+        );
+        // :defined: not an element waiting for its definition, nor one
+        // whose constructor failed.
+        assert_eq!(
+            eval(
+                &mut h,
+                "host.innerHTML = '<x-wait></x-wait><x-fail></x-fail><p></p>'; var kids = host.children; \
+                 var before = [kids[0].matches(':defined'), kids[2].matches(':defined'), e.matches(':defined'), host.querySelectorAll(':defined').length]; \
+                 customElements.define('x-wait', class extends HTMLElement {}); customElements.define('x-fail', class extends HTMLElement { constructor() { super(); throw new Error('no'); } }); \
+                 before.concat([kids[0].matches(':defined'), kids[1].matches(':defined'), host.querySelectorAll(':defined').length, \
+                   document.querySelector('x-wait:not(:defined)') === null]).join()"
+            ),
+            "false,true,true,1,true,false,2,true"
+        );
+        assert_eq!(lines(&mut h).len(), 1, "the failed constructor is reported");
+        // An element becoming defined is a change the tab restyles for.
+        let changes = h.take_dom_changes();
+        assert!(
+            changes.iter().any(|c| matches!(c, DomChange::Attr { name, .. } if name == browser_style::selector_impl::DEFINED_FEATURE)),
+            "{changes:?}"
+        );
+        // What the parser appends after a definition exists is upgraded
+        // when the document is next lent.
+        let mut doc = h.reclaim_document();
+        let body = doc.descendants(doc.root()).find(|&n| doc.element(n).is_some_and(|e| &*e.name.local == "body")).expect("body");
+        let parsed = doc.create_html_element("x-c");
+        doc.append_child(body, parsed);
+        assert!(doc.has_logged_mutations(), "the tab is told there is something to deliver");
+        h.lend_document(doc, true, Default::default());
+        h.deliver_mutations();
+        assert_eq!(eval(&mut h, "[take(), document.body.lastChild instanceof C].join()"), "new connected:true,true");
         assert_eq!(lines(&mut h), Vec::<String>::new());
     }
 

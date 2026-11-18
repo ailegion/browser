@@ -1052,6 +1052,7 @@ fn scan_selector<'a>(
                     let (attrs, from_ancestor): (&[&str], bool) = match pc {
                         PseudoClass::Link | PseudoClass::AnyLink | PseudoClass::Visited => (&["href"], false),
                         PseudoClass::Checked => (&["checked", "selected"], false),
+                        PseudoClass::Defined => (&[crate::selector_impl::DEFINED_FEATURE], false),
                         PseudoClass::Disabled | PseudoClass::Enabled => (&["disabled"], true),
                         PseudoClass::Lang(_) => (&["lang"], true),
                         PseudoClass::Dir(_) => (&["dir"], true),

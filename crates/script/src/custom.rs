@@ -46,7 +46,7 @@ const ATTRIBUTE_CHANGED: usize = 4;
 
 /// A lifecycle callback by name, for the callers that enqueue reactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "the tree's insertions, removals and attribute changes enqueue the rest (the next block)")]
+#[allow(dead_code, reason = "connectedMoveCallback is enqueued by moveBefore(), which the engine does not have")]
 pub(crate) enum Lifecycle {
     Connected,
     Disconnected,
@@ -112,6 +112,8 @@ pub(crate) struct Registry {
     processing_backup: bool,
     /// Each element's custom element reaction queue.
     queues: HashMap<NodeId, VecDeque<Reaction>>,
+    /// A reaction ran since the host last asked (`take_ran`).
+    ran: bool,
 }
 
 pub(crate) type SharedRegistry = Rc<RefCell<Registry>>;
@@ -242,6 +244,7 @@ fn run_reactions(element: NodeId, context: &mut Context) {
     loop {
         let reaction = shared.borrow_mut().queues.get_mut(&element).and_then(VecDeque::pop_front);
         let Some(reaction) = reaction else { break };
+        shared.borrow_mut().ran = true;
         match reaction {
             Reaction::Upgrade(definition) => {
                 if let Err(err) = upgrade(definition, element, context) {
@@ -280,11 +283,75 @@ pub(crate) fn with_reactions<T>(context: &mut Context, operation: impl FnOnce(&m
     let Ok(shared) = registry(context) else { return operation(context) };
     shared.borrow_mut().stack.push(Vec::new());
     let result = operation(context);
+    // What the operation did to the tree and to custom elements'
+    // attributes becomes reactions on its queue.
+    collect(context);
     let queue = shared.borrow_mut().stack.pop().unwrap_or_default();
     for element in queue {
         run_reactions(element, context);
     }
     result
+}
+
+/// The tail of a `[CEReactions]` operation that has already run: the
+/// reactions of what it changed are enqueued and invoked now.
+pub(crate) fn settle(context: &mut Context) {
+    let _ = with_reactions(context, |_| Ok(()));
+}
+
+/// Whether a reaction ran since the last call (the host then performs a
+/// microtask checkpoint, as after any script).
+pub(crate) fn take_ran(context: &mut Context) -> bool {
+    registry(context).is_ok_and(|shared| std::mem::take(&mut shared.borrow_mut().ran))
+}
+
+/// Turn what the tree logged (DOM's insert and remove, for the elements
+/// and fragments placed under or taken from a connected parent) and the
+/// attribute changes of custom elements into reactions: a custom element
+/// that became connected gets `connectedCallback`, any other element is
+/// tried for an upgrade; one that was connected gets
+/// `disconnectedCallback`; a changed attribute `attributeChangedCallback`.
+fn collect(context: &mut Context) {
+    let (Ok(shared), Ok(shared_dom)) = (registry(context), dom(context)) else { return };
+    if shared.borrow().definitions.is_empty() {
+        return;
+    }
+    let (events, attributes) = {
+        let mut dom = shared_dom.borrow_mut();
+        (dom.doc.take_custom_events(), std::mem::take(&mut dom.attr_reactions))
+    };
+    for event in events {
+        let (node, inserted) = match event {
+            browser_dom::custom::CustomTreeEvent::Inserted(node) => (node, true),
+            browser_dom::custom::CustomTreeEvent::Removed(node) => (node, false),
+        };
+        // The node's inclusive descendants that are elements, in tree
+        // order, each with whether it is custom.
+        let elements: Vec<(NodeId, bool)> = {
+            let dom = shared_dom.borrow();
+            if !dom.doc.contains(node) || (inserted && !dom.doc.is_connected(node)) {
+                continue;
+            }
+            std::iter::once(node)
+                .chain(dom.doc.descendants(node))
+                .filter(|&id| dom.doc.get(id).is_element())
+                .map(|id| (id, dom.doc.custom_element_state(id) == CustomElementState::Custom))
+                .collect()
+        };
+        for (element, custom) in elements {
+            match (inserted, custom) {
+                (true, true) => enqueue_callback(element, Lifecycle::Connected, Vec::new(), context),
+                (true, false) => try_to_upgrade(element, context),
+                (false, true) => enqueue_callback(element, Lifecycle::Disconnected, Vec::new(), context),
+                (false, false) => {}
+            }
+        }
+    }
+    for change in attributes {
+        let value = |v: Option<String>| v.map_or(JsValue::null(), |v| js_str(&v));
+        let args = vec![js_str(&change.local), value(change.old), value(change.new), value(change.namespace)];
+        enqueue_callback(change.element, Lifecycle::AttributeChanged, args, context);
+    }
 }
 
 /// "Upgrade an element" with a definition.
@@ -344,6 +411,11 @@ fn upgrade(definition: usize, element: NodeId, context: &mut Context) -> JsResul
     let mut dom = shared_dom.borrow_mut();
     if dom.doc.contains(element) {
         dom.doc.set_custom_element_state(element, CustomElementState::Custom);
+        // It is defined now: what `:defined` matches changed.
+        if dom.doc.is_connected(element) {
+            dom.generation += 1;
+            dom.note_attr(element, browser_style::selector_impl::DEFINED_FEATURE, None);
+        }
     }
     Ok(())
 }
@@ -654,6 +726,9 @@ fn define_steps(args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let read = read_definition(&constructor, context);
     shared.borrow_mut().running = false;
     let read = read?;
+    // From the first definition on the tree tells of its insertions and
+    // removals.
+    dom(context)?.borrow_mut().doc.watch_custom_elements();
     let index = {
         let mut registry = shared.borrow_mut();
         registry.definitions.push(Definition {

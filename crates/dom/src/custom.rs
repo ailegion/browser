@@ -64,7 +64,56 @@ pub fn is_valid_custom_element_name(name: &str) -> bool {
         )
 }
 
+/// An element or a fragment was placed in a tree or taken out of one
+/// (the insertion and removal primitives, whoever called them: a script,
+/// the parser), under a parent that was connected then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomTreeEvent {
+    Inserted(NodeId),
+    Removed(NodeId),
+}
+
 impl Document {
+    /// Log insertions and removals from now on (a custom element
+    /// definition exists).
+    pub fn watch_custom_elements(&mut self) {
+        if self.custom_log.is_none() {
+            self.custom_log = Some(Vec::new());
+        }
+    }
+
+    pub fn custom_elements_watched(&self) -> bool {
+        self.custom_log.is_some()
+    }
+
+    /// What was logged since the last call, in order.
+    pub fn take_custom_events(&mut self) -> Vec<CustomTreeEvent> {
+        self.custom_log.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Whether a node can hold an element: an element or a fragment.
+    fn holds_elements(&self, node: NodeId) -> bool {
+        matches!(self.get(node).kind, NodeKind::Element(_) | NodeKind::DocumentFragment)
+    }
+
+    pub(crate) fn log_custom_inserted(&mut self, node: NodeId, parent: NodeId) {
+        if self.custom_log.is_some() && self.holds_elements(node) {
+            let connected = self.is_connected(parent);
+            if let Some(log) = self.custom_log.as_mut().filter(|_| connected) {
+                log.push(CustomTreeEvent::Inserted(node));
+            }
+        }
+    }
+
+    pub(crate) fn log_custom_removed(&mut self, node: NodeId, parent: NodeId) {
+        if self.custom_log.is_some() && self.holds_elements(node) {
+            let connected = self.is_connected(parent);
+            if let Some(log) = self.custom_log.as_mut().filter(|_| connected) {
+                log.push(CustomTreeEvent::Removed(node));
+            }
+        }
+    }
+
     /// The element's custom element state.
     pub fn custom_element_state(&self, id: NodeId) -> CustomElementState {
         let data = self.custom.get(&id);

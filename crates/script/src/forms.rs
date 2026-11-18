@@ -649,6 +649,7 @@ pub(crate) fn reset_form(form: NodeId, context: &mut Context) -> JsResult<()> {
             // `<img>`, and the observers hear of the replaced children.
             crate::dom::flush_images(context);
             crate::observers::drain(context);
+            crate::custom::settle(context);
         }
         Ok(())
     })();

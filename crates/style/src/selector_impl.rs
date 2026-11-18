@@ -104,6 +104,11 @@ impl ToCss for NamespacePrefix {
     }
 }
 
+/// The name under which an element becoming defined is told to the
+/// restyle (`Feature::Attr`): `:defined` follows no attribute, so its
+/// change travels as one of a name no attribute has.
+pub const DEFINED_FEATURE: &str = ":defined";
+
 /// Pseudo-classes that are not tree-structural (those are handled by the
 /// `selectors` crate itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +125,9 @@ pub enum PseudoClass {
     Disabled,
     Enabled,
     Target,
+    /// `:defined` (HTML §4.16.3): an element that is not waiting for a
+    /// custom element definition.
+    Defined,
     /// `:lang(x)` with its argument.
     Lang(String),
     /// `:dir(ltr)` / `:dir(rtl)`; any other argument parses and matches
@@ -161,6 +169,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Disabled => ":disabled",
             PseudoClass::Enabled => ":enabled",
             PseudoClass::Target => ":target",
+            PseudoClass::Defined => ":defined",
             PseudoClass::Lang(l) => return write!(dest, ":lang({l})"),
             PseudoClass::Dir(Some(browser_dom::Directionality::Ltr)) => ":dir(ltr)",
             PseudoClass::Dir(Some(browser_dom::Directionality::Rtl)) => ":dir(rtl)",
@@ -266,6 +275,7 @@ impl<'i> parser::Parser<'i> for SelectorParser {
             "any-link" => PseudoClass::AnyLink,
             "visited" => PseudoClass::Visited,
             "checked" => PseudoClass::Checked,
+            "defined" => PseudoClass::Defined,
             "disabled" => PseudoClass::Disabled,
             "enabled" => PseudoClass::Enabled,
             "target" => PseudoClass::Target,
@@ -478,6 +488,10 @@ impl selectors::Element for ElementRef<'_> {
                 Some(_) => false,
                 None => e.is_html() && e.name.local == local_name!("option") && self.doc.option_selectedness(self.id),
             },
+            PseudoClass::Defined => matches!(
+                self.doc.custom_element_state(self.id),
+                browser_dom::custom::CustomElementState::Uncustomized | browser_dom::custom::CustomElementState::Custom
+            ),
             PseudoClass::Disabled => self.doc.disabled_state(self.id) == Some(true),
             PseudoClass::Enabled => self.doc.disabled_state(self.id) == Some(false),
             PseudoClass::Dir(dir) => dir.is_some_and(|d| self.doc.directionality(self.id) == d),
