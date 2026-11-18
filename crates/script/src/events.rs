@@ -1500,6 +1500,26 @@ pub(crate) fn new_event(kind: &str, init: UiEventInit, context: &mut Context) ->
     Ok(JsObject::from_proto_and_data(proto, data))
 }
 
+/// `HTMLElement.click()` (HTML §6.8.4): a synthetic `click` pointer event
+/// at the element, not trusted, bubbling, cancelable and composed, with
+/// the activation behavior a click has.
+pub(crate) fn synthetic_click(element: NodeId, context: &mut Context) -> JsResult<()> {
+    let init = UiEventInit { class: UiClass::Pointer, bubbles: true, cancelable: true, pointer_id: -1, ..UiEventInit::default() };
+    let event = new_event("click", init, context)?;
+    {
+        let mut data = event.downcast_mut::<EventData>().ok_or_else(illegal_invocation)?;
+        data.flags.is_trusted = false;
+        data.flags.composed = true;
+    }
+    let target = EventTargetRef::Node(element);
+    let activation = crate::forms::before_click(target, true, context)?;
+    let not_cancelled = dispatch(&event, target, None, context)?;
+    if let Some((control, saved)) = activation {
+        crate::forms::after_click(control, saved, not_cancelled, context)?;
+    }
+    Ok(())
+}
+
 // ----- dispatch -----
 
 /// The DOM's dispatch: capture down the path, at the target, bubble up

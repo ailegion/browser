@@ -2088,6 +2088,103 @@ remaining lists as they stand.
       'null' or 'undefined' to object" errors of google, youtube,
       amazon's challenge and cloudflare's beacon are all still there,
       so `attributes` was not their cause.
+- [ ] 19. What scripts reach for and do not find (2026-11-18; the
+      sites' remaining "cannot convert 'null' or 'undefined' to object"
+      and "not a callable function" errors do not name what was
+      called). The script crate's ignored test `probe_missing_apis`
+      (`cargo test -p browser-script probe_missing_apis -- --ignored
+      --nocapture`) asks the engine for some 900 standard globals and
+      members and prints those it lacks; its output is the list. The
+      groups, in the order to build them (each a block; the element
+      members are Phase 5's DOM bindings (C), moved up):
+      - [ ] 19a. Every element's own members, in three parts (the
+        implementer's split, 2026-11-18):
+        - [x] 19a-1 (built 2026-11-18). `crates/script/src/reflect.rs`:
+          on `HTMLElement`, `title`, `lang`, `accessKey` (strings),
+          `dir`, `inputMode`, `enterKeyHint` (keywords: the known value
+          in its canonical case, else empty; a write stores what was
+          given), `hidden` (a flag, `until-found` kept, what removes it
+          as HTML lists), `autofocus`, `inert`, `tabIndex` (HTML's
+          integer parsing; without the attribute 0 for `a`/`area` with
+          `href`, `button`, `frame`, `iframe`, `input`, `object`,
+          `select`, `textarea`, a `details`' first `summary`, an
+          editing host and a `draggable=true` element, else -1),
+          `draggable` (an `img` and an `a` with `href` by default),
+          `spellcheck` and `translate` (own state, else an ancestor's,
+          else true), `contentEditable` (`inherit` removes, another
+          value a SyntaxError) and `isContentEditable`, `nonce` (what a
+          script sets is kept beside the attribute until the attribute
+          changes); on `Element`, `role` and the 43 string ARIA
+          properties (null when absent, null and undefined remove);
+          `HTMLElement.click()` (`events::synthetic_click`: an
+          untrusted `PointerEvent` `click`, bubbling, cancelable,
+          composed, with the activation a click has; nothing on a
+          disabled control or from inside its own click). Writes go
+          through `write_attribute` inside `with_reactions`. Test:
+          script `html_elements_reflect_their_global_attributes_and_click`.
+          Full runs: dom 27, style 92, script 36, tab 112, layout 119,
+          paint 27 passing; clippy: none in the changed code. SKIPPED:
+          `autocapitalize`, `popover` and its three methods,
+          `writingSuggestions`, `accessKeyLabel`, the ARIA properties
+          that hold elements. Not verified against Chrome and Firefox:
+          `tabIndex`'s defaults beyond HTML's list (Chrome differs by
+          `input` type); `spellcheck`'s default of true. Timing
+          (release probe, live, two runs against line 17b's two):
+          slower: iana.org full restyle 2.19–2.49 ms (2.25–2.36),
+          relayout 272–360 µs (266–334), not attributed (nothing here
+          runs in either); Wikipedia Main Page load 607–628 ms
+          (612–623), full restyle 41.9–42.6 ms (41.7–44.0), relayout
+          1.62–1.74 ms (1.70–2.08); iana.org load 514–526 ms (530–868).
+          The sites after: no console line changed.
+        - [ ] 19a-2. `focus()`, `blur()`, `document.activeElement`,
+          `hasFocus()`: focus is the tab's alone today; browsers move
+          it and fire its events inside `focus()`, so the script side
+          has to hold it.
+        - [ ] 19a-3. `innerText`, `outerText`: the getter reads
+          computed style (`display`, `visibility`, `white-space`).
+      - [ ] 19b. The reflected attributes and members of each element
+        interface: `a` (`href` and the URL parts, `target`, `rel`,
+        `relList`, `download`), `img` (`src`, `srcset`, `sizes`, `alt`,
+        `width`, `height`, `naturalWidth`, `naturalHeight`, `complete`,
+        `decode`, `loading`), `script` (`src`, `type`, `async`, `defer`,
+        `text`, ...), `link`, `style` (`sheet`), `iframe`, `label`,
+        `details`, `table`, the form controls' (`type`, `name`,
+        `disabled`, `required`, `placeholder`, the selection and
+        validity members, ...), `form`'s, and the legacy constructors
+        `Image`, `Audio`, `Option`.
+      - [ ] 19c. `document`: `currentScript` (the cause suspected for
+        bbc's "chunk path empty but not in a worker"), `activeElement`,
+        `hasFocus`, `visibilityState`, `hidden`, `scripts`, `links`,
+        `images`, `anchors`, `embeds`, `styleSheets`, `doctype`,
+        `implementation`, `createEvent`, `getElementsByName`, `dir`,
+        `designMode`, `lastModified`, `write`/`writeln`/`open`/`close`,
+        `importNode`, `adoptNode`, `all`.
+      - [ ] 19d. `window`: `DOMException` (errors here are `Error`s
+        with a name), `postMessage`, `MessageChannel`, `MessagePort`,
+        `MessageEvent`, `ErrorEvent`, `PromiseRejectionEvent`,
+        `reportError`, `onunhandledrejection`, `requestIdleCallback`,
+        `alert`/`confirm`/`prompt`/`print`, `focus`/`blur`, `open`,
+        `close`, `stop`, `name`, `length`, `opener`, `origin`,
+        `isSecureContext`, `getSelection`, and the interface objects
+        `Window`, `Navigator`, `Location`, `Screen`, `HTMLDocument`,
+        `DocumentType`, `SVGElement`.
+      - [ ] 19e. `Range`, `StaticRange`, `Selection`, `TreeWalker`,
+        `NodeIterator`, `NodeFilter`, the `Text` members (`splitText`,
+        `wholeText`, the data methods), `DOMParser`, `XMLSerializer`.
+      - [ ] 19f. `Blob`, `File`, `FileReader`, streams, `Response.body`
+        and `blob()`/`formData()` (line 7's "Later").
+      - [ ] 19g. `ResizeObserver`, the animation and transition events,
+        `Element.animate`, `checkVisibility`, `DOMMatrix`, `DOMPoint`,
+        the CSSOM interface objects (`CSSStyleSheet`, `CSSRule`, ...).
+      - [ ] 19h. `navigator`'s members (`userAgentData`, `clipboard`,
+        `maxTouchPoints`, `deviceMemory`, `plugins`, `mimeTypes`,
+        `permissions`, ...).
+      Not here because they have lines or are out of scope: shadow DOM
+      (after line 17), canvas, media, workers, `WebSocket`,
+      `indexedDB`, `WebAssembly`, `crypto.subtle`, navigation and
+      resource timing (line 14), the `Intl` gaps (line 15). V8-only
+      (`Error.captureStackTrace`) and one probe line that did not
+      parse (`Request`) are noise.
 
 ## Phase 0: Skeleton, policy, one resolved crate set
 

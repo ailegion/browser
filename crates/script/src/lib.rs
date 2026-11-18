@@ -46,6 +46,7 @@ mod forms;
 mod history;
 mod observers;
 mod perf;
+mod reflect;
 mod storage;
 mod urlapi;
 mod view;
@@ -1062,6 +1063,7 @@ fn register_window(context: &mut Context) -> JsResult<()> {
     dom::register(context)?;
     custom::register(context)?;
     attrs::register(context)?;
+    reflect::register(context)?;
     fonts::register(context)?;
     urlapi::register(context)?;
     perf::register(context)?;
@@ -3494,6 +3496,241 @@ mod tests {
                           () => m.observe(document.body, {characterData: false, characterDataOldValue: true}), () => m.observe(document.body, {attributes: false, attributeFilter: ['a']}), () => new MutationObserver(1), () => MutationObserver(() => {})]) \
                           { try { f(); errs.push('ok') } catch (e) { errs.push(e.name) } } [errs.join(','), typeof WebKitMutationObserver, m.takeRecords().length].join('|')"),
             "TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError|function|0"
+        );
+        assert_eq!(lines(&mut h), Vec::<String>::new());
+    }
+
+    /// Which of the web platform's commonly used globals and members the
+    /// engine does not have: `cargo test -p browser-script
+    /// probe_missing_apis -- --ignored --nocapture`. A list to work from,
+    /// not a test of anything.
+    #[test]
+    #[ignore]
+    fn probe_missing_apis() {
+        let mut h = host();
+        h.lend_document(browser_dom::parse_html(b"<!DOCTYPE html><body><div id=d></div><form id=f><input id=i></form></body>"), false, Default::default());
+        let globals = "NodeFilter MessageChannel MessagePort BroadcastChannel Worker SharedWorker AbortController AbortSignal Blob File FileReader FileList FormData \
+            Headers Request Response ReadableStream WritableStream TransformStream TextEncoder TextDecoder URL URLSearchParams WebSocket EventSource XMLHttpRequest \
+            DOMParser XMLSerializer Range Selection TreeWalker NodeIterator DOMException Event CustomEvent EventTarget UIEvent MouseEvent KeyboardEvent PointerEvent \
+            TouchEvent FocusEvent InputEvent WheelEvent ErrorEvent PromiseRejectionEvent MessageEvent AnimationEvent TransitionEvent CompositionEvent ClipboardEvent \
+            DragEvent HashChangeEvent PopStateEvent PageTransitionEvent BeforeUnloadEvent StorageEvent ProgressEvent CloseEvent SubmitEvent FormDataEvent ToggleEvent \
+            ResizeObserver ResizeObserverEntry IntersectionObserver IntersectionObserverEntry MutationObserver MutationRecord PerformanceObserver \
+            requestAnimationFrame cancelAnimationFrame requestIdleCallback cancelIdleCallback queueMicrotask structuredClone setTimeout setInterval clearTimeout \
+            clearInterval fetch atob btoa matchMedia getComputedStyle getSelection scrollTo scrollBy scroll open close stop postMessage addEventListener \
+            removeEventListener dispatchEvent alert confirm prompt print focus blur reportError createImageBitmap localStorage sessionStorage indexedDB caches \
+            cookieStore navigator location history screen performance crypto customElements visualViewport devicePixelRatio innerWidth innerHeight outerWidth \
+            outerHeight scrollX scrollY pageXOffset pageYOffset screenX screenY screenLeft screenTop origin isSecureContext crossOriginIsolated name frames length \
+            parent top opener frameElement self window document closed status event onload onerror onunhandledrejection onmessage onresize onscroll onpopstate \
+            onhashchange onbeforeunload onpagehide onpageshow onstorage Image Audio Option HTMLDocument Document DocumentFragment DocumentType ShadowRoot Element \
+            HTMLElement SVGElement SVGSVGElement MathMLElement Node Text Comment CDATASection ProcessingInstruction CharacterData NodeList HTMLCollection \
+            HTMLFormControlsCollection HTMLOptionsCollection RadioNodeList DOMTokenList DOMStringMap NamedNodeMap Attr DOMRect DOMRectReadOnly DOMRectList DOMPoint \
+            DOMPointReadOnly DOMMatrix DOMMatrixReadOnly DOMQuad DOMImplementation CSSStyleSheet CSSStyleDeclaration CSSRule CSSStyleRule CSSMediaRule CSSRuleList \
+            StyleSheet StyleSheetList MediaList MediaQueryList MediaQueryListEvent CSS Intl WebAssembly WeakRef FinalizationRegistry console Notification Storage \
+            Navigator Location History Window Screen Performance PerformanceEntry PerformanceMark PerformanceMeasure PerformanceResourceTiming \
+            PerformanceNavigationTiming CanvasRenderingContext2D OffscreenCanvas ImageData ImageBitmap Path2D FontFace FontFaceSet TextMetrics DataTransfer \
+            MediaSource AudioContext Animation KeyframeEffect DocumentTimeline trustedTypes scheduler navigation CompressionStream DecompressionStream \
+            TextEncoderStream TextDecoderStream CountQueuingStrategy ByteLengthQueuingStrategy XPathResult XPathEvaluator XPathExpression CustomElementRegistry \
+            ElementInternals URLPattern Crypto SubtleCrypto CryptoKey ValidityState VisualViewport ScreenOrientation IdleDeadline StaticRange AbstractRange \
+            HTMLSlotElement HTMLTemplateElement HTMLCanvasElement HTMLVideoElement HTMLIFrameElement Iterator SharedArrayBuffer Atomics AggregateError";
+        let members = "document:createRange createTreeWalker createNodeIterator createEvent createDocumentFragment createComment createTextNode createElementNS \
+            createCDATASection createProcessingInstruction importNode adoptNode getElementById getElementsByName getElementsByClassName getElementsByTagName \
+            getElementsByTagNameNS querySelector querySelectorAll elementFromPoint elementsFromPoint caretRangeFromPoint caretPositionFromPoint hasFocus write writeln \
+            open close execCommand queryCommandSupported getSelection implementation defaultView activeElement currentScript scripts links images forms embeds \
+            plugins anchors styleSheets adoptedStyleSheets cookie referrer URL documentURI baseURI domain characterSet charset inputEncoding contentType compatMode \
+            visibilityState hidden readyState fonts scrollingElement fullscreenElement fullscreenEnabled pictureInPictureElement pointerLockElement doctype \
+            lastModified dir designMode title head body documentElement childElementCount children firstElementChild lastElementChild append prepend \
+            replaceChildren startViewTransition timeline getAnimations exitFullscreen exitPointerLock all location onreadystatechange onvisibilitychange \
+            hasStorageAccess requestStorageAccess featurePolicy rootElement prerendering wasDiscarded\n\
+            d:attachShadow shadowRoot slot assignedSlot getAttribute getAttributeNS setAttribute setAttributeNS removeAttribute removeAttributeNS hasAttribute \
+            hasAttributeNS hasAttributes getAttributeNames toggleAttribute getAttributeNode attributes closest matches webkitMatchesSelector insertAdjacentHTML \
+            insertAdjacentElement insertAdjacentText outerHTML innerHTML getBoundingClientRect getClientRects scrollIntoView scrollIntoViewIfNeeded scrollTo scrollBy \
+            scroll scrollTop scrollLeft scrollWidth scrollHeight clientWidth clientHeight clientTop clientLeft animate getAnimations requestFullscreen \
+            requestPointerLock setPointerCapture releasePointerCapture hasPointerCapture checkVisibility computedStyleMap part role ariaLabel ariaHidden id className \
+            classList tagName localName namespaceURI prefix children childElementCount firstElementChild lastElementChild previousElementSibling nextElementSibling \
+            before after replaceWith remove append prepend replaceChildren setHTMLUnsafe getHTML moveBefore getElementsByTagName getElementsByClassName \
+            querySelector querySelectorAll style dataset hidden title lang dir tabIndex accessKey draggable contentEditable isContentEditable inert innerText \
+            outerText offsetParent offsetTop offsetLeft offsetWidth offsetHeight click focus blur attachInternals popover showPopover hidePopover togglePopover \
+            nonce autofocus spellcheck translate enterKeyHint inputMode onclick onload onerror oninput onchange onkeydown onfocus onblur onscroll onanimationend \
+            ontransitionend nodeType nodeName baseURI isConnected ownerDocument parentNode parentElement childNodes firstChild lastChild previousSibling \
+            nextSibling nodeValue textContent hasChildNodes getRootNode normalize cloneNode isEqualNode isSameNode compareDocumentPosition contains lookupPrefix \
+            lookupNamespaceURI isDefaultNamespace insertBefore appendChild replaceChild removeChild addEventListener removeEventListener dispatchEvent align\n\
+            new Event('x'):composedPath stopPropagation stopImmediatePropagation preventDefault initEvent target srcElement currentTarget eventPhase bubbles \
+            cancelable defaultPrevented composed isTrusted timeStamp returnValue cancelBubble type NONE CAPTURING_PHASE AT_TARGET BUBBLING_PHASE\n\
+            navigator:userAgent userAgentData appVersion appName product productSub vendor vendorSub language languages platform onLine cookieEnabled \
+            hardwareConcurrency deviceMemory maxTouchPoints sendBeacon clipboard serviceWorker permissions mediaDevices geolocation connection storage locks share \
+            canShare vibrate webdriver plugins mimeTypes doNotTrack javaEnabled pdfViewerEnabled getBattery credentials mediaSession wakeLock scheduling \
+            globalPrivacyControl userActivation getGamepads requestMediaKeySystemAccess registerProtocolHandler\n\
+            screen:width height availWidth availHeight availLeft availTop colorDepth pixelDepth orientation\n\
+            history:length state scrollRestoration pushState replaceState back forward go\n\
+            location:href protocol host hostname port pathname search hash origin assign replace reload ancestorOrigins toString\n\
+            performance:now timeOrigin mark measure getEntries getEntriesByType getEntriesByName clearMarks clearMeasures timing navigation memory \
+            setResourceTimingBufferSize clearResourceTimings toJSON eventCounts addEventListener\n\
+            console:log info warn error debug trace table group groupCollapsed groupEnd time timeEnd timeLog count countReset assert dir dirxml clear\n\
+            document.getElementById('i'):value defaultValue type name checked defaultChecked disabled readOnly required placeholder form labels validity \
+            validationMessage willValidate checkValidity reportValidity setCustomValidity select setSelectionRange selectionStart selectionEnd selectionDirection \
+            setRangeText maxLength minLength min max step pattern multiple accept autocomplete files list stepUp stepDown valueAsNumber valueAsDate size src alt \
+            width height indeterminate showPicker\n\
+            document.getElementById('f'):action method enctype encoding target noValidate acceptCharset autocomplete elements length name submit requestSubmit \
+            reset checkValidity reportValidity rel relList\n\
+            document.createElement('a'):href protocol host hostname port pathname search hash origin username password target rel relList download ping \
+            hreflang type text referrerPolicy\n\
+            document.createElement('img'):src srcset sizes alt width height naturalWidth naturalHeight complete currentSrc decode loading decoding crossOrigin \
+            referrerPolicy useMap isMap fetchPriority x y\n\
+            document.createElement('script'):src type async defer noModule crossOrigin integrity text charset event htmlFor referrerPolicy nonce fetchPriority \
+            blocking\n\
+            document.createElement('link'):href rel relList as media type sizes crossOrigin integrity hreflang disabled sheet referrerPolicy fetchPriority \
+            imageSrcset imageSizes blocking\n\
+            document.createElement('style'):sheet media disabled type blocking\n\
+            document.createElement('template'):content shadowRootMode\n\
+            document.createElement('iframe'):src srcdoc name sandbox allow allowFullscreen contentWindow contentDocument loading referrerPolicy width height\n\
+            document.createElement('canvas'):getContext toDataURL toBlob width height transferControlToOffscreen captureStream\n\
+            document.createElement('video'):src currentSrc play pause load canPlayType currentTime duration paused ended muted volume playbackRate readyState \
+            networkState autoplay loop controls preload poster videoWidth videoHeight buffered played seekable error textTracks addTextTrack\n\
+            document.createElement('select'):value selectedIndex options length form selectedOptions add remove item namedItem multiple size disabled required \
+            name type labels validity\n\
+            document.createElement('textarea'):value defaultValue form select setSelectionRange selectionStart selectionEnd rows cols wrap maxLength placeholder \
+            readOnly disabled required name textLength labels validity\n\
+            document.createElement('button'):type form name value disabled formAction formMethod labels validity popoverTargetElement command commandForElement\n\
+            document.createElement('label'):htmlFor control form\n\
+            document.createElement('dialog'):open returnValue show showModal close requestClose\n\
+            document.createElement('details'):open name\n\
+            document.createElement('table'):rows tBodies tHead tFoot caption insertRow deleteRow createTHead createTBody createCaption\n\
+            document.createElement('div').style:cssText length getPropertyValue setProperty removeProperty getPropertyPriority item parentRule color cssFloat\n\
+            document.createElement('div').classList:add remove toggle contains replace item length value supports entries forEach keys values\n\
+            document.createTextNode('x'):data length wholeText splitText substringData appendData insertData deleteData replaceData before after replaceWith \
+            remove assignedSlot nextElementSibling previousElementSibling\n\
+            document.createDocumentFragment():children childElementCount firstElementChild lastElementChild append prepend replaceChildren querySelector \
+            querySelectorAll getElementById\n\
+            new XMLHttpRequest():open send abort setRequestHeader getResponseHeader getAllResponseHeaders overrideMimeType readyState status statusText response \
+            responseText responseType responseURL responseXML timeout withCredentials upload onreadystatechange onload onerror\n\
+            new Response(''):ok status statusText headers url type redirected body bodyUsed clone text json arrayBuffer blob formData bytes\n\
+            new Request('https://example.test/'):url method headers body bodyUsed mode credentials cache redirect referrer referrerPolicy integrity keepalive \
+            signal clone text json arrayBuffer blob formData duplex\n\
+            Promise:all allSettled any race resolve reject withResolvers try\n\
+            Object:hasOwn fromEntries groupBy entries values assign\n\
+            Array:from of isArray fromAsync\n\
+            []:at flat flatMap findLast findLastIndex toSorted toReversed toSpliced with includes copyWithin\n\
+            '':replaceAll at matchAll padStart padEnd trimStart trimEnd isWellFormed toWellFormed normalize localeCompare\n\
+            new Set():union intersection difference isSubsetOf\n\
+            new Map():entries forEach\n\
+            Map:groupBy\n\
+            Error:captureStackTrace stackTraceLimit\n\
+            Symbol:asyncIterator dispose asyncDispose\n\
+            Math:sumPrecise clz32 fround hypot\n\
+            JSON:rawJSON parse stringify\n\
+            Intl:Collator DateTimeFormat NumberFormat PluralRules ListFormat Segmenter Locale RelativeTimeFormat DisplayNames DurationFormat getCanonicalLocales \
+            supportedValuesOf";
+        let code = format!(
+            "var missing = []; for (var g of {globals:?}.split(/\\s+/)) if (g && !(g in window)) missing.push(g); \
+             var out = ['GLOBALS: ' + missing.join(' ')]; \
+             for (var line of {members:?}.split('\\n')) {{ var at = line.indexOf(':'), expr = line.slice(0, at).trim(), names = line.slice(at + 1).trim().split(/\\s+/); \
+               var lacking; try {{ var o = eval('(' + expr + ')'); lacking = names.filter(n => n && !(n in Object(o))); }} catch (e) {{ lacking = ['<' + e + '>']; }} \
+               if (lacking.length) out.push(expr + ': ' + lacking.join(' ')); }} out.join('\\n')"
+        );
+        match h.eval_to_string(&code) {
+            Ok(text) => println!("{}", text.trim_matches('"').replace("\\n", "\n")),
+            Err(err) => println!("the probe failed: {err}"),
+        }
+    }
+
+    /// The members every HTML element reflects its attributes through
+    /// (HTML §3.2.6, §6), the ARIA ones of every element, and `click()`.
+    #[test]
+    fn html_elements_reflect_their_global_attributes_and_click() {
+        let mut h = host();
+        let doc = browser_dom::parse_html(
+            b"<!DOCTYPE html><body><div id=d title=T lang=en DIR=RTL hidden tabindex=3 accesskey=k></div><p id=p></p>\
+              <a id=a href=/x>l</a><a id=n>n</a><img id=i><button id=b></button><input id=dis disabled><details><summary id=s1></summary><summary id=s2></summary></details>\
+              <section id=ed contenteditable><span id=in></span><span id=out contenteditable=false><b id=deep></b></span></section>\
+              <div spellcheck=false translate=no><i id=inh></i></div><svg id=svg aria-label=pic></svg>\
+              <form id=f><input type=checkbox id=c><button id=sub></button></form></body>",
+        );
+        h.lend_document(doc, false, Default::default());
+        h.run_script("var $ = id => document.getElementById(id), name = f => { try { f(); return 'no' } catch (e) { return e.name } };");
+        // Reading: strings, keywords in their canonical case, flags.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var d = $('d'), p = $('p'); [d.title, d.lang, d.dir, d.hidden, d.tabIndex, d.accessKey, p.title === '', p.lang === '', p.dir === '', p.hidden, p.tabIndex, \
+                  p.autofocus, p.inert, p.inputMode === '', p.enterKeyHint === '', p.nonce === '', 'title' in HTMLElement.prototype, 'title' in Element.prototype, \
+                  Object.keys(HTMLElement.prototype).includes('hidden')].join()"
+            ),
+            "T,en,rtl,true,3,k,true,true,true,false,-1,false,false,true,true,true,true,false,true"
+        );
+        // Writing goes to the attribute, as given; a bad keyword reads empty.
+        assert_eq!(
+            eval(
+                &mut h,
+                "p.title = 'x'; p.lang = 'de'; p.dir = 'LTR'; p.tabIndex = '7.9'; p.accessKey = 'q'; p.autofocus = 1; p.inert = true; p.inputMode = 'NUMERIC'; \
+                 p.enterKeyHint = 'bogus'; var w = [p.getAttribute('title'), p.getAttribute('lang'), p.getAttribute('dir'), p.dir, p.getAttribute('tabindex'), p.tabIndex, \
+                  p.getAttribute('accesskey'), p.getAttribute('autofocus') === '', p.hasAttribute('inert'), p.getAttribute('inputmode'), p.inputMode, \
+                  p.getAttribute('enterkeyhint'), p.enterKeyHint === '']; p.autofocus = 0; p.inert = false; p.dir = 'sideways'; \
+                 w.concat([p.hasAttribute('autofocus'), p.hasAttribute('inert'), p.dir === '', p.getAttribute('dir')]).join()"
+            ),
+            "x,de,LTR,ltr,7,7,q,true,true,NUMERIC,numeric,bogus,true,false,false,true,sideways"
+        );
+        // hidden: a flag, with `until-found` kept.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var hs = []; for (var v of [true, 'until-found', 'UNTIL-FOUND', 'yes', 1, 0, NaN, '', null, false, undefined]) { p.hidden = v; \
+                   hs.push(String(p.hidden) + '/' + String(p.getAttribute('hidden'))); } hs.join(' ')"
+            ),
+            "true/ until-found/until-found until-found/until-found true/ true/ false/null false/null false/null false/null false/null false/null"
+        );
+        // tabIndex without the attribute: 0 where focus goes anyway.
+        assert_eq!(
+            eval(
+                &mut h,
+                "[$('a').tabIndex, $('n').tabIndex, $('b').tabIndex, $('dis').tabIndex, $('s1').tabIndex, $('s2').tabIndex, $('ed').tabIndex, $('in').tabIndex, \
+                  $('i').tabIndex, (p.setAttribute('tabindex', 'x'), p.tabIndex), (p.setAttribute('tabindex', ' -2abc'), p.tabIndex)].join()"
+            ),
+            "0,-1,0,0,0,-1,0,-1,-1,-1,-2"
+        );
+        // draggable, spellcheck, translate, contentEditable.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var e = $('ed'), q = $('n'); [$('a').draggable, q.draggable, $('i').draggable, (q.draggable = true, q.getAttribute('draggable')), q.tabIndex, \
+                  (q.draggable = false, q.getAttribute('draggable')), $('inh').spellcheck, $('inh').translate, q.spellcheck, q.translate, \
+                  (q.spellcheck = false, q.getAttribute('spellcheck')), (q.translate = false, q.getAttribute('translate')), (q.translate = true, q.getAttribute('translate')), \
+                  e.contentEditable, e.isContentEditable, $('in').contentEditable, $('in').isContentEditable, $('out').contentEditable, $('out').isContentEditable, \
+                  $('deep').isContentEditable, q.isContentEditable, (q.contentEditable = 'PLAINTEXT-ONLY', q.getAttribute('contenteditable')), q.isContentEditable, \
+                  (q.contentEditable = 'inherit', q.hasAttribute('contenteditable')), name(() => { q.contentEditable = 'maybe' }), (q.isContentEditable = true, q.isContentEditable)].join()"
+            ),
+            "true,false,true,true,0,false,false,false,true,true,false,no,yes,true,true,inherit,true,false,false,false,false,plaintext-only,true,false,SyntaxError,false"
+        );
+        // nonce: what a script sets is read back, the attribute stays.
+        assert_eq!(
+            eval(
+                &mut h,
+                "q.setAttribute('nonce', 'a1'); var n1 = q.nonce; q.nonce = 'b2'; var n2 = [q.nonce, q.getAttribute('nonce')]; q.setAttribute('nonce', 'c3'); [n1, n2, q.nonce].join()"
+            ),
+            "a1,b2,a1,c3"
+        );
+        // ARIA: null when absent, on every element; null removes.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var s = $('svg'); [s.ariaLabel, String(s.ariaHidden), String(s.role), (s.role = 'img', s.getAttribute('role')), (s.ariaHidden = true, s.getAttribute('aria-hidden')), \
+                  (s.ariaLabel = null, s.hasAttribute('aria-label')), (s.role = undefined, s.hasAttribute('role')), 'ariaLabel' in Element.prototype, 'title' in s, \
+                  (p.ariaValueNow = 5, p.getAttribute('aria-valuenow'))].join()"
+            ),
+            "pic,null,null,img,true,false,false,true,false,5"
+        );
+        // click(): an untrusted, bubbling click with its activation; not
+        // on a disabled control; not from inside itself.
+        assert_eq!(
+            eval(
+                &mut h,
+                "var seen = []; document.addEventListener('click', ev => seen.push([ev.target.id, ev.isTrusted, ev.bubbles, ev.cancelable, ev.composed, ev instanceof MouseEvent, \
+                   ev.detail, ev.view === window].join('/'))); var c = $('c'); c.click(); var first = [c.checked, seen.join(' ')]; seen = []; \
+                 c.addEventListener('click', ev => ev.preventDefault(), { once: true }); c.click(); first.push(c.checked, seen.length); seen = []; \
+                 $('dis').click(); first.push(seen.length); var again = 0; p.addEventListener('click', () => { again++; p.click(); }); p.click(); first.push(again); \
+                 var submitted = 0; $('f').addEventListener('submit', ev => { submitted++; ev.preventDefault(); }); $('sub').click(); first.push(submitted, typeof p.click, \
+                 name(() => HTMLElement.prototype.click.call($('svg')))); first.join()"
+            ),
+            "true,c/false/true/true/true/true/0/true,true,1,0,1,1,function,TypeError"
         );
         assert_eq!(lines(&mut h), Vec::<String>::new());
     }

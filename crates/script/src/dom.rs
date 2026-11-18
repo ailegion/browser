@@ -116,6 +116,12 @@ pub(crate) struct Dom {
     /// Attribute changes of custom elements not yet turned into
     /// `attributeChangedCallback` reactions (`custom.rs`).
     pub(crate) attr_reactions: Vec<AttrReaction>,
+    /// Elements whose `nonce` a script set: the value `nonce` reads, until
+    /// the attribute changes (`reflect.rs`).
+    pub(crate) nonces: HashMap<NodeId, String>,
+    /// Elements whose `click()` is under way: a `click()` inside it does
+    /// nothing.
+    pub(crate) clicking: std::collections::HashSet<NodeId>,
 }
 
 /// An attribute of a custom element was set, changed or removed: the
@@ -350,6 +356,9 @@ impl Dom {
         // the value it had and has no element any more.
         if self.attr_nodes.contains_key(&element) {
             crate::attrs::attribute_changed(self, element, name, old.as_deref());
+        }
+        if name == "nonce" {
+            self.nonces.remove(&element);
         }
         // A custom element hears of it (DOM's "handle attribute changes").
         if self.doc.custom_elements_watched()
